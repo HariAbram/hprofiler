@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "hprofiler"
+version = "0.1.0"
+description = "Multi-backend CPU/GPU profiler (CUDA, ROCm, OpenCL, OpenMP)"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "textual>=0.47",
+    "rich>=13.0",
+]
+
+[project.scripts]
+hprofiler = "hprofiler:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

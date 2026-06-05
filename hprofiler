@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""
+hprofiler — multi-backend CPU/GPU profiler CLI
+
+Usage examples:
+  hprofiler run -- ./my_omp_program
+  hprofiler run --backend omp -- ./my_omp_program        # alias for openmp
+  hprofiler run --backend cuda,cpu -- ./my_cuda_app arg1 arg2
+  hprofiler run --backend opencl,cpu --output trace.json -- ./acpp_program
+  hprofiler run --backend rocm -- ./hip_program          # or: --backend hip
+  hprofiler view trace.json
+  hprofiler summary trace.json
+  hprofiler backends          # list available backends on this system
+"""
+
+import sys
+import os
+
+# Add src to path so we can import without installing
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "."))
+
+import click
+from pathlib import Path
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _available_backends() -> dict[str, bool]:
+    from src.backends import ALL_BACKENDS
+    return {name: cls().is_available() for name, cls in ALL_BACKENDS.items()}
+
+
+_ALIASES: dict[str, str] = {
+    "omp":    "openmp",
+    "cl":     "opencl",
+    "hip":    "rocm",
+    "perf":   "cpu",
+}
+
+
+def _resolve_backends(backend_str: str | None) -> list[str]:
+    """Resolve comma-separated backend list (with aliases), defaulting to all available."""
+    avail = _available_backends()
+    if not backend_str or backend_str == "auto":
+        chosen = [name for name, ok in avail.items() if ok]
+        if not chosen:
+            chosen = ["cpu"]
+        return chosen
+    requested = [_ALIASES.get(b.strip(), b.strip()) for b in backend_str.split(",")]
+    unknown = [b for b in requested if b not in avail]
+    if unknown:
+        valid = list(avail.keys()) + list(_ALIASES.keys())
+        click.echo(f"[warn] Unknown backends: {', '.join(unknown)} "
+                   f"(valid: {', '.join(sorted(valid))})", err=True)
+    return [b for b in requested if b in avail]
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+@click.group()
+@click.version_option("0.1.0", prog_name="hprofiler")
+def cli():
+    """Multi-backend CPU/GPU profiler — CUDA, ROCm, OpenCL, OpenMP, perf."""
+
+
+@cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.option("--backend", "-b", default="auto",
+              help="Comma-separated backends: cpu,cuda,opencl,rocm,openmp  [default: auto]")
+@click.option("--output", "-o", default=None,
+              help="Output trace file (JSON).  Default: <program>.hprofiler.json")
+@click.option("--ui/--no-ui", default=True,
+              help="Open the TUI viewer after profiling  [default: yes]")
+@click.option("--summary/--no-summary", default=True,
+              help="Print text summary after profiling  [default: yes]")
+@click.option("--perf-freq", default=9999, show_default=True,
+              help="perf sampling frequency (Hz)")
+@click.option("--perf-callgraph", default=None,
+              type=click.Choice(["fp", "dwarf", "lbr"]),
+              help="perf call-graph method (disabled by default — use fp/dwarf/lbr for stacks)")
+@click.option("--disasm/--no-disasm", default=False,
+              help="Collect per-kernel disassembly after profiling  [default: no]")
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, command):
+    """Profile COMMAND with the selected backends.
+
+    Separate hprofiler options from the program and its arguments with --:
+
+      hprofiler run --backend cuda -- ./my_program --arg1 val
+    """
+    from src.core.runner import Runner
+
+    backends = _resolve_backends(backend)
+    cmd = list(command)
+
+    click.echo(f"[hprofiler] Backends: {', '.join(backends)}", err=True)
+    click.echo(f"[hprofiler] Command:  {' '.join(cmd)}", err=True)
+
+    out_path = output
+    if not out_path:
+        prog_name = Path(cmd[0]).name
+        out_path = f"{prog_name}.hprofiler.json"
+
+    env_extra: dict = {}
+    if perf_callgraph:
+        env_extra["HPROFILER_CALLGRAPH"] = perf_callgraph
+
+    runner = Runner(
+        command=cmd,
+        backends=backends,
+        perf_freq=perf_freq,
+        env_extra=env_extra,
+        collect_disasm=disasm,
+    )
+
+    trace = runner.run()
+    click.echo(f"\n[hprofiler] Run complete — {len(trace.spans)} events captured", err=True)
+
+    # Save trace
+    from src.output import chrome_trace
+    chrome_trace.write(trace, out_path)
+    click.echo(f"[hprofiler] Trace written to: {out_path}", err=True)
+
+    if summary:
+        from src.output.summary import print_summary
+        print_summary(trace)
+
+    if ui and trace.all_events:
+        from src.ui.app import launch_viewer
+        launch_viewer(trace, collect_disasm=disasm)
+    elif ui and not trace.all_events:
+        click.echo("[hprofiler] No events to display.", err=True)
+
+
+@cli.command()
+@click.argument("trace_file", type=click.Path(exists=True))
+@click.option("--disasm/--no-disasm", default=False,
+              help="Collect per-kernel disassembly in the background  [default: no]")
+def view(trace_file, disasm):
+    """Open the TUI viewer for a saved trace JSON file."""
+    from src.ui.app import load_trace_from_json, launch_viewer
+    click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)
+    trace = load_trace_from_json(trace_file, collect_disasm=disasm)
+    click.echo(f"[hprofiler] {len(trace.spans)} spans loaded", err=True)
+    launch_viewer(trace, collect_disasm=disasm)
+
+
+def _open_browser(path: str) -> None:
+    """Open *path* in a browser, delegating to the invoking user when under sudo."""
+    import os, webbrowser, subprocess as _sp
+    url = f"file://{os.path.abspath(path)}"
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.geteuid() == 0:
+        # Running as root via sudo: open the browser as the original user so
+        # it can reach their desktop session.
+        # sudo sanitizes the environment when switching users, so passing
+        # env= to Popen only sets the environment for sudo itself, not for
+        # xdg-open. Use the `env` command inside the sudo invocation to
+        # explicitly set DISPLAY/XAUTHORITY after sudo's sanitization step.
+        display = os.environ.get("DISPLAY", ":0")
+        xauth   = os.environ.get("XAUTHORITY",
+                                  f"/home/{sudo_user}/.Xauthority")
+        try:
+            _sp.Popen(
+                ["sudo", "-u", sudo_user,
+                 "env",
+                 f"DISPLAY={display}",
+                 f"XAUTHORITY={xauth}",
+                 "xdg-open", url],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+            return
+        except FileNotFoundError:
+            pass   # xdg-open / sudo not available — fall through to webbrowser
+    webbrowser.open(url)
+
+
+@cli.command(
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
+)
+@click.option("--backend", "-b", default=None,
+              help="Backend to use when running command  (cuda | rocm | cpu | openmp)")
+@click.option("--output", "-o", default=None,
+              help="Output HTML file")
+@click.option("--open/--no-open", "open_browser", default=True,
+              help="Open the chart in the default browser  [default: yes]")
+@click.argument("target", nargs=-1, type=click.UNPROCESSED)
+def roofline(backend, output, open_browser, target):
+    """Generate an interactive roofline chart using hardware performance counters.
+
+    Two modes:
+
+    \b
+    1. Run the program directly (recommended — uses real hardware counters):
+         hprofiler roofline --backend cuda -- ./app args...
+
+    \b
+    2. From a saved trace (uses disasm-based estimates — less accurate):
+         hprofiler roofline app.hprofiler.json
+
+    Hardware counter tools required:
+      CUDA  → ncu  (Nsight Compute, ships with CUDA toolkit)
+      ROCm  → rocprof  (ships with ROCm)
+      CPU   → perf stat  (linux-tools-$(uname -r))
+
+    If the tool lacks permission to access counters, a fix is shown.
+    """
+    import os, webbrowser, time
+    from src.analysis.device import query_devices
+    from src.analysis.roofline import metrics_from_counters
+    from src.output.roofline_html import write
+
+    # ── Mode 1: run command with hardware counters ────────────────────────────
+    if backend:
+        args = [a for a in target if a != "--"]
+        if not args:
+            raise click.UsageError(
+                "Specify the command to profile after --:\n"
+                "  hprofiler roofline --backend cuda -- ./app"
+            )
+
+        out = output or (Path(args[0]).name + ".roofline.html")
+
+        click.echo(
+            f"[hprofiler] Collecting hardware counters via {backend} backend ...",
+            err=True,
+        )
+        click.echo(
+            f"[hprofiler] Command: {' '.join(args)}  "
+            f"(this re-runs the application)",
+            err=True,
+        )
+
+        from src.analysis.hwcounters import collect, CounterPermissionError
+
+        try:
+            raw_counters = collect(backend, args)
+        except FileNotFoundError as e:
+            click.echo(f"\n[hprofiler] ✗  Tool not found:\n{e}", err=True)
+            raise SystemExit(1)
+        except CounterPermissionError as e:
+            click.echo(f"\n[hprofiler] ✗  Permission denied:\n{e}", err=True)
+            raise SystemExit(1)
+        except Exception as e:
+            click.echo(f"\n[hprofiler] ✗  Counter collection failed:\n{e}", err=True)
+            raise SystemExit(1)
+
+        if not raw_counters:
+            click.echo(
+                "[hprofiler] No counter data collected. "
+                "The program may not have run any kernels.",
+                err=True,
+            )
+            raise SystemExit(1)
+
+        # Query device peaks
+        devices = query_devices([backend])
+        if not devices:
+            click.echo(
+                "[hprofiler] Cannot query device capabilities. "
+                "Is the GPU/driver available?",
+                err=True,
+            )
+            raise SystemExit(1)
+        device = devices[0]
+
+        # Diagnostics: show raw counter values before building metrics
+        click.echo(
+            f"[hprofiler] Device: {device.name}  "
+            f"fp32={device.fp32_tflops:.2f} TFLOPs  "
+            f"bw={device.bandwidth_gbs:.0f} GB/s  "
+            f"ridge={device.ridge_point:.1f} F/B  "
+            f"SMs={device.sm_count}  "
+            f"clock={device.core_clock_ghz:.3f} GHz",
+            err=True,
+        )
+        for c in raw_counters:
+            clock_hz = device.core_clock_ghz * 1e9 if device.core_clock_ghz > 0 else 1e9
+            dur_src = ("max" if c.sm_cycles_max > 0
+                       else "sum/N" if c.sm_cycles_elapsed > 0
+                       else "none")
+            dur_ns  = (int(c.sm_cycles_max / clock_hz * 1e9)      if c.sm_cycles_max > 0
+                       else int(c.sm_cycles_elapsed / (device.sm_count or 1) / clock_hz * 1e9)
+                       if c.sm_cycles_elapsed > 0 else 0)
+            click.echo(
+                f"  {c.kernel_name[:40]:<40}  "
+                f"fp32={c.fp32_ops:.3e}  dram={c.dram_bytes:.3e} B  "
+                f"AI={c.fp32_ops/c.dram_bytes:.1f} F/B  "
+                f"cycles_max={c.sm_cycles_max:.0f}  cycles_sum={c.sm_cycles_elapsed:.0f}  "
+                f"dur={dur_ns/1e6:.3f} ms ({dur_src})",
+                err=True,
+            )
+
+        metrics = [m for c in raw_counters
+                   if (m := metrics_from_counters(c, device)) is not None]
+
+        if not metrics:
+            click.echo(
+                "[hprofiler] No kernels with nonzero FLOPs or DRAM bytes. "
+                "The program may be compute-light.",
+                err=True,
+            )
+            raise SystemExit(1)
+
+        click.echo(
+            f"[hprofiler] Collected counters for {len(metrics)} kernel(s) "
+            f"on {device.name}",
+            err=True,
+        )
+
+        name = Path(args[0]).name
+        try:
+            write(device, metrics, out, trace_name=name)
+        except PermissionError:
+            click.echo(
+                f"\n[hprofiler] ✗  Cannot write '{out}' — file is owned by another user "
+                f"(probably a previous sudo run).\n"
+                f"  Fix:  rm {out}\n"
+                f"  Or:   hprofiler roofline --backend {backend} -o out.html -- {' '.join(args)}",
+                err=True,
+            )
+            raise SystemExit(1)
+        click.echo(f"[hprofiler] Roofline chart → {out}", err=True)
+
+        if open_browser:
+            _open_browser(out)
+        return
+
+    # ── Mode 2: from saved trace (disasm-based) ───────────────────────────────
+    if not target:
+        raise click.UsageError(
+            "Provide a trace file or use --backend to run with hardware counters:\n"
+            "  hprofiler roofline app.hprofiler.json\n"
+            "  hprofiler roofline --backend cuda -- ./app"
+        )
+
+    trace_file = target[0]
+    if not Path(trace_file).exists():
+        raise click.BadParameter(f"File not found: {trace_file}")
+
+    out = output or (Path(trace_file).stem + ".roofline.html")
+
+    click.echo(
+        f"[hprofiler] Loading {trace_file} (disasm-based estimates — "
+        "less accurate than hardware counters) ...",
+        err=True,
+    )
+
+    from src.ui.app import load_trace_from_json
+    from src.output.roofline_html import write_from_trace
+
+    trace = load_trace_from_json(trace_file, collect_disasm=True)
+    for _ in range(40):          # wait up to 12 s for background disasm
+        if trace.disasm:
+            break
+        time.sleep(0.3)
+
+    if not trace.devices:
+        click.echo(
+            "[hprofiler] No device info in trace. "
+            "Re-run with a GPU/CPU backend.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    n = write_from_trace(trace, out)
+    if n == 0:
+        click.echo(
+            "[hprofiler] Nothing to plot.  "
+            "Tip: for accurate results use hardware counters:\n"
+            f"  hprofiler roofline --backend <backend> -- {trace.metadata.command}",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    click.echo(
+        f"[hprofiler] Roofline chart ({n} kernels, disasm estimates) → {out}",
+        err=True,
+    )
+    if open_browser:
+        _open_browser(out)
+
+
+@cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.option("--output", "-o", default=None,
+              help="Output SVG file  [default: <program>.flamegraph.svg]")
+@click.option("--callgraph", default="fp", show_default=True,
+              type=click.Choice(["fp", "dwarf", "lbr"]),
+              help="perf call-graph method.  fp = frame-pointer (fast, needs "
+                   "-fno-omit-frame-pointer).  dwarf = DWARF CFI (slower, "
+                   "works with any binary).")
+@click.option("--freq", "-F", default=99, show_default=True,
+              help="perf sampling frequency (Hz)")
+@click.option("--open/--no-open", "open_browser", default=True,
+              help="Open the SVG in the default browser  [default: yes]")
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+def flamegraph(output, callgraph, freq, open_browser, command):
+    """Generate an interactive flame graph SVG by profiling COMMAND.
+
+    Re-runs COMMAND under perf record --call-graph and renders an interactive
+    SVG: hover for details, click a frame to zoom, double-click background
+    to reset.
+
+    \b
+    Examples:
+      hprofiler flamegraph -- ./my_program
+      hprofiler flamegraph --callgraph dwarf -o out.svg -- ./my_program args
+    """
+    import os, webbrowser, shutil as _shutil
+
+    if not _shutil.which("perf"):
+        click.echo("[hprofiler] ✗  perf not found — install linux-tools-$(uname -r)",
+                   err=True)
+        raise SystemExit(1)
+
+    cmd = [a for a in command if a != "--"]
+    if not cmd:
+        raise click.UsageError("Specify a command after --:\n  hprofiler flamegraph -- ./app")
+
+    out = output or (Path(cmd[0]).name + ".flamegraph.svg")
+    env = dict(os.environ)
+
+    click.echo(
+        f"[hprofiler] Recording CPU stacks (--call-graph={callgraph}, -F{freq}) ...",
+        err=True,
+    )
+    click.echo(f"[hprofiler] Command: {' '.join(cmd)}", err=True)
+
+    from src.output.flamegraph import collect_folded_stacks, save as fg_save
+
+    folded = collect_folded_stacks(cmd, env, callgraph=callgraph, freq=freq)
+
+    if not folded.strip():
+        click.echo(
+            "[hprofiler] ✗  No CPU stacks collected.\n"
+            "  Tips:\n"
+            "    • Use --callgraph dwarf if the binary lacks frame pointers\n"
+            "    • Lower perf_event_paranoid: "
+            "sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'\n"
+            "    • Make sure the program runs long enough to collect samples",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    total = sum(
+        int(ln.rsplit(" ", 1)[1])
+        for ln in folded.splitlines()
+        if ln.strip() and ln.rsplit(" ", 1)[-1].isdigit()
+    )
+    click.echo(f"[hprofiler] Collected {total:,} samples — rendering ...", err=True)
+
+    title = f"{Path(cmd[0]).name} — flame graph ({callgraph})"
+    try:
+        fg_save(folded, out, title)
+    except ValueError as e:
+        click.echo(f"[hprofiler] ✗  {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"[hprofiler] Flame graph → {out}", err=True)
+    if open_browser:
+        _open_browser(out)
+
+
+@cli.command()
+@click.argument("trace_file", type=click.Path(exists=True))
+@click.option("--top", "-n", default=20, show_default=True,
+              help="Number of top hotspots to show")
+def summary(trace_file, top):
+    """Print a text summary of a saved trace JSON file."""
+    from src.ui.app import load_trace_from_json
+    from src.output.summary import print_summary
+    # Disasm is never used in a text summary — skip the background collection.
+    trace = load_trace_from_json(trace_file, collect_disasm=False)
+    print_summary(trace, top_n=top)
+
+
+@cli.command()
+def backends():
+    """List all backends and their availability on this system."""
+    from src.backends import ALL_BACKENDS
+
+    # reverse-map: canonical name → aliases
+    reverse_aliases: dict[str, list[str]] = {}
+    for alias, canon in _ALIASES.items():
+        reverse_aliases.setdefault(canon, []).append(alias)
+
+    click.echo("\nAvailable backends:\n")
+    for name, cls in ALL_BACKENDS.items():
+        backend_obj = cls()
+        ok = backend_obj.is_available()
+        if ok:
+            status = click.style("✓", fg="green") + "  available  "
+        else:
+            status = click.style("✗", fg="red") + "  unavailable"
+        aliases = reverse_aliases.get(name, [])
+        alias_str = f"  [alias: {', '.join(aliases)}]" if aliases else ""
+        click.echo(f"  {name:<10}  {status}  {backend_obj.description}{alias_str}")
+
+        # Extra hint for OpenMP when libomp is missing
+        note = getattr(backend_obj, "availability_note", lambda: "")()
+        if note:
+            click.echo(f"  {'':10}     {'':13} → {click.style(note, fg='yellow')}")
+
+    click.echo()
+
+
+@cli.command()
+@click.option("--build-dir", default="build", show_default=True,
+              help="CMake build directory")
+@click.option("--jobs", "-j", default=os.cpu_count() or 4, show_default=True,
+              help="Parallel build jobs")
+def build(build_dir, jobs):
+    """Build the C hook libraries (CUDA, OpenCL, OpenMP, ROCm)."""
+    import subprocess
+    build_path = Path(build_dir)
+    build_path.mkdir(parents=True, exist_ok=True)
+
+    root = Path(__file__).parent.resolve()
+
+    click.echo(f"[hprofiler] Configuring CMake in {build_path} ...")
+    r = subprocess.run(
+        ["cmake", str(root.resolve()), "-DCMAKE_BUILD_TYPE=Release"],
+        cwd=build_path,
+    )
+    if r.returncode != 0:
+        raise click.ClickException("CMake configure failed")
+
+    click.echo(f"[hprofiler] Building with {jobs} jobs ...")
+    r = subprocess.run(["cmake", "--build", ".", f"-j{jobs}"], cwd=build_path)
+    if r.returncode != 0:
+        raise click.ClickException("Build failed")
+
+    # Copy libs to build/lib in project root
+    lib_src = build_path / "lib"
+    lib_dst = root / "build" / "lib"
+    lib_dst.mkdir(parents=True, exist_ok=True)
+
+    import shutil
+    for so in lib_src.glob("*.so*"):
+        dst = lib_dst / so.name
+
+        if so.resolve() == dst.resolve():
+            click.echo(f"  → {dst} already in place")
+            continue
+
+        shutil.copy2(so, dst)
+        click.echo(f"  → {dst}")
+
+    click.echo(click.style("[hprofiler] Build complete.", fg="green"))
+
+
+if __name__ == "__main__":
+    cli()

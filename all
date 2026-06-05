@@ -1,0 +1,8 @@
+----- START LOGGING OF TOOL REGISTRATION -----
+Search for OMP tool in current address space... Failed.
+Searching tool libraries...
+OMP_TOOL_LIBRARIES = /home/hari/git/profiler/build/lib/libprofiler_ompt.so
+Opening /home/hari/git/profiler/build/lib/libprofiler_ompt.so... Success. 
+Searching for ompt_start_tool in /home/hari/git/profiler/build/lib/libprofiler_ompt.so... Success.
+Tool was started and is using the OMPT interface.
+----- END LOGGING OF TOOL REGISTRATION -----

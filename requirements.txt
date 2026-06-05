@@ -1,0 +1,4 @@
+click>=8.1
+textual>=0.47
+rich>=13.0
+capstone>=5.0

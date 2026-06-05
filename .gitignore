@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+*.so
+*.perf.data
+*.hprofiler.json
+MEMORY.md

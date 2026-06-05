@@ -1,0 +1,1 @@
+{"traceEvents": [{"ph": "M", "pid": 3978618, "tid": 0, "name": "process_name", "args": {"name": "/bin/echo"}}], "displayTimeUnit": "ms", "metadata": {"command": "/bin/echo", "args": ["hello"], "backends": ["openmp"], "hostname": "linux-machine", "duration_ms": 0.0}}
