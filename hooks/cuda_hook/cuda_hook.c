@@ -90,12 +90,22 @@ static void ensure_connected(void) {
     }
 }
 
+/* send_all: write all n bytes; close socket on EPIPE/error so next call
+ * reconnects rather than spinning on a broken socket. Caller holds mutex. */
+static void send_all(const char *buf, int n) {
+    while (n > 0) {
+        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
+        if (r < 0) { close(g_sock); g_sock = -1; return; }
+        buf += r; n -= (int)r;
+    }
+}
+
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
     pthread_mutex_lock(&g_sock_mutex);
     ensure_connected();
     if (g_sock >= 0) {
-        char buf[1024];
+        char buf[2048];   /* 2 KB: enough for long kernel names + tags */
         int n;
         if (extra && *extra)
             n = snprintf(buf, sizeof(buf),
@@ -109,7 +119,8 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                          cat, g_pid, (int)tid,
                          (unsigned long long)start_ns,
                          (unsigned long long)dur_ns, name);
-        if (n > 0) send(g_sock, buf, n, MSG_NOSIGNAL);
+        /* snprintf returns >= sizeof(buf) when truncated; drop truncated spans */
+        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
     }
     pthread_mutex_unlock(&g_sock_mutex);
 }
@@ -124,7 +135,7 @@ static void emit_ctr(const char *cat, const char *name,
                          "ctr:%s:%d:%llu:%s:%lld:%s\n",
                          cat, g_pid, (unsigned long long)now_ns(),
                          name, (long long)value, unit);
-        if (n > 0) send(g_sock, buf, n, MSG_NOSIGNAL);
+        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
     }
     pthread_mutex_unlock(&g_sock_mutex);
 }
@@ -154,19 +165,28 @@ static const char *resolve_kernel_name(const void *fn) {
     return "<jit-kernel>";
 }
 
-/* ── GPU device memory tracking ─────────────────────────────────────────── */
-#define ALLOC_CAP 4096
+/* ── GPU device memory tracking (dynamic growing table) ─────────────────── */
 typedef struct { uintptr_t ptr; size_t sz; } AllocRec;
 
-static AllocRec        g_allocs[ALLOC_CAP];
+static AllocRec       *g_allocs   = NULL;
 static int             g_alloc_n  = 0;
+static int             g_alloc_cap = 0;
 static int64_t         g_gpu_mem  = 0;
 static pthread_mutex_t g_alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void _alloc_grow(void) {
+    int new_cap = g_alloc_cap ? g_alloc_cap * 2 : 4096;
+    AllocRec *p = (AllocRec *)realloc(g_allocs, (size_t)new_cap * sizeof(AllocRec));
+    if (p) { g_allocs = p; g_alloc_cap = new_cap; }
+    /* If realloc fails, g_allocs/g_alloc_cap are unchanged; the caller's
+     * bounds check (g_alloc_n < g_alloc_cap) prevents a write to NULL. */
+}
 
 static void mem_track_add(void *ptr, size_t sz) {
     int64_t total;
     pthread_mutex_lock(&g_alloc_mutex);
-    if (g_alloc_n < ALLOC_CAP) {
+    if (g_alloc_n >= g_alloc_cap) _alloc_grow();
+    if (g_alloc_n < g_alloc_cap) {
         g_allocs[g_alloc_n].ptr = (uintptr_t)ptr;
         g_allocs[g_alloc_n].sz  = sz;
         g_alloc_n++;
@@ -193,6 +213,7 @@ static void mem_track_rem(void *ptr) {
 }
 
 /* ── Pinned host memory tracking (cudaHostAlloc / cudaMallocHost) ─────────── */
+#define ALLOC_CAP 4096   /* kept for pin table — pinned allocs are few */
 static AllocRec        g_pin_allocs[ALLOC_CAP];
 static int             g_pin_n    = 0;
 static int64_t         g_pin_mem  = 0;
@@ -1120,6 +1141,63 @@ void nvtxMarkW(const wchar_t *message) {
     nvtxMarkA(narrow);
 }
 
+/* ── CUDA Graph launch interception ─────────────────────────────────────── */
+
+/* Runtime API: cudaGraphLaunch */
+cudaError_t cudaGraphLaunch(void *graphExec, cudaStream_t stream) {
+    typedef cudaError_t (*fn_t)(void*, cudaStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)find_cuda_sym("cudaGraphLaunch");
+    if (!real) return -1;
+    if (in_hook) return real(graphExec, stream);
+    in_hook = 1;
+
+    pid_t tid = gettid_compat();
+    int sid = get_stream_id(stream);
+    char extra[128];
+    snprintf(extra, sizeof(extra), "type=graph_launch,stream=%d", sid);
+
+    cudaEvent_t ev_s, ev_e;
+    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
+    uint64_t t0 = now_ns();
+    cudaError_t ret = real(graphExec, stream);
+    if (gpu_ok)
+        pk_commit(ev_s, ev_e, stream, "cuda", "cudaGraphLaunch", extra, t0, tid);
+    else
+        emit_span("cuda", tid, t0, now_ns() - t0, "cudaGraphLaunch", extra);
+
+    in_hook = 0;
+    return ret;
+}
+
+/* Driver API: cuGraphLaunch */
+CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
+    typedef CUresult (*fn_t)(void*, CUstream);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)find_cuda_sym("cuGraphLaunch");
+    if (!real) return -1;
+    if (in_hook) return real(hGraphExec, hStream);
+    in_hook = 1;
+
+    pid_t tid = gettid_compat();
+    cudaStream_t stream = (cudaStream_t)hStream;
+    int sid = get_stream_id(stream);
+    char extra[128];
+    snprintf(extra, sizeof(extra), "type=graph_launch,stream=%d", sid);
+
+    cudaEvent_t ev_s, ev_e;
+    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
+    uint64_t t0 = now_ns();
+    CUresult ret = real(hGraphExec, hStream);
+    if (gpu_ok)
+        pk_commit(ev_s, ev_e, stream, "cuda", "cuGraphLaunch", extra, t0, tid);
+    else
+        emit_span("cuda", tid, t0, now_ns() - t0, "cuGraphLaunch", extra);
+
+    in_hook = 0;
+    return ret;
+}
+
 /* ── Constructor / Destructor ───────────────────────────────────────────── */
 
 __attribute__((constructor))
@@ -1139,6 +1217,19 @@ static void hprofiler_cuda_init(void) {
 __attribute__((destructor))
 static void hprofiler_cuda_fini(void) {
     pk_flush(NULL, 1);
+
+    /* Report leaked GPU allocations (cudaMalloc without matching cudaFree). */
+    pthread_mutex_lock(&g_alloc_mutex);
+    if (g_alloc_n > 0) {
+        int64_t leaked = 0;
+        for (int i = 0; i < g_alloc_n; i++)
+            leaked += (int64_t)g_allocs[i].sz;
+        pthread_mutex_unlock(&g_alloc_mutex);
+        emit_ctr("memory", "gpu_memory_leaked_bytes", leaked, "bytes");
+    } else {
+        pthread_mutex_unlock(&g_alloc_mutex);
+    }
+
     if (g_sock >= 0) {
         close(g_sock);
         g_sock = -1;

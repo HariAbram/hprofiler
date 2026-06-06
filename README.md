@@ -1,4 +1,4 @@
-# hprofiler
+# hprofiler (Heterogenous Profiler)
 
 Multi-device CPU/GPU profiler for Linux. Traces programs via CUDA, ROCm, OpenCL, OpenMP, and perf — simultaneously — with a terminal UI.
 

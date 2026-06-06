@@ -25,12 +25,15 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from rich.text import Text
 from rich.panel import Panel
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import ScrollableContainer, Horizontal, Vertical
+from textual.events import MouseMove
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
@@ -60,6 +63,32 @@ _CAT_RICH: dict[str, str] = {
 def _cat_color(cat: str) -> str:
     return _CAT_RICH.get(cat, "grey70")
 
+# Per-function color palette — 8 primary hues spaced 45° apart, interleaved
+# so adjacent palette indices are ~180° apart in hue (maximum contrast).
+# idx 0 (red) vs idx 1 (cyan), idx 2 (green) vs idx 3 (magenta), etc.
+_SPAN_PALETTE = [
+    "bright_red",      # 0°
+    "bright_cyan",     # 180°
+    "bright_green",    # 120°
+    "bright_magenta",  # 300°
+    "bright_yellow",   # 60°
+    "deep_sky_blue1",  # 210°
+    "orange3",         # 30°
+    "medium_purple1",  # 270°
+    "hot_pink",        # 330°
+    "turquoise2",      # 175°
+    "chartreuse3",     # 90°
+    "gold1",           # 45°
+    "cornflower_blue", # 230°
+    "light_salmon1",   # 15°
+    "spring_green2",   # 150°
+    "plum2",           # 285°
+]
+
+def _span_color(name: str) -> str:
+    """Stable per-function color derived from the function name."""
+    return _SPAN_PALETTE[(hash(name) & 0x7FFFFFFF) % len(_SPAN_PALETTE)]
+
 def _fmt_ns(ns: float) -> str:
     if ns >= 1_000_000_000:
         return f"{ns / 1e9:.3f}s"
@@ -72,6 +101,41 @@ def _fmt_ns(ns: float) -> str:
 def _bar(frac: float, width: int, filled: str = "█", empty: str = "░") -> str:
     n = max(0, min(width, int(frac * width)))
     return filled * n + empty * (width - n)
+
+def _grad_bar(frac: float, width: int) -> str:
+    """Gradient block bar using sub-character resolution (▏▎▍▌▋▊▉█)."""
+    blocks = " ▏▎▍▌▋▊▉█"
+    total_eighths = int(frac * width * 8)
+    full  = total_eighths // 8
+    rem   = total_eighths %  8
+    s = "█" * full
+    if rem and full < width:
+        s += blocks[rem]
+        s += " " * (width - full - 1)
+    else:
+        s += " " * (width - full)
+    return s[:width]
+
+def _grade(pct: float) -> tuple[str, str]:
+    """Return (letter_grade, color) for a percentage 0–100."""
+    if pct >= 85: return "A+", "bright_green"
+    if pct >= 70: return "A",  "green"
+    if pct >= 55: return "B",  "yellow"
+    if pct >= 35: return "C",  "orange3"
+    if pct >= 15: return "D",  "red"
+    return "F",  "bright_red"
+
+def _sparkline(values: list[float], width: int = 12) -> str:
+    """Compact sparkline using Braille dots."""
+    if not values: return " " * width
+    mn, mx = min(values), max(values)
+    rng = mx - mn or 1
+    spark_chars = "▁▂▃▄▅▆▇█"
+    result = ""
+    for v in values[-width:]:
+        idx = int((v - mn) / rng * 7)
+        result += spark_chars[idx]
+    return result.ljust(width)
 
 def _fmt_bytes(b: float) -> str:
     if b >= 1024**3:
@@ -158,7 +222,248 @@ class HelpScreen(ModalScreen):
         self.dismiss()
 
 
-# ── Overview tab ──────────────────────────────────────────────────────────────
+# ── System tab ────────────────────────────────────────────────────────────────
+
+class SystemWidget(Static):
+    """Minimal system / device information card."""
+
+    def __init__(self, trace: Trace, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._trace = trace
+
+    def render(self) -> Any:  # noqa: ANN401
+        trace = self._trace
+        meta  = trace.metadata
+        L: list[str] = []
+
+        def _kv(key: str, val: str, key_w: int = 14) -> None:
+            L.append(f"  [dim]{key:<{key_w}}[/dim]  {val}")
+
+        def _sep(title: str = "") -> None:
+            if title:
+                L.append(f"\n  [dim]── {title} {'─' * max(0, 44 - len(title))}[/dim]")
+            else:
+                L.append(f"  [dim]{'─' * 48}[/dim]")
+
+        # ── Run info ──────────────────────────────────────────────────────
+        cmd = f"{meta.command} {' '.join(meta.args[:4])}"
+        if len(cmd) > 50: cmd = cmd[:47] + "…"
+        _kv("Command", f"[cyan]{cmd}[/cyan]")
+        _kv("Host",    f"[dim]{meta.hostname or '—'}[/dim]")
+        _kv("Duration", f"[yellow]{_fmt_ns(trace.duration_ns)}[/yellow]")
+        _kv("Backend",  "  ".join(
+            f"[{_cat_color(b)}]{b}[/{_cat_color(b)}]"
+            for b in (meta.backends_used or ["none"])
+        ))
+
+        # ── Device specs ──────────────────────────────────────────────────
+        for dev in trace.devices:
+            bk_col = _cat_color(dev.backend)
+            sm_label = "SMs" if dev.backend in ("cuda", "rocm") else "Cores"
+            _sep(f"{dev.backend.upper()} — {dev.name}")
+            if dev.compute_cap:
+                _kv("Compute cap", f"[dim]{dev.compute_cap}[/dim]")
+            _kv(sm_label, f"[dim]{dev.sm_count}[/dim]")
+            if dev.core_clock_ghz:
+                _kv("Clock",  f"[dim]{dev.core_clock_ghz:.2f} GHz[/dim]")
+            L.append("")
+            if dev.fp16_tflops:
+                _kv("FP16 peak",   f"[magenta]{_fmt_tf(dev.fp16_tflops)}/s[/magenta]")
+            if dev.fp32_tflops:
+                _kv("FP32 peak",   f"[bright_green]{_fmt_tf(dev.fp32_tflops)}/s[/bright_green]")
+            if dev.fp64_tflops:
+                _kv("FP64 peak",   f"[red]{_fmt_tf(dev.fp64_tflops)}/s[/red]")
+            if dev.tensor_tflops > 0:
+                _kv("Tensor peak", f"[cyan]{_fmt_tf(dev.tensor_tflops)}/s[/cyan]")
+            L.append("")
+            if dev.bandwidth_gbs:
+                _kv("Bandwidth", f"[bright_cyan]{dev.bandwidth_gbs:.0f} GB/s[/bright_cyan]")
+            if dev.vram_gb > 0:
+                _kv("VRAM", f"[blue]{dev.vram_gb:.1f} GB[/blue]")
+            if dev.ridge_point > 0:
+                hint = (
+                    "memory-bound"    if dev.ridge_point < 5  else
+                    "balanced"        if dev.ridge_point < 30 else
+                    "compute-bound"
+                )
+                _kv("Ridge point",
+                    f"[dim]{dev.ridge_point:.0f} FLOPs/byte  ·  {hint}[/dim]")
+
+        # ── CPU microarch ─────────────────────────────────────────────────
+        ctrs: dict[str, float] = {c.name: c.value for c in trace.counters}
+        ipc   = ctrs.get("ipc", 0.0)
+        cmiss = ctrs.get("cache_miss_pct", -1.0)
+        bmiss = ctrs.get("branch_miss_pct", -1.0)
+        rss   = ctrs.get("process_max_rss_bytes", 0.0)
+        if ipc > 0 or cmiss >= 0 or rss > 0:
+            _sep("CPU")
+            if ipc > 0:
+                col = "bright_green" if ipc >= 2 else ("yellow" if ipc >= 1 else "red")
+                _kv("IPC", f"[{col}]{ipc:.2f}[/{col}]")
+            if cmiss >= 0:
+                col = "green" if cmiss < 5 else ("yellow" if cmiss < 20 else "red")
+                _kv("LLC miss rate", f"[{col}]{cmiss:.1f}%[/{col}]")
+            if bmiss >= 0:
+                col = "green" if bmiss < 1 else ("yellow" if bmiss < 5 else "red")
+                _kv("Branch miss", f"[{col}]{bmiss:.1f}%[/{col}]")
+            if rss > 0:
+                L.append("")
+                _kv("Peak RSS", f"[yellow]{_fmt_bytes(rss)}[/yellow]")
+
+        L.append("")
+        return "\n".join(L)
+
+
+# ── Profile tab ───────────────────────────────────────────────────────────────
+
+class ProfileWidget(Static):
+    """Minimal profiling results: activity, backend breakdown, hotspots, insight."""
+
+    def __init__(self, trace: Trace, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._trace = trace
+
+    def render(self) -> Any:  # noqa: ANN401
+        trace  = self._trace
+        spans  = trace.spans
+        wall_ns = trace.duration_ns or 1
+        L: list[str] = []
+
+        def _sep(title: str = "") -> None:
+            if title:
+                L.append(f"\n  [dim]── {title} {'─' * max(0, 44 - len(title))}[/dim]\n")
+            else:
+                L.append("")
+
+        # ── GPU activity ──────────────────────────────────────────────────
+        for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm")):
+            kspans = [s for s in spans
+                      if s.category.value == cat_val and s.tags.get("type") == "kernel"]
+            if not kspans:
+                continue
+            kern_ns  = sum(s.duration_ns for s in kspans)
+            sync_ns  = sum(s.duration_ns for s in spans if s.category.value == "sync")
+            pct      = 100.0 * kern_ns / wall_ns
+            sync_pct = 100.0 * sync_ns / wall_ns
+            avg_ns   = kern_ns / len(kspans)
+            eff      = pct / (pct + sync_pct) * 100 if (pct + sync_pct) > 0 else 0
+            color    = _cat_color(cat_val)
+            grade, gc = _grade(pct)
+
+            _sep(f"{label} ACTIVITY")
+            L.append(
+                f"  [bold]Kernel active[/bold]   "
+                f"[yellow]{pct:.1f}%[/yellow] of wall time"
+                f"  [{gc}]({grade})[/{gc}]"
+            )
+            L.append(
+                f"  [dim]Sync overhead    {sync_pct:.1f}% of wall time[/dim]"
+            )
+            L.append(
+                f"  [dim]GPU efficiency   {eff:.0f}%  (kernel / (kernel + sync))[/dim]"
+            )
+            L.append("")
+            L.append(
+                f"  [dim]{len(kspans)} kernel launches"
+                f"  ·  {_fmt_ns(avg_ns)} average"
+                f"  ·  {_fmt_ns(kern_ns)} total[/dim]"
+            )
+
+        # ── Time breakdown ────────────────────────────────────────────────
+        by_cat: dict[str, dict] = defaultdict(lambda: {"ns": 0, "n": 0})
+        for s in spans:
+            by_cat[s.category.value]["ns"] += s.duration_ns
+            by_cat[s.category.value]["n"]  += 1
+        grand = sum(v["ns"] for v in by_cat.values()) or 1
+
+        _sep("TIME BREAKDOWN")
+        BAR = 16
+        for cat, info in sorted(by_cat.items(), key=lambda kv: -kv[1]["ns"]):
+            frac  = info["ns"] / grand
+            color = _cat_color(cat)
+            bar   = _bar(frac, BAR)
+            L.append(
+                f"  [{color}]{cat:<8}[/{color}]"
+                f"  [{color}]{bar}[/{color}]"
+                f"  [yellow]{frac*100:5.1f}%[/yellow]"
+                f"  [dim]{_fmt_ns(info['ns']):>9}[/dim]"
+            )
+
+        # ── Hotspots ──────────────────────────────────────────────────────
+        # Single row per hotspot with fixed-width columns.
+        # Name is not padded with markup (markup inflates Python length);
+        # instead we pad a plain string first, then wrap in markup.
+        stats = trace.aggregated_stats()
+        if stats:
+            _sep("HOTSPOTS")
+            total_all = sum(r["total_ns"] for r in stats) or 1
+            NAME_W = 36
+            CAT_W  = 7
+            # Column header — plain strings only, no markup
+            hdr = (
+                f"  {'#':>2}  "
+                f"{'FUNCTION':<{NAME_W}}  "
+                f"{'CATEGORY':<{CAT_W}}  "
+                f"{'SHARE':>6}  "
+                f"{'TOTAL':>9}  "
+                f"{'AVG':>9}  "
+                f"CALLS"
+            )
+            L.append(f"  [dim]{hdr.strip()}[/dim]")
+            L.append(f"  [dim]{'─' * (len(hdr) - 2)}[/dim]")
+            for i, row in enumerate(stats[:12]):
+                color   = _cat_color(row["category"])
+                avg_ns  = row["total_ns"] / max(row["count"], 1)
+                pct     = row["total_ns"] / total_all * 100
+                # Pad plain name first, then apply markup
+                name_plain = row["name"][:NAME_W]
+                name_pad   = f"{name_plain:<{NAME_W}}"
+                cat_pad    = f"{row['category']:<{CAT_W}}"
+                L.append(
+                    f"  [dim]{i+1:>2}[/dim]  "
+                    f"[bold {color}]{name_pad}[/bold {color}]  "
+                    f"[{color}]{cat_pad}[/{color}]  "
+                    f"[yellow]{pct:6.1f}%[/yellow]  "
+                    f"[white]{_fmt_ns(row['total_ns']):>9}[/white]  "
+                    f"[dim]{_fmt_ns(avg_ns):>9}[/dim]  "
+                    f"[dim]{row['count']}[/dim]"
+                )
+
+        # ── Insight ───────────────────────────────────────────────────────
+        try:
+            from ..output.summary import _bottleneck_analysis
+            ctrs_d = {c.name: c.value for c in trace.counters}
+            ctr_sub: dict[str, float] = {
+                k: ctrs_d[k]
+                for k in ("ipc", "cache_miss_pct", "branch_miss_pct")
+                if k in ctrs_d
+            }
+            tips = _bottleneck_analysis(trace, ctr_sub)
+            if tips:
+                _sep("INSIGHT")
+                for tip in tips:
+                    icon = tip[:2]
+                    body = tip[2:].strip()
+                    # Hard-wrap at 62 chars
+                    words, lines_w, cur = body.split(), [], ""
+                    for w in words:
+                        if len(cur) + len(w) + 1 > 60:
+                            lines_w.append(cur); cur = w
+                        else:
+                            cur = (cur + " " + w).strip()
+                    if cur: lines_w.append(cur)
+                    for j, wl in enumerate(lines_w):
+                        pfx = f"  {icon} " if j == 0 else "      "
+                        L.append(f"{pfx}[dim]{wl}[/dim]")
+                    L.append("")
+        except Exception:
+            pass
+
+        L.append("")
+        return "\n".join(L)
+
+
+# ── Overview tab (legacy wrapper kept for direct write() callers) ──────────────
 
 class OverviewWidget(Static):
     """Dashboard: key metrics, time-by-backend bars, top-10 hotspots."""
@@ -168,209 +473,303 @@ class OverviewWidget(Static):
         self._trace = trace
 
     def render(self) -> Any:  # noqa: ANN401
+        import time as _time
         trace = self._trace
         meta  = trace.metadata
         spans = trace.spans
 
-        lines: list[str] = []
+        # Hard limit: every rendered line must stay ≤ this many visible chars.
+        # Rich markup tags are invisible but Python f-string padding counts them,
+        # so we keep content short and never use markup inside padded fields.
+        _LIM = 72
 
-        # ── Run info ──────────────────────────────────────────────────────
-        cmd_str = f"{meta.command} {' '.join(meta.args[:3])}"
-        if len(cmd_str) > 56:
-            cmd_str = cmd_str[:53] + "…"
-        backs = ", ".join(meta.backends_used) or "none"
-        dur   = _fmt_ns(trace.duration_ns)
+        L: list[str] = []
 
-        lines.append(
-            f"[bold white]Command:[/bold white] [cyan]{cmd_str}[/cyan]   "
-            f"[bold white]Host:[/bold white] [dim]{meta.hostname}[/dim]"
-        )
-        lines.append(
-            f"[bold white]Duration:[/bold white] [yellow]{dur}[/yellow]   "
-            f"[bold white]Backends:[/bold white] {backs}   "
-            f"[bold white]Spans:[/bold white] {len(spans)}   "
-            f"[bold white]Instants:[/bold white] {len(trace.instants)}   "
-            f"[bold white]Counters:[/bold white] {len(trace.counters)}"
-        )
-        lines.append("")
-
-        # ── Device characteristics ────────────────────────────────────────
-        devices = trace.devices
-        if devices:
-            lines.append(
-                "[bold]── Device Characteristics ──────────────────────────────────────[/bold]"
+        def _sec(title: str, icon: str = "◈") -> None:
+            pad = _LIM - len(title) - 3
+            L.append(
+                f"[bold bright_cyan]{icon} {title}[/bold bright_cyan]"
+                f"[dim] {'─' * pad}[/dim]"
             )
-            for dev in devices:
-                bk_color = _cat_color(dev.backend)
-                tag      = f"[{bk_color}][{dev.backend}][/{bk_color}]"
-                cap      = f"  cap {dev.compute_cap}" if dev.compute_cap else ""
-                sm_label = "SMs" if dev.backend in ("cuda", "rocm") else "cores"
-                clk      = f"{dev.core_clock_ghz:.2f} GHz" if dev.core_clock_ghz else ""
-                fp32     = f"FP32 {_fmt_tf(dev.fp32_tflops)}" if dev.fp32_tflops else ""
-                fp64     = f"FP64 {_fmt_tf(dev.fp64_tflops)}" if dev.fp64_tflops else ""
-                tc       = (f"TC {_fmt_tf(dev.tensor_tflops)}"
-                            if dev.tensor_tflops > 0 else "")
-                bw       = (f"BW {dev.bandwidth_gbs:.0f} GB/s"
-                            if dev.bandwidth_gbs else "")
-                vram     = (f"VRAM {dev.vram_gb:.1f} GB"
-                            if dev.vram_gb > 0 else "")
-                ridge    = (f"ridge {dev.ridge_point:.0f} FLOPs/B"
-                            if dev.ridge_point > 0 else "")
 
-                details = "  ".join(filter(None, [
-                    f"{dev.sm_count} {sm_label}", clk, fp32, fp64, tc, bw, vram, ridge
-                ]))
-                lines.append(
-                    f"  {tag} [bold]{dev.name}[/bold]{cap}\n"
-                    f"       [dim]{details}[/dim]"
-                )
-            lines.append("")
+        # ── Header ────────────────────────────────────────────────────────
+        ts      = _time.strftime("%Y-%m-%d %H:%M:%S")
+        cmd_str = f"{meta.command} {' '.join(meta.args[:3])}"
+        if len(cmd_str) > 46: cmd_str = cmd_str[:43] + "…"
+        host    = (meta.hostname or "")[:20]
+        backs_plain = "  ".join(meta.backends_used or ["none"])
+        backs_rich  = "  ".join(
+            f"[{_cat_color(b)}]{b}[/{_cat_color(b)}]"
+            for b in (meta.backends_used or ["none"])
+        )
+        dur_str = _fmt_ns(trace.duration_ns)
 
-        # ── Run health ────────────────────────────────────────────────────
-        # Collect counter events into dicts for O(1) lookup.
+        L.append(
+            f"  [bold bright_white]◆ HPROFILER[/bold bright_white]"
+            f"  [dim cyan]{ts}[/dim cyan]"
+            f"  [dim]·  {host}[/dim]"
+        )
+        L.append(
+            f"  [cyan]{cmd_str}[/cyan]"
+        )
+        L.append(
+            f"  [bold yellow]{dur_str}[/bold yellow]"
+            f"  {backs_rich}"
+            f"  [dim]·  {len(spans)} spans"
+            f"  ·  {len(trace.instants)} instants"
+            f"  ·  {len(trace.counters)} counters[/dim]"
+        )
+        L.append(f"  [dim bright_cyan]{'─' * (_LIM - 2)}[/dim bright_cyan]")
+        L.append("")
+
+        # ── Collect counters ──────────────────────────────────────────────
         ctrs_last: dict[str, float] = {}
         gpu_util_peak: dict[str, float] = {}
         gpu_mem_peak:  dict[str, float] = {}
+        gpu_util_series: dict[str, list] = defaultdict(list)
         for c in trace.counters:
             ctrs_last[c.name] = c.value
             if c.name.startswith("gpu_utilization_pct"):
                 gpu_util_peak[c.name] = max(gpu_util_peak.get(c.name, 0.0), c.value)
+                gpu_util_series[c.name].append(c.value)
             if c.name.startswith("gpu_mem_used_bytes"):
                 gpu_mem_peak[c.name] = max(gpu_mem_peak.get(c.name, 0.0), c.value)
 
         wall_ns = trace.duration_ns or 1
-        health_lines: list[str] = []
+        devices = trace.devices
 
-        # GPU kernel active % computed from span durations (exact, not polling).
+        # ── DEVICES ───────────────────────────────────────────────────────
+        if devices:
+            _sec("DEVICES", "◈")
+            for idx, dev in enumerate(devices):
+                bk_col   = _cat_color(dev.backend)
+                sm_lbl   = "SMs" if dev.backend in ("cuda", "rocm") else "cores"
+                ridge_hint = (
+                    "[red]mem-bound[/red]"    if dev.ridge_point < 5  else
+                    "[yellow]balanced[/yellow]"  if dev.ridge_point < 30 else
+                    "[green]compute-bound[/green]"
+                ) if dev.ridge_point > 0 else ""
+
+                # line 1: name + topology
+                L.append(
+                    f"  [{bk_col}]GPU {idx}[/{bk_col}]"
+                    f"  [bold]{dev.name}[/bold]"
+                    f"  [dim]cap {dev.compute_cap or '?'}"
+                    f"  {dev.sm_count} {sm_lbl}[/dim]"
+                )
+                # line 2: FP peaks (only non-zero)
+                peaks = "  ".join(filter(None, [
+                    f"[bright_green]FP32 {_fmt_tf(dev.fp32_tflops)}[/bright_green]" if dev.fp32_tflops else "",
+                    f"[red]FP64 {_fmt_tf(dev.fp64_tflops)}[/red]"                   if dev.fp64_tflops else "",
+                    f"[magenta]FP16 {_fmt_tf(dev.fp16_tflops)}[/magenta]"            if dev.fp16_tflops else "",
+                    f"[cyan]Tensor {_fmt_tf(dev.tensor_tflops)}[/cyan]"              if dev.tensor_tflops > 0 else "",
+                ]))
+                L.append(f"       {peaks}")
+                # line 3: memory
+                mem = "  ".join(filter(None, [
+                    f"[bright_cyan]BW {dev.bandwidth_gbs:.0f} GB/s[/bright_cyan]" if dev.bandwidth_gbs else "",
+                    f"[blue]VRAM {dev.vram_gb:.1f} GB[/blue]"                      if dev.vram_gb > 0  else "",
+                    f"[dim]ridge {dev.ridge_point:.0f} F/B[/dim]"                  if dev.ridge_point > 0 else "",
+                    ridge_hint,
+                ]))
+                L.append(f"       {mem}")
+            L.append("")
+
+        # ── PERFORMANCE HEALTH ────────────────────────────────────────────
+        _sec("PERFORMANCE HEALTH", "◈")
+        BAR = 22  # bar width kept short so stats fit on same line
+
         for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm")):
-            kernel_spans = [s for s in spans
-                            if s.category.value == cat_val
-                            and s.tags.get("type") == "kernel"]
-            if kernel_spans:
-                kern_ns = sum(s.duration_ns for s in kernel_spans)
-                pct     = 100.0 * kern_ns / wall_ns
-                color   = _cat_color(cat_val)
-                bar     = _bar(pct / 100, 20)
-                health_lines.append(
-                    f"  [bold white]{label} kernel active[/bold white]  "
-                    f"[{color}]{bar}[/{color}]  "
-                    f"[yellow]{pct:.2f}%[/yellow] of wall time  "
-                    f"[dim]({_fmt_ns(kern_ns)}, {len(kernel_spans)} launches)[/dim]"
-                )
-
-        rss = ctrs_last.get("process_max_rss_bytes", 0.0)
-        if rss > 0:
-            health_lines.append(
-                f"  [bold white]Peak process RSS   [/bold white]  "
-                f"[yellow]{_fmt_bytes(rss)}[/yellow]"
+            kspans = [s for s in spans
+                      if s.category.value == cat_val and s.tags.get("type") == "kernel"]
+            if not kspans:
+                continue
+            kern_ns    = sum(s.duration_ns for s in kspans)
+            pct        = 100.0 * kern_ns / wall_ns
+            color      = _cat_color(cat_val)
+            grade, gc  = _grade(pct)
+            bar        = _grad_bar(pct / 100, BAR)
+            avg_ns     = kern_ns / len(kspans)
+            sync_ns    = sum(s.duration_ns for s in spans if s.category.value == "sync")
+            sync_pct   = 100.0 * sync_ns / wall_ns
+            eff        = pct / (pct + sync_pct) * 100 if (pct + sync_pct) > 0 else 0
+            # line 1: bar + pct + grade
+            L.append(
+                f"  [bold]{label} Active[/bold]"
+                f"  [{color}]{bar}[/{color}]"
+                f"  [yellow]{pct:.1f}%[/yellow]"
+                f"  [{gc}]{grade}[/{gc}]"
+            )
+            # line 2: stats indented under the bar
+            L.append(
+                f"  [dim]  {len(kspans)}×"
+                f"  total {_fmt_ns(kern_ns)}"
+                f"  avg {_fmt_ns(avg_ns)}"
+                f"  sync {sync_pct:.1f}%"
+                f"  eff {eff:.0f}%[/dim]"
             )
 
-        if gpu_util_peak:
-            for key, val in sorted(gpu_util_peak.items()):
-                lbl = key.replace("gpu_utilization_pct", "").strip("[]") or "0"
-                health_lines.append(
-                    f"  [bold white]GPU {lbl} compute (smi)[/bold white]   "
-                    f"[yellow]{val:.0f}%[/yellow]"
-                    + ("  [dim](0% if kernels < poll interval)[/dim]" if val == 0 else "")
-                )
-            for key, val in sorted(gpu_mem_peak.items()):
-                lbl = key.replace("gpu_mem_used_bytes", "").strip("[]") or "0"
-                health_lines.append(
-                    f"  [bold white]GPU {lbl} mem used (smi)[/bold white]  "
-                    f"[yellow]{_fmt_bytes(val)}[/yellow]"
-                )
-
-        if health_lines:
-            lines.append(
-                "[bold]── Run Health ───────────────────────────────────────────────────[/bold]"
-            )
-            lines.extend(health_lines)
-            lines.append("")
-
-        # ── CPU microarch ─────────────────────────────────────────────────
-        ipc        = ctrs_last.get("ipc", 0.0)
+        # CPU microarch — each metric on one concise line
+        ipc        = ctrs_last.get("ipc",            0.0)
         cache_miss = ctrs_last.get("cache_miss_pct", -1.0)
-        br_miss    = ctrs_last.get("branch_miss_pct", -1.0)
-        if ipc > 0 or cache_miss >= 0 or br_miss >= 0:
-            lines.append(
-                "[bold]── CPU Microarch (perf stat) ────────────────────────────────────[/bold]"
-            )
-            if ipc > 0:
-                # Colour: green >2, yellow 1–2, red <1
-                ipc_color = "green" if ipc >= 2.0 else ("yellow" if ipc >= 1.0 else "red")
-                lines.append(
-                    f"  [bold white]IPC                [/bold white]  "
-                    f"[{ipc_color}]{ipc:.2f}[/{ipc_color}]"
-                )
-            if cache_miss >= 0:
-                cm_color = "green" if cache_miss < 5 else ("yellow" if cache_miss < 20 else "red")
-                lines.append(
-                    f"  [bold white]LLC cache miss rate[/bold white]  "
-                    f"[{cm_color}]{cache_miss:.2f}%[/{cm_color}]"
-                )
-            if br_miss >= 0:
-                bm_color = "green" if br_miss < 1 else ("yellow" if br_miss < 5 else "red")
-                lines.append(
-                    f"  [bold white]Branch miss rate   [/bold white]  "
-                    f"[{bm_color}]{br_miss:.2f}%[/{bm_color}]"
-                )
-            lines.append("")
+        br_miss    = ctrs_last.get("branch_miss_pct",-1.0)
 
-        # ── Time by backend ───────────────────────────────────────────────
-        lines.append(
-            "[bold]── Time by Backend ─────────────────────────────────────────────[/bold]"
+        if ipc > 0:
+            ipc_col  = "bright_green" if ipc >= 2 else ("yellow" if ipc >= 1 else "red")
+            ipc_hint = "excellent" if ipc >= 3 else ("good" if ipc >= 2 else
+                       "ok" if ipc >= 1 else "stalled")
+            L.append(
+                f"  [bold]IPC[/bold]"
+                f"  [{ipc_col}]{_grad_bar(min(ipc/4.0,1.0), BAR)}[/{ipc_col}]"
+                f"  [{ipc_col}]{ipc:.2f}[/{ipc_col}]"
+                f"  [dim]{ipc_hint}[/dim]"
+            )
+        if cache_miss >= 0:
+            cm_col  = "green" if cache_miss < 5 else ("yellow" if cache_miss < 20 else "red")
+            cm_hint = "hot" if cache_miss < 5 else ("warm" if cache_miss < 20 else "thrashing!")
+            L.append(
+                f"  [bold]LLC miss[/bold]"
+                f"  [{cm_col}]{_grad_bar(min(cache_miss/50.0,1.0), BAR)}[/{cm_col}]"
+                f"  [{cm_col}]{cache_miss:.1f}%[/{cm_col}]"
+                f"  [dim]{cm_hint}[/dim]"
+            )
+        if br_miss >= 0:
+            bm_col  = "green" if br_miss < 1 else ("yellow" if br_miss < 5 else "red")
+            bm_hint = "predictable" if br_miss < 1 else ("ok" if br_miss < 5 else "poor")
+            L.append(
+                f"  [bold]Branch[/bold]"
+                f"  [{bm_col}]{_grad_bar(min(br_miss/20.0,1.0), BAR)}[/{bm_col}]"
+                f"  [{bm_col}]{br_miss:.1f}%[/{bm_col}]"
+                f"  [dim]{bm_hint}[/dim]"
+            )
+
+        # Memory / GPU util — one compact line
+        rss    = ctrs_last.get("process_max_rss_bytes", 0.0)
+        leaked = ctrs_last.get("gpu_memory_leaked_bytes", 0.0)
+        mem_parts: list[str] = []
+        if rss > 0:
+            mem_parts.append(f"[bold]RSS[/bold] [yellow]{_fmt_bytes(rss)}[/yellow]")
+        for key, val in sorted(gpu_util_peak.items()):
+            lbl = key.replace("gpu_utilization_pct", "").strip("[]") or "0"
+            gu_bar = _grad_bar(val / 100, 10)
+            mem_parts.append(
+                f"[bold]GPU{lbl}[/bold] [cyan]{gu_bar}[/cyan] [yellow]{val:.0f}%[/yellow]"
+            )
+        for key, val in sorted(gpu_mem_peak.items()):
+            lbl = key.replace("gpu_mem_used_bytes", "").strip("[]") or "0"
+            vt  = next((d.vram_gb * 1024**3 for d in devices if d.backend in ("cuda","rocm")), 0)
+            mem_parts.append(
+                f"[bold]VRAM{lbl}[/bold] [blue]{_grad_bar(val/vt if vt else 0, 10)}[/blue]"
+                f" [yellow]{_fmt_bytes(val)}[/yellow]"
+            )
+        if leaked > 0:
+            mem_parts.append(f"[bold bright_red]LEAK {_fmt_bytes(leaked)}[/bold bright_red]")
+        if mem_parts:
+            L.append("  " + "  ·  ".join(mem_parts))
+
+        L.append("")
+
+        # ── TIME BY BACKEND ───────────────────────────────────────────────
+        _sec("TIME BY BACKEND", "◈")
+        by_cat: dict[str, dict] = defaultdict(
+            lambda: {"total_ns": 0, "count": 0, "dur_list": []}
         )
-        by_cat: dict[str, dict] = defaultdict(lambda: {"total_ns": 0, "count": 0})
         for s in spans:
             by_cat[s.category.value]["total_ns"] += s.duration_ns
             by_cat[s.category.value]["count"]    += 1
+            by_cat[s.category.value]["dur_list"].append(s.duration_ns)
 
         grand_total = sum(v["total_ns"] for v in by_cat.values()) or 1
-        bar_w = 32
 
         for cat, info in sorted(by_cat.items(), key=lambda kv: -kv[1]["total_ns"]):
-            frac  = info["total_ns"] / grand_total
-            bar   = _bar(frac, bar_w)
-            color = _cat_color(cat)
-            lines.append(
-                f"  [{color}]{cat:<10}[/{color}] "
-                f"[{color}]{bar}[/{color}] "
-                f"[yellow]{frac * 100:5.1f}%[/yellow]  "
-                f"[white]{_fmt_ns(info['total_ns']):>10}[/white]  "
-                f"[dim]{info['count']:>5} events[/dim]"
+            frac   = info["total_ns"] / grand_total
+            color  = _cat_color(cat)
+            dl     = sorted(info["dur_list"])
+            avg_ns = info["total_ns"] / max(info["count"], 1)
+            p99_ns = dl[min(int(len(dl)*0.99), len(dl)-1)] if dl else 0
+            spark  = _sparkline(info["dur_list"][-14:], 7)
+            # line 1: category  bar  %  total  count  sparkline
+            L.append(
+                f"  [{color}]{cat:<8}[/{color}]"
+                f"  [{color}]{_grad_bar(frac, 20)}[/{color}]"
+                f"  [yellow]{frac*100:5.1f}%[/yellow]"
+                f"  [white]{_fmt_ns(info['total_ns']):>9}[/white]"
+                f"  [dim]{info['count']:>4}×[/dim]"
+                f"  [dim cyan]{spark}[/dim cyan]"
+            )
+            # line 2: timing stats (indented to align under bar)
+            L.append(
+                f"  [dim]          "
+                f"avg {_fmt_ns(avg_ns):<10}"
+                f"  p99 {_fmt_ns(p99_ns)}[/dim]"
             )
 
         if not by_cat:
-            lines.append("  [dim]No spans recorded.[/dim]")
-        lines.append("")
+            L.append("  [dim]No spans recorded.[/dim]")
+        L.append("")
 
-        # ── Top 10 hotspots ───────────────────────────────────────────────
-        lines.append(
-            "[bold]── Top 10 Hotspots ─────────────────────────────────────────────[/bold]"
-        )
+        # ── TOP HOTSPOTS ──────────────────────────────────────────────────
+        _sec("TOP HOTSPOTS", "◈")
         stats = trace.aggregated_stats()
         if not stats:
-            lines.append("  [dim]No spans recorded.[/dim]")
+            L.append("  [dim]No spans recorded.[/dim]")
         else:
             total_all = sum(r["total_ns"] for r in stats) or 1
-            bar_w2    = 22
-            for i, row in enumerate(stats[:10]):
-                frac  = row["total_ns"] / total_all
-                color = _cat_color(row["category"])
-                bar   = _bar(frac, bar_w2)
-                name  = row["name"][:34]
-                cat_tag = f"({row['category']:<6})"  # parens avoid Rich markup conflicts
-                lines.append(
-                    f"  [dim]{i + 1:>2}.[/dim] "
-                    f"[{color}]{cat_tag}[/{color}] "
-                    f"[bold]{name:<34}[/bold]  "
-                    f"[{color}]{bar}[/{color}]  "
-                    f"[yellow]{row['pct']:5.1f}%[/yellow]  "
-                    f"[white]{_fmt_ns(row['total_ns']):>10}[/white]  "
-                    f"[dim]{row['count']:>4}×[/dim]"
-                )
+            L.append(f"  [dim]{'─' * 68}[/dim]")
 
-        return "\n".join(lines)
+            for i, row in enumerate(stats[:12]):
+                frac    = row["total_ns"] / total_all
+                color   = _cat_color(row["category"])
+                bar     = _grad_bar(frac, 10)
+                # Truncate name to 28 chars — no padding (avoids column calc with markup)
+                name    = row["name"][:28]
+                avg_ns  = row["total_ns"] / max(row["count"], 1)
+                grade, gc = _grade(row["pct"])
+                cat_str   = row["category"][:6]
+                # Line 1: index  name  bar  grade  (narrow — always fits)
+                L.append(
+                    f"  [dim]{i+1:>2}[/dim]"
+                    f"  [bold {color}]{name}[/bold {color}]"
+                    f"  [{color}]{bar}[/{color}]"
+                    f"[{gc}]{grade}[/{gc}]"
+                )
+                # Line 2: indented stats — category / share / total / avg / count
+                L.append(
+                    f"      [dim][{cat_str}]"
+                    f"  {row['pct']:5.1f}%"
+                    f"  {_fmt_ns(row['total_ns']):>9}"
+                    f"  avg {_fmt_ns(avg_ns)}"
+                    f"  {row['count']}×[/dim]"
+                )
+        L.append("")
+
+        # ── BOTTLENECK ADVISOR ────────────────────────────────────────────
+        try:
+            from ..output.summary import _bottleneck_analysis
+            ctr_sub: dict[str, float] = {}
+            for k in ("ipc", "cache_miss_pct", "branch_miss_pct"):
+                if k in ctrs_last: ctr_sub[k] = ctrs_last[k]
+            tips = _bottleneck_analysis(trace, ctr_sub)
+            if tips:
+                _sec("BOTTLENECK ADVISOR", "⚡")
+                for tip in tips:
+                    icon = tip[:2]
+                    body = tip[2:].strip()
+                    words, lines_w, cur = body.split(), [], ""
+                    for w in words:
+                        if len(cur) + len(w) + 1 > 64:
+                            lines_w.append(cur); cur = w
+                        else:
+                            cur = (cur + " " + w).strip()
+                    if cur: lines_w.append(cur)
+                    for j, wl in enumerate(lines_w):
+                        pfx = f"  {icon} " if j == 0 else "      "
+                        L.append(f"{pfx}[dim]{wl}[/dim]")
+                    L.append("")
+        except Exception:
+            pass
+
+        return "\n".join(L)
 
 
 # ── Timeline widget ───────────────────────────────────────────────────────────
@@ -415,6 +814,7 @@ class TimelineWidget(Widget):
     view_x: reactive[int]   = reactive(0)
     view_y: reactive[int]   = reactive(0)
     zoom:   reactive[float] = reactive(1.0)
+    _hover: reactive[str]   = reactive("")   # hover info shown in status bar
 
     # label column: "omp  T12  (120)" = up to 17 chars
     _LABEL_W = 17
@@ -480,6 +880,49 @@ class TimelineWidget(Widget):
             self._view_end   = trace.metadata.end_time_ns or self._view_start + 1
         self._trace_dur = max(self._view_end - self._view_start, 1)
 
+        # Per-function color map — encounter-order assignment avoids hash collisions.
+        seen: dict[str, int] = {}
+        for s in (all_spans if all_spans else []):
+            if s.name not in seen:
+                seen[s.name] = len(seen)
+        self._func_colors: dict[str, str] = {
+            name: _SPAN_PALETTE[idx % len(_SPAN_PALETTE)]
+            for name, idx in seen.items()
+        }
+        # Integer palette index per function — used by the numpy render path.
+        self._func_color_idx: dict[str, int] = {
+            name: idx % len(_SPAN_PALETTE)
+            for name, idx in seen.items()
+        }
+
+        # ── Spatial index + numpy column arrays ──────────────────────────────
+        # Sort each lane once by start_ns; keep numpy arrays of start, end, and
+        # palette-index so _density_row can run loop-free over visible spans.
+        self._sorted_spans: dict[str, list] = {
+            lane: sorted(spans_list, key=lambda s: s.start_ns)
+            for lane, spans_list in self._lanes.items()
+        }
+        cidx_map = self._func_color_idx   # name → int palette index
+        self._starts_arr: dict[str, np.ndarray] = {}
+        self._ends_arr:   dict[str, np.ndarray] = {}
+        self._cidx_arr:   dict[str, np.ndarray] = {}
+        self._max_dur:    dict[str, int]         = {}
+        for lane, slist in self._sorted_spans.items():
+            if slist:
+                self._starts_arr[lane] = np.array(
+                    [s.start_ns for s in slist], dtype=np.int64)
+                self._ends_arr[lane]   = np.array(
+                    [s.end_ns   for s in slist], dtype=np.int64)
+                self._cidx_arr[lane]   = np.array(
+                    [cidx_map.get(s.name, 0) for s in slist], dtype=np.int32)
+                self._max_dur[lane]    = int(
+                    self._ends_arr[lane].max() - self._starts_arr[lane].min())
+            else:
+                self._starts_arr[lane] = np.empty(0, dtype=np.int64)
+                self._ends_arr[lane]   = np.empty(0, dtype=np.int64)
+                self._cidx_arr[lane]   = np.empty(0, dtype=np.int32)
+                self._max_dur[lane]    = 0
+
     def _lane_label(self, lane_name: str) -> str:
         parts = lane_name.split("/", 1)
         cat   = parts[0]
@@ -506,26 +949,198 @@ class TimelineWidget(Widget):
         else:
             core = abbr
 
-        label = f"{core}  ({count})"
+        # Reserve 4 chars for "  (N)" count suffix; truncate core to fit _LABEL_W.
+        count_str  = f"({count})"
+        # core + "  " + count_str must fit in _LABEL_W
+        max_core   = self._LABEL_W - 2 - len(count_str)
+        core_part  = core[:max_core] if len(core) > max_core else f"{core:<{max_core}}"
+        label      = f"{core_part}  {count_str}"
         return f"{label:<{self._LABEL_W}}"
 
+    def _density_row(self, lane_name: str, width: int,
+                     _unused: str) -> tuple[Text, float]:
+        """
+        Return (rendered Text row, visible-window utilisation %).
+
+        Fully vectorised — no Python loop over spans:
+          1. Spatial index  : np.searchsorted clips to only the visible spans O(log n)
+          2. Numpy broadcast: pixel positions computed for all spans at once
+          3. Diff + cumsum  : interior pixel activity accumulated without loops
+          4. searchsorted   : dominant-function color assigned to pixels in O(width)
+
+        Renders each pixel as:
+          █  solid block colored by the function dominating that column
+          ·  dim dot for idle (no span coverage)
+        """
+        visible_ns = self._trace_dur / self.zoom
+        offset_ns  = self._trace_dur * self.view_x / (width * self.zoom)
+        vis_start  = self._view_start + offset_ns
+        vis_end    = vis_start + visible_ns
+
+        # ── 1. Spatial index ──────────────────────────────────────────────
+        starts  = self._starts_arr[lane_name]
+        max_dur = self._max_dur[lane_name]
+
+        lo = int(np.searchsorted(starts, vis_start - max_dur, side="left"))
+        hi = int(np.searchsorted(starts, vis_end,             side="right"))
+
+        if lo >= hi:
+            return Text("·" * width, style="color(237)"), 0.0
+
+        s_ns = self._starts_arr[lane_name][lo:hi].astype(np.float64)
+        e_ns = self._ends_arr[lane_name][lo:hi].astype(np.float64)
+        c_np = self._cidx_arr[lane_name][lo:hi]          # int32 palette indices
+
+        # ── 2. Pixel positions — all spans at once ────────────────────────
+        scale = width * self.zoom / self._trace_dur
+        cx0 = np.clip((s_ns - self._view_start) * scale - self.view_x,
+                      0.0, float(width)).astype(np.float32)
+        cx1 = np.clip((e_ns - self._view_start) * scale - self.view_x,
+                      0.0, float(width)).astype(np.float32)
+
+        vis = cx1 > cx0 + 1e-6            # drop zero-width spans
+        cx0 = cx0[vis]; cx1 = cx1[vis]; c_np = c_np[vis]
+        if len(cx0) == 0:
+            return Text("·" * width, style="color(237)"), 0.0
+
+        ix0 = cx0.astype(np.int32)
+        ix1 = np.minimum(cx1.astype(np.int32), width - 1)
+
+        # ── 3. Activity accumulation via scatter-add + diff/cumsum ────────
+        activity = np.zeros(width, dtype=np.float32)
+
+        # Left-boundary overlap for every span (= total overlap for single-pixel spans)
+        left_ov = np.minimum(cx1, (ix0 + 1).astype(np.float32)) - cx0
+        np.add.at(activity, ix0, left_ov)
+
+        multi = ix1 > ix0
+        if multi.any():
+            ix0m, ix1m = ix0[multi], ix1[multi]
+            # Right boundary
+            np.add.at(activity, ix1m, cx1[multi] - ix1m.astype(np.float32))
+            # Interior via diff array: cumsum adds 1.0 to pixels ix0m+1 .. ix1m-1
+            diff = np.zeros(width + 1, dtype=np.float32)
+            np.add.at(diff, ix0m + 1,  1.0)
+            np.add.at(diff, ix1m,     -1.0)
+            activity += np.cumsum(diff[:width])
+
+        np.clip(activity, 0.0, 1.0, out=activity)
+        util_pct = float(activity.sum()) / width * 100.0
+
+        # ── 4. Dominant color per pixel via searchsorted — O(width) ──────
+        # ix0 is monotonically non-decreasing (sorted spans → sorted start pixels).
+        # For pixel p, the candidate span is the last one whose left edge ≤ p.
+        pix      = np.arange(width, dtype=np.int32)
+        sp       = np.searchsorted(ix0, pix, side="right") - 1   # shape (width,)
+        sp_safe  = np.clip(sp, 0, len(ix0) - 1)
+        covered  = (sp >= 0) & (ix1[sp_safe] >= pix)
+        dom_idx  = np.where(covered, c_np[sp_safe].astype(np.int32), -1)
+
+        # ── Build Rich Text row (run-length encoded by color) ─────────────
+        row  = Text()
+        IDLE = 0.05
+        act  = activity          # local alias for speed
+        i    = 0
+        while i < width:
+            if act[i] <= IDLE:
+                j = i + 1
+                while j < width and act[j] <= IDLE:
+                    j += 1
+                row.append("·" * (j - i), style="color(237)")
+                i = j
+            else:
+                ci = int(dom_idx[i])
+                c  = _SPAN_PALETTE[ci] if ci >= 0 else "white"
+                j  = i + 1
+                while j < width and act[j] > IDLE and int(dom_idx[j]) == ci:
+                    j += 1
+                row.append("█" * (j - i), style=c)
+                i = j
+
+        return row, util_pct
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        """Update hover info when the mouse moves over the timeline."""
+        UTIL_W = 6
+        width  = self.size.width - self._COL_W - UTIL_W
+        height = self.size.height
+        if width < 4 or height < 4:
+            return
+
+        x, y = event.x - self._COL_W - 1, event.y
+        # Rows 0-1 = ruler; lanes start at row 2, each lane = 2 rows (data + spacer)
+        lane_row = y - 2
+        if lane_row < 0 or x < 0 or x >= width:
+            self._hover = ""
+            return
+
+        visible_ns = self._trace_dur / self.zoom
+        offset_ns  = self._trace_dur * self.view_x / (width * self.zoom)
+        ns_per_px  = visible_ns / max(width, 1)
+
+        total_lanes  = len(self._lane_names)
+        visible_rows = max(1, (height - 4) // 2)
+        max_sy       = max(0, total_lanes - visible_rows)
+        lo           = min(self.view_y, max_sy)
+        hi           = min(total_lanes, lo + visible_rows)
+
+        lane_idx = lane_row // 2   # integer division: data row or spacer row → same lane
+        actual_lane = lo + lane_idx
+        if actual_lane >= hi:
+            self._hover = ""
+            return
+
+        lane_name   = self._lane_names[actual_lane]
+        sorted_spans = self._sorted_spans[lane_name]
+        if not sorted_spans:
+            self._hover = ""
+            return
+
+        # Time position the mouse is pointing at (absolute trace time)
+        cursor_abs = int(self._view_start + offset_ns + x * ns_per_px)
+
+        # Spatial index: narrow to spans that could contain cursor_abs
+        starts  = self._starts_arr[lane_name]
+        max_dur = self._max_dur[lane_name]
+        lo_s = int(np.searchsorted(starts, cursor_abs - max_dur, side="left"))
+        hi_s = int(np.searchsorted(starts, cursor_abs,           side="right"))
+        candidates = sorted_spans[lo_s:hi_s]
+
+        # Only show hover when cursor is inside a span's actual time range
+        containing = [s for s in candidates
+                      if s.start_ns <= cursor_abs <= s.end_ns]
+        if not containing:
+            self._hover = ""
+            return
+
+        # If multiple spans overlap here, prefer the shortest (most specific)
+        span  = min(containing, key=lambda s: s.duration_ns)
+        dur   = _fmt_ns(span.duration_ns)
+        start = _fmt_ns(span.start_ns - self._view_start)
+        cat   = lane_name.split("/")[0]
+        self._hover = f"{span.name}  [{cat}]  @{start}  dur {dur}"
+
+    def on_leave(self, _event: Any) -> None:
+        self._hover = ""
+
     def render(self) -> Any:  # noqa: ANN401
-        width  = self.size.width - self._COL_W
+        UTIL_W = 6
+        width  = self.size.width - self._COL_W - UTIL_W
         height = self.size.height
         if width < 4 or height < 4:
             return Text("(too small)")
 
         out = Text()
 
-        visible_ns     = self._trace_dur / self.zoom
-        offset_ns      = self._trace_dur * self.view_x / (width * self.zoom)
-        tick_step_px   = max(12, width // 8)
-        tick_ns_per_px = visible_ns / width
+        visible_ns   = self._trace_dur / self.zoom
+        offset_ns    = self._trace_dur * self.view_x / (width * self.zoom)
+        ns_per_px    = visible_ns / max(width, 1)
+        tick_step_px = max(12, width // 8)
 
-        # ── Time ruler (2 lines) ────────────────────────────────────────
+        # ── Time ruler (2 rows) ──────────────────────────────────────────
         out.append(" " * self._COL_W, style="dim")
         for i in range(0, width, tick_step_px):
-            ts_ns = offset_ns + i * tick_ns_per_px
+            ts_ns = offset_ns + i * ns_per_px
             cell  = f"{_fmt_ns(ts_ns):<{tick_step_px}}"[:tick_step_px]
             out.append(cell, style="bold white")
         out.append("\n")
@@ -535,70 +1150,56 @@ class TimelineWidget(Widget):
             out.append("┬" if i % tick_step_px == 0 else "─", style="dim")
         out.append("\n")
 
-        # ── Visible lanes ────────────────────────────────────────────────
-        # Each lane = 1 data row + 1 blank spacer → 2 lines per lane.
-        # Reserve 2 lines for ruler + 1 legend + 1 status = 4 overhead.
-        overhead     = 4
+        # ── Lanes — 2 rows each (data + blank spacer) ────────────────────
+        # Overhead: 2 ruler + 1 footer = 3; each lane needs 2 rows
+        overhead     = 3
         visible_rows = max(1, (height - overhead) // 2)
         total_lanes  = len(self._lane_names)
 
-        # Clamp for display only — never mutate reactive inside render()
         max_sy = max(0, total_lanes - visible_rows)
         lo = min(self.view_y, max_sy)
         hi = min(total_lanes, lo + visible_rows)
 
+        lanes_drawn = 0
         for lane_name in self._lane_names[lo:hi]:
-            spans = self._lanes[lane_name]
             cat   = lane_name.split("/")[0]
             color = _cat_color(cat)
 
-            # data row
+            # Data row
             out.append(f"{self._lane_label(lane_name)} ", style=f"bold {color}")
-
-            cells = bytearray(width)
-            for span in spans:
-                rel0 = span.start_ns - self._view_start
-                rel1 = span.end_ns   - self._view_start
-                x0   = int((rel0 / self._trace_dur) * width * self.zoom) - self.view_x
-                x1   = max(x0 + 1,
-                            int((rel1 / self._trace_dur) * width * self.zoom) - self.view_x)
-                for x in range(max(0, x0), min(width, x1)):
-                    cells[x] = 1
-
-            i = 0
-            while i < width:
-                filled = cells[i]
-                j = i + 1
-                while j < width and cells[j] == filled:
-                    j += 1
-                ch    = "█" if filled else "·"
-                style = f"bold {color}" if filled else "color(237)"
-                out.append(ch * (j - i), style=style)
-                i = j
+            density_row, util_pct = self._density_row(lane_name, width, color)
+            out.append(density_row)
+            util_col = ("bright_green" if util_pct >= 50
+                        else "yellow"  if util_pct >= 20
+                        else "red")
+            out.append(f" {util_pct:4.0f}%", style=f"dim {util_col}")
             out.append("\n")
 
-            # blank spacer row
+            # Blank spacer row — gives visual breathing room between lanes
+            out.append("\n")
+            lanes_drawn += 1
+
+        # ── Pad to push footer to the bottom of the widget ───────────────
+        used = 2 + lanes_drawn * 2        # ruler rows + lane rows
+        pad  = max(0, height - used - 1)  # -1 for the footer line itself
+        for _ in range(pad):
             out.append("\n")
 
-        # ── Color legend ─────────────────────────────────────────────────
-        present = {ln.split("/")[0] for ln in self._lane_names}
-        out.append(" " * self._COL_W, style="dim")
-        for cat in ["cpu", "cuda", "rocm", "opencl", "openmp",
-                    "memory", "sync", "jit", "nvtx", "other"]:
-            if cat in present:
-                color = _cat_color(cat)
-                out.append(f"█ {cat}  ", style=f"bold {color}")
-        out.append("\n")
-
-        # ── Status footer ─────────────────────────────────────────────────
-        lane_info = (f"threads {lo + 1}–{hi} of {total_lanes}   "
+        # ── Status footer — always at the bottom ─────────────────────────
+        lane_info = (f"  lanes {lo+1}–{hi}/{total_lanes}"
                      if total_lanes > visible_rows else "")
-        out.append(
-            f" zoom {self.zoom:.1f}×   offset {_fmt_ns(offset_ns)}   "
-            f"window {_fmt_ns(visible_ns)}   {lane_info}"
-            f"[←→] scroll  [↑↓] pan  [+/-] zoom  [r] reset",
-            style="dim italic",
-        )
+        if self._hover:
+            # Show hover info in place of key hints
+            out.append(f" {self._hover}", style="bold white")
+        else:
+            out.append(
+                f" zoom {self.zoom:.1f}×"
+                f"  offset {_fmt_ns(offset_ns)}"
+                f"  window {_fmt_ns(visible_ns)}"
+                f"{lane_info}"
+                f"    [←→] scroll  [↑↓] pan  [+/-] zoom  [r] reset",
+                style="dim italic",
+            )
         return out
 
     def action_scroll_right(self) -> None:
@@ -1063,8 +1664,10 @@ class ProfilerApp(App):
         content-align: left middle;
         color: $text;
     }
-    HotspotsWidget  { height: 1fr; }
-    DisasmWidget    { height: 1fr; }
+    HotspotsWidget   { height: 1fr; }
+    DisasmWidget     { height: 1fr; }
+    #system-scroll   { height: 1fr; }
+    #profile-scroll  { height: 1fr; }
     #overview-scroll { height: 1fr; }
     """
 
@@ -1088,9 +1691,13 @@ class ProfilerApp(App):
         yield Header(name=f"Profiler — {cmd[:60]}")
 
         with TabbedContent():
-            with TabPane("Overview  [O]", id="tab-overview"):
-                with ScrollableContainer(id="overview-scroll"):
-                    yield OverviewWidget(self.trace)
+            with TabPane("System", id="tab-system"):
+                with ScrollableContainer(id="system-scroll"):
+                    yield SystemWidget(self.trace)
+
+            with TabPane("Profile", id="tab-profile"):
+                with ScrollableContainer(id="profile-scroll"):
+                    yield ProfileWidget(self.trace)
 
             with TabPane("Timeline  [T]", id="tab-timeline"):
                 yield TimelineWidget(self.trace)

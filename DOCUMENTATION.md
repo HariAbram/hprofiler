@@ -1,7 +1,7 @@
 # Profiler — Documentation
 
 A command-line CPU/GPU profiler with a terminal UI that traces programs across
-OpenMP, OpenCL, CUDA, ROCm, and Linux perf backends. Supports JIT-compiled
+OpenMP, OpenCL, CUDA, ROCm, NCCL, MPI, and Linux perf backends. Supports JIT-compiled
 kernels (ACPP/AdaptiveCpp, nvcc, etc.) with per-kernel disassembly. GPU-accurate
 kernel timing is captured via CUDA/HIP event pairs. NVTX annotations are
 intercepted without requiring libnvToolsExt.
@@ -22,7 +22,8 @@ intercepted without requiring libnvToolsExt.
 10. [Architecture Overview](#10-architecture-overview)
 11. [Implementation Details](#11-implementation-details)
 12. [Wire Protocol](#12-wire-protocol)
-13. [Extending the Profiler](#13-extending-the-profiler)
+13. [Performance Overhead](#13-performance-overhead)
+14. [Extending the Profiler](#14-extending-the-profiler)
 
 ---
 
@@ -86,6 +87,8 @@ python3 hprofiler run --no-ui -- ./my_program
 | CUDA backend | CUDA Runtime installed (`libcuda.so`) |
 | OpenCL backend | Any ICD loader (`libOpenCL.so`) |
 | ROCm backend | ROCm installed at `/opt/rocm` |
+| NCCL backend | CUDA Runtime + `libnccl.so` at runtime |
+| MPI backend | Any MPI implementation (`mpicc` at build time) |
 | Disasm (CUDA AoT) | `cuobjdump` (CUDA toolkit) |
 | Disasm (CPU/ELF) | `capstone>=5.0` (fast path) or `objdump` / `llvm-objdump` |
 | Disasm (ROCm) | `llvm-objdump` |
@@ -115,7 +118,9 @@ build/lib/
 ├── libhprofiler_cuda.so      # CUDA Runtime + Driver API + NVTX hook
 ├── libhprofiler_opencl.so    # OpenCL API hook
 ├── libhprofiler_ompt.so      # OpenMP OMPT tool
-└── libhprofiler_rocm.so      # ROCm/HIP hook (only if ROCm is found)
+├── libhprofiler_rocm.so      # ROCm/HIP hook (only if ROCm is found)
+├── libhprofiler_nccl.so      # NCCL multi-GPU collectives hook
+└── libhprofiler_mpi.so       # MPI PMPI profiling hook (built with mpicc)
 ```
 
 ### Run without installing
@@ -155,7 +160,7 @@ hprofiler run --backend cuda -- ./app --iterations 1000
 hprofiler run --backend cuda ./app --iterations 1000
 ```
 
-**Backend names:** `cpu`, `cuda`, `opencl`, `rocm`, `openmp`
+**Backend names:** `cpu`, `cuda`, `opencl`, `rocm`, `openmp`, `nccl`, `mpi`
 **Aliases:** `omp` = `openmp`, `hip` = `rocm`, `cl` = `opencl`, `perf` = `cpu`
 
 ```bash
@@ -438,6 +443,97 @@ spans by stream ID, and saves JIT binaries for disassembly.
 ```bash
 hprofiler run --backend rocm -- ./my_hip_program
 ```
+
+---
+
+### `nccl` — NCCL Multi-GPU Collectives
+
+Injects `libhprofiler_nccl.so` via `LD_PRELOAD`. Wraps NCCL collective and
+point-to-point operations, measuring **GPU-accurate duration** using
+`cudaEvent_t` pairs (same mechanism as the CUDA hook). Falls back to wall-clock
+timing if CUDA event functions are not available.
+
+**No NCCL headers required** — the hook uses minimal type stubs and resolves
+all NCCL symbols at runtime via `dlsym(RTLD_NEXT, ...)`.
+
+**Wrapped functions:**
+
+| Function | Tag | Description |
+|----------|-----|-------------|
+| `ncclAllReduce` | `type=allreduce` | All-to-all reduction |
+| `ncclBroadcast` | `type=broadcast` | One-to-all broadcast |
+| `ncclReduce` | `type=reduce` | Many-to-one reduction |
+| `ncclAllGather` | `type=allgather` | All-to-all gather |
+| `ncclReduceScatter` | `type=reduce_scatter` | Reduce + scatter |
+| `ncclSend` | `type=send,peer=N` | Point-to-point send |
+| `ncclRecv` | `type=recv,peer=N` | Point-to-point receive |
+| `ncclGroupStart` / `ncclGroupEnd` | `type=group` | Group-operation boundary span |
+
+Every span carries `bytes=N` (count × dtype size) and `stream=ID`.
+
+**Stream ID tracking:** Each unique `cudaStream_t` pointer is assigned a
+sequential integer ID (1, 2, 3, …). Stream 0 means the default/null stream.
+Up to 512 streams are tracked; beyond that, spans are tagged `stream=-1`.
+
+**Group operations:** `ncclGroupStart` / `ncclGroupEnd` nest correctly — only
+the outermost pair emits a `ncclGroup` span covering the full group duration.
+
+**Requirements:** CUDA Runtime (`libcuda.so`) must be loaded in the same
+process for GPU-accurate timing. NCCL itself need not be present at build time.
+
+```bash
+# Profile NCCL collectives alongside CUDA kernels
+hprofiler run --backend cuda,nccl -- ./my_multi_gpu_app
+```
+
+---
+
+### `mpi` — MPI Point-to-Point and Collectives
+
+Provides `libhprofiler_mpi.so`, built with `mpicc`. Uses the **PMPI profiling
+interface** — the MPI standard requires every conforming implementation to
+expose `PMPI_*` wrappers, so no `LD_PRELOAD` or `dlsym` tricks are needed.
+Link the library alongside the program.
+
+**Wrapped functions:**
+
+| Category | Functions |
+|----------|----------|
+| Point-to-point | `MPI_Send`, `MPI_Recv`, `MPI_Isend`, `MPI_Irecv`, `MPI_Ssend`, `MPI_Bsend`, `MPI_Wait`, `MPI_Waitall` |
+| Collectives | `MPI_Bcast`, `MPI_Reduce`, `MPI_Allreduce`, `MPI_Alltoall`, `MPI_Allgather`, `MPI_Scatter`, `MPI_Gather`, `MPI_Barrier`, `MPI_Scan` |
+| One-sided | `MPI_Put`, `MPI_Get`, `MPI_Accumulate` |
+| Lifecycle | `MPI_Init`, `MPI_Init_thread`, `MPI_Finalize` |
+
+Every span is in category `mpi` and carries `type=<call>`, `bytes=N`
+(count × datatype size), `rank=<own rank>`, and where applicable `peer=<rank>`
+and `tag=N`.
+
+**Timing:** All timings are **wall-clock** from `CLOCK_MONOTONIC` on the host
+calling thread. For blocking collectives (`MPI_Allreduce`, `MPI_Barrier`, etc.)
+this measures the full synchronisation cost including waiting for the slowest
+rank.
+
+**Datatype sizes:** Common built-in MPI types are resolved by a static table.
+Unknown derived datatypes fall back to `PMPI_Type_size`.
+
+**Build and use:**
+
+```bash
+# Build
+mpicc -shared -fPIC -o libhprofiler_mpi.so hooks/mpi_hook/mpi_hook.c -ldl -lpthread
+# Or: cmake --build build -- libhprofiler_mpi
+
+# Run (no --backend flag needed — link or preload the library directly)
+mpirun -np 4 env LD_PRELOAD=build/lib/libhprofiler_mpi.so \
+              HPROFILER_SOCKET=/tmp/hprofiler.sock ./my_mpi_app
+
+# Combined with hprofiler run (MPI backend auto-injects the library)
+hprofiler run --backend mpi -- mpirun -np 4 ./my_mpi_app
+```
+
+**Note:** The MPI hook uses wall-clock host timing only. It does not intercept
+MPI-3 RMA epochs or non-blocking collective progress; `MPI_Wait` / `MPI_Waitall`
+spans cover the wait time but not the underlying network transfer time.
 
 ---
 
@@ -763,6 +859,8 @@ flowchart TB
             R2["OpenCL\nICD Loader"]
             R3["OpenMP\nlibomp"]
             R4["ROCm / HIP"]
+            R5["NCCL\nlibnccl"]
+            R6["MPI\nOpenMPI / MPICH"]
         end
 
         subgraph HK["  Hook libraries  "]
@@ -771,17 +869,21 @@ flowchart TB
             H2["libhprofiler_opencl\n─────────────\nforce queue profiling\nGPU-side timestamps\nJIT span timing"]
             H3["libhprofiler_ompt\n─────────────\nOMPT callbacks\ndladdr + /proc/maps\ncodeptr → symbol"]
             H4["libhprofiler_rocm\n─────────────\nGPU event timing\nstream ID tagging\nmemory counters\nJIT binary capture"]
+            H5["libhprofiler_nccl\n─────────────\nGPU event timing\ncollective type + bytes\nstream ID tagging\ngroup boundaries"]
+            H6["libhprofiler_mpi\n─────────────\nPMPI wrappers\nwall-clock timing\nbytes · rank · peer\ncollectives + p2p"]
         end
 
         R1 -->|LD_PRELOAD| H1
         R2 -->|LD_PRELOAD| H2
         R3 -->|OMP_TOOL| H3
         R4 -->|LD_PRELOAD| H4
+        R5 -->|LD_PRELOAD| H5
+        R6 -->|PMPI link| H6
     end
 
     WIRE(["🔌  Unix domain socket\nspan: · ctr: · inst:\nnewline-delimited ASCII"])
 
-    H1 & H2 & H3 & H4 --> WIRE
+    H1 & H2 & H3 & H4 & H5 & H6 --> WIRE
 
     subgraph PY["  🐍  Profiler — Python  "]
         direction TB
@@ -816,8 +918,8 @@ flowchart TB
     classDef output   fill:#0c1a3d,stroke:#60a5fa,stroke-width:2px,color:#bfdbfe
     classDef engine   fill:#1c1917,stroke:#a8a29e,stroke-width:2px,color:#e7e5e4
 
-    class R1,R2,R3,R4 runtime
-    class H1,H2,H3,H4 hook
+    class R1,R2,R3,R4,R5,R6 runtime
+    class H1,H2,H3,H4,H5,H6 hook
     class WIRE wire
     class TRACE store
     class J,S,T,RF output
@@ -827,7 +929,7 @@ flowchart TB
 ### Data flow summary
 
 1. `hprofiler run` creates a Unix domain socket and sets `HPROFILER_SOCKET`.
-2. C hook libraries are injected via `LD_PRELOAD`; the OMPT tool via `OMP_TOOL_LIBRARIES`.
+2. C hook libraries are injected via `LD_PRELOAD` (CUDA, OpenCL, ROCm, NCCL), the OMPT tool via `OMP_TOOL_LIBRARIES`, and the MPI hook via PMPI link-time interposition.
 3. Each hook streams newline-delimited `span:` / `ctr:` records as API calls are intercepted.
 4. After the process exits, the `Trace` is serialized to Chrome Trace JSON.
 5. When `--disasm` is passed, a background thread starts `_collect_disasm`:
@@ -980,6 +1082,12 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | `openmp` | `type=work,count=N` | Work-sharing iteration count |
 | `nvtx` | `type=nvtx_range` | NVTX push/pop range |
 | `jit` | `type=jit_load,path=<so>` | ACPP SSCP `.jit.so` loaded |
+| `nccl` | `type=allreduce\|broadcast\|...` | Collective type |
+| `nccl` | `bytes=N,stream=ID` | Transfer size and CUDA stream |
+| `nccl` | `type=group` | `ncclGroupStart/End` boundary |
+| `nccl` | `peer=N` | Target rank for `ncclSend`/`ncclRecv` |
+| `mpi` | `type=send\|recv\|allreduce\|...` | MPI call type |
+| `mpi` | `bytes=N,rank=R,peer=P,tag=T` | Message size, own rank, remote rank |
 
 ### Counter record
 
@@ -999,9 +1107,100 @@ Each hook connects once in its `__attribute__((constructor))`. A per-process
 `pthread_mutex_t` serializes all `send()` calls. The socket is closed in
 `__attribute__((destructor))` after flushing pending GPU-event timing data.
 
+`send_all()` (in each hook) loops until all bytes are written, handling partial
+writes. If `send()` returns `EPIPE` or any error, the socket is closed and
+`g_sock = -1`; the next `emit_span` call triggers a reconnect attempt via
+`ensure_connected()`. Span records longer than the format buffer (2 KB) are
+detected by checking `snprintf`'s return value and silently dropped rather than
+sending a truncated/unparseable line.
+
 ---
 
-## 13. Extending the Profiler
+## 13. Performance Overhead
+
+### Where overhead comes from
+
+Every intercepted API call (kernel launch, memcpy, sync, collective) does the
+following before returning to the application:
+
+1. Grab a per-process mutex
+2. Call `clock_gettime(CLOCK_MONOTONIC)` to record start time
+3. Call the real API function
+4. Call `clock_gettime` again for end time
+5. Format a 100–200 byte ASCII record with `snprintf`
+6. Write it to a Unix domain socket with `send()`
+7. Release the mutex
+
+Steps 1–7 are synchronous and on the application's calling thread. Typical
+overhead per intercepted call on a modern Linux system:
+
+| Operation | Overhead |
+|-----------|----------|
+| `clock_gettime` (vDSO, 2×) | ~10–20 ns |
+| `snprintf` (one format string) | ~200–500 ns |
+| `send()` to local Unix socket | ~1–5 µs when socket buffer has space |
+| Mutex lock + unlock | ~10–30 ns (uncontended) |
+| **Total per call** | **~2–6 µs typical** |
+
+For most programs this is invisible. It becomes measurable when:
+
+- **Very short kernels** (< 10 µs GPU duration) — the 2–6 µs hook cost is a
+  significant fraction of the kernel's time. Use `--no-ui --no-summary` to
+  minimize Python-side processing if overhead is a concern.
+- **High-frequency calls** (> 100k calls/sec) — e.g., many small OpenMP loop
+  iterations. OMPT callbacks have the same overhead per callback.
+- **Contended mutex** — multiple threads launching kernels simultaneously will
+  serialize on the socket write mutex. In practice, CUDA streams are usually
+  driven from one host thread, so contention is rare.
+
+### Socket buffer behaviour
+
+The socket is a Unix domain stream socket. The kernel provides a buffer
+(typically 208 KB). As long as the Python receiver consumes data fast enough,
+`send()` returns immediately without blocking. If the buffer fills up (very
+high event rates with a slow Python process), `send()` will block until space
+is available. The hook does **not** drop events silently — it blocks the
+application thread instead.
+
+If non-blocking behavior is needed for a latency-critical workload, disable
+the profiler for the hot region using the NVTX `nvtxRangePush/Pop` pattern
+(already intercepted) or use `--no-ui` to minimize receiver overhead.
+
+### TUI Timeline rendering performance
+
+The Timeline widget uses fully vectorised numpy rendering:
+
+- **Spatial index**: `np.searchsorted` on sorted per-lane start arrays clips
+  computation to only the spans that overlap the visible viewport — O(log n)
+  per render call regardless of total span count.
+- **Numpy accumulation**: pixel activity and dominant-function color are
+  computed with numpy broadcast + diff/cumsum — no Python loop over spans.
+- **Measured render times** (20-render average, single CUDA lane, 200-wide terminal):
+
+| Span count | Full view | 64× zoom |
+|------------|-----------|----------|
+| 10k spans | 1.5 ms | 1.2 ms |
+| 100k spans | 7 ms | 1.7 ms |
+| 250k spans | 8 ms | 2.3 ms |
+
+The TUI remains responsive at 250k spans at all zoom levels.
+
+### Known limitations
+
+| Area | Limitation | Workaround |
+|------|-----------|------------|
+| **Synchronous IPC** | Each intercepted call blocks on a Unix socket write. At very high rates (>100k calls/s), this adds measurable latency. | Reduce profiling scope; use `--backend cuda` only (not `--backend cuda,cpu,opencl`). |
+| **OpenCL GPU timing accuracy** | GPU-side timestamps are converted to wall-clock time using a single calibration sample at first event. Sub-millisecond kernels may have ±50 µs timestamp error. | Use CUDA or ROCm backends for accurate short-kernel timing. |
+| **CUDA GPU timing latency** | `cudaEventElapsedTime` is called at sync points, not immediately after each kernel. Kernels appear in the trace with GPU-accurate duration but a slight delay in when they are recorded. | Expected behaviour; all durations are accurate. |
+| **NCCL stream tracking** | Tracks up to 512 unique CUDA streams per process. Beyond that, all excess streams are tagged `stream=-1`. | Rare in practice; most multi-GPU programs use 1–16 streams. |
+| **Roofline bandwidth model** | Uses HBM (DRAM) bandwidth as the memory-bound ceiling. L2-resident kernels with high reuse will appear memory-bound on the chart even though they run at L2 bandwidth (2–4× higher). | Treat the roofline as a conservative lower bound for cache-resident workloads. |
+| **OpenCL semantic depth** | OpenCL only shows host-API events (kernel name, memcpy size). Intra-kernel constructs (barriers, local memory, work-group size) are not visible. OpenMP shows construct-level detail via OMPT. | Expected: OpenCL has no host-visible construct callback API. |
+| **NVTX v3** | NVTX v3 (header-only, inline-expanded API) is not intercepted by LD_PRELOAD. Only NVTX v2 (library-dispatched) calls are captured. | Compile with `NVTX_DISABLE` or use `nvtxRangePushA` (v2 path). |
+| **snprintf truncation** | Span records longer than 2048 bytes (e.g., extremely long kernel names + many tags) are silently dropped. | Unlikely in practice; kernel names from `nm`/CUDA are typically < 256 chars. |
+
+---
+
+## 14. Extending the Profiler
 
 ### Adding a new backend
 

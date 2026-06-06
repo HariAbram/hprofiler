@@ -59,6 +59,36 @@ static int             g_sock        = -1;
 static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pid_t           g_pid         = 0;
 
+/*
+ * CL device timestamps are in the OpenCL device time domain (an opaque
+ * monotonic counter reset independently from CLOCK_MONOTONIC).  To make
+ * kernel spans appear at the correct wall-clock position in the trace we
+ * capture a (wall_ns, cl_ns) pair at the first observed event and use the
+ * offset to translate all subsequent CL timestamps.
+ *
+ * The offset may be off by the latency between the kernel completing and
+ * the callback firing (typically < 1 ms), but it is far better than the
+ * unbounded error of raw CL timestamps.
+ */
+static int64_t         g_cl_offset_ns   = INT64_MIN;
+static pthread_mutex_t g_cl_offset_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t now_ns(void);   /* forward declaration — defined below */
+
+static uint64_t cl_to_wall_ns(cl_ulong cl_ns) {
+    pthread_mutex_lock(&g_cl_offset_mutex);
+    if (g_cl_offset_ns == INT64_MIN) {
+        /* First calibration: record wall time at the moment we first observe
+         * a CL timestamp.  The offset is negative when the CL counter started
+         * earlier than CLOCK_MONOTONIC (common on discrete GPUs). */
+        g_cl_offset_ns = (int64_t)now_ns() - (int64_t)cl_ns;
+    }
+    int64_t offset = g_cl_offset_ns;
+    pthread_mutex_unlock(&g_cl_offset_mutex);
+    int64_t wall = (int64_t)cl_ns + offset;
+    return wall > 0 ? (uint64_t)wall : 0;
+}
+
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -92,17 +122,22 @@ static void ensure_connected(void) {
     if (g_dbg) fflush(g_dbg);
 }
 
+static void send_all(const char *buf, int n) {
+    while (n > 0) {
+        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
+        if (r < 0) { close(g_sock); g_sock = -1; return; }
+        buf += r; n -= (int)r;
+    }
+}
+
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
     pthread_mutex_lock(&g_sock_mutex);
     ensure_connected();
-    if (g_dbg) {
-        fprintf(g_dbg, "[opencl-hook] emit_span g_sock=%d cat=%s name=%s\n",
-                g_sock, cat, name);
-        fflush(g_dbg);
-    }
+    if (g_dbg)
+        fprintf(g_dbg, "[opencl-hook] emit_span cat=%s name=%s\n", cat, name);
     if (g_sock >= 0) {
-        char buf[1024];
+        char buf[2048];
         int n;
         if (extra && *extra)
             n = snprintf(buf, sizeof(buf),
@@ -116,10 +151,8 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                 cat, g_pid, tid,
                 (unsigned long long)start_ns, (unsigned long long)dur_ns,
                 name);
-        if (n > 0) {
-            ssize_t sent = send(g_sock, buf, n, MSG_NOSIGNAL);
-            if (g_dbg) { fprintf(g_dbg, "[opencl-hook] send n=%d sent=%zd\n", n, sent); fflush(g_dbg); }
-        }
+        if (n > 0 && n < (int)sizeof(buf))
+            send_all(buf, n);
     }
     pthread_mutex_unlock(&g_sock_mutex);
 }
@@ -154,9 +187,9 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
     if (real_prof &&
         real_prof(ev, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &gpu_start, NULL) == CL_SUCCESS &&
         real_prof(ev, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &gpu_end,   NULL) == CL_SUCCESS) {
-        emit_span("opencl", gettid_compat(),
-                  (uint64_t)gpu_start, (uint64_t)(gpu_end - gpu_start),
-                  d->name, d->extra);
+        uint64_t wall_start = cl_to_wall_ns(gpu_start);
+        uint64_t dur_ns     = (gpu_end >= gpu_start) ? (gpu_end - gpu_start) : 0;
+        emit_span("opencl", gettid_compat(), wall_start, dur_ns, d->name, d->extra);
     }
     if (real_release) real_release(ev);
     free(d);

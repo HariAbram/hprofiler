@@ -24,6 +24,100 @@ def _fmt_bytes(b: float) -> str:
     return f"{b:.0f} B"
 
 
+def _bottleneck_analysis(trace: Trace, ctrs: dict) -> list[str]:
+    """Return a list of human-readable bottleneck observations with advice."""
+    from ..core.events import Category
+
+    tips: list[str] = []
+
+    # CPU bottlenecks from perf stat counters
+    ipc = ctrs.get("ipc", 0.0)
+    llc = ctrs.get("cache_miss_pct", 0.0)
+    br  = ctrs.get("branch_miss_pct", 0.0)
+
+    if 0 < ipc < 1.0:
+        tips.append(
+            f"⚡ Low IPC ({ipc:.2f}) — CPU is stalled waiting on memory or long-latency "
+            "instructions. Consider software prefetching, loop unrolling, or reordering "
+            "independent operations to expose instruction-level parallelism."
+        )
+    if llc > 10.0:
+        tips.append(
+            f"💾 High LLC miss rate ({llc:.1f}%) — working set exceeds L3 cache. "
+            "Consider blocking/tiling data access patterns, improving spatial locality, "
+            "or using structure-of-arrays instead of array-of-structures."
+        )
+    if br > 5.0:
+        tips.append(
+            f"🔀 High branch misprediction rate ({br:.1f}%) — consider replacing "
+            "unpredictable conditionals with branchless code (e.g. ternary, CMOV, SIMD masks)."
+        )
+
+    # GPU bottlenecks from roofline analysis in trace
+    try:
+        from ..analysis.roofline import analyze_trace
+        results = analyze_trace(trace)
+        if results:
+            mem_bound  = [m for _, m in results if m.bound == "memory"]
+            comp_bound = [m for _, m in results if m.bound == "compute"]
+
+            if mem_bound:
+                top = sorted(mem_bound, key=lambda m: -m.duration_ns)[:3]
+                names = ", ".join(m.kernel_name[:20] for m in top)
+                pcts  = [m.bw_pct for m in top]
+                avg   = sum(pcts) / len(pcts)
+                tips.append(
+                    f"🔴 {len(mem_bound)} memory-bound kernel(s): [{names}] "
+                    f"(avg {avg:.0f}% of peak BW). "
+                    "Increase arithmetic intensity via loop fusion, tiling, or blocking. "
+                    "Use shared memory to reuse data across threads."
+                )
+            if comp_bound:
+                top = sorted(comp_bound, key=lambda m: -m.duration_ns)[:3]
+                names = ", ".join(m.kernel_name[:20] for m in top)
+                pcts  = [m.flops_pct for m in top]
+                avg   = sum(pcts) / len(pcts)
+                tips.append(
+                    f"🟢 {len(comp_bound)} compute-bound kernel(s): [{names}] "
+                    f"(avg {avg:.0f}% of peak FP32). "
+                    + ("Already near peak — consider FP16 or tensor-core operations "
+                       "to increase throughput." if avg > 60
+                       else "Below compute peak — check for thread divergence, "
+                            "register spilling, or insufficient occupancy.")
+                )
+    except Exception:
+        pass
+
+    # GPU utilization too low
+    wall_ns = trace.duration_ns or 1
+    for cat_val in ("cuda", "rocm"):
+        gpu_spans = [s for s in trace.spans
+                     if s.category.value == cat_val
+                     and s.tags.get("type") == "kernel"]
+        if gpu_spans:
+            kernel_ns = sum(s.duration_ns for s in gpu_spans)
+            pct = 100.0 * kernel_ns / wall_ns
+            if pct < 30.0:
+                tips.append(
+                    f"⚠ GPU kernel active only {pct:.1f}% of wall time — large gaps between "
+                    "kernels suggest CPU↔GPU synchronization overhead. Consider using streams, "
+                    "asynchronous copies, or CUDA graphs to overlap CPU and GPU work."
+                )
+
+    # Memory leak
+    leaked_bytes = 0.0
+    for c in trace.counters:
+        if c.name == "gpu_memory_leaked_bytes":
+            leaked_bytes = max(leaked_bytes, c.value)
+    if leaked_bytes > 0:
+        tips.append(
+            f"🚨 GPU memory leak detected: {_fmt_bytes(leaked_bytes)} "
+            "allocated but never freed. Check cudaMalloc/cudaFree balance."
+        )
+
+    return tips
+
+
 def print_summary(trace: Trace, top_n: int = 20) -> None:
     meta = trace.metadata
     print(f"\n{'='*72}")
@@ -114,5 +208,12 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
                 f" {_fmt_ns(row['total_ns']):>10} {_fmt_ns(row['avg_ns']):>10}"
                 f" {row['pct']:>5.1f}%"
             )
+
+    # ── Bottleneck identification ───────────────────────────────────────────────
+    bottlenecks = _bottleneck_analysis(trace, ctrs)
+    if bottlenecks:
+        print(f"\n  Bottleneck analysis:")
+        for b in bottlenecks:
+            print(f"    {b}")
 
     print(f"{'='*72}\n")

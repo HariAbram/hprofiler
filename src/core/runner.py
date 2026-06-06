@@ -129,29 +129,31 @@ class Runner:
         env["HPROFILER_SOCKET"] = sock_path
         env.update(self.env_extra)
 
+        # ── Inject hooks via backend interface ───────────────────────────────
+        from ..backends import ALL_BACKENDS
         preload_libs: list[str] = []
-        if "cuda" in self.backends:
-            lib = HOOKS_DIR / "libhprofiler_cuda.so"
-            if lib.exists():
-                preload_libs.append(str(lib))
-        if "opencl" in self.backends:
-            lib = HOOKS_DIR / "libhprofiler_opencl.so"
-            if lib.exists():
-                preload_libs.append(str(lib))
-        if "rocm" in self.backends:
-            lib = HOOKS_DIR / "libhprofiler_rocm.so"
-            if lib.exists():
-                preload_libs.append(str(lib))
+        for bname in self.backends:
+            backend_cls = ALL_BACKENDS.get(bname)
+            if backend_cls is None:
+                continue
+            try:
+                b = backend_cls()
+                for lib_path in b.preload_libs():
+                    if lib_path and Path(lib_path).exists():
+                        preload_libs.append(lib_path)
+                for k, v in b.env_vars().items():
+                    # OMP_TOOL_LIBRARIES uses ":" separator
+                    if k == "OMP_TOOL_LIBRARIES":
+                        existing = env.get(k, "")
+                        env[k] = ":".join(filter(None, [existing, v]))
+                    else:
+                        env.setdefault(k, v)
+            except Exception:
+                pass
 
         if preload_libs:
             existing = env.get("LD_PRELOAD", "")
             env["LD_PRELOAD"] = ":".join(filter(None, [existing] + preload_libs))
-
-        if "openmp" in self.backends:
-            lib = HOOKS_DIR / "libhprofiler_ompt.so"
-            if lib.exists():
-                existing = env.get("OMP_TOOL_LIBRARIES", "")
-                env["OMP_TOOL_LIBRARIES"] = ":".join(filter(None, [existing, str(lib)]))
 
         metadata = TraceMetadata(
             command=self.command[0],
@@ -218,7 +220,8 @@ class Runner:
         # ── Start the profiled process directly ───────────────────────────────
         # perf record and perf stat attach via -p PID so we can run both
         # simultaneously without nesting and still get the env vars right.
-        callgraph = self.env_extra.pop("HPROFILER_CALLGRAPH", None)
+        # Read HPROFILER_CALLGRAPH from env_extra without mutating caller's dict.
+        callgraph = self.env_extra.get("HPROFILER_CALLGRAPH")
         proc = subprocess.Popen(run_command, env=env)
         pid = proc.pid
 
@@ -243,9 +246,12 @@ class Runner:
                 perf_data = None
 
         # ── Attach perf stat for CPU microarch counters ───────────────────────
+        # Only run when a CPU-side backend is active — GPU-only workloads don't
+        # benefit and we'd waste PMU counter slots + add a second process.
         perf_stat_proc: subprocess.Popen | None = None
         perf_stat_file: str | None = None
-        if shutil.which("perf"):
+        _cpu_backends = {"cpu", "openmp", "likwid"}
+        if shutil.which("perf") and any(b in self.backends for b in _cpu_backends):
             perf_stat_file = tempfile.mktemp(suffix=".perf_stat.txt", prefix="hprofiler_")
             _MICROARCH_EVENTS = (
                 "cycles,instructions,cache-references,cache-misses,"
@@ -387,27 +393,50 @@ def _poll_nvidia_smi(trace: Trace, stop: threading.Event) -> None:
 def _poll_rocm_smi(trace: Trace, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
-            r = subprocess.run(
-                ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--csv"],
+            # Use separate queries so column positions are unambiguous.
+            # --showuse gives "GPU use (%)" and --showmeminfo gives VRAM used/total.
+            r_use = subprocess.run(
+                ["rocm-smi", "--showuse", "--csv"],
+                capture_output=True, text=True, timeout=3,
+            )
+            r_mem = subprocess.run(
+                ["rocm-smi", "--showmeminfo", "vram", "--csv"],
                 capture_output=True, text=True, timeout=3,
             )
             ts = time.monotonic_ns()
-            for line in r.stdout.strip().splitlines():
-                if line.startswith("#") or "," not in line:
+
+            # Parse GPU utilization: header has "GPU use (%)"
+            for line in r_use.stdout.strip().splitlines():
+                if not line or line.startswith("#"):
                     continue
                 parts = [p.strip() for p in line.split(",")]
-                # rocm-smi CSV columns vary by version; look for numeric fields
-                nums = []
-                for p in parts:
-                    try:
-                        nums.append(float(p))
-                    except ValueError:
-                        pass
-                if len(nums) >= 2:
-                    trace.add(CounterEvent("gpu_utilization_pct",
-                                            Category.MEMORY, ts, nums[0], "%"))
-                    trace.add(CounterEvent("gpu_mem_used_bytes",
-                                            Category.MEMORY, ts, nums[1] * 1024**2, "bytes"))
+                if parts[0].lower() == "device":   # header row
+                    continue
+                try:
+                    idx      = int(parts[0].replace("card", ""))
+                    util_pct = float(parts[1].rstrip("%"))
+                    suf      = f"[gpu{idx}]" if idx else ""
+                    trace.add(CounterEvent(f"gpu_utilization_pct{suf}",
+                                            Category.MEMORY, ts, util_pct, "%"))
+                except (ValueError, IndexError):
+                    pass
+
+            # Parse VRAM: header has "VRAM Used (MB)" and "VRAM Total (MB)"
+            for line in r_mem.stdout.strip().splitlines():
+                if not line or line.startswith("#"):
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if parts[0].lower() == "device":
+                    continue
+                try:
+                    idx = int(parts[0].replace("card", ""))
+                    # Find "used" and "total" columns by header; fallback: parts[1]
+                    used_mb  = float(parts[1])
+                    suf = f"[gpu{idx}]" if idx else ""
+                    trace.add(CounterEvent(f"gpu_mem_used_bytes{suf}",
+                                            Category.MEMORY, ts, used_mb * 1024**2, "bytes"))
+                except (ValueError, IndexError):
+                    pass
         except Exception:
             pass
         stop.wait(timeout=0.1)
@@ -676,13 +705,28 @@ def _parse_perf_script(perf_data: str, trace: Trace, trace_start_ns: int) -> Non
     def _flush():
         if not cur_ts:
             return
-        name = cur_stack[0] if cur_stack else (cur_top_sym or "[cpu]")
-        if name:
-            trace.add(SpanEvent(
-                name=name, category=Category.CPU,
-                start_ns=max(0, cur_ts - trace_start_ns),
-                duration_ns=0, pid=cur_pid, tid=cur_tid,
-            ))
+        rel_ts = max(0, cur_ts - trace_start_ns)
+        if cur_stack:
+            # Emit all stack frames so the TUI and chrome trace can show a
+            # proper call-tree. cur_stack[0] = innermost (top of stack).
+            # Encode the full folded stack as a tag for flame graph aggregation.
+            folded = ";".join(reversed(cur_stack))   # outer-to-inner, flamegraph.pl convention
+            for depth, sym in enumerate(cur_stack):
+                if sym:
+                    trace.add(SpanEvent(
+                        name=sym, category=Category.CPU,
+                        start_ns=rel_ts, duration_ns=0,
+                        pid=cur_pid, tid=cur_tid,
+                        tags={"depth": str(depth), "stack": folded},
+                    ))
+        else:
+            name = cur_top_sym or "[cpu]"
+            if name:
+                trace.add(SpanEvent(
+                    name=name, category=Category.CPU,
+                    start_ns=rel_ts, duration_ns=0,
+                    pid=cur_pid, tid=cur_tid,
+                ))
 
     for raw_line in lines:
         if not raw_line.strip():

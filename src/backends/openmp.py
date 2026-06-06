@@ -75,7 +75,7 @@ class OpenMPBackend(Backend):
     description = "OpenMP parallel region / task tracing via OMPT (requires clang libomp, not GCC libgomp)"
 
     def is_available(self) -> bool:
-        return _TOOL_LIB.exists()
+        return _TOOL_LIB.exists() and self.libomp_available()
 
     def libomp_available(self) -> bool:
         return bool(_libomp_paths())

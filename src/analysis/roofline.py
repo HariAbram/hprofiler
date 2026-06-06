@@ -181,6 +181,10 @@ class KernelMetrics:
     bound:         str      # "compute", "memory", or "unknown"
     ridge:         float    # device ridge point (FLOPs/byte)
     data_source:   str = "disasm"   # "hardware_counters" | "disasm"
+    fp64_fraction: float = 0.0   # fraction of FLOPs that are FP64 (0–1)
+    fp16_fraction: float = 0.0   # fraction of FLOPs that are FP16 (0–1)
+    fp64_tflops:   float = 0.0   # device FP64 peak (TFLOPs/s)
+    fp16_tflops:   float = 0.0   # device FP16 peak (TFLOPs/s)
 
 
 def metrics_from_counters(
@@ -219,19 +223,29 @@ def metrics_from_counters(
     if dur_ns <= 0:
         return None
 
-    # Use all FP precisions; weight FP64 ×2 against an FP32 peak device
-    flops = counters.fp32_ops + counters.fp64_ops * 2 + counters.fp16_ops * 0.5
-    byt   = counters.dram_bytes
-    ai    = flops / byt if byt > 0 else float("inf")
+    # Use all FP precisions with equal weight — standard "FP32-equivalent" view.
+    # Do NOT double fp64_ops: that was non-standard and would misplace FP64
+    # kernels against the FP32 ceiling. Instead, fp64_fraction is recorded so
+    # the chart can annotate high-FP64 kernels and draw a separate FP64 ceiling.
+    fp32 = counters.fp32_ops
+    fp64 = counters.fp64_ops
+    fp16 = counters.fp16_ops
+    flops = fp32 + fp64 + fp16 * 0.5
+    byt   = max(counters.dram_bytes, 0.0)   # guard against negative hw-counter glitches
+    ai    = flops / byt if byt > 0.0 else float("inf")
 
-    secs            = dur_ns / 1e9
-    achieved_tflops = (flops / secs) / 1e12 if secs > 0 else 0.0
-    achieved_gbs    = (byt   / secs) / 1e9  if secs > 0 else 0.0
+    secs            = dur_ns / 1e9   # dur_ns > 0 guaranteed by early return above
+    achieved_tflops = (flops / secs) / 1e12
+    achieved_gbs    = (byt   / secs) / 1e9
 
-    flops_pct = 100 * achieved_tflops / device.fp32_tflops   if device.fp32_tflops   > 0 else 0.0
-    bw_pct    = 100 * achieved_gbs    / device.bandwidth_gbs if device.bandwidth_gbs > 0 else 0.0
+    # Clamp percentages to [0, 999] — values >100% are valid (measurement error /
+    # tensor-core overlap) but >1000% indicate a hw-counter miscalibration.
+    fp32_peak = max(device.fp32_tflops,   1e-9)
+    bw_peak   = max(device.bandwidth_gbs, 1e-9)
+    flops_pct = min(100 * achieved_tflops / fp32_peak, 999.0)
+    bw_pct    = min(100 * achieved_gbs    / bw_peak,   999.0)
 
-    bound = "compute" if (byt == 0 or ai >= device.ridge_point) else "memory"
+    bound = "compute" if (byt == 0.0 or (ai != float("inf") and ai >= device.ridge_point)) else "memory"
 
     threads = _thread_count(span.tags) if span else 1
 
@@ -241,6 +255,11 @@ def metrics_from_counters(
         src = "hw_counters(LLC proxy — write traffic missing)"
     elif src in ("ncu", "rocprof", "likwid", "perf_uncore"):
         src = f"hw_counters({src})"
+
+    # Precision fractions for chart annotation
+    total_ops = max(fp32 + fp64 + fp16 * 0.5, 1e-30)   # never zero
+    fp64_frac = fp64 / total_ops
+    fp16_frac = (fp16 * 0.5) / total_ops
 
     return KernelMetrics(
         kernel_name=counters.kernel_name,
@@ -257,6 +276,10 @@ def metrics_from_counters(
         bound=bound,
         ridge=device.ridge_point,
         data_source=src,
+        fp64_fraction=fp64_frac,
+        fp16_fraction=fp16_frac,
+        fp64_tflops=device.fp64_tflops,
+        fp16_tflops=device.fp16_tflops,
     )
 
 

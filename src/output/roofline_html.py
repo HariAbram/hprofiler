@@ -25,224 +25,302 @@ if TYPE_CHECKING:
 _PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.27.0.min.js"
 
 
-def _make_figure(device: "DevicePeak",
+def _axis_id(idx: int) -> str:
+    """Plotly axis suffix: '' for first subplot, '2' for second, etc."""
+    return "" if idx == 0 else str(idx + 1)
+
+
+_AXIS_STYLE = {
+    "type":  "log",
+    "range": [-3, 5],
+    "gridcolor":  "#374151",
+    "tickcolor":  "#6b7280",
+    "tickfont":   {"color": "#9ca3af"},
+    "titlefont":  {"color": "#d1d5db"},
+    "showline": True, "linecolor": "#4b5563",
+    "zeroline": False,
+}
+
+
+def _make_traces(device: "DevicePeak",
                  metrics: list["KernelMetrics"],
-                 trace_name: str = "",
-                 data_source: str = "disasm") -> dict:
-    """Build a Plotly figure dict (serialisable to JSON)."""
+                 ax: str = "",
+                 legendgroup: str = "") -> tuple[list, list]:
+    """
+    Build Plotly trace dicts + annotation dicts for *device*/*metrics*.
 
-    peak   = device.fp32_tflops
-    bw     = device.bandwidth_gbs
-    ridge  = device.ridge_point   # FLOPs/byte
+    *ax*          — Plotly axis suffix ('' → xaxis/yaxis, '2' → xaxis2/yaxis2, …)
+    *legendgroup* — group name so multiple subplots share legend colours
+    Returns (traces, annotations).
+    """
+    peak  = device.fp32_tflops
+    bw    = device.bandwidth_gbs
+    ridge = device.ridge_point
 
-    # ── Ceiling lines ──────────────────────────────────────────────────────────
-    # Span from 0.001 to 100 000 FLOPs/byte (wider than the plot range so
-    # the line reaches the edge of the axis after log-scale clipping).
-    x_bw   = [1e-3, ridge]
-    y_bw   = [v * bw / 1000 for v in x_bw]           # TFLOPs/s = F/B × GB/s / 1000
+    xref = f"x{ax}"
+    yref = f"y{ax}"
 
-    x_comp = [ridge, 1e5]
-    y_comp = [peak,  peak]
+    def _ridge(tflops: float) -> float:
+        return tflops * 1e12 / (bw * 1e9) if bw > 0 else 0.0
+
+    def _tr(name, xs, ys, color, dash=None, width=2.5, show=True, sym=None, hover=None,
+            custom=None, text=None, sizes=None) -> dict:
+        t: dict = {
+            "type": "scatter", "x": xs, "y": ys,
+            "name": name, "xaxis": xref, "yaxis": yref,
+            "showlegend": show,
+        }
+        if legendgroup:
+            t["legendgroup"] = legendgroup
+        line: dict = {"color": color, "width": width}
+        if dash:
+            line["dash"] = dash
+        if sym is None:
+            t["mode"] = "lines"
+            t["line"] = line
+            t["hoverinfo"] = "skip"
+        else:
+            t["mode"] = "markers+text"
+            t["marker"] = {"color": color, "size": sizes, "symbol": sym,
+                           "line": {"color": "white", "width": 0.5}}
+            t["text"] = text
+            t["textposition"] = "top center"
+            t["textfont"] = {"size": 10, "color": color}
+            t["hovertemplate"] = "%{customdata}<extra></extra>"
+            t["customdata"] = custom
+        return t
 
     traces = [
-        # Memory bandwidth ceiling
-        {
-            "type": "scatter",
-            "x": x_bw, "y": y_bw,
-            "mode": "lines",
-            "name": f"BW ceiling  ({bw:.0f} GB/s)",
-            "line": {"color": "rgba(34,211,238,0.9)", "width": 2.5},
-            "hoverinfo": "skip",
-        },
-        # Compute ceiling
-        {
-            "type": "scatter",
-            "x": x_comp, "y": y_comp,
-            "mode": "lines",
-            "name": f"FP32 ceiling  ({peak:.1f} TFLOPs/s)",
-            "line": {"color": "rgba(250,204,21,0.9)", "width": 2.5, "dash": "dash"},
-            "hoverinfo": "skip",
-        },
+        _tr(f"BW ceiling  ({bw:.0f} GB/s)",
+            [1e-3, ridge], [v * bw / 1000 for v in [1e-3, ridge]],
+            "rgba(34,211,238,0.9)"),
+        _tr(f"FP32 ceiling  ({peak:.2f} TFLOPs/s)",
+            [ridge, 1e5], [peak, peak],
+            "rgba(250,204,21,0.9)", dash="dash"),
     ]
 
-    # ── Kernel scatter split by bound type ────────────────────────────────────
+    if device.fp64_tflops > 0 and device.fp64_tflops < peak * 0.95:
+        r64 = _ridge(device.fp64_tflops)
+        traces.append(_tr(f"FP64 ceiling  ({device.fp64_tflops:.2f} TFLOPs/s)",
+                          [max(r64, 1e-3), 1e5],
+                          [device.fp64_tflops, device.fp64_tflops],
+                          "rgba(248,113,113,0.85)", dash="dashdot", width=1.8))
+        traces.append(_tr("", [1e-3, r64], [v * bw / 1000 for v in [1e-3, r64]],
+                          "rgba(248,113,113,0.4)", width=1.2, show=False))
+
+    if device.fp16_tflops > peak * 1.05:
+        r16 = _ridge(device.fp16_tflops)
+        traces.append(_tr(f"FP16 ceiling  ({device.fp16_tflops:.1f} TFLOPs/s)",
+                          [max(r16, 1e-3), 1e5],
+                          [device.fp16_tflops, device.fp16_tflops],
+                          "rgba(167,139,250,0.85)", dash="dot", width=1.8))
+
+    if device.tensor_tflops > device.fp16_tflops * 1.05:
+        r_tc = _ridge(device.tensor_tflops)
+        traces.append(_tr(f"Tensor ceiling  ({device.tensor_tflops:.0f} TFLOPs/s)",
+                          [max(r_tc, 1e-3), 1e5],
+                          [device.tensor_tflops, device.tensor_tflops],
+                          "rgba(52,211,153,0.85)", dash="dot", width=1.8))
+
     for bound, color, symbol in [
         ("compute", "rgba(74,222,128,1.0)", "circle"),
         ("memory",  "rgba(248,113,113,1.0)", "diamond"),
     ]:
-        if not any(m.bound == bound for m in metrics):
+        pts = [(m.arith_intensity if m.arith_intensity < 1e9 else ridge * 100,
+                min(m.achieved_tflops,
+                    m.arith_intensity * bw / 1000 if bound == "memory" and m.arith_intensity > 0
+                    else m.achieved_tflops),
+                m)
+               for m in metrics if m.bound == bound]
+        if not pts:
             continue
-
-        pts = []
-        for m in metrics:
-            if m.bound != bound:
-                continue
-            ai  = m.arith_intensity if m.arith_intensity < 1e9 else ridge * 100
-            tfl = m.achieved_tflops
-            # Memory-bound kernels cannot physically exceed the BW ceiling.
-            # ncu's dram__bytes.sum includes L2 write-backs + HW prefetch, so
-            # the apparent bandwidth can be 5-15% above the theoretical peak.
-            # Cap the plotted Y at the BW ceiling so the point stays inside the
-            # roofline envelope; the actual measured value is shown in the hover.
-            if bound == "memory" and ai > 0:
-                bw_ceiling_tfl = ai * bw / 1000
-                tfl = min(tfl, bw_ceiling_tfl)
-            pts.append((ai, max(tfl, 1e-9), m))
-
-        xs, ys, ms = zip(*pts)
-        # Marker size: proportional to log(duration_ns), min 10 px
-        sizes = [max(10, 8 + 4 * math.log10(max(m.duration_ns, 1) / 1e6))
-                 for m in ms]
-
+        xs, ys, ms = zip(*[(p[0], max(p[1], 1e-9), p[2]) for p in pts])
+        sizes = [max(10, 8 + 4 * math.log10(max(m.duration_ns, 1) / 1e6)) for m in ms]
         hover = []
         for m in ms:
-            bw_note = ""
-            if m.bw_pct >= 90:
-                bw_note = (
-                    "<br><i>⚠ Bandwidth-saturated — HW counters (dram__bytes.sum) "
-                    "include L2 write-backs + prefetch, so measured BW can "
-                    "slightly exceed theoretical peak.</i>"
-                )
-            ceiling_tflops = min(m.arith_intensity * bw / 1000, peak)
-            headroom = ceiling_tflops / m.achieved_tflops if m.achieved_tflops > 0 else float("inf")
+            bw_note = ("<br><i>⚠ BW counter includes L2 write-backs — may exceed peak</i>"
+                       if m.bw_pct >= 90 else "")
+            ceil_t = min(m.arith_intensity * bw / 1000, peak)
+            hr = ceil_t / m.achieved_tflops if m.achieved_tflops > 0 else float("inf")
+            prec = (f"FP64: {m.fp64_fraction*100:.1f}%  FP16: {m.fp16_fraction*100:.1f}%<br>"
+                    if m.fp64_fraction > 0.01 or m.fp16_fraction > 0.01 else "")
+            src_line = (f"FLOPs: {m.est_flops/1e9:.3f} GFLOPs<br>DRAM: {m.est_bytes/1e9:.3f} GB<br>"
+                        if "disasm" not in m.data_source
+                        else f"Est FLOPs: {m.est_flops/1e9:.3f} GFLOPs <i>(disasm)</i><br>"
+                             f"Est DRAM: {m.est_bytes/1e9:.3f} GB <i>(disasm)</i><br>")
             hover.append(
-                f"<b>{m.kernel_name}</b><br>"
-                f"Arch: {m.arch}<br>"
-                f"Duration: {m.duration_ns/1e6:.3f} ms<br>"
-                f"Threads: {m.threads:,}<br>"
-                f"Arith intensity: {m.arith_intensity:.4f} FLOPs/byte<br>"
-                + (f"FLOPs: {m.est_flops/1e9:.3f} GFLOPs<br>"
-                   f"DRAM: {m.est_bytes/1e9:.3f} GB<br>"
-                   if m.data_source != "disasm"
-                   else f"Est FLOPs: {m.est_flops/1e9:.3f} GFLOPs  <i>(disasm estimate)</i><br>"
-                        f"Est DRAM: {m.est_bytes/1e9:.3f} GB  <i>(disasm estimate)</i><br>")
-                + f"Achieved FP32: {m.achieved_tflops:.4f} TFLOPs/s  ({m.flops_pct:.1f}% peak)<br>"
-                  f"Achieved BW:   {m.achieved_gbs:.1f} GB/s  ({m.bw_pct:.1f}% peak)"
-                  f"{bw_note}<br>"
-                  f"<b>Peak at this AI: {ceiling_tflops:.4f} TFLOPs/s</b>  "
-                  f"({headroom:.1f}× headroom)<br>"
-                  f"<b>Bound: {m.bound}</b>  |  ridge: {m.ridge:.1f} FLOPs/byte<br>"
-                  f"<i>Source: {m.data_source}</i>"
+                f"<b>{m.kernel_name}</b><br>Arch: {m.arch}<br>"
+                f"Duration: {m.duration_ns/1e6:.3f} ms  Threads: {m.threads:,}<br>"
+                f"AI: {m.arith_intensity:.4f} FLOPs/byte<br>{src_line}{prec}"
+                f"Perf: {m.achieved_tflops:.4f} TFLOPs/s ({m.flops_pct:.1f}% peak)<br>"
+                f"BW: {m.achieved_gbs:.1f} GB/s ({m.bw_pct:.1f}% peak){bw_note}<br>"
+                f"<b>FP32 ceiling: {ceil_t:.4f} TFLOPs/s ({hr:.1f}× headroom)</b><br>"
+                f"<b>Bound: {m.bound}</b>  ridge: {m.ridge:.1f} F/B<br>"
+                f"<i>Source: {m.data_source}</i>"
             )
+        traces.append(_tr(f"{bound}-bound", list(xs), list(ys), color,
+                          sym=symbol, sizes=list(sizes),
+                          text=[m.kernel_name[:20] for m in ms], custom=hover))
 
-        traces.append({
-            "type": "scatter",
-            "x": list(xs), "y": list(ys),
-            "mode": "markers+text",
-            "name": f"{bound}-bound",
-            "text": [m.kernel_name[:20] for m in ms],
-            "textposition": "top center",
-            "textfont": {"size": 10, "color": color},
-            "hovertemplate": "%{customdata}<extra></extra>",
-            "customdata": hover,
-            "marker": {
-                "color": color, "size": list(sizes),
-                "symbol": symbol,
-                "line": {"color": "white", "width": 0.5},
-            },
-        })
+    annotations = [{
+        "x": math.log10(ridge), "y": math.log10(peak),
+        "xref": xref, "yref": yref,
+        "text": f"Ridge<br>{ridge:.1f} F/B",
+        "showarrow": True, "arrowhead": 2, "arrowcolor": "rgba(250,204,21,0.8)",
+        "ax": 30, "ay": -30,
+        "font": {"color": "rgba(250,204,21,0.9)", "size": 11},
+    }]
+    return traces, annotations
 
-    # ── Ridge annotation ───────────────────────────────────────────────────────
-    annotations = [
-        {
-            "x": math.log10(ridge), "y": math.log10(peak),
-            "xref": "x", "yref": "y",
-            "text": f"Ridge<br>{ridge:.1f} F/B",
-            "showarrow": True, "arrowhead": 2, "arrowcolor": "rgba(250,204,21,0.8)",
-            "ax": 30, "ay": -30,
-            "font": {"color": "rgba(250,204,21,0.9)", "size": 11},
-        },
-    ]
 
-    # ── Layout ─────────────────────────────────────────────────────────────────
+def _make_figure(device: "DevicePeak",
+                 metrics: list["KernelMetrics"],
+                 trace_name: str = "",
+                 data_source: str = "disasm") -> dict:
+    """Build a single-device Plotly figure dict."""
+    peak  = device.fp32_tflops
+    bw    = device.bandwidth_gbs
+
+    traces, annotations = _make_traces(device, metrics)
+
     layout = {
         "title": {
             "text": (
-                f"Roofline Model — {trace_name}<br>"
-                f"<sub>{device.name}  ({device.backend} · {device.compute_cap})"
-                f"  |  Peak FP32: {peak:.1f} TFLOPs/s"
-                f"  |  Peak BW: {bw:.0f} GB/s"
-                + (f"  |  Tensor: {device.tensor_tflops:.0f} TFLOPs/s"
-                   if device.tensor_tflops > 0 else "")
-                + "</sub>"
+                f"Roofline — {trace_name}<br>"
+                f"<sub>{device.name}  ({device.backend})"
+                f"  |  FP32: {peak:.2f} TFLOPs/s"
+                + (f"  |  FP64: {device.fp64_tflops:.3f} TFLOPs/s"
+                   if device.fp64_tflops > 0 else "")
+                + f"  |  BW: {bw:.0f} GB/s</sub>"
             ),
             "font": {"color": "#f9fafb", "size": 16},
         },
         "paper_bgcolor": "#111827",
         "plot_bgcolor":  "#1f2937",
         "font":          {"color": "#d1d5db", "family": "monospace"},
-        "xaxis": {
-            "title": "Arithmetic Intensity (FLOPs / byte)",
-            "type":  "log",
-            "range": [-3, 5],           # 0.001 → 100 000
-            "gridcolor":     "#374151",
-            "tickcolor":     "#6b7280",
-            "tickfont":      {"color": "#9ca3af"},
-            "titlefont":     {"color": "#d1d5db"},
-            "showline": True, "linecolor": "#4b5563",
-            "zeroline": False,
-        },
-        "yaxis": {
-            "title": "Performance (TFLOPs/s)",
-            "type":  "log",
-            "gridcolor":     "#374151",
-            "tickcolor":     "#6b7280",
-            "tickfont":      {"color": "#9ca3af"},
-            "titlefont":     {"color": "#d1d5db"},
-            "showline": True, "linecolor": "#4b5563",
-            "zeroline": False,
-        },
-        "legend": {
-            "bgcolor": "#1f2937", "bordercolor": "#374151", "borderwidth": 1,
-            "font": {"color": "#d1d5db"},
-        },
+        "xaxis": {"title": "Arithmetic Intensity (FLOPs / byte)", **_AXIS_STYLE},
+        "yaxis": {"title": "Performance (TFLOPs/s)", **_AXIS_STYLE},
+        "legend": {"bgcolor": "#1f2937", "bordercolor": "#374151",
+                   "borderwidth": 1, "font": {"color": "#d1d5db"}},
         "annotations": annotations,
         "hovermode": "closest",
         "margin": {"l": 70, "r": 30, "t": 100, "b": 70},
     }
-
     return {"data": traces, "layout": layout}
 
 
-def write(device: "DevicePeak",
-          metrics: list["KernelMetrics"],
-          out_path: str | Path,
-          trace_name: str = "") -> None:
-    """Write an interactive HTML roofline chart to *out_path*."""
-    src = "disasm" if all(m.data_source == "disasm" for m in metrics) else "hardware_counters"
-    fig = _make_figure(device, metrics, trace_name, data_source=src)
+def _make_combined_figure(device_metrics: list[tuple["DevicePeak", list["KernelMetrics"]]],
+                          trace_name: str = "") -> dict:
+    """
+    Build a Plotly figure with one subplot per device, all in a single HTML.
+    Devices are arranged in a single row of N columns.
+    """
+    n = len(device_metrics)
+    if n == 1:
+        dev, mets = device_metrics[0]
+        return _make_figure(dev, mets, trace_name)
 
-    html = f"""\
+    # Column widths split equally with a small gap
+    gap = 0.04
+    col_w = (1.0 - gap * (n - 1)) / n
+
+    all_traces: list[dict] = []
+    all_annotations: list[dict] = []
+    layout: dict = {
+        "paper_bgcolor": "#111827",
+        "plot_bgcolor":  "#1f2937",
+        "font":          {"color": "#d1d5db", "family": "monospace"},
+        "legend": {"bgcolor": "#1f2937", "bordercolor": "#374151",
+                   "borderwidth": 1, "font": {"color": "#d1d5db"},
+                   "tracegroupgap": 4},
+        "hovermode": "closest",
+        "margin": {"l": 70, "r": 30, "t": 100, "b": 70},
+        "title": {
+            "text": f"Roofline — {trace_name}",
+            "font": {"color": "#f9fafb", "size": 16},
+        },
+    }
+
+    for col, (dev, mets) in enumerate(device_metrics):
+        ax = _axis_id(col)
+        xref = f"x{ax}"
+        yref = f"y{ax}"
+        domain_x = [col * (col_w + gap), col * (col_w + gap) + col_w]
+        domain_y = [0.0, 1.0]
+
+        traces, annotations = _make_traces(dev, mets, ax=ax,
+                                           legendgroup=f"gpu{col}")
+        all_traces.extend(traces)
+        all_annotations.extend(annotations)
+
+        axis_key_x = f"xaxis{ax}"
+        axis_key_y = f"yaxis{ax}"
+        sub_title = (f"{dev.name}  ({dev.backend})<br>"
+                     f"FP32: {dev.fp32_tflops:.2f} TFLOPs/s  "
+                     f"BW: {dev.bandwidth_gbs:.0f} GB/s")
+        layout[axis_key_x] = {
+            "title": ("Arithmetic Intensity (FLOPs / byte)"
+                      if col == n // 2 else ""),
+            "domain": domain_x,
+            "anchor": yref,
+            **_AXIS_STYLE,
+        }
+        layout[axis_key_y] = {
+            "title": "Performance (TFLOPs/s)" if col == 0 else "",
+            "domain": domain_y,
+            "anchor": xref,
+            **_AXIS_STYLE,
+        }
+        # Per-subplot title via annotation at the top of each subplot
+        all_annotations.append({
+            "x": (domain_x[0] + domain_x[1]) / 2,
+            "y": 1.02,
+            "xref": "paper", "yref": "paper",
+            "text": f"<b>GPU {col}</b>: {sub_title}",
+            "showarrow": False,
+            "font": {"color": "#9ca3af", "size": 10},
+            "xanchor": "center",
+        })
+
+    layout["annotations"] = all_annotations
+    return {"data": all_traces, "layout": layout}
+
+
+def _html_page(fig: dict, title: str,
+               device_info: list[tuple[float, float]]) -> str:
+    """
+    Render a complete HTML page for *fig*.
+    *device_info* — list of (bandwidth_gbs, fp32_tflops) per subplot axis index.
+    Axis key for index 0 = "x", index 1 = "x2", etc.
+    """
+    # Build JS maps from axis id → BW / PEAK
+    bw_map   = {(f"x{_axis_id(i)}"): bw   for i, (bw, pk) in enumerate(device_info)}
+    peak_map = {(f"x{_axis_id(i)}"): pk   for i, (bw, pk) in enumerate(device_info)}
+
+    return f"""\
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Roofline — {trace_name}</title>
+  <title>Roofline — {title}</title>
   <script src="{_PLOTLY_CDN}"></script>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
-      background: #111827;
-      color: #f9fafb;
+      background: #111827; color: #f9fafb;
       font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
       padding: 16px;
     }}
     #chart {{ width: 100%; height: calc(100vh - 32px); min-height: 500px; }}
-    .no-script {{
-      text-align: center; padding: 40px;
-      color: #9ca3af; border: 1px solid #374151;
-    }}
+    .no-script {{ text-align:center; padding:40px; color:#9ca3af; border:1px solid #374151; }}
   </style>
 </head>
 <body>
   <div id="chart">
-    <noscript>
-      <div class="no-script">
-        JavaScript is required to render the interactive chart.<br>
-        Open this file in a modern browser with JS enabled.
-      </div>
-    </noscript>
+    <noscript><div class="no-script">
+      JavaScript is required to render the interactive chart.
+    </div></noscript>
   </div>
   <script>
     var figData   = {json.dumps(fig["data"])};
@@ -250,14 +328,18 @@ def write(device: "DevicePeak",
     var chart = document.getElementById("chart");
 
     Plotly.newPlot(chart, figData, figLayout, {{
-      responsive: true,
-      displaylogo: false,
+      responsive: true, displaylogo: false,
       modeBarButtonsToRemove: ["lasso2d", "select2d"],
     }});
 
-    var BW   = {device.bandwidth_gbs};
-    var PEAK = {device.fp32_tflops};
-    var SKIP = ["BW ceiling", "FP32 ceiling"];
+    // Per-subplot device limits keyed by Plotly axis id ("x", "x2", …)
+    var BW_MAP   = {json.dumps(bw_map)};
+    var PEAK_MAP = {json.dumps(peak_map)};
+    // Fallback for single-plot (axis id "x")
+    var BW   = {device_info[0][0]};
+    var PEAK = {device_info[0][1]};
+    var SKIP = ["BW ceiling", "FP32 ceiling", "FP64 ceiling", "FP16 ceiling",
+                "Tensor ceiling", ""];
 
     // ── SVG overlay helpers ───────────────────────────────────────────────────
     // Draw crosshairs directly on the chart SVG so Plotly's hover state and
@@ -305,20 +387,31 @@ def write(device: "DevicePeak",
       if (el) el.remove();
     }}
 
-    function drawCrosshairs(ai, perf, ceiling) {{
+    function drawCrosshairs(ai, perf, ceiling, xax, yax) {{
       removeCrosshairs();
-      var xax = chart._fullLayout.xaxis;
-      var yax = chart._fullLayout.yaxis;
-      var ml  = chart._fullLayout.margin.l;
-      var mt  = chart._fullLayout.margin.t;
+      // For subplots, each axis has a domain property [frac_start, frac_end].
+      // Convert data → pixel within subplot domain, then add the domain offset
+      // relative to the full figure.
+      var fl   = chart._fullLayout;
+      var figW = fl.width, figH = fl.height;
+      var ml = fl.margin.l, mr = fl.margin.r,
+          mt = fl.margin.t, mb = fl.margin.b;
+      var plotW = figW - ml - mr;
+      var plotH = figH - mt - mb;
 
-      // c2p converts actual data value → pixel offset within the plot area
-      var xPx   = xax.c2p(ai,      false) + ml;
-      var yPx   = yax.c2p(perf,    false) + mt;
-      var yCeil = yax.c2p(ceiling, false) + mt;
-      // plot-area edges
-      var yBot  = yax.c2p(Math.pow(10, yax.range[0]), false) + mt;
-      var xLeft = xax.c2p(Math.pow(10, xax.range[0]), false) + ml;
+      var xDom = xax.domain;   // [left_frac, right_frac] in paper coords
+      var yDom = yax.domain;   // [bottom_frac, top_frac] in paper coords
+
+      // Subplot's pixel origin (top-left corner in SVG coords)
+      var subL = ml + xDom[0] * plotW;
+      var subT = mt + (1 - yDom[1]) * plotH;
+
+      // c2p returns pixel offset from the subplot's left / top edge
+      var xPx   = xax.c2p(ai,      false) + subL;
+      var yPx   = yax.c2p(perf,    false) + subT;
+      var yCeil = yax.c2p(ceiling, false) + subT;
+      var yBot  = yax.c2p(Math.pow(10, yax.range[0]), false) + subT;
+      var xLeft = subL;
 
       var headroom = ceiling / perf;
 
@@ -347,8 +440,16 @@ def write(device: "DevicePeak",
     chart.on("plotly_hover", function(ev) {{
       var pt = ev.points[0];
       if (SKIP.indexOf(pt.data.name) !== -1) return;
-      var ceiling = Math.min(pt.x * BW / 1000, PEAK);
-      drawCrosshairs(pt.x, pt.y, ceiling);
+      // Resolve per-subplot BW and PEAK using the trace's axis id
+      var axId  = pt.data.xaxis || "x";
+      var bw    = BW_MAP[axId]   || BW;
+      var peak  = PEAK_MAP[axId] || PEAK;
+      var ceiling = Math.min(pt.x * bw / 1000, peak);
+      // Retrieve axis objects for subplot-aware pixel conversion
+      var xax = chart._fullLayout[axId === "x" ? "xaxis" : "xaxis" + axId.slice(1)];
+      var yax = chart._fullLayout[(pt.data.yaxis || "y") === "y" ? "yaxis"
+                                  : "yaxis" + (pt.data.yaxis || "y").slice(1)];
+      drawCrosshairs(pt.x, pt.y, ceiling, xax, yax);
     }});
 
     chart.on("plotly_unhover", function() {{
@@ -358,14 +459,26 @@ def write(device: "DevicePeak",
 </body>
 </html>
 """
+
+
+def write(device: "DevicePeak",
+          metrics: list["KernelMetrics"],
+          out_path: str | Path,
+          trace_name: str = "") -> None:
+    """Write a single-device interactive HTML roofline chart to *out_path*."""
+    fig = _make_figure(device, metrics, trace_name)
+    html = _html_page(fig, trace_name, [(device.bandwidth_gbs, device.fp32_tflops)])
     with open(out_path, "w") as f:
         f.write(html)
 
 
 def write_from_trace(trace, out_path: str | Path) -> int:
     """
-    Analyse *trace* and write an HTML roofline chart.
-    Returns the number of kernels plotted (0 if nothing to plot).
+    Analyse *trace* and write a single HTML roofline file.
+
+    When multiple GPU devices are present all are shown as side-by-side
+    subplots within the same HTML file — no separate files.
+    Returns the number of kernels plotted.
     """
     from ..analysis.roofline import analyze_trace
     from pathlib import Path as _Path
@@ -374,9 +487,26 @@ def write_from_trace(trace, out_path: str | Path) -> int:
     if not results or not trace.devices:
         return 0
 
-    device  = trace.devices[0]
-    metrics = [m for _, m in results]
-    name    = trace.metadata.command or str(_Path(str(out_path)).stem)
+    name = trace.metadata.command or str(_Path(str(out_path)).stem)
 
-    write(device, metrics, out_path, trace_name=name)
-    return len(metrics)
+    # Group metrics by device index
+    by_device: dict[int, list] = {}
+    for dev, m in results:
+        idx = trace.devices.index(dev) if dev in trace.devices else 0
+        by_device.setdefault(idx, []).append(m)
+
+    device_metrics = [(trace.devices[i], mets)
+                      for i, mets in sorted(by_device.items())]
+
+    if len(device_metrics) == 1:
+        dev, mets = device_metrics[0]
+        fig = _make_figure(dev, mets, name)
+        device_info = [(dev.bandwidth_gbs, dev.fp32_tflops)]
+    else:
+        fig = _make_combined_figure(device_metrics, name)
+        device_info = [(d.bandwidth_gbs, d.fp32_tflops) for d, _ in device_metrics]
+
+    html = _html_page(fig, name, device_info)
+    with open(out_path, "w") as f:
+        f.write(html)
+    return sum(len(m) for _, m in device_metrics)

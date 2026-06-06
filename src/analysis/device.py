@@ -31,6 +31,27 @@ def _cuda_cores_per_sm(major: int, minor: int) -> int:
     )
 
 
+# FP64 throughput as a fraction of FP32 peak, by compute capability.
+# Consumer GPUs intentionally ship with crippled FP64 (1/32 or 1/64 of FP32).
+# Datacenter / workstation SKUs (V100, A100, H100) retain full FP64.
+# Where the same cc covers both (e.g. 7.5 Turing), use the conservative consumer ratio.
+_CUDA_FP64_RATIO: dict[tuple[int, int], float] = {
+    (7, 0): 1 / 2,    # Volta: V100/Titan V = fp32 / 2
+    (7, 5): 1 / 32,   # Turing consumer (RTX 2000); Quadro is /16 but we can't distinguish
+    (8, 0): 1 / 2,    # Ampere A100 = fp32 / 2
+    (8, 6): 1 / 64,   # Ampere consumer (RTX 3000 / GA104)
+    (8, 7): 1 / 64,   # Ampere Jetson / RTX high-end GA102
+    (8, 9): 1 / 64,   # Ada Lovelace consumer (RTX 4000)
+    (9, 0): 1 / 2,    # Hopper H100 / H200
+}
+
+def _cuda_fp64_ratio(major: int, minor: int) -> float:
+    return _CUDA_FP64_RATIO.get(
+        (major, minor),
+        _CUDA_FP64_RATIO.get((major, 0), 1 / 32),   # safe default: consumer-class
+    )
+
+
 @dataclass
 class DevicePeak:
     """Theoretical peak capabilities of a single compute device."""
@@ -134,7 +155,7 @@ def query_cuda_devices() -> list[DevicePeak]:
             core_clock_ghz = core_clock_khz / 1e6
             # Peak FP32: SMs × cores/SM × 2 (FMA = mul+add) × clock
             fp32_tflops   = sm_count * cores_sm * 2 * core_clock_ghz / 1000
-            fp64_tflops   = fp32_tflops / 2      # varies; conservative
+            fp64_tflops   = fp32_tflops * _cuda_fp64_ratio(major, minor)
             fp16_tflops   = fp32_tflops * 2
 
             # Tensor cores: rough estimate from known GPU families
@@ -207,11 +228,15 @@ def query_rocm_devices() -> list[DevicePeak]:
             total_mem = ctypes.c_size_t(0)
             hip.hipDeviceTotalMem(ctypes.byref(total_mem), i)
 
-            # AMD GCN/RDNA: 64 shader processors per CU
-            shaders_per_cu = 64
+            # AMD GCN/RDNA: 64 shader processors per CU.
+            # CDNA2 (MI200 series, gfx90a) has 2 shader engines per CU = 128 SPs/CU.
+            gfx_str = f"gfx{gfx_major}{gfx_minor:02d}"
+            shaders_per_cu = 128 if gfx_str in ("gfx90a", "gfx940", "gfx941", "gfx942") else 64
             core_clock_ghz = core_clock_khz / 1e6
             fp32_tflops    = sm_count * shaders_per_cu * 2 * core_clock_ghz / 1000
-            fp64_tflops    = fp32_tflops / 2
+            # CDNA2 retains full FP64 (fp32/2); consumer RDNA is fp32/16
+            fp64_ratio     = 0.5 if gfx_str in ("gfx90a", "gfx940", "gfx941", "gfx942") else 1 / 16
+            fp64_tflops    = fp32_tflops * fp64_ratio
             fp16_tflops    = fp32_tflops * 2
 
             mem_clock_ghz  = mem_clock_khz / 1e6
