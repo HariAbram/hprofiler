@@ -24,5 +24,9 @@ class Backend(ABC):
         """Paths to shared libraries to inject via LD_PRELOAD."""
         return []
 
+    def wrap_command(self, command: list[str]) -> list[str] | None:
+        """Return a wrapped command (e.g. prepend a tool), or None for no wrapping."""
+        return None
+
     def post_process(self, trace: "Trace") -> None:
         """Called after the profiled process exits; can add events to the trace."""

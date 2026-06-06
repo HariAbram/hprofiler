@@ -103,6 +103,8 @@ def _make_figure(device: "DevicePeak",
                     "include L2 write-backs + prefetch, so measured BW can "
                     "slightly exceed theoretical peak.</i>"
                 )
+            ceiling_tflops = min(m.arith_intensity * bw / 1000, peak)
+            headroom = ceiling_tflops / m.achieved_tflops if m.achieved_tflops > 0 else float("inf")
             hover.append(
                 f"<b>{m.kernel_name}</b><br>"
                 f"Arch: {m.arch}<br>"
@@ -117,6 +119,8 @@ def _make_figure(device: "DevicePeak",
                 + f"Achieved FP32: {m.achieved_tflops:.4f} TFLOPs/s  ({m.flops_pct:.1f}% peak)<br>"
                   f"Achieved BW:   {m.achieved_gbs:.1f} GB/s  ({m.bw_pct:.1f}% peak)"
                   f"{bw_note}<br>"
+                  f"<b>Peak at this AI: {ceiling_tflops:.4f} TFLOPs/s</b>  "
+                  f"({headroom:.1f}× headroom)<br>"
                   f"<b>Bound: {m.bound}</b>  |  ridge: {m.ridge:.1f} FLOPs/byte<br>"
                   f"<i>Source: {m.data_source}</i>"
             )
@@ -241,12 +245,114 @@ def write(device: "DevicePeak",
     </noscript>
   </div>
   <script>
-    var figData = {json.dumps(fig["data"])};
+    var figData   = {json.dumps(fig["data"])};
     var figLayout = {json.dumps(fig["layout"])};
-    Plotly.newPlot("chart", figData, figLayout, {{
+    var chart = document.getElementById("chart");
+
+    Plotly.newPlot(chart, figData, figLayout, {{
       responsive: true,
       displaylogo: false,
       modeBarButtonsToRemove: ["lasso2d", "select2d"],
+    }});
+
+    var BW   = {device.bandwidth_gbs};
+    var PEAK = {device.fp32_tflops};
+    var SKIP = ["BW ceiling", "FP32 ceiling"];
+
+    // ── SVG overlay helpers ───────────────────────────────────────────────────
+    // Draw crosshairs directly on the chart SVG so Plotly's hover state and
+    // tooltip are never disturbed (Plotly.relayout() during hover clears the
+    // tooltip and can trigger plotly_unhover in a loop).
+
+    function _svgLine(x1, y1, x2, y2, stroke, dash) {{
+      var el = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      el.setAttribute("x1", x1); el.setAttribute("y1", y1);
+      el.setAttribute("x2", x2); el.setAttribute("y2", y2);
+      el.setAttribute("stroke", stroke);
+      el.setAttribute("stroke-width", "1.5");
+      el.setAttribute("stroke-dasharray", dash);
+      el.setAttribute("pointer-events", "none");
+      return el;
+    }}
+
+    function _svgText(x, y, lines, fg, bg) {{
+      var g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      var pad = 5, lh = 14;
+      var maxW = lines.reduce(function(m, l) {{ return Math.max(m, l.length * 6.5); }}, 0);
+      var h = lines.length * lh + pad * 2;
+      var rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("x", x + 8); rect.setAttribute("y", y - lh);
+      rect.setAttribute("width", maxW + pad * 2); rect.setAttribute("height", h);
+      rect.setAttribute("fill", bg); rect.setAttribute("rx", "3");
+      rect.setAttribute("stroke", fg); rect.setAttribute("stroke-width", "0.5");
+      rect.setAttribute("pointer-events", "none");
+      g.appendChild(rect);
+      lines.forEach(function(line, i) {{
+        var t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        t.setAttribute("x", x + 8 + pad); t.setAttribute("y", y + i * lh);
+        t.setAttribute("fill", fg);
+        t.setAttribute("font-size", "11");
+        t.setAttribute("font-family", "monospace");
+        t.setAttribute("pointer-events", "none");
+        t.textContent = line;
+        g.appendChild(t);
+      }});
+      return g;
+    }}
+
+    function removeCrosshairs() {{
+      var el = document.getElementById("_hprofiler_ch");
+      if (el) el.remove();
+    }}
+
+    function drawCrosshairs(ai, perf, ceiling) {{
+      removeCrosshairs();
+      var xax = chart._fullLayout.xaxis;
+      var yax = chart._fullLayout.yaxis;
+      var ml  = chart._fullLayout.margin.l;
+      var mt  = chart._fullLayout.margin.t;
+
+      // c2p converts actual data value → pixel offset within the plot area
+      var xPx   = xax.c2p(ai,      false) + ml;
+      var yPx   = yax.c2p(perf,    false) + mt;
+      var yCeil = yax.c2p(ceiling, false) + mt;
+      // plot-area edges
+      var yBot  = yax.c2p(Math.pow(10, yax.range[0]), false) + mt;
+      var xLeft = xax.c2p(Math.pow(10, xax.range[0]), false) + ml;
+
+      var headroom = ceiling / perf;
+
+      var svg = chart.querySelector("svg.main-svg");
+      var g   = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.id = "_hprofiler_ch";
+
+      // Dotted drop to x-axis
+      g.appendChild(_svgLine(xPx, yPx, xPx, yBot,  "rgba(255,255,255,0.4)", "4 4"));
+      // Dotted drop to y-axis
+      g.appendChild(_svgLine(xPx, yPx, xLeft, yPx, "rgba(255,255,255,0.4)", "4 4"));
+      // Dashed gap up to ceiling (only when there is a visible gap)
+      if (Math.abs(yCeil - yPx) > 2) {{
+        g.appendChild(_svgLine(xPx, yPx, xPx, yCeil, "rgba(250,204,21,0.7)", "6 3"));
+      }}
+      // Ceiling label
+      var label = [
+        "Ceiling: " + ceiling.toFixed(4) + " TFLOPs/s",
+        headroom.toFixed(2) + "\xd7 headroom",
+      ];
+      g.appendChild(_svgText(xPx, yCeil - 4, label, "rgba(250,204,21,1)", "rgba(17,24,39,0.88)"));
+
+      svg.appendChild(g);
+    }}
+
+    chart.on("plotly_hover", function(ev) {{
+      var pt = ev.points[0];
+      if (SKIP.indexOf(pt.data.name) !== -1) return;
+      var ceiling = Math.min(pt.x * BW / 1000, PEAK);
+      drawCrosshairs(pt.x, pt.y, ceiling);
+    }});
+
+    chart.on("plotly_unhover", function() {{
+      removeCrosshairs();
     }});
   </script>
 </body>

@@ -205,11 +205,21 @@ class Runner:
         accept_thread = threading.Thread(target=accept_loop, args=(stop_accept,), daemon=True)
         accept_thread.start()
 
+        # ── LIKWID command wrapping ───────────────────────────────────────────
+        # likwid-perfctr must be the outer process; env vars (incl. HPROFILER_SOCKET)
+        # are inherited by the child so all socket-based hooks still work.
+        _likwid_backend = None
+        run_command = list(self.command)
+        if "likwid" in self.backends:
+            from ..backends.likwid import LIKWIDBackend
+            _likwid_backend = LIKWIDBackend()
+            run_command = _likwid_backend.wrap_command(self.command)
+
         # ── Start the profiled process directly ───────────────────────────────
         # perf record and perf stat attach via -p PID so we can run both
         # simultaneously without nesting and still get the env vars right.
         callgraph = self.env_extra.pop("HPROFILER_CALLGRAPH", None)
-        proc = subprocess.Popen(self.command, env=env)
+        proc = subprocess.Popen(run_command, env=env)
         pid = proc.pid
 
         # ── Attach perf record for CPU sampling ───────────────────────────────
@@ -307,6 +317,10 @@ class Runner:
 
         # ── Emit max-RSS counter event ────────────────────────────────────────
         _collect_rss(rss_before, rss_after, trace, metadata.end_time_ns)
+
+        # ── LIKWID counter post-processing ────────────────────────────────────
+        if _likwid_backend is not None:
+            _likwid_backend.post_process(trace)
 
         # ── Query device theoretical peaks ────────────────────────────────────
         try:

@@ -35,6 +35,7 @@ _ALIASES: dict[str, str] = {
     "cl":     "opencl",
     "hip":    "rocm",
     "perf":   "cpu",
+    "hwc":    "likwid",
 }
 
 
@@ -263,33 +264,6 @@ def roofline(backend, output, open_browser, target):
             raise SystemExit(1)
         device = devices[0]
 
-        # Diagnostics: show raw counter values before building metrics
-        click.echo(
-            f"[hprofiler] Device: {device.name}  "
-            f"fp32={device.fp32_tflops:.2f} TFLOPs  "
-            f"bw={device.bandwidth_gbs:.0f} GB/s  "
-            f"ridge={device.ridge_point:.1f} F/B  "
-            f"SMs={device.sm_count}  "
-            f"clock={device.core_clock_ghz:.3f} GHz",
-            err=True,
-        )
-        for c in raw_counters:
-            clock_hz = device.core_clock_ghz * 1e9 if device.core_clock_ghz > 0 else 1e9
-            dur_src = ("max" if c.sm_cycles_max > 0
-                       else "sum/N" if c.sm_cycles_elapsed > 0
-                       else "none")
-            dur_ns  = (int(c.sm_cycles_max / clock_hz * 1e9)      if c.sm_cycles_max > 0
-                       else int(c.sm_cycles_elapsed / (device.sm_count or 1) / clock_hz * 1e9)
-                       if c.sm_cycles_elapsed > 0 else 0)
-            click.echo(
-                f"  {c.kernel_name[:40]:<40}  "
-                f"fp32={c.fp32_ops:.3e}  dram={c.dram_bytes:.3e} B  "
-                f"AI={c.fp32_ops/c.dram_bytes:.1f} F/B  "
-                f"cycles_max={c.sm_cycles_max:.0f}  cycles_sum={c.sm_cycles_elapsed:.0f}  "
-                f"dur={dur_ns/1e6:.3f} ms ({dur_src})",
-                err=True,
-            )
-
         metrics = [m for c in raw_counters
                    if (m := metrics_from_counters(c, device)) is not None]
 
@@ -300,12 +274,6 @@ def roofline(backend, output, open_browser, target):
                 err=True,
             )
             raise SystemExit(1)
-
-        click.echo(
-            f"[hprofiler] Collected counters for {len(metrics)} kernel(s) "
-            f"on {device.name}",
-            err=True,
-        )
 
         name = Path(args[0]).name
         try:
