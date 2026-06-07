@@ -169,6 +169,10 @@ class Runner:
 
         events_lock = threading.Lock()
         client_threads: list[threading.Thread] = []
+        # Maps (pid, tid) → most recent SpanEvent from that thread.
+        # stk: records are always sent immediately after their span: record
+        # from the same thread, so this single-slot cache is sufficient.
+        _last_span: dict[tuple[int, int], SpanEvent] = {}
 
         def handle_client(client: sock_mod.socket) -> None:
             buf = ""
@@ -180,12 +184,27 @@ class Runner:
                     buf += data.decode("utf-8", errors="replace")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
-                        ev = _parse_record(line)
-                        if ev is not None:
-                            with events_lock:
-                                trace.add(ev)
-                            if self.on_event:
-                                self.on_event(ev)
+                        if line.startswith("stk:"):
+                            try:
+                                parts = line.strip().split(":", 4)
+                                if len(parts) == 5:
+                                    pid, tid, start_ns = int(parts[1]), int(parts[2]), int(parts[3])
+                                    frames = [f for f in parts[4].split(";") if f]
+                                    with events_lock:
+                                        span = _last_span.get((pid, tid))
+                                        if span is not None and span.start_ns == start_ns:
+                                            span.stack_frames = frames
+                            except Exception:
+                                pass
+                        else:
+                            ev = _parse_record(line)
+                            if ev is not None:
+                                with events_lock:
+                                    if isinstance(ev, SpanEvent):
+                                        _last_span[(ev.pid, ev.tid)] = ev
+                                    trace.add(ev)
+                                if self.on_event:
+                                    self.on_event(ev)
             except Exception:
                 pass
             finally:
@@ -351,9 +370,11 @@ class Runner:
 
 def _gpu_poll(trace: Trace, backends: list[str], stop: threading.Event) -> None:
     """Background thread: poll GPU utilisation every second, emit CounterEvents."""
-    if "cuda" in backends and shutil.which("nvidia-smi"):
+    _nvidia_backends = {"cuda", "opencl", "nccl"}
+    _amd_backends    = {"rocm", "opencl"}
+    if any(b in backends for b in _nvidia_backends) and shutil.which("nvidia-smi"):
         _poll_nvidia_smi(trace, stop)
-    elif "rocm" in backends and shutil.which("rocm-smi"):
+    elif any(b in backends for b in _amd_backends) and shutil.which("rocm-smi"):
         _poll_rocm_smi(trace, stop)
 
 

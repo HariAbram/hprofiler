@@ -130,6 +130,8 @@ static void send_all(const char *buf, int n) {
     }
 }
 
+#include "../common/callstack.h"
+
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
     pthread_mutex_lock(&g_sock_mutex);
@@ -153,6 +155,7 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                 name);
         if (n > 0 && n < (int)sizeof(buf))
             send_all(buf, n);
+        emit_callstack(start_ns);
     }
     pthread_mutex_unlock(&g_sock_mutex);
 }
@@ -425,6 +428,93 @@ cl_int clCompileProgram(
     emit_span("jit", gettid_compat(), t0, now_ns()-t0,
               "clCompileProgram", "type=jit_compile");
     return ret;
+}
+
+/* ── clFinish / clWaitForEvents sync spans ──────────────────────────── */
+
+cl_int clFinish(cl_command_queue queue) {
+    typedef cl_int (*fn_t)(cl_command_queue);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clFinish");
+    uint64_t t0 = now_ns();
+    cl_int ret = real ? real(queue) : -1;
+    emit_span("sync", gettid_compat(), t0, now_ns()-t0, "clFinish", "type=sync");
+    return ret;
+}
+
+cl_int clWaitForEvents(cl_uint num_events, const cl_event *event_list) {
+    typedef cl_int (*fn_t)(cl_uint, const cl_event*);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clWaitForEvents");
+    char extra[64]; snprintf(extra, sizeof(extra), "type=sync,count=%u", num_events);
+    uint64_t t0 = now_ns();
+    cl_int ret = real ? real(num_events, event_list) : -1;
+    emit_span("sync", gettid_compat(), t0, now_ns()-t0, "clWaitForEvents", extra);
+    return ret;
+}
+
+/* ── clCreateBuffer / clReleaseMemObject alloc tracking ─────────────── */
+typedef uint64_t cl_mem_flags;
+
+#define CL_ALLOC_CAP 1024
+typedef struct { cl_mem handle; size_t sz; } ClAllocRec;
+static ClAllocRec      g_cl_allocs[CL_ALLOC_CAP];
+static int             g_cl_alloc_n   = 0;
+static int64_t         g_cl_mem_bytes = 0;
+static pthread_mutex_t g_cl_alloc_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void emit_ctr_cl(const char *name, int64_t value) {
+    pthread_mutex_lock(&g_sock_mutex);
+    ensure_connected();
+    if (g_sock >= 0) {
+        char buf[256];
+        int n = snprintf(buf, sizeof(buf), "ctr:memory:%d:%llu:%s:%lld:bytes\n",
+                         g_pid, (unsigned long long)now_ns(), name, (long long)value);
+        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
+    }
+    pthread_mutex_unlock(&g_sock_mutex);
+}
+
+cl_mem clCreateBuffer(cl_context ctx, cl_mem_flags flags, size_t size,
+                       void *host_ptr, cl_int *err) {
+    typedef cl_mem (*fn_t)(cl_context, cl_mem_flags, size_t, void*, cl_int*);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clCreateBuffer");
+    cl_mem ret = real ? real(ctx, flags, size, host_ptr, err) : NULL;
+    if (ret) {
+        pthread_mutex_lock(&g_cl_alloc_mtx);
+        if (g_cl_alloc_n < CL_ALLOC_CAP) {
+            g_cl_allocs[g_cl_alloc_n].handle = ret;
+            g_cl_allocs[g_cl_alloc_n].sz     = size;
+            g_cl_alloc_n++;
+        }
+        g_cl_mem_bytes += (int64_t)size;
+        int64_t total = g_cl_mem_bytes;
+        pthread_mutex_unlock(&g_cl_alloc_mtx);
+        emit_ctr_cl("opencl_memory_bytes", total);
+        char extra[64]; snprintf(extra, sizeof(extra), "type=alloc,bytes=%zu", size);
+        emit_span("memory", gettid_compat(), now_ns(), 0, "clCreateBuffer", extra);
+    }
+    return ret;
+}
+
+cl_int clReleaseMemObject(cl_mem memobj) {
+    typedef cl_int (*fn_t)(cl_mem);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clReleaseMemObject");
+    pthread_mutex_lock(&g_cl_alloc_mtx);
+    for (int i = 0; i < g_cl_alloc_n; i++) {
+        if (g_cl_allocs[i].handle == memobj) {
+            g_cl_mem_bytes -= (int64_t)g_cl_allocs[i].sz;
+            g_cl_allocs[i] = g_cl_allocs[--g_cl_alloc_n];
+            break;
+        }
+    }
+    int64_t total = g_cl_mem_bytes;
+    pthread_mutex_unlock(&g_cl_alloc_mtx);
+    emit_ctr_cl("opencl_memory_bytes", total);
+    emit_span("memory", gettid_compat(), now_ns(), 0, "clReleaseMemObject", "type=free");
+    return real ? real(memobj) : -1;
 }
 
 /* ── dlopen intercept ────────────────────────────────────────────────────
@@ -738,6 +828,7 @@ static void hprofiler_opencl_init(void) {
         if (g_dbg) { fprintf(g_dbg, "[opencl-hook] init pid=%d\n", (int)getpid()); fflush(g_dbg); }
     }
     ensure_connected();
+    cs_init();
 }
 
 __attribute__((destructor))

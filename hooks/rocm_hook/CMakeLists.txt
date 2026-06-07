@@ -1,5 +1,5 @@
 add_library(hprofiler_rocm SHARED rocm_hook.c)
-target_compile_options(hprofiler_rocm PRIVATE -fPIC -O2 -Wall)
+target_compile_options(hprofiler_rocm PRIVATE -fPIC -O2 -Wall -fno-omit-frame-pointer)
 target_link_libraries(hprofiler_rocm PRIVATE dl pthread)
 set_target_properties(hprofiler_rocm PROPERTIES
     OUTPUT_NAME hprofiler_rocm

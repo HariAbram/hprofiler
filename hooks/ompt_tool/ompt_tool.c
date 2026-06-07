@@ -144,10 +144,22 @@ typedef enum {
     ompt_callback_thread_end     = 2,
     ompt_callback_parallel_begin = 3,
     ompt_callback_parallel_end   = 4,
+    ompt_callback_task_create    = 5,
+    ompt_callback_task_schedule  = 6,
     ompt_callback_target         = 8,
     ompt_callback_work           = 20,
     ompt_callback_sync_region    = 23,
 } ompt_callbacks_t;
+
+typedef enum {
+    ompt_task_complete      = 1,
+    ompt_task_yield         = 2,
+    ompt_task_cancel        = 3,
+    ompt_task_detach        = 4,
+    ompt_task_early_fulfill = 5,
+    ompt_task_late_fulfill  = 6,
+    ompt_task_switch        = 7,
+} ompt_task_status_t;
 
 typedef enum {
     ompt_set_error      = 0,
@@ -177,9 +189,9 @@ typedef struct {
 typedef struct { void *exit_frame; void *enter_frame; } ompt_frame_t;
 
 /* ── Globals ─────────────────────────────────────────────────────────── */
-static int             g_sock       = -1;
-static pthread_mutex_t g_sock_lock  = PTHREAD_MUTEX_INITIALIZER;
-static pid_t           g_pid        = 0;
+static int             g_sock        = -1;
+static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
+static pid_t           g_pid         = 0;
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 static uint64_t now_ns(void) {
@@ -205,10 +217,20 @@ static void ensure_connected(void) {
     }
 }
 
+static void send_all(const char *buf, int n) {
+    while (n > 0) {
+        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
+        if (r < 0) { close(g_sock); g_sock = -1; return; }
+        buf += r; n -= (int)r;
+    }
+}
+
+#include "../common/callstack.h"
+
 static void emit_span(const char *cat, pid_t tid,
                       uint64_t start_ns, uint64_t dur_ns,
                       const char *name, const char *extra) {
-    pthread_mutex_lock(&g_sock_lock);
+    pthread_mutex_lock(&g_sock_mutex);
     ensure_connected();
     if (g_sock >= 0) {
         char buf[512]; int n;
@@ -223,9 +245,10 @@ static void emit_span(const char *cat, pid_t tid,
                 "span:%s:%d:%d:%llu:%llu:%s\n",
                 cat, g_pid, tid,
                 (unsigned long long)start_ns, (unsigned long long)dur_ns, name);
-        if (n > 0) send(g_sock, buf, n, MSG_NOSIGNAL);
+        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
+        emit_callstack(start_ns);
     }
-    pthread_mutex_unlock(&g_sock_lock);
+    pthread_mutex_unlock(&g_sock_mutex);
 }
 
 /* ── Per-thread nesting stacks ───────────────────────────────────────── */
@@ -241,6 +264,13 @@ static __thread uint64_t     tls_sync_start[MAX_DEPTH];
 static __thread const void  *tls_sync_codeptr[MAX_DEPTH];
 static __thread int          tls_sync_depth      = 0;
 static __thread uint64_t     tls_target_start    = 0;
+
+/* Task scheduling stacks */
+#define MAX_TASK_DEPTH 32
+static __thread uint64_t     tls_task_start[MAX_TASK_DEPTH];
+static __thread uint64_t     tls_task_id[MAX_TASK_DEPTH];
+static __thread int          tls_task_depth = 0;
+static uint64_t              g_task_id_seq  = 1;
 
 /* ── Callbacks ───────────────────────────────────────────────────────── */
 
@@ -383,6 +413,61 @@ static void cb_sync_region(
     }
 }
 
+static void cb_task_create(
+    ompt_data_t *encountering_task_data,
+    const ompt_frame_t *encountering_task_frame,
+    ompt_data_t *new_task_data,
+    int flags, int has_dependences,
+    const void *codeptr_ra)
+{
+    (void)encountering_task_data; (void)encountering_task_frame;
+    (void)flags; (void)has_dependences;
+    uint64_t task_id = (uint64_t)__sync_fetch_and_add(&g_task_id_seq, 1);
+    if (new_task_data) new_task_data->value = task_id;
+    const char *sym = NULL; char lib[256]; uint64_t off = 0;
+    char extra[512];
+    if (resolve_codeptr_full(codeptr_ra, &sym, lib, sizeof(lib), &off)) {
+        if (sym)
+            snprintf(extra, sizeof(extra), "type=task_create,id=%llu,sym=%s",
+                     (unsigned long long)task_id, sym);
+        else
+            snprintf(extra, sizeof(extra),
+                     "type=task_create,id=%llu,lib=%s,offset=0x%llx",
+                     (unsigned long long)task_id, lib, (unsigned long long)off);
+    } else {
+        snprintf(extra, sizeof(extra), "type=task_create,id=%llu",
+                 (unsigned long long)task_id);
+    }
+    uint64_t now = now_ns();
+    emit_span("openmp", gettid_compat(), now, 0, "omp_task_create", extra);
+}
+
+static void cb_task_schedule(
+    ompt_data_t *prior_task_data,
+    int prior_task_status,
+    ompt_data_t *next_task_data)
+{
+    uint64_t now = now_ns();
+    /* Complete / suspend prior task */
+    if (prior_task_data && tls_task_depth > 0 &&
+        prior_task_data->value == tls_task_id[tls_task_depth - 1]) {
+        tls_task_depth--;
+        char extra[64];
+        snprintf(extra, sizeof(extra), "type=task,id=%llu,status=%d",
+                 (unsigned long long)prior_task_data->value, prior_task_status);
+        emit_span("openmp", gettid_compat(),
+                  tls_task_start[tls_task_depth],
+                  now - tls_task_start[tls_task_depth],
+                  "omp_task", extra);
+    }
+    /* Start next task */
+    if (next_task_data && tls_task_depth < MAX_TASK_DEPTH) {
+        tls_task_start[tls_task_depth] = now;
+        tls_task_id[tls_task_depth]    = next_task_data->value;
+        tls_task_depth++;
+    }
+}
+
 static void cb_target(
     ompt_target_t kind, ompt_scope_endpoint_t endpoint,
     int device_num, ompt_data_t *task_data,
@@ -416,6 +501,7 @@ static int tool_initialize(ompt_function_lookup_t lookup,
 {
     (void)initial_device_num; (void)tool_data;
     ensure_connected();
+    cs_init();
 
     ompt_set_callback_t set_callback =
         (ompt_set_callback_t)lookup("ompt_set_callback");
@@ -426,6 +512,8 @@ static int tool_initialize(ompt_function_lookup_t lookup,
     REG(ompt_callback_thread_end,     cb_thread_end);
     REG(ompt_callback_parallel_begin, cb_parallel_begin);
     REG(ompt_callback_parallel_end,   cb_parallel_end);
+    REG(ompt_callback_task_create,    cb_task_create);
+    REG(ompt_callback_task_schedule,  cb_task_schedule);
     REG(ompt_callback_work,           cb_work);
     REG(ompt_callback_sync_region,    cb_sync_region);
     REG(ompt_callback_target,         cb_target);

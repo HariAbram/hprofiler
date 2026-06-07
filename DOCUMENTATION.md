@@ -1,7 +1,8 @@
 # Profiler — Documentation
 
 A command-line CPU/GPU profiler with a terminal UI that traces programs across
-OpenMP, OpenCL, CUDA, ROCm, NCCL, MPI, and Linux perf backends. Supports JIT-compiled
+OpenMP, OpenCL, CUDA, ROCm, NCCL, and MPI. CPU sampling is provided via Linux
+perf. Supports JIT-compiled
 kernels (ACPP/AdaptiveCpp, nvcc, etc.) with per-kernel disassembly. GPU-accurate
 kernel timing is captured via CUDA/HIP event pairs. NVTX annotations are
 intercepted without requiring libnvToolsExt.
@@ -149,6 +150,7 @@ hprofiler run [OPTIONS] -- COMMAND [ARGS...]
 | `--perf-freq` | `9999` | Sampling frequency in Hz (CPU/perf backend only) |
 | `--perf-callgraph` | — | Call-graph method: `fp`, `dwarf`, or `lbr` |
 | `--disasm / --no-disasm` | `--no-disasm` | Collect per-kernel disassembly after the run; adds the Disasm tab to the TUI |
+| `--call-tree / --no-call-tree` | `--no-call-tree` | Capture CPU call stacks at every API interception point; adds the Call Tree tab to the TUI. Requires the profiled binary to be compiled with `-fno-omit-frame-pointer -rdynamic`. Adds ~50 µs per intercepted call — do not use during benchmarking. |
 
 Always separate the profiler's options from the target program with `--`:
 
@@ -160,8 +162,8 @@ hprofiler run --backend cuda -- ./app --iterations 1000
 hprofiler run --backend cuda ./app --iterations 1000
 ```
 
-**Backend names:** `cpu`, `cuda`, `opencl`, `rocm`, `openmp`, `nccl`, `mpi`
-**Aliases:** `omp` = `openmp`, `hip` = `rocm`, `cl` = `opencl`, `perf` = `cpu`
+**Backend names:** `cpu`, `cuda`, `opencl`, `rocm`, `openmp`, `nccl`, `mpi`, `likwid`
+**Aliases:** `omp` = `openmp`, `hip` = `rocm`, `cl` = `opencl`, `perf` = `cpu`, `hwc` = `likwid`
 
 ```bash
 # Multiple backends
@@ -302,6 +304,70 @@ Available backends:
 
 ---
 
+### `hprofiler flamegraph`
+
+Generate a self-contained interactive HTML flame graph by profiling COMMAND
+with Linux `perf record`.
+
+```
+hprofiler flamegraph [OPTIONS] -- COMMAND [ARGS...]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--backend`, `-b` | — | Inject backend hooks (same names as `run`) so GPU/MPI API overhead appears in CPU stacks |
+| `--output`, `-o` | `<prog>.flamegraph.html` | Output HTML file |
+| `--callgraph` | `fp` | Call-graph method: `fp` (frame-pointer), `dwarf`, or `lbr` |
+| `--freq`, `-F` | `99` | perf sampling frequency in Hz |
+| `--open / --no-open` | `--open` | Open the HTML in the default browser |
+
+**Output format:** A single self-contained HTML file. Open in any browser — no
+server or internet connection required. All rendering and interactivity is done
+in a `<canvas>` element with embedded JavaScript.
+
+**Browser controls:**
+
+| Action | Effect |
+|--------|--------|
+| Click a frame | Zoom in — the clicked frame expands to fill the full width |
+| Right-click | Zoom out one level |
+| ↑ Up button | Zoom out one level |
+| Esc / ⟲ Reset | Return to the full unzoomed view |
+| Hover | Tooltip: name, sample count, % of total, % of current view |
+| Search box | Regex search — matching frames highlighted gold, others dimmed |
+
+**Orientation:** Root frame (process name) at the bottom, hottest leaf frames
+at the top — standard Brendan Gregg flame graph convention.
+
+**With `--backend`:** Backend hooks are injected via `LD_PRELOAD` so the CPU
+stacks captured by `perf` include time spent inside GPU API calls:
+
+- `cudaLaunchKernel` / `clEnqueueNDRangeKernel` — kernel launch overhead
+- `cudaDeviceSynchronize` / `clFinish` — CPU blocking while GPU runs
+- `MPI_Allreduce` / `MPI_Barrier` — collective synchronisation wait
+- `hipLaunchKernel` — ROCm launch overhead
+
+```bash
+# CPU-only flame graph
+hprofiler flamegraph -- ./my_program
+
+# CUDA program — shows GPU API overhead in CPU stacks
+hprofiler flamegraph --backend cuda -- ./cuda_app
+
+# For binaries compiled without -fno-omit-frame-pointer use dwarf unwinding
+hprofiler flamegraph --callgraph dwarf --backend cuda -- ./cuda_app
+
+# ACPP SYCL targeting CUDA
+ACPP_VISIBILITY_MASK=cuda hprofiler flamegraph --backend cuda -- ./sycl_app
+```
+
+**Requirements:**
+- `perf` installed (`apt install linux-tools-$(uname -r)`)
+- `perf_event_paranoid` ≤ 1 for user-space sampling: `sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'`
+- Compile with `-fno-omit-frame-pointer` for the `fp` call-graph method (default); otherwise use `--callgraph dwarf`
+
+---
+
 ### `hprofiler build`
 
 Compile the C hook libraries using CMake.
@@ -408,9 +474,13 @@ Tools Interface (OMPT).
 | Callback | Category | What it captures |
 |----------|---------|-----------------|
 | `ompt_callback_parallel_begin/end` | `openmp` | `parallel_region` spans |
-| `ompt_callback_work` | `openmp` | `omp_loop`, `omp_sections`, etc. |
+| `ompt_callback_work` | `openmp` | `omp_loop`, `omp_sections`, `omp_taskloop`, etc. |
+| `ompt_callback_task_create` | `openmp` | `omp_task_create` spans (one per `#pragma omp task`) |
+| `ompt_callback_task_schedule` | `openmp` | `omp_task` execution spans (start → complete/yield) |
 | `ompt_callback_sync_region` | `sync` | Barriers, `taskwait`, `taskgroup` |
 | `ompt_callback_target begin/end` | `openmp` | GPU offload spans |
+
+**Note on task callbacks:** `task_create` and `task_schedule` use enum values 5 and 6 per the OpenMP 5.0 specification. `task_create` is called from user-code context so call-tree capture works for it. `task_schedule` is called from the runtime worker thread, so its call stack does not include `main` even with `--call-tree`.
 
 **Critical requirement:** The profiled program must link against **LLVM's
 `libomp`**, not GCC's `libgomp`. GCC's `libgomp` on Ubuntu 24.04 does not
@@ -537,10 +607,62 @@ spans cover the wait time but not the underlying network transfer time.
 
 ---
 
+### `likwid` — Hardware PMU Counters
+
+Wraps the target command with `likwid-perfctr` to collect hardware performance
+counter data over the full program run. Results are emitted as `CounterEvent`
+records in the trace and appear in the TUI Overview tab.
+
+**Requirements:** `likwid-perfctr` in PATH (`apt install likwid` or build from
+[github.com/RRZE-HPC/likwid](https://github.com/RRZE-HPC/likwid)). PMU access
+requires either root or:
+
+```bash
+sudo sysctl -w kernel.perf_event_paranoid=-1
+sudo sysctl -w kernel.nmi_watchdog=0
+```
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HPROFILER_LIKWID_GROUP` | `FLOPS_DP` | Counter group to collect |
+| `HPROFILER_LIKWID_CORES` | all cores | CPU core range, e.g. `0-7` |
+
+**Common counter groups:**
+
+| Group | What it measures |
+|-------|-----------------|
+| `FLOPS_DP` | Double-precision FLOPs and MFLOP/s |
+| `FLOPS_SP` | Single-precision FLOPs and MFLOP/s |
+| `MEM` | DRAM bandwidth (read/write GB/s) |
+| `L2` / `L3` | Cache hit/miss rates |
+| `BRANCH` | Branch prediction miss rate |
+| `CLOCK` | CPI / clock frequency (always works, no special permissions) |
+
+Per-core values are stored as `likwid.core<N>.<metric>` counters; an aggregate
+(`likwid.total.<metric>` for rates, `likwid.avg.<metric>` for latency/CPI) is
+also emitted.
+
+```bash
+HPROFILER_LIKWID_GROUP=MEM hprofiler run --backend likwid -- ./my_program
+```
+
+---
+
 ## 5. TUI Viewer
 
-The TUI is built with [Textual](https://textual.textualize.io/) and has four
-permanent tabs plus an optional fifth tab when `--disasm` is passed.
+The TUI is built with [Textual](https://textual.textualize.io/). Three tabs are
+always present; additional tabs appear conditionally based on recorded data:
+
+| Tab | When shown |
+|-----|-----------|
+| Overview | Always |
+| Timeline | Always |
+| Hotspots | Always |
+| Flame | Only when CPU/perf samples are present (`--backend cpu` or `auto`) |
+| Call Tree | Only when `--call-tree` was passed during `hprofiler run` |
+| Disasm | Only when `--disasm` is passed to `run` or `view` |
 
 ### Overview Tab
 
@@ -577,10 +699,44 @@ category. Type to filter by name; press `s` to cycle the sort column.
 | Total / Avg / Min / Max | Duration statistics |
 | % | Fraction of total profiled time |
 
-### Flame Graph Tab
+### Flame Graph Tab *(only shown when CPU/perf data is present)*
 
 CPU sample data (from the `cpu` / perf backend) as horizontal bars sorted by
-total time. Only populated when `--backend cpu` (or `auto`) is used.
+total time. Only shown when at least one CPU span is present in the trace.
+
+### Call Tree Tab *(only shown when `--call-tree` was used)*
+
+A from-main call tree built from CPU call stacks captured at every intercepted
+API call. Only shown when the trace was recorded with `--call-tree`.
+
+**Two tree-building modes:**
+
+- **Stack-based** (default when `--call-tree` is active): Each API span's full
+  call stack is captured via `backtrace()` at interception time. Frames are
+  reversed (innermost-first → root-first) and merged into a trie rooted at
+  `_start` / `main`. This gives accurate from-main call paths.
+
+- **Temporal containment** (fallback): When no stack data is present, the tree
+  is inferred from span start/end nesting on a per-thread basis. Less accurate
+  than stack-based but works without `--call-tree`.
+
+**Requirements for stack-based mode:** The profiled binary must be compiled with
+`-fno-omit-frame-pointer -rdynamic`. Without `-rdynamic`, symbol names resolve
+via `dladdr` (works for shared-library symbols but not static functions).
+
+**Keyboard controls:**
+
+| Key | Action |
+|-----|--------|
+| `e` | Expand all nodes |
+| `u` | Collapse all nodes |
+| `↑` / `↓` | Navigate the tree |
+
+**Known limitation:** OMPT callbacks for `task_schedule`, `sync_region`, and
+`work` are invoked by the OpenMP runtime from worker threads. Their call stacks
+do not include `main` even with `--call-tree`. Only `task_create` and
+`parallel_begin` callbacks fire from user-code context and show the full call
+path from `main`.
 
 ### Disasm Tab *(only shown when `--disasm` is passed)*
 
@@ -634,9 +790,23 @@ It can be opened in **[ui.perfetto.dev](https://ui.perfetto.dev)** or
 command, backends, hostname, and `cwd` (used to resolve relative binary paths
 when reloading).
 
+### Flame Graph HTML
+
+`hprofiler flamegraph` writes a self-contained interactive HTML file.
+
+The flame graph data is embedded as a JSON tree in a `<script>` tag and
+rendered at load time onto a `<canvas>` element. No external dependencies,
+no server, no internet connection required — open the file directly in any
+browser. The canvas renderer re-draws on every zoom/search/resize event;
+performance is proportional to the number of visible frames, not the total
+frame count.
+
+**File size:** typically 10–50 KB for a 60-second profile of a moderate
+workload (a few thousand unique stacks).
+
 ### Roofline HTML
 
-`profiler roofline` writes a self-contained interactive HTML file. Open it in
+`hprofiler roofline` writes a self-contained interactive HTML file. Open it in
 any browser; no server required.
 
 ### Text Summary
@@ -851,8 +1021,6 @@ events. The parser handles:
 flowchart TB
 
     subgraph PROC["  🖥️  Profiled Process  "]
-        direction LR
-
         subgraph RT["  Runtimes  "]
             direction LR
             R1["CUDA Runtime\nDriver API · NVTX"]
@@ -888,16 +1056,23 @@ flowchart TB
     subgraph PY["  🐍  Profiler — Python  "]
         direction TB
 
-        RUNNER["Runner\nsocket server · event parser\ncwd path resolver"]
-        PERF["perf backend\nperf record + script\nDWARF stack unwinding"]
+        subgraph INGEST[" "]
+            direction LR
+            RUNNER["Runner\nsocket server · event parser\ncwd path resolver"]
+            PERF["perf backend\nperf record + script\nDWARF stack unwinding"]
+        end
 
         TRACE[("Trace\nspans · counters\ninstants · disasm")]
 
         RUNNER & PERF --> TRACE
 
-        J["Chrome Trace JSON\nPerfetto / chrome://tracing"]
-        S["Text\nSummary"]
-        T["TUI Viewer\nOverview · Timeline\nHotspots · Flame\n[Disasm — with --disasm]"]
+        subgraph OUTPUTS[" "]
+            direction LR
+            J["Chrome Trace JSON\nPerfetto / chrome://tracing"]
+            S["Text\nSummary"]
+            T["TUI Viewer\nOverview · Timeline · Hotspots\n[Flame — CPU data]\n[Call Tree — --call-tree]\n[Disasm — --disasm]"]
+            FG["Flame Graph HTML\ncanvas · zoom · search\nhprofiler flamegraph"]
+        end
 
         TRACE --> J & S & T
 
@@ -930,8 +1105,9 @@ flowchart TB
 
 1. `hprofiler run` creates a Unix domain socket and sets `HPROFILER_SOCKET`.
 2. C hook libraries are injected via `LD_PRELOAD` (CUDA, OpenCL, ROCm, NCCL), the OMPT tool via `OMP_TOOL_LIBRARIES`, and the MPI hook via PMPI link-time interposition.
-3. Each hook streams newline-delimited `span:` / `ctr:` records as API calls are intercepted.
-4. After the process exits, the `Trace` is serialized to Chrome Trace JSON.
+3. Each hook streams newline-delimited `span:` / `ctr:` / `stk:` records as API calls are intercepted. `stk:` records are emitted only when `HPROFILER_CALLSTACK=1` (set by `--call-tree`).
+4. The Python receiver matches `stk:` records to their preceding `span:` by `(pid, tid, start_ns)` and attaches the call stack to the `SpanEvent`.
+5. After the process exits, the `Trace` is serialized to Chrome Trace JSON.
 5. When `--disasm` is passed, a background thread starts `_collect_disasm`:
    - CUDA: parses PTX/cubin blobs from `/tmp/hprofiler_cubin_*.bin`
    - ROCm: parses AMDGCN blobs from `/tmp/hprofiler_rocm_*.bin`
@@ -951,10 +1127,15 @@ flowchart TB
 Three event types, all immutable dataclasses:
 
 ```
-SpanEvent      name, category, start_ns, duration_ns, pid, tid, tags
+SpanEvent      name, category, start_ns, duration_ns, pid, tid, tags, stack_frames
 InstantEvent   name, category, timestamp_ns, pid, tid, tags
 CounterEvent   name, category, timestamp_ns, value, unit, pid
 ```
+
+`stack_frames` on `SpanEvent` is a list of symbol names (innermost-first) attached
+by the Python receiver when a matching `stk:` record arrives. Populated only when
+the trace was recorded with `--call-tree`. Serialized as `_stack` in the Chrome
+Trace JSON `args` dict and restored on `load_trace_from_json`.
 
 All timestamps are **absolute nanoseconds** from `CLOCK_MONOTONIC`.
 
@@ -1048,9 +1229,23 @@ counts as a fallback estimate.
 
 ### `src/ui/app.py` — Textual TUI
 
-`ProfilerApp.__init__` takes `collect_disasm: bool`. `compose()` conditionally
-includes the Disasm tab only when `collect_disasm=True`. The Roofline tab has
-been removed — use `profiler roofline` instead.
+`ProfilerApp.compose()` includes tabs conditionally:
+
+- **Flame** tab: included only when `any(s.category == Category.CPU for s in trace.spans)`
+- **Call Tree** tab: included only when `any(s.stack_frames for s in trace.spans)`
+- **Disasm** tab: included only when `collect_disasm=True`
+
+`CallTreeWidget` uses Textual's `Tree` widget. It calls `_ct_build()` which
+selects between two tree-building strategies:
+
+- **Stack-based** (`_ct_build_from_stacks`): iterates spans that have
+  `stack_frames`, reverses each frame list (innermost→outermost), and merges
+  into a trie (`_StackNode`). Nodes are aggregated by name + category.
+- **Temporal containment** (`_ct_build_raw` + `_ct_aggregate`): groups spans
+  per thread, uses a stack algorithm to infer parent/child from start/end
+  nesting, then aggregates sibling nodes with the same name.
+
+Keyboard shortcuts: `e` = expand all, `u` = collapse all.
 
 The Disasm mix bar iterates `[VEC_SP, VEC_DP, VEC_MEM, VECTOR, COMPUTE,
 MEMORY, SCALAR, CONTROL, SYNC]` so vector sub-types appear grouped together.
@@ -1088,6 +1283,25 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | `nccl` | `peer=N` | Target rank for `ncclSend`/`ncclRecv` |
 | `mpi` | `type=send\|recv\|allreduce\|...` | MPI call type |
 | `mpi` | `bytes=N,rank=R,peer=P,tag=T` | Message size, own rank, remote rank |
+
+### Call-stack record *(emitted only when `HPROFILER_CALLSTACK=1`)*
+
+Immediately follows the `span:` record it annotates, while the socket mutex is
+still held. The `start_ns` field matches the preceding span for correlation.
+
+```
+stk:<pid>:<tid>:<start_ns>:<frame0>;<frame1>;...
+```
+
+Frames are in **innermost-first** order (as returned by `backtrace()`). The
+Python receiver reverses them to build a root→leaf call tree. Frame names are
+extracted from `backtrace_symbols()`, with `dladdr()` as a fallback for PIE
+binaries. C++ names are demangled via `__cxa_demangle`. Hook and runtime frames
+are filtered out using a prefix skip-list (`libhprofiler_`, `libcuda`, `libmpi`,
+`libgomp`, `libomp`, etc.). Semicolons within names are replaced with commas
+to avoid ambiguity with the field separator.
+
+**Set by** `--call-tree` flag → `HPROFILER_CALLSTACK=1` in the child environment.
 
 ### Counter record
 
@@ -1152,6 +1366,40 @@ For most programs this is invisible. It becomes measurable when:
 - **Contended mutex** — multiple threads launching kernels simultaneously will
   serialize on the socket write mutex. In practice, CUDA streams are usually
   driven from one host thread, so contention is rare.
+
+### `--call-tree` overhead
+
+When `--call-tree` is active (`HPROFILER_CALLSTACK=1`), each intercepted API
+call additionally runs `emit_callstack()` while the socket mutex is held. This
+adds:
+
+| Operation | Measured cost (this machine) |
+|-----------|------------------------------|
+| `backtrace()` (up to 32 frames) | ~4 µs |
+| `backtrace_symbols()` (malloc + symbol lookup) | ~47 µs |
+| `dladdr()` fallback (PIE binaries without `-rdynamic`) | ~44 µs |
+| `__cxa_demangle()` per frame | <1 µs (cached after first call) |
+| **Total per intercepted call** | **~50 µs** (with `-rdynamic`) or **~90 µs** (without) |
+
+`backtrace_symbols()` dominates — it performs a `malloc` and a `/proc/self/maps`
+scan per frame. Building with `-rdynamic` eliminates the `dladdr` fallback path.
+
+**Impact by workload:**
+
+| Workload | Calls | Added overhead |
+|----------|-------|----------------|
+| MPI collectives (large, infrequent) | 10–100 | 0.5–5 ms — negligible |
+| CUDA kernels (moderate density) | 100–1 000 | 5–50 ms — measurable |
+| CUDA kernels (tight loop) | 10 000+ | 500 ms+ — significant |
+| OpenMP tasks | 10–1 000 | 0.5–50 ms |
+
+**Without `--call-tree`:** zero overhead — `emit_callstack()` returns immediately
+on the `if (!g_callstack) return;` guard. Never use `--call-tree` during
+benchmarking; it is intended for debugging call paths only.
+
+**Thread contention:** The socket mutex is held for the entire `emit_callstack()`
+duration (~50 µs), so multi-threaded programs will see threads serializing behind
+each other for this period in addition to the `emit_span()` mutex hold time.
 
 ### Socket buffer behaviour
 

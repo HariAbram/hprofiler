@@ -9,6 +9,12 @@
  *   4. hipModuleGetFunction → kernel name table.
  *   5. More memory hooks: hipMallocAsync/FreeAsync, hipHostMalloc/Free,
  *      hipMallocManaged. Pinned host memory tracked as pinned_memory_bytes.
+ *   6. send_all() loop + truncation guard (parity with CUDA hook).
+ *   7. 2048-byte span buffer (handles long HIP template kernel names).
+ *   8. Dynamic alloc array (realloc-based, no hard cap).
+ *   9. Memory leak detection in destructor.
+ *  10. ROCTx annotation interception (roctxRangePushA/Pop/MarkA).
+ *  11. hipGraphLaunch span with GPU-accurate timing.
  */
 
 #define _GNU_SOURCE
@@ -63,12 +69,22 @@ static void ensure_connected(void) {
     }
 }
 
+static void send_all(const char *buf, int n) {
+    while (n > 0) {
+        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
+        if (r < 0) { close(g_sock); g_sock = -1; return; }
+        buf += r; n -= (int)r;
+    }
+}
+
+#include "../common/callstack.h"
+
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
     pthread_mutex_lock(&g_sock_mutex);
     ensure_connected();
     if (g_sock >= 0) {
-        char buf[512]; int n;
+        char buf[2048]; int n;
         if (extra && *extra)
             n = snprintf(buf, sizeof(buf),
                 "span:%s:%d:%d:%llu:%llu:%s:%s\n",
@@ -81,7 +97,8 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                 cat, g_pid, (int)tid,
                 (unsigned long long)start_ns, (unsigned long long)dur_ns,
                 name);
-        if (n > 0) send(g_sock, buf, n, MSG_NOSIGNAL);
+        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
+        emit_callstack(start_ns);
     }
     pthread_mutex_unlock(&g_sock_mutex);
 }
@@ -96,7 +113,7 @@ static void emit_ctr(const char *cat, const char *name,
                          "ctr:%s:%d:%llu:%s:%lld:%s\n",
                          cat, g_pid, (unsigned long long)now_ns(),
                          name, (long long)value, unit);
-        if (n > 0) send(g_sock, buf, n, MSG_NOSIGNAL);
+        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
     }
     pthread_mutex_unlock(&g_sock_mutex);
 }
@@ -125,18 +142,23 @@ static const char *resolve_name(const void *fn) {
 }
 
 /* ── GPU device memory tracking ─────────────────────────────────────────── */
-#define ALLOC_CAP 4096
 typedef struct { uintptr_t ptr; size_t sz; } AllocRec;
 
-static AllocRec        g_allocs[ALLOC_CAP];
-static int             g_alloc_n = 0;
-static int64_t         g_gpu_mem = 0;
+static AllocRec       *g_allocs    = NULL;
+static int             g_alloc_cap = 0;
+static int             g_alloc_n   = 0;
+static int64_t         g_gpu_mem   = 0;
 static pthread_mutex_t g_alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void mem_track_add(void *ptr, size_t sz) {
     int64_t total;
     pthread_mutex_lock(&g_alloc_mutex);
-    if (g_alloc_n < ALLOC_CAP) {
+    if (g_alloc_n >= g_alloc_cap) {
+        int newcap = g_alloc_cap ? g_alloc_cap * 2 : 256;
+        AllocRec *tmp = realloc(g_allocs, (size_t)newcap * sizeof(AllocRec));
+        if (tmp) { g_allocs = tmp; g_alloc_cap = newcap; }
+    }
+    if (g_alloc_n < g_alloc_cap) {
         g_allocs[g_alloc_n].ptr = (uintptr_t)ptr;
         g_allocs[g_alloc_n].sz  = sz;
         g_alloc_n++;
@@ -163,15 +185,21 @@ static void mem_track_rem(void *ptr) {
 }
 
 /* ── Pinned host memory tracking ─────────────────────────────────────────── */
-static AllocRec        g_pin_allocs[ALLOC_CAP];
-static int             g_pin_n    = 0;
-static int64_t         g_pin_mem  = 0;
-static pthread_mutex_t g_pin_mutex = PTHREAD_MUTEX_INITIALIZER;
+static AllocRec       *g_pin_allocs = NULL;
+static int             g_pin_cap   = 0;
+static int             g_pin_n     = 0;
+static int64_t         g_pin_mem   = 0;
+static pthread_mutex_t g_pin_mutex  = PTHREAD_MUTEX_INITIALIZER;
 
 static void pin_track_add(void *ptr, size_t sz) {
     int64_t total;
     pthread_mutex_lock(&g_pin_mutex);
-    if (g_pin_n < ALLOC_CAP) {
+    if (g_pin_n >= g_pin_cap) {
+        int newcap = g_pin_cap ? g_pin_cap * 2 : 256;
+        AllocRec *tmp = realloc(g_pin_allocs, (size_t)newcap * sizeof(AllocRec));
+        if (tmp) { g_pin_allocs = tmp; g_pin_cap = newcap; }
+    }
+    if (g_pin_n < g_pin_cap) {
         g_pin_allocs[g_pin_n].ptr = (uintptr_t)ptr;
         g_pin_allocs[g_pin_n].sz  = sz;
         g_pin_n++;
@@ -803,9 +831,87 @@ hipError_t hipModuleGetFunction(hipFunction_t *hfunc, hipModule_t hmod,
     return ret;
 }
 
+/* ── HIP Graph launch ────────────────────────────────────────────────────── */
+typedef void *hipGraphExec_t;
+
+hipError_t hipGraphLaunch(hipGraphExec_t graphExec, hipStream_t stream) {
+    typedef hipError_t (*fn_t)(hipGraphExec_t, hipStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipGraphLaunch");
+    if (!real) return -1;
+    if (in_hook) return real(graphExec, stream);
+    in_hook = 1;
+
+    pid_t tid = gettid_compat();
+    int sid = get_stream_id(stream);
+    char extra[64];
+    snprintf(extra, sizeof(extra), "type=graph_launch,stream=%d", sid);
+
+    hipEvent_t ev_s, ev_e;
+    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
+    uint64_t t0 = now_ns();
+    hipError_t ret = real(graphExec, stream);
+    if (gpu_ok) pk_commit(ev_s, ev_e, stream, "rocm", "hipGraphLaunch", extra, t0, tid);
+    else        emit_span("rocm", tid, t0, now_ns()-t0, "hipGraphLaunch", extra);
+
+    in_hook = 0;
+    return ret;
+}
+
+/* ── ROCTx annotation interception ──────────────────────────────────────── */
+typedef int64_t roctx_range_id_t;
+
+#define ROCTX_STACK_DEPTH 64
+static __thread uint64_t roctx_stack_ts[ROCTX_STACK_DEPTH];
+static __thread char     roctx_stack_nm[ROCTX_STACK_DEPTH][256];
+static __thread int      roctx_depth = 0;
+
+roctx_range_id_t roctxRangePushA(const char *message) {
+    typedef roctx_range_id_t (*fn_t)(const char *);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "roctxRangePushA");
+    roctx_range_id_t id = real ? real(message) : (roctx_range_id_t)roctx_depth;
+    if (roctx_depth < ROCTX_STACK_DEPTH) {
+        roctx_stack_ts[roctx_depth] = now_ns();
+        snprintf(roctx_stack_nm[roctx_depth], 256, "%s", message ? message : "");
+        roctx_depth++;
+    }
+    return id;
+}
+
+roctx_range_id_t roctxRangePop(void) {
+    typedef roctx_range_id_t (*fn_t)(void);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "roctxRangePop");
+    if (roctx_depth > 0) {
+        roctx_depth--;
+        emit_span("annotation", gettid_compat(),
+                  roctx_stack_ts[roctx_depth],
+                  now_ns() - roctx_stack_ts[roctx_depth],
+                  roctx_stack_nm[roctx_depth], "type=roctx_range");
+    }
+    return real ? real() : 0;
+}
+
+void roctxMarkA(const char *message) {
+    typedef void (*fn_t)(const char *);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "roctxMarkA");
+    emit_span("annotation", gettid_compat(), now_ns(), 0,
+              message ? message : "roctx_mark", "type=roctx_mark");
+    if (real) real(message);
+}
+
 /* ── Constructor / Destructor ───────────────────────────────────────────── */
-__attribute__((constructor)) static void init(void) { ensure_connected(); }
+__attribute__((constructor)) static void init(void) { ensure_connected(); cs_init(); }
 __attribute__((destructor))  static void fini(void) {
     pk_flush(NULL, 1);
+    /* Detect unreleased GPU allocations (R4: memory leak detection) */
+    int64_t leaked = 0;
+    pthread_mutex_lock(&g_alloc_mutex);
+    for (int i = 0; i < g_alloc_n; i++) leaked += (int64_t)g_allocs[i].sz;
+    pthread_mutex_unlock(&g_alloc_mutex);
+    if (leaked > 0)
+        emit_ctr("memory", "gpu_memory_leaked_bytes", leaked, "bytes");
     if (g_sock >= 0) { close(g_sock); g_sock = -1; }
 }

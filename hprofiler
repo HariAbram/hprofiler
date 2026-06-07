@@ -61,7 +61,50 @@ def _resolve_backends(backend_str: str | None) -> list[str]:
 @click.group()
 @click.version_option("0.1.0", prog_name="hprofiler")
 def cli():
-    """Multi-backend CPU/GPU profiler — CUDA, ROCm, OpenCL, OpenMP, perf."""
+    """Multi-backend CPU/GPU profiler for Linux.
+
+    Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI via
+    LD_PRELOAD hooks and OMPT callbacks. CPU sampling is provided via Linux
+    perf. All backends can run simultaneously.
+
+    \b
+    Backends:
+      cpu      Linux perf — CPU samples and call-graph stacks
+      cuda     CUDA Runtime + Driver API + NVTX — kernels, memcpy, sync
+      opencl   OpenCL — kernel enqueues, buffer transfers, JIT compile time
+      openmp   OpenMP OMPT — parallel regions, tasks, barriers, target offload
+      rocm     ROCm/HIP — kernel launches, memcpy, device memory
+      nccl     NCCL — AllReduce, Broadcast, Send/Recv (GPU-accurate timing)
+      mpi      MPI — point-to-point, collectives, one-sided ops (PMPI)
+      likwid   Hardware PMU counters via likwid-perfctr (FLOPS, bandwidth)
+
+    \b
+    Aliases:  omp=openmp  hip=rocm  cl=opencl  perf=cpu  hwc=likwid
+
+    \b
+    Quick start:
+      hprofiler build                                  # compile hook libraries
+      hprofiler backends                               # check what is available
+      hprofiler run --backend cuda -- ./app            # profile a CUDA program
+      hprofiler run -- ./app                           # auto-detect all backends
+      hprofiler run --backend cuda,nccl -- ./app       # multiple backends
+      hprofiler run --call-tree --backend cuda -- ./app  # + call tree from main
+      hprofiler roofline --backend cuda -- ./app       # hardware roofline chart
+      hprofiler flamegraph -- ./app                    # CPU flame graph SVG
+      hprofiler view app.hprofiler.json                # reopen a saved trace
+
+    \b
+    Output written after every run:
+      <prog>.hprofiler.json — Chrome Trace (open in ui.perfetto.dev)
+      TUI viewer            — opens automatically (tabs: Overview, Timeline,
+                              Hotspots, [Flame], [Call Tree], [Disasm])
+
+    Always separate hprofiler options from the target program with --:
+
+    \b
+      hprofiler run --backend cuda -- ./app --flag   (correct)
+      hprofiler run --backend cuda ./app --flag      (--flag parsed as profiler option)
+    """
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -80,9 +123,35 @@ def cli():
               help="perf call-graph method (disabled by default — use fp/dwarf/lbr for stacks)")
 @click.option("--disasm/--no-disasm", default=False,
               help="Collect per-kernel disassembly after profiling  [default: no]")
+@click.option("--call-tree/--no-call-tree", default=False,
+              help="Capture CPU call stacks to build a from-main call tree  [default: no]")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
-def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, command):
+def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, call_tree, command):
     """Profile COMMAND with the selected backends.
+
+    Backends are injected via LD_PRELOAD (CUDA, OpenCL, ROCm, NCCL, MPI) or
+    OMP_TOOL_LIBRARIES (OpenMP OMPT). The CPU backend runs perf record in
+    parallel with the target process. All backends can be combined freely.
+
+    \b
+    Every run produces:
+      <prog>.hprofiler.json  — Chrome Trace JSON (Perfetto / chrome://tracing)
+      TUI viewer             — opened automatically unless --no-ui
+
+    \b
+    Examples:
+      hprofiler run --backend cuda -- ./cuda_app
+      hprofiler run --backend cuda,nccl -- ./multi_gpu_app
+      hprofiler run --backend mpi -- mpirun -np 4 ./mpi_app
+      hprofiler run --backend cuda --disasm -- ./app        # adds Disasm tab
+      hprofiler run --call-tree --backend cuda -- ./app     # adds Call Tree tab
+      hprofiler run --no-ui -o my_trace.json -- ./app       # skip TUI
+
+    \b
+    The --call-tree flag captures CPU call stacks at every API interception
+    point, enabling a from-main call tree in the TUI. Requires the profiled
+    binary to be compiled with -fno-omit-frame-pointer -rdynamic. Adds ~50 us
+    overhead per intercepted call; do not use during benchmarking.
 
     Separate hprofiler options from the program and its arguments with --:
 
@@ -104,6 +173,8 @@ def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, command
     env_extra: dict = {}
     if perf_callgraph:
         env_extra["HPROFILER_CALLGRAPH"] = perf_callgraph
+    if call_tree:
+        env_extra["HPROFILER_CALLSTACK"] = "1"
 
     runner = Runner(
         command=cmd,
@@ -137,7 +208,24 @@ def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, command
 @click.option("--disasm/--no-disasm", default=False,
               help="Collect per-kernel disassembly in the background  [default: no]")
 def view(trace_file, disasm):
-    """Open the TUI viewer for a saved trace JSON file."""
+    """Open the TUI viewer for a saved trace JSON file.
+
+    Loads the trace and opens the same terminal UI produced by 'hprofiler run'.
+    Tabs shown depend on what data the trace contains:
+
+    \b
+      Overview   — command info, backend breakdown, top hotspots
+      Timeline   — Gantt view; per-stream lanes for CUDA/ROCm
+      Hotspots   — filterable, sortable table (type to filter, 's' to sort)
+      Flame      — only when CPU/perf samples are present
+      Call Tree  — only when trace was recorded with --call-tree
+      Disasm     — only when --disasm is passed to this command
+
+    \b
+    Examples:
+      hprofiler view app.hprofiler.json
+      hprofiler view --disasm app.hprofiler.json
+    """
     from src.ui.app import load_trace_from_json, launch_viewer
     click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)
     trace = load_trace_from_json(trace_file, collect_disasm=disasm)
@@ -349,8 +437,12 @@ def roofline(backend, output, open_browser, target):
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.option("--backend", "-b", default=None,
+              help="Inject backend hooks (cuda, opencl, rocm, openmp, mpi, …) so their "
+                   "API call overhead appears in the CPU flame graph.  "
+                   "Comma-separated; same names as 'hprofiler run --backend'.")
 @click.option("--output", "-o", default=None,
-              help="Output SVG file  [default: <program>.flamegraph.svg]")
+              help="Output HTML file  [default: <program>.flamegraph.html]")
 @click.option("--callgraph", default="fp", show_default=True,
               type=click.Choice(["fp", "dwarf", "lbr"]),
               help="perf call-graph method.  fp = frame-pointer (fast, needs "
@@ -359,19 +451,32 @@ def roofline(backend, output, open_browser, target):
 @click.option("--freq", "-F", default=99, show_default=True,
               help="perf sampling frequency (Hz)")
 @click.option("--open/--no-open", "open_browser", default=True,
-              help="Open the SVG in the default browser  [default: yes]")
+              help="Open the HTML file in the default browser  [default: yes]")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
-def flamegraph(output, callgraph, freq, open_browser, command):
-    """Generate an interactive flame graph SVG by profiling COMMAND.
+def flamegraph(backend, output, callgraph, freq, open_browser, command):
+    """Generate an interactive flame graph HTML page by profiling COMMAND.
 
-    Re-runs COMMAND under perf record --call-graph and renders an interactive
-    SVG: hover for details, click a frame to zoom, double-click background
-    to reset.
+    Runs COMMAND under 'perf record --call-graph' and renders a self-contained
+    HTML file. Open it in any browser — no server needed.
+
+    \b
+    Controls in the browser:
+      Click frame      → zoom in (that frame fills the full width)
+      Right-click / ↑  → zoom out one level
+      Esc / ⟲ Reset   → return to full view
+      Search box       → regex highlight (matching frames gold, rest dimmed)
+      Hover            → tooltip with name, sample count, and percentages
+
+    Use --backend to inject GPU/MPI/OpenMP hooks alongside perf so the flame
+    graph shows time spent inside CUDA, OpenCL, ROCm, MPI, etc. API calls
+    (kernel launches, synchronisation waits, collectives).
 
     \b
     Examples:
       hprofiler flamegraph -- ./my_program
-      hprofiler flamegraph --callgraph dwarf -o out.svg -- ./my_program args
+      hprofiler flamegraph --backend cuda -- ./cuda_app
+      hprofiler flamegraph --backend cuda,openmp -- ./acpp_app
+      hprofiler flamegraph --callgraph dwarf -- ./my_program
     """
     import os, webbrowser, shutil as _shutil
 
@@ -384,8 +489,40 @@ def flamegraph(output, callgraph, freq, open_browser, command):
     if not cmd:
         raise click.UsageError("Specify a command after --:\n  hprofiler flamegraph -- ./app")
 
-    out = output or (Path(cmd[0]).name + ".flamegraph.svg")
+    out = output or (Path(cmd[0]).name + ".flamegraph.html")
     env = dict(os.environ)
+
+    # ── Inject backend hooks into the environment ─────────────────────────────
+    if backend:
+        backends = _resolve_backends(backend)
+        if backends:
+            from src.backends import ALL_BACKENDS
+            from pathlib import Path as _Path
+            preload_libs: list[str] = []
+            for bname in backends:
+                bcls = ALL_BACKENDS.get(bname)
+                if bcls is None:
+                    continue
+                try:
+                    b = bcls()
+                    for lib in b.preload_libs():
+                        if lib and _Path(lib).exists():
+                            preload_libs.append(lib)
+                    for k, v in b.env_vars().items():
+                        if k == "OMP_TOOL_LIBRARIES":
+                            existing = env.get(k, "")
+                            env[k] = ":".join(filter(None, [existing, v]))
+                        else:
+                            env.setdefault(k, v)
+                except Exception:
+                    pass
+            if preload_libs:
+                existing = env.get("LD_PRELOAD", "")
+                env["LD_PRELOAD"] = ":".join(filter(None, [existing] + preload_libs))
+            click.echo(
+                f"[hprofiler] Backends: {', '.join(backends)}",
+                err=True,
+            )
 
     click.echo(
         f"[hprofiler] Recording CPU stacks (--call-graph={callgraph}, -F{freq}) ...",
@@ -423,7 +560,7 @@ def flamegraph(output, callgraph, freq, open_browser, command):
         click.echo(f"[hprofiler] ✗  {e}", err=True)
         raise SystemExit(1)
 
-    click.echo(f"[hprofiler] Flame graph → {out}", err=True)
+    click.echo(f"[hprofiler] Flame graph → {out}  (open in any browser)", err=True)
     if open_browser:
         _open_browser(out)
 
@@ -433,7 +570,16 @@ def flamegraph(output, callgraph, freq, open_browser, command):
 @click.option("--top", "-n", default=20, show_default=True,
               help="Number of top hotspots to show")
 def summary(trace_file, top):
-    """Print a text summary of a saved trace JSON file."""
+    """Print a text summary of a saved trace JSON file.
+
+    Groups spans by (name, category), sorts by total time, and shows count,
+    total / average duration, and percentage of wall time. Use --top to limit
+    how many entries are printed.
+
+    \b
+    Example:
+      hprofiler summary --top 10 app.hprofiler.json
+    """
     from src.ui.app import load_trace_from_json
     from src.output.summary import print_summary
     # Disasm is never used in a text summary — skip the background collection.
@@ -443,7 +589,16 @@ def summary(trace_file, top):
 
 @cli.command()
 def backends():
-    """List all backends and their availability on this system."""
+    """List all backends and their availability on this system.
+
+    Shows whether each backend's required library or tool is present. If a
+    backend is unavailable, a hint for installing the missing dependency is
+    printed. Use the Name or any listed alias with --backend.
+
+    \b
+    Aliases accepted by --backend:
+      omp=openmp   hip=rocm   cl=opencl   perf=cpu   hwc=likwid
+    """
     from src.backends import ALL_BACKENDS
 
     # reverse-map: canonical name → aliases
@@ -477,7 +632,23 @@ def backends():
 @click.option("--jobs", "-j", default=os.cpu_count() or 4, show_default=True,
               help="Parallel build jobs")
 def build(build_dir, jobs):
-    """Build the C hook libraries (CUDA, OpenCL, OpenMP, ROCm)."""
+    """Build the C hook libraries (CUDA, OpenCL, OpenMP, ROCm, NCCL, MPI).
+
+    Runs CMake to compile the hook shared libraries into build/lib/. Only
+    hooks whose required headers are detected at configure time are built
+    (e.g. libhprofiler_mpi.so requires MPI headers).
+
+    \b
+    Libraries produced in build/lib/:
+      libhprofiler_cuda.so    CUDA Runtime + Driver API + NVTX
+      libhprofiler_opencl.so  OpenCL ICD
+      libhprofiler_ompt.so    OpenMP OMPT tool (requires libomp, not libgomp)
+      libhprofiler_rocm.so    ROCm/HIP (requires ROCm at /opt/rocm)
+      libhprofiler_nccl.so    NCCL collectives (no NCCL headers needed)
+      libhprofiler_mpi.so     MPI PMPI wrappers (requires mpicc)
+
+    Re-run after pulling new hook code. Existing .so files are overwritten.
+    """
     import subprocess
     build_path = Path(build_dir)
     build_path.mkdir(parents=True, exist_ok=True)

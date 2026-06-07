@@ -22,6 +22,7 @@ Keyboard shortcuts:
 from __future__ import annotations
 import json
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +40,7 @@ from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
     Header, Footer, TabbedContent, TabPane,
-    DataTable, Input, Static, RichLog,
+    DataTable, Input, Static, RichLog, Tree,
 )
 
 from ..core.trace import Trace
@@ -53,6 +54,8 @@ _CAT_RICH: dict[str, str] = {
     "rocm":    "magenta",
     "opencl":  "yellow",
     "openmp":  "green",
+    "mpi":     "dodger_blue2",
+    "nccl":    "deep_pink3",
     "memory":  "blue",
     "sync":    "white",
     "jit":     "purple",
@@ -1369,6 +1372,231 @@ class FlameGraphWidget(Static):
         return "\n".join(lines)
 
 
+# ── Call tree widget ─────────────────────────────────────────────────────────
+
+@dataclass
+class _CTNode:
+    """Aggregated call-tree node: N spans with the same name at the same tree level."""
+    name: str
+    category: str
+    total_ns: int
+    count: int
+    self_ns: int
+    children: list["_CTNode"] = field(default_factory=list)
+
+    @property
+    def avg_ns(self) -> int:
+        return self.total_ns // max(self.count, 1)
+
+
+@dataclass
+class _RawNode:
+    span: SpanEvent
+    children: list["_RawNode"] = field(default_factory=list)
+
+
+def _ct_build_raw(spans: list[SpanEvent]) -> list[_RawNode]:
+    """Containment tree for one thread via stack algorithm (O(n log n))."""
+    stack: list[_RawNode] = []
+    roots: list[_RawNode] = []
+    for span in sorted(spans, key=lambda s: s.start_ns):
+        while stack and stack[-1].span.end_ns <= span.start_ns:
+            stack.pop()
+        node = _RawNode(span=span)
+        if stack and stack[-1].span.end_ns >= span.end_ns:
+            stack[-1].children.append(node)
+        else:
+            roots.append(node)
+        stack.append(node)
+    return roots
+
+
+def _ct_aggregate(raw_nodes: list[_RawNode]) -> list[_CTNode]:
+    """Recursively aggregate siblings by (name, category)."""
+    groups: dict[tuple[str, str], list[_RawNode]] = defaultdict(list)
+    for rn in raw_nodes:
+        groups[(rn.span.name, rn.span.category.value)].append(rn)
+
+    result: list[_CTNode] = []
+    for (name, cat), nodes in groups.items():
+        total_ns = sum(n.span.duration_ns for n in nodes)
+        all_children: list[_RawNode] = []
+        for n in nodes:
+            all_children.extend(n.children)
+        children = _ct_aggregate(all_children)
+        self_ns = max(0, total_ns - sum(c.total_ns for c in children))
+        result.append(_CTNode(
+            name=name, category=cat,
+            total_ns=total_ns, count=len(nodes),
+            self_ns=self_ns,
+            children=sorted(children, key=lambda c: -c.total_ns),
+        ))
+    return sorted(result, key=lambda n: -n.total_ns)
+
+
+@dataclass
+class _StackNode:
+    """Mutable trie node used while building the stack-based call tree."""
+    name: str
+    category: str
+    total_ns: int = 0
+    count: int = 0          # spans that end here (leaves)
+    children: "dict[str, _StackNode]" = field(default_factory=dict)
+
+    def to_ctnode(self) -> "_CTNode":
+        children = sorted(
+            (c.to_ctnode() for c in self.children.values()),
+            key=lambda n: -n.total_ns,
+        )
+        self_ns = max(0, self.total_ns - sum(c.total_ns for c in children))
+        return _CTNode(
+            name=self.name, category=self.category,
+            total_ns=self.total_ns, count=self.count,
+            self_ns=self_ns, children=children,
+        )
+
+
+def _ct_build_from_stacks(spans: list[SpanEvent]) -> list[_CTNode]:
+    """Build call tree from captured CPU stack frames (from-main view)."""
+    roots: dict[str, _StackNode] = {}
+
+    for span in spans:
+        # Frames arrive innermost-first (backtrace order); reverse to root-first.
+        path = list(reversed(span.stack_frames))
+        if not path:
+            continue
+
+        level = roots
+        nodes_on_path: list[_StackNode] = []
+        for i, frame in enumerate(path):
+            is_leaf = (i == len(path) - 1)
+            cat = span.category.value if is_leaf else "other"
+            if frame not in level:
+                level[frame] = _StackNode(name=frame, category=cat)
+            node = level[frame]
+            node.total_ns += span.duration_ns
+            if is_leaf:
+                node.count += 1
+                # Promote category to the actual span category on the leaf.
+                node.category = span.category.value
+            nodes_on_path.append(node)
+            level = node.children
+
+        # Add the span itself as the innermost leaf (the actual API call / kernel).
+        leaf_key = f"__leaf__{span.name}"
+        if leaf_key not in level:
+            level[leaf_key] = _StackNode(name=span.name, category=span.category.value)
+        leaf = level[leaf_key]
+        leaf.total_ns += span.duration_ns
+        leaf.count    += 1
+
+    return sorted((n.to_ctnode() for n in roots.values()), key=lambda n: -n.total_ns)
+
+
+def _ct_build(spans: list[SpanEvent]) -> list[_CTNode]:
+    """Call tree: uses CPU stack frames when available, temporal containment otherwise."""
+    duration_spans = [s for s in spans if s.duration_ns > 0]
+    if not duration_spans:
+        return []
+
+    stacked = [s for s in duration_spans if s.stack_frames]
+    if stacked:
+        return _ct_build_from_stacks(stacked)
+
+    # Fallback: temporal containment per thread.
+    by_thread: dict[tuple[int, int], list[SpanEvent]] = defaultdict(list)
+    for s in duration_spans:
+        by_thread[(s.pid, s.tid)].append(s)
+
+    if len(by_thread) == 1:
+        return _ct_aggregate(_ct_build_raw(next(iter(by_thread.values()))))
+
+    all_roots: list[_CTNode] = []
+    for (pid, tid), thread_spans in sorted(by_thread.items()):
+        children = _ct_aggregate(_ct_build_raw(thread_spans))
+        total_ns = sum(c.total_ns for c in children)
+        all_roots.append(_CTNode(
+            name=f"Thread {tid} (pid {pid})",
+            category="other",
+            total_ns=total_ns, count=1, self_ns=0,
+            children=children,
+        ))
+    return sorted(all_roots, key=lambda n: -n.total_ns)
+
+
+class CallTreeWidget(Widget):
+    """
+    Hierarchical call tree for all backends.
+    Builds parent-child relationships from temporal containment of spans,
+    then aggregates duplicate siblings by name for a compact view.
+    Keys: ↑↓ navigate · Enter/Space expand · e expand all · u collapse all
+    """
+
+    DEFAULT_CSS = """
+    CallTreeWidget { height: 1fr; layout: vertical; }
+    #ct-tree      { height: 1fr; }
+    #ct-hint      { height: 1; dock: bottom; color: $text-muted; }
+    """
+
+    def __init__(self, trace: Trace, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._trace = trace
+
+    def compose(self) -> ComposeResult:
+        yield Tree("Call Tree", id="ct-tree")
+        yield Static(
+            "  [dim][↑↓] navigate  [enter/space] expand  [e] expand all  [u] collapse all[/dim]",
+            id="ct-hint",
+        )
+
+    def on_mount(self) -> None:
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        tree: Tree = self.query_one("#ct-tree", Tree)  # type: ignore[type-arg]
+        tree.clear()
+        wall_ns = max(self._trace.duration_ns, 1)
+        spans = [s for s in self._trace.spans if s.duration_ns > 0]
+
+        if not spans:
+            tree.root.add_leaf("[dim]No duration spans captured.[/dim]")
+            tree.root.expand()
+            return
+
+        roots = _ct_build(spans)
+        for node in roots:
+            self._add_node(tree.root, node, wall_ns)
+        tree.root.expand()
+
+    def _add_node(self, parent: Any, node: _CTNode, wall_ns: int) -> None:
+        color = _cat_color(node.category)
+        pct   = 100.0 * node.total_ns / wall_ns
+        label = (
+            f"[{color}]{node.name}[/{color}]"
+            f"  [dim]{node.count}×[/dim]"
+            f"  [yellow]{_fmt_ns(node.total_ns)}[/yellow]"
+            f"  [dim]{pct:.1f}%[/dim]"
+        )
+        if node.count > 1:
+            label += f"  [dim]avg {_fmt_ns(node.avg_ns)}[/dim]"
+        if node.children:
+            branch = parent.add(label, data=node)
+            for child in node.children:
+                self._add_node(branch, child, wall_ns)
+        else:
+            parent.add_leaf(label, data=node)
+
+    def on_key(self, event: Any) -> None:
+        tree: Tree = self.query_one("#ct-tree", Tree)  # type: ignore[type-arg]
+        if event.key == "e":
+            tree.root.expand_all()
+            event.stop()
+        elif event.key == "u":
+            tree.root.collapse_all()
+            tree.root.expand()
+            event.stop()
+
+
 # ── Disasm widget ─────────────────────────────────────────────────────────────
 
 class DisasmWidget(Widget):
@@ -1705,9 +1933,14 @@ class ProfilerApp(App):
             with TabPane("Hotspots  [H]", id="tab-hotspots"):
                 yield HotspotsWidget(self.trace, id="hotspots")
 
-            with TabPane("Flame  [F]", id="tab-flame"):
-                with ScrollableContainer():
-                    yield FlameGraphWidget(self.trace)
+            if any(s.stack_frames for s in self.trace.spans):
+                with TabPane("Call Tree  [C]", id="tab-calltree"):
+                    yield CallTreeWidget(self.trace)
+
+            if any(s.category == Category.CPU for s in self.trace.spans):
+                with TabPane("Flame  [F]", id="tab-flame"):
+                    with ScrollableContainer():
+                        yield FlameGraphWidget(self.trace)
 
             if self._collect_disasm:
                 with TabPane("Disasm  [D]", id="tab-disasm"):
@@ -1779,6 +2012,8 @@ def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trac
             cat = Category.OTHER
 
         if ph == "X":
+            args = ev.get("args", {})
+            stack = args.pop("_stack", [])
             trace.add(SpanEvent(
                 name=ev.get("name", ""),
                 category=cat,
@@ -1786,7 +2021,8 @@ def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trac
                 duration_ns=int(ev.get("dur", 0) * 1_000),
                 pid=ev.get("pid", 0),
                 tid=ev.get("tid", 0),
-                tags=ev.get("args", {}),
+                tags=args,
+                stack_frames=stack if isinstance(stack, list) else [],
             ))
         elif ph == "i":
             trace.add(InstantEvent(

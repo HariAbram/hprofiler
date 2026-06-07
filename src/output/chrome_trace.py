@@ -55,7 +55,7 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             "pid": span.pid or meta.pid,
             "tid": span.tid,
             "cname": _category_color(span.category.value),
-            "args": span.tags,
+            "args": {**span.tags, **({"_stack": span.stack_frames} if span.stack_frames else {})},
         })
 
     for inst in trace.instants:

@@ -100,6 +100,8 @@ static void send_all(const char *buf, int n) {
     }
 }
 
+#include "../common/callstack.h"
+
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
     pthread_mutex_lock(&g_sock_mutex);
@@ -121,6 +123,7 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                          (unsigned long long)dur_ns, name);
         /* snprintf returns >= sizeof(buf) when truncated; drop truncated spans */
         if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
+        emit_callstack(start_ns);
     }
     pthread_mutex_unlock(&g_sock_mutex);
 }
@@ -1203,6 +1206,7 @@ CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
 __attribute__((constructor))
 static void hprofiler_cuda_init(void) {
     ensure_connected();
+    cs_init();
     static const char *candidates[] = {
         "libcudart.so.12", "libcudart.so.11", "libcudart.so",
         "libcuda.so.1",    "libcuda.so",       NULL

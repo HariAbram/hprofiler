@@ -9,6 +9,8 @@ find_path(_MPI_INCLUDE mpi.h
         /usr/local/include
         /opt/openmpi/include
         /opt/mpich/include
+        /usr/lib/x86_64-linux-gnu/mpich/include
+        /usr/lib/x86_64-linux-gnu/openmpi/include
     NO_CMAKE_SYSTEM_PATH
 )
 
@@ -19,6 +21,7 @@ if(_MPI_INCLUDE)
         NO_CMAKE_SYSTEM_PATH
     )
     add_library(hprofiler_mpi SHARED mpi_hook.c)
+    target_compile_options(hprofiler_mpi PRIVATE -fPIC -O2 -Wall -fno-omit-frame-pointer)
     target_include_directories(hprofiler_mpi PRIVATE "${_MPI_INCLUDE}")
     if(_MPI_LIB)
         target_link_libraries(hprofiler_mpi PRIVATE "${_MPI_LIB}" pthread dl)

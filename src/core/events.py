@@ -21,6 +21,8 @@ class Category(str, Enum):
     GPU_ROCM = "rocm"
     GPU_OPENCL = "opencl"
     OPENMP = "openmp"
+    MPI = "mpi"
+    NCCL = "nccl"
     MEMORY = "memory"
     SYNC = "sync"
     JIT = "jit"
@@ -38,6 +40,7 @@ class SpanEvent:
     pid: int = 0
     tid: int = 0
     tags: dict[str, Any] = field(default_factory=dict)
+    stack_frames: list[str] = field(default_factory=list)  # innermost→outermost (backtrace order)
 
     @property
     def end_ns(self) -> int:

@@ -1,4 +1,5 @@
 add_library(hprofiler_nccl SHARED nccl_hook.c)
+target_compile_options(hprofiler_nccl PRIVATE -fPIC -O2 -Wall -fno-omit-frame-pointer)
 target_link_libraries(hprofiler_nccl PRIVATE pthread dl)
 set_target_properties(hprofiler_nccl PROPERTIES
     OUTPUT_NAME hprofiler_nccl
