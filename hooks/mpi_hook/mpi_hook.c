@@ -290,14 +290,19 @@ int MPI_Wait(MPI_Request *request, MPI_Status *status) {
 }
 
 int MPI_Waitall(int count, MPI_Request requests[], MPI_Status statuses[]) {
-    /* Save all request handles before PMPI_Waitall nullifies them. */
-    MPI_Request saved[count > 0 ? count : 1];
-    for (int i = 0; i < count; i++) saved[i] = requests[i];
+    /* Save all request handles before PMPI_Waitall nullifies them.
+     * Heap-allocate to avoid stack overflow with large request arrays. */
+    MPI_Request *saved = (count > 0)
+        ? (MPI_Request *)malloc((size_t)count * sizeof(MPI_Request)) : NULL;
+    if (saved)
+        for (int i = 0; i < count; i++) saved[i] = requests[i];
     uint64_t t0 = now_ns();
     int ret = PMPI_Waitall(count, requests, statuses);
-    /* Remove matched requests from the tracking table. */
-    for (int i = 0; i < count; i++) {
-        uint64_t dummy = 0; req_lookup(saved[i], &dummy);
+    if (saved) {
+        for (int i = 0; i < count; i++) {
+            uint64_t dummy = 0; req_lookup(saved[i], &dummy);
+        }
+        free(saved);
     }
     char extra[96];
     snprintf(extra, sizeof(extra), "type=waitall,count=%d,rank=%d", count, g_mpi_rank);

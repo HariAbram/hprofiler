@@ -257,13 +257,15 @@ static __thread uint64_t     tls_parallel_start[MAX_DEPTH];
 static __thread ompt_id_t    tls_parallel_id[MAX_DEPTH];
 static __thread const void  *tls_parallel_codeptr[MAX_DEPTH];
 static __thread int          tls_parallel_depth = 0;
-static __thread uint64_t     tls_work_start     = 0;
-static __thread ompt_work_t  tls_work_type       = 0;
-static __thread const void  *tls_work_codeptr    = NULL;
+static __thread uint64_t     tls_work_start[MAX_DEPTH];
+static __thread ompt_work_t  tls_work_type[MAX_DEPTH];
+static __thread const void  *tls_work_codeptr[MAX_DEPTH];
+static __thread int          tls_work_depth      = 0;
 static __thread uint64_t     tls_sync_start[MAX_DEPTH];
 static __thread const void  *tls_sync_codeptr[MAX_DEPTH];
 static __thread int          tls_sync_depth      = 0;
-static __thread uint64_t     tls_target_start    = 0;
+static __thread uint64_t     tls_target_start[MAX_DEPTH];
+static __thread int          tls_target_depth    = 0;
 
 /* Task scheduling stacks */
 #define MAX_TASK_DEPTH 32
@@ -346,13 +348,17 @@ static void cb_work(
     if (*wname == '\0') wname = "omp_work";
 
     if (endpoint == ompt_scope_begin) {
-        tls_work_start   = now_ns();
-        tls_work_type    = wstype;
-        tls_work_codeptr = codeptr_ra;
-    } else if (tls_work_start) {
+        if (tls_work_depth < MAX_DEPTH) {
+            tls_work_start[tls_work_depth]   = now_ns();
+            tls_work_type[tls_work_depth]    = wstype;
+            tls_work_codeptr[tls_work_depth] = codeptr_ra;
+            tls_work_depth++;
+        }
+    } else if (tls_work_depth > 0) {
+        tls_work_depth--;
         const char *sym = NULL; char lib[256]; uint64_t off = 0;
         char extra[512];
-        if (resolve_codeptr_full(tls_work_codeptr, &sym, lib, sizeof(lib), &off)) {
+        if (resolve_codeptr_full(tls_work_codeptr[tls_work_depth], &sym, lib, sizeof(lib), &off)) {
             if (sym)
                 snprintf(extra, sizeof(extra), "type=work,count=%llu,sym=%s",
                          (unsigned long long)count, sym);
@@ -365,9 +371,8 @@ static void cb_work(
                      (unsigned long long)count);
         }
         emit_span("openmp", gettid_compat(),
-                  tls_work_start, now_ns() - tls_work_start,
+                  tls_work_start[tls_work_depth], now_ns() - tls_work_start[tls_work_depth],
                   wname, extra);
-        tls_work_start = 0;
     }
 }
 
@@ -482,14 +487,16 @@ static void cb_target(
     if (*tname == '\0') tname = "omp_target";
 
     if (endpoint == ompt_scope_begin) {
-        tls_target_start = now_ns();
-    } else if (tls_target_start) {
+        if (tls_target_depth < MAX_DEPTH)
+            tls_target_start[tls_target_depth++] = now_ns();
+    } else if (tls_target_depth > 0) {
+        tls_target_depth--;
         char extra[64];
         snprintf(extra, sizeof(extra), "type=offload,device=%d", device_num);
         emit_span("openmp", gettid_compat(),
-                  tls_target_start, now_ns() - tls_target_start,
+                  tls_target_start[tls_target_depth],
+                  now_ns() - tls_target_start[tls_target_depth],
                   tname, extra);
-        tls_target_start = 0;
     }
 }
 

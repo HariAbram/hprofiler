@@ -408,7 +408,7 @@ def _poll_nvidia_smi(trace: Trace, stop: threading.Event) -> None:
                                         Category.MEMORY, ts, mem_mib * 1024**2, "bytes"))
         except Exception:
             pass
-        stop.wait(timeout=0.1)
+        stop.wait(timeout=1.0)
 
 
 def _poll_rocm_smi(trace: Trace, stop: threading.Event) -> None:
@@ -460,7 +460,7 @@ def _poll_rocm_smi(trace: Trace, stop: threading.Event) -> None:
                     pass
         except Exception:
             pass
-        stop.wait(timeout=0.1)
+        stop.wait(timeout=1.0)
 
 
 # ── CPU microarchitecture counters (perf stat) ────────────────────────────────
@@ -480,7 +480,9 @@ def _parse_perf_stat_microarch(text: str) -> dict[str, float]:
             val = float(raw)
         except ValueError:
             continue
+        # Strip perf event qualifiers (:u, :k, :p, :H) and PMU prefix (cpu/)
         key = re.sub(r"^[\w-]+/", "", parts[1].rstrip("/")).lower().strip()
+        key = re.sub(r":[ukpHG]+$", "", key)
         if key:
             ev[key] = ev.get(key, 0.0) + val
 
@@ -728,10 +730,9 @@ def _parse_perf_script(perf_data: str, trace: Trace, trace_start_ns: int) -> Non
             return
         rel_ts = max(0, cur_ts - trace_start_ns)
         if cur_stack:
-            # Emit all stack frames so the TUI and chrome trace can show a
-            # proper call-tree. cur_stack[0] = innermost (top of stack).
-            # Encode the full folded stack as a tag for flame graph aggregation.
-            folded = ";".join(reversed(cur_stack))   # outer-to-inner, flamegraph.pl convention
+            # insert(0, sym) means cur_stack[0] = outermost caller.
+            # depth=0 for outermost matches call-tree display convention.
+            folded = ";".join(cur_stack)   # outer-to-inner, flamegraph.pl convention
             for depth, sym in enumerate(cur_stack):
                 if sym:
                     trace.add(SpanEvent(
