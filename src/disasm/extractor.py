@@ -548,10 +548,12 @@ def _acpp_kernel_short(mangled: str) -> str:
 # ── Top-level collection ──────────────────────────────────────────────────────
 
 def collect_disasm(
-    command:   list[str],
-    backends:  list[str],
-    jit_spans: list[dict],           # [{name, so_path, mangled?}] from JIT load events
-    omp_syms:  dict[str, tuple] | None = None,  # {span_name: ("sym",name)|("lib",(path,off))}
+    command:      list[str],
+    backends:     list[str],
+    jit_spans:    list[dict],           # [{name, so_path, mangled?}] from JIT load events
+    omp_syms:     dict[str, tuple] | None = None,  # {span_name: ("sym",name)|("lib",(path,off))}
+    profiled_pid: int = 0,              # PID of the profiled process; used to filter /tmp files
+    cpu_names:    set[str] | None = None,  # CPU function names from perf sampling
 ) -> dict[str, KernelDisasm]:
     """
     Collect disassembly for all profiled kernels.
@@ -570,6 +572,8 @@ def collect_disasm(
     binary = command[0] if command else ""
     if omp_syms is None:
         omp_syms = {}
+    if cpu_names is None:
+        cpu_names = set()
 
     # ── CUDA AoT: SASS + PTX from the main binary ────────────────────────────
     if "cuda" in backends and binary and Path(binary).exists():
@@ -582,14 +586,19 @@ def collect_disasm(
 
     # ── CUDA JIT cubins saved by the hook ────────────────────────────────────
     # cuda_hook.c saves cubins as /tmp/hprofiler_cubin_<pid>_<n>.bin.
-    # Guard on the cuda backend so leftover files from a prior CUDA run
-    # don't bleed into unrelated OpenMP/CPU profiles.
+    # Filter by the profiled process's PID so we never read stale cubin files
+    # left over from previous runs (which would show the wrong code).
     if "cuda" in backends:
         import glob
-        for cubin_path in glob.glob("/tmp/hprofiler_cubin_*.bin"):
+        pid_pat = str(profiled_pid) if profiled_pid else "*"
+        for cubin_path in glob.glob(f"/tmp/hprofiler_cubin_{pid_pat}_*.bin"):
             jit_kd = disasm_cuda_cubin(cubin_path)
             for name, kd in jit_kd.items():
                 result.setdefault(name, kd)
+            try:
+                os.unlink(cubin_path)
+            except OSError:
+                pass
 
     # ── ROCm AoT + JIT binaries saved by the hook ────────────────────────────
     if "rocm" in backends:
@@ -597,23 +606,28 @@ def collect_disasm(
             rocm = disasm_rocm_binary(binary)
             result.update(rocm)
         import glob as _rocm_glob
-        for rocm_path in _rocm_glob.glob("/tmp/hprofiler_rocm_*.bin"):
+        pid_pat = str(profiled_pid) if profiled_pid else "*"
+        for rocm_path in _rocm_glob.glob(f"/tmp/hprofiler_rocm_{pid_pat}_*.bin"):
             with open(rocm_path, "rb") as _rf:
                 _rm = _rf.read(4)
             if _rm[:2] in (b"//", b".v", b"; ") or _rm[:1] in (b".", b";"):
-                # PTX/IR text — use same PTX parser
                 text = Path(rocm_path).read_text(errors="replace")
                 jit_kd = _parse_ptx_text(text, rocm_path)
             else:
-                # AMDGCN ELF
                 jit_kd = disasm_rocm_binary(rocm_path)
             for name, kd in jit_kd.items():
                 result.setdefault(name, kd)
+            try:
+                os.unlink(rocm_path)
+            except OSError:
+                pass
 
     # ── OpenCL / CPU: disassemble ACPP SSCP .jit.so files ───────────────────
-    # Also check /tmp/hprofiler_jit_*.so copies saved by the hook
+    # Also check /tmp/hprofiler_jit_*.so copies saved by the hook.
+    # Filter by PID so stale copies from previous runs are ignored.
     import glob as _glob
-    tmp_jit = {Path(p).name: p for p in _glob.glob("/tmp/hprofiler_jit_*.so")}
+    pid_pat = str(profiled_pid) if profiled_pid else "*"
+    tmp_jit = {Path(p).name: p for p in _glob.glob(f"/tmp/hprofiler_jit_{pid_pat}_*.so")}
 
     for entry in jit_spans:
         so_path    = entry.get("so_path", "")
@@ -653,10 +667,15 @@ def collect_disasm(
         if kd:
             kd.name = short_name or kd.name
             result[kd.name] = kd
-            # Remove the used temp file so next entry doesn't reuse it
+            # Remove the used temp file from disk and from the dict so the
+            # next jit_span entry doesn't reuse the same .so file.
             if candidate in tmp_jit.values():
                 used_key = next(k for k, v in tmp_jit.items() if v == candidate)
                 del tmp_jit[used_key]
+                try:
+                    os.unlink(candidate)
+                except OSError:
+                    pass
 
     # ── CPU / OpenMP: targeted disasm via codeptr resolution ─────────────────
     # The OMPT hook emits either:
@@ -665,28 +684,30 @@ def collect_disasm(
     #                             library and computed the static file offset
     # For both forms we resolve symbol name+size with nm, then disassemble with
     # capstone (reads only the function bytes) or fall back to objdump.
+    #
+    # sym_cache: (target_path, sym_name) → KernelDisasm
+    # Prevents running objdump twice when multiple span names (e.g. omp_loop and
+    # omp_barrier_implicit) fall at different offsets within the same function.
     if binary and Path(binary).exists() and omp_syms:
         seen_keys: set[str] = set()
+        sym_cache: dict[tuple[str, str], Optional[KernelDisasm]] = {}
         for span_name, sym_info in omp_syms.items():
             if span_name in result:
                 continue
             kind, payload = sym_info
 
             if kind == "sym":
-                # dladdr resolved: payload is mangled symbol name in the binary
                 sym_name: str = payload
                 if sym_name in seen_keys:
                     continue
                 seen_keys.add(sym_name)
                 target_path = binary
             elif kind == "lib":
-                # /proc/self/maps resolved: payload is (library_path, static_offset)
                 lib_path, static_off = payload
                 key = f"{lib_path}:{static_off}"
                 if key in seen_keys or not Path(lib_path).exists():
                     continue
                 seen_keys.add(key)
-                # Find which symbol contains this offset in the library
                 sym_name = ""
                 nm_text = _run(["nm", "-S", "--defined-only", lib_path])
                 for line in nm_text.splitlines():
@@ -706,7 +727,12 @@ def collect_disasm(
             else:
                 continue
 
-            # Look up sym address+size in the target binary
+            # Skip if a different span already produced disasm for this symbol.
+            cache_key = (target_path, sym_name)
+            if cache_key in sym_cache:
+                continue   # duplicate function — suppress redundant entry
+
+            # Look up sym address+size, then disassemble.
             nm_text = _run(["nm", "-S", "--defined-only", target_path])
             sym_addr, sym_size = 0, 0
             for line in nm_text.splitlines():
@@ -725,13 +751,44 @@ def collect_disasm(
                 else None
             )
             if not kd:
-                # objdump fallback: detect arch from ELF header so AArch64 and
-                # RISC-V binaries get the correct instruction classifier.
                 kd = disasm_elf(target_path, symbol=sym_name,
                                 arch=_elf_arch(target_path))
                 if kd:
                     kd.name = span_name
+            sym_cache[cache_key] = kd   # record result (None = not found)
             if kd and kd.lines:
                 result[span_name] = kd
+
+    # ── CPU (perf sampling): disasm top functions by name in main binary ──────
+    # perf-sampled spans have function names but no sym=/lib= tags, so they
+    # don't go through the OMPT path above.  Try to look up each unique name
+    # in the main binary's symbol table and disassemble it.
+    if cpu_names and binary and Path(binary).exists():
+        nm_syms: dict[str, tuple[int, int]] = {}
+        nm_text = _run(["nm", "-S", "--defined-only", binary])
+        for line in nm_text.splitlines():
+            parts = line.split()
+            if len(parts) == 4 and parts[2] in ("T", "t", "W", "w"):
+                try:
+                    nm_syms[parts[3]] = (int(parts[0], 16), int(parts[1], 16))
+                except ValueError:
+                    pass
+
+        elf_arch = _elf_arch(binary)
+        for fn_name in cpu_names:
+            if fn_name in result:
+                continue
+            if fn_name not in nm_syms:
+                continue
+            sym_addr, sym_size = nm_syms[fn_name]
+            if not sym_addr or not sym_size:
+                continue
+            kd = _disasm_elf_capstone(binary, sym_addr, sym_size, fn_name, elf_arch)
+            if not kd:
+                kd = disasm_elf(binary, symbol=fn_name, arch=elf_arch)
+                if kd:
+                    kd.name = fn_name
+            if kd and kd.lines:
+                result[fn_name] = kd
 
     return result

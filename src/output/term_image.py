@@ -286,10 +286,21 @@ class RawTerminal:
         Special keys  →  'up', 'down', 'left', 'right', 'enter', 'esc', 'ctrl+c'
         Mouse clicks  →  'click:{row}:{col}'  (0-indexed; left button only)
         Mouse scroll  →  'scroll_up' / 'scroll_down'
+
+        Implementation note: we use ``os.read(fd, 1)`` throughout rather than
+        ``sys.stdin.read(1)`` to bypass Python's text-I/O buffering layer.
+        In raw mode, Python may pre-buffer multiple bytes into its internal
+        buffer; subsequent ``select()`` calls on the underlying fd then
+        return "not ready" even though data is sitting in the Python buffer,
+        causing escape sequences (including SGR mouse events) to be silently
+        truncated.  ``os.read`` reads directly from the kernel, keeping the
+        fd state consistent with ``select``.
         """
         import select
 
-        ch = sys.stdin.read(1)
+        # Blocking read of the first byte — directly from the kernel fd.
+        ch = os.read(self._fd, 1).decode("latin-1")
+
         if ch != "\x1b":
             if ch in ("\x03", "\x04"):
                 return "ctrl+c"
@@ -297,16 +308,16 @@ class RawTerminal:
                 return "enter"
             return ch
 
-        # Read the rest of the escape sequence with a 50 ms timeout so a bare
-        # Esc (no following bytes) is returned quickly as "esc".
+        # Read the rest of the escape sequence.  We poll with a 50 ms timeout
+        # so a bare Esc (nothing following) returns "esc" quickly.
         seq: list[str] = []
         while True:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+            ready, _, _ = select.select([self._fd], [], [], 0.05)
             if not ready:
                 break
-            c = sys.stdin.read(1)
+            c = os.read(self._fd, 1).decode("latin-1")
             seq.append(c)
-            # CSI sequences terminate with a letter or '~'
+            # CSI sequences end with a letter or '~'
             if c.isalpha() or c == "~":
                 break
 
@@ -317,26 +328,73 @@ class RawTerminal:
         if s == "[C": return "right"
         if s == "[D": return "left"
 
-        # SGR mouse: \x1b[<{btn};{col};{row}M (press) or m (release)
+        # SGR mouse: \x1b[<{btn};{col};{row}M (press) / m (release)
         if s.startswith("[<"):
-            body = s[2:]
+            body  = s[2:]
             press = body.endswith("M")
             body  = body[:-1]
             try:
                 btn_s, col_s, row_s = body.split(";")
                 btn, col, row = int(btn_s), int(col_s), int(row_s)
                 if press:
-                    if btn == 0:                     # left click
-                        return f"click:{row - 1}:{col - 1}"
-                    if btn == 64:                    # scroll wheel up
-                        return "scroll_up"
-                    if btn == 65:                    # scroll wheel down
-                        return "scroll_down"
+                    if btn == 0:  return f"click:{row - 1}:{col - 1}"   # left
+                    if btn == 64: return "scroll_up"
+                    if btn == 65: return "scroll_down"
             except (ValueError, IndexError):
                 pass
             return "mouse"
 
         return "esc"
+
+
+# ── Browser launcher ─────────────────────────────────────────────────────────
+
+def open_in_browser(path: str) -> None:
+    """
+    Open *path* (a local HTML file) in a web browser.
+
+    ``xdg-open`` blindly follows the system MIME-type associations and can
+    open non-browser apps (Slack, VS Code, …) that register ``text/html``
+    handlers.  Instead we:
+
+    1. Honour the ``$BROWSER`` environment variable if set.
+    2. Try a ranked list of known browser executables.
+    3. Fall back to ``xdg-open`` only as a last resort.
+    """
+    import shutil
+    import subprocess
+
+    url = f"file://{os.path.abspath(path)}"
+
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", url], stderr=subprocess.DEVNULL)
+        return
+
+    # 1 — $BROWSER env var (user's explicit preference)
+    browser_env = os.environ.get("BROWSER", "").strip()
+    if browser_env:
+        exe = browser_env.split()[0]
+        if shutil.which(exe):
+            subprocess.Popen([exe, url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+    # 2 — well-known browser executables in preference order
+    for exe in [
+        "firefox", "firefox-esr",
+        "chromium", "chromium-browser",
+        "google-chrome", "google-chrome-stable",
+        "brave-browser",
+        "epiphany", "epiphany-browser",
+        "falkon", "midori",
+    ]:
+        if shutil.which(exe):
+            subprocess.Popen([exe, url],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+    # 3 — last resort (may open Slack / VS Code on misconfigured systems)
+    subprocess.Popen(["xdg-open", url], stderr=subprocess.DEVNULL)
 
 
 # ── Spinner for slow renders ──────────────────────────────────────────────────

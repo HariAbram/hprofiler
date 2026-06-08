@@ -384,7 +384,5 @@ def show(
 
 
 def _open_html(path: str) -> None:
-    import subprocess
-    import sys
-    opener = "open" if sys.platform == "darwin" else "xdg-open"
-    subprocess.Popen([opener, str(path)], stderr=subprocess.DEVNULL)
+    from .term_image import open_in_browser
+    open_in_browser(path)

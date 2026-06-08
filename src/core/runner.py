@@ -360,7 +360,7 @@ class Runner:
             import threading as _threading
             _threading.Thread(
                 target=_collect_disasm,
-                args=(trace, self.command, self.backends),
+                args=(trace, self.command, self.backends, pid),
                 daemon=True,
             ).start()
         return trace
@@ -545,7 +545,12 @@ def _collect_rss(
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _collect_disasm(trace: Trace, command: list[str], backends: list[str]) -> None:
+def _collect_disasm(
+    trace: Trace,
+    command: list[str],
+    backends: list[str],
+    profiled_pid: int = 0,
+) -> None:
     """
     Post-run: extract disassembly for all profiled kernels and attach to trace.
 
@@ -566,11 +571,13 @@ def _collect_disasm(trace: Trace, command: list[str], backends: list[str]) -> No
     except ImportError:
         return
 
-    # Build jit_spans and omp_codeptrs from trace events
+    # Build jit_spans, omp_syms, and cpu_names from trace events
     jit_spans: list[dict] = []
     # omp_syms:  {span_name: ("sym", mangled_name)}
     #         or {span_name: ("lib", (lib_path, static_offset))}
     omp_syms: dict[str, tuple] = {}
+    # cpu_names: function names from perf-sampled CPU spans (no sym/lib tags)
+    cpu_names: set[str] = set()
 
     for span in trace.spans:
         # OpenCL/ACPP SSCP JIT .so files
@@ -596,9 +603,13 @@ def _collect_disasm(trace: Trace, command: list[str], backends: list[str]) -> No
                     omp_syms[span.name] = ("lib", (lib, int(off_s, 16)))
                 except ValueError:
                     pass
+                continue
+            # perf-sampled CPU span: no sym/lib tags — collect the name directly
+            if span.category.value == "cpu" and span.name and span.name != "[cpu]":
+                cpu_names.add(span.name)
 
     try:
-        disasm_map = collect_disasm(command, backends, jit_spans, omp_syms)
+        disasm_map = collect_disasm(command, backends, jit_spans, omp_syms, profiled_pid, cpu_names)
 
         import copy as _copy
 

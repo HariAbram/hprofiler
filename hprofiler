@@ -234,33 +234,52 @@ def view(trace_file, disasm):
 
 
 def _open_browser(path: str) -> None:
-    """Open *path* in a browser, delegating to the invoking user when under sudo."""
-    import os, webbrowser, subprocess as _sp
+    """Open *path* in a web browser, delegating to the invoking user when under sudo."""
+    import os, shutil, subprocess as _sp, sys as _sys
     url = f"file://{os.path.abspath(path)}"
+
+    # When running as root via sudo, re-launch the browser as the original
+    # user so it can reach their desktop session.
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and os.geteuid() == 0:
-        # Running as root via sudo: open the browser as the original user so
-        # it can reach their desktop session.
-        # sudo sanitizes the environment when switching users, so passing
-        # env= to Popen only sets the environment for sudo itself, not for
-        # xdg-open. Use the `env` command inside the sudo invocation to
-        # explicitly set DISPLAY/XAUTHORITY after sudo's sanitization step.
         display = os.environ.get("DISPLAY", ":0")
-        xauth   = os.environ.get("XAUTHORITY",
-                                  f"/home/{sudo_user}/.Xauthority")
-        try:
-            _sp.Popen(
-                ["sudo", "-u", sudo_user,
-                 "env",
-                 f"DISPLAY={display}",
-                 f"XAUTHORITY={xauth}",
-                 "xdg-open", url],
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-            )
+        xauth   = os.environ.get("XAUTHORITY", f"/home/{sudo_user}/.Xauthority")
+        browser_env = os.environ.get("BROWSER", "").strip()
+        browsers = (
+            [browser_env.split()[0]] if browser_env else []
+        ) + ["firefox", "firefox-esr", "chromium", "chromium-browser",
+             "google-chrome", "google-chrome-stable", "xdg-open"]
+        for exe in browsers:
+            if shutil.which(exe):
+                try:
+                    _sp.Popen(
+                        ["sudo", "-u", sudo_user,
+                         "env",
+                         f"DISPLAY={display}",
+                         f"XAUTHORITY={xauth}",
+                         exe, url],
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                    )
+                    return
+                except FileNotFoundError:
+                    continue
+        return
+
+    if _sys.platform == "darwin":
+        _sp.Popen(["open", url], stderr=_sp.DEVNULL)
+        return
+
+    # Prefer explicit browser executables over xdg-open, which may be
+    # misconfigured to open non-browser apps (Slack, VS Code, …).
+    browser_env = os.environ.get("BROWSER", "").strip()
+    for exe in (
+        [browser_env.split()[0]] if browser_env else []
+    ) + ["firefox", "firefox-esr", "chromium", "chromium-browser",
+         "google-chrome", "google-chrome-stable", "brave-browser",
+         "epiphany", "epiphany-browser", "falkon", "midori", "xdg-open"]:
+        if shutil.which(exe):
+            _sp.Popen([exe, url], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
             return
-        except FileNotFoundError:
-            pass   # xdg-open / sudo not available — fall through to webbrowser
-    webbrowser.open(url)
 
 
 @cli.command(
