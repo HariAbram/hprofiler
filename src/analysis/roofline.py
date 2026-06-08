@@ -185,6 +185,16 @@ class KernelMetrics:
     fp16_fraction: float = 0.0   # fraction of FLOPs that are FP16 (0–1)
     fp64_tflops:   float = 0.0   # device FP64 peak (TFLOPs/s)
     fp16_tflops:   float = 0.0   # device FP16 peak (TFLOPs/s)
+    # Multi-level roofline
+    l2_ai:         float = 0.0   # FLOPs / L2_bytes  (GPU)
+    l1_ai:         float = 0.0   # FLOPs / L1_bytes  (GPU)
+    l3_ai:         float = 0.0   # FLOPs / L3_bytes  (CPU LLC)
+    l2_bytes:      float = 0.0   # L2 traffic bytes (GPU)
+    l1_bytes:      float = 0.0   # L1 traffic bytes (GPU)
+    l3_bytes:      float = 0.0   # L3 traffic bytes (CPU)
+    # SM occupancy and ILP
+    occupancy_pct: float = 0.0   # SM occupancy % 0–100 (GPU, from ncu)
+    ipc:           float = 0.0   # instructions per cycle (GPU, from ncu)
 
 
 def metrics_from_counters(
@@ -261,6 +271,14 @@ def metrics_from_counters(
     fp64_frac = fp64 / total_ops
     fp16_frac = (fp16 * 0.5) / total_ops
 
+    # Multi-level arithmetic intensities
+    l2_b = max(counters.l2_bytes, 0.0)
+    l1_b = max(counters.l1_bytes, 0.0)
+    l3_b = max(counters.l3_bytes, 0.0)
+    l2_ai = flops / l2_b if l2_b > 0.0 else 0.0
+    l1_ai = flops / l1_b if l1_b > 0.0 else 0.0
+    l3_ai = flops / l3_b if l3_b > 0.0 else 0.0
+
     return KernelMetrics(
         kernel_name=counters.kernel_name,
         arch=arch,
@@ -280,6 +298,14 @@ def metrics_from_counters(
         fp16_fraction=fp16_frac,
         fp64_tflops=device.fp64_tflops,
         fp16_tflops=device.fp16_tflops,
+        l2_ai=l2_ai,
+        l1_ai=l1_ai,
+        l3_ai=l3_ai,
+        l2_bytes=l2_b,
+        l1_bytes=l1_b,
+        l3_bytes=l3_b,
+        occupancy_pct=counters.occupancy_pct,
+        ipc=counters.ipc,
     )
 
 

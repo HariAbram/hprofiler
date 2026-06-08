@@ -31,6 +31,45 @@ def _cuda_cores_per_sm(major: int, minor: int) -> int:
     )
 
 
+# L2 cache bandwidth (GB/s) by CUDA compute capability.
+# Values are from NVIDIA architecture whitepapers and benchmarked measurements.
+# Used for multi-level roofline L2 ceiling.
+_CUDA_L2_BW_GBS: dict[tuple[int, int], float] = {
+    (6, 0): 2000.0,   # P100 (GP100, HBM2, 4 MB L2)
+    (6, 1): 400.0,    # GTX 1080 (GP104, 2 MB L2)
+    (7, 0): 3072.0,   # V100 (GV100, HBM2, 6 MB L2)
+    (7, 5): 1700.0,   # RTX 2080 Ti (TU102, 6 MB L2)
+    (8, 0): 6144.0,   # A100 (GA100, HBM2e, 40/80 MB L2)
+    (8, 6): 1560.0,   # RTX 3090 (GA102, GDDR6X, 6 MB L2)
+    (8, 9): 2400.0,   # RTX 4090 (AD102, GDDR6X, 72 MB L2)
+    (9, 0): 12288.0,  # H100 (GH100, HBM3, 50 MB L2)
+}
+
+
+def _cuda_l2_bw_gbs(major: int, minor: int, dram_bw_gbs: float) -> float:
+    v = _CUDA_L2_BW_GBS.get((major, minor),
+        _CUDA_L2_BW_GBS.get((major, 0), 0.0))
+    return v if v > 0 else dram_bw_gbs * 4   # fallback: 4× DRAM bandwidth
+
+
+# L2 bandwidth (GB/s) by AMD GFX version.
+_ROCM_L2_BW_GBS: dict[str, float] = {
+    "gfx908": 1600.0,   # MI100 (CDNA1)
+    "gfx90a": 6400.0,   # MI200/MI250 (CDNA2)
+    "gfx940": 6400.0,   # MI300A (CDNA3)
+    "gfx941": 6400.0,
+    "gfx942": 6400.0,
+    "gfx1030": 860.0,   # RX 6800 XT (RDNA2)
+    "gfx1100": 1920.0,  # RX 7900 XTX (RDNA3)
+    "gfx1101": 960.0,   # RX 7800 XT (RDNA3)
+}
+
+
+def _rocm_l2_bw_gbs(compute_cap: str, dram_bw_gbs: float) -> float:
+    v = _ROCM_L2_BW_GBS.get(compute_cap.lower(), 0.0)
+    return v if v > 0 else dram_bw_gbs * 4   # fallback: 4× DRAM bandwidth
+
+
 # FP64 throughput as a fraction of FP32 peak, by compute capability.
 # Consumer GPUs intentionally ship with crippled FP64 (1/32 or 1/64 of FP32).
 # Datacenter / workstation SKUs (V100, A100, H100) retain full FP64.
@@ -68,6 +107,9 @@ class DevicePeak:
     vram_gb:        float
     compute_cap:    str     # e.g. "8.0" or "gfx908"
     tensor_tflops:  float = 0.0  # tensor core peak if available (FP16/BF16)
+    l2_bandwidth_gbs: float = 0.0  # L2 cache peak bandwidth (GPU); 0 = unknown
+    l1_bandwidth_gbs: float = 0.0  # L1 cache peak bandwidth (GPU); 0 = unknown
+    l3_bandwidth_gbs: float = 0.0  # L3/LLC peak bandwidth (CPU); 0 = unknown
 
     @property
     def ridge_point(self) -> float:
@@ -85,6 +127,9 @@ class DevicePeak:
             "mem_clock_ghz": self.mem_clock_ghz, "mem_bus_bits": self.mem_bus_bits,
             "vram_gb": self.vram_gb, "compute_cap": self.compute_cap,
             "tensor_tflops": self.tensor_tflops,
+            "l2_bandwidth_gbs": self.l2_bandwidth_gbs,
+            "l1_bandwidth_gbs": self.l1_bandwidth_gbs,
+            "l3_bandwidth_gbs": self.l3_bandwidth_gbs,
         }
 
     @staticmethod
@@ -103,6 +148,9 @@ class DevicePeak:
             vram_gb=float(d.get("vram_gb", 0)),
             compute_cap=d.get("compute_cap", ""),
             tensor_tflops=float(d.get("tensor_tflops", 0)),
+            l2_bandwidth_gbs=float(d.get("l2_bandwidth_gbs", 0)),
+            l1_bandwidth_gbs=float(d.get("l1_bandwidth_gbs", 0)),
+            l3_bandwidth_gbs=float(d.get("l3_bandwidth_gbs", 0)),
         )
 
 
@@ -167,6 +215,7 @@ def query_cuda_devices() -> list[DevicePeak]:
 
             mem_clock_ghz  = mem_clock_khz / 1e6
             bandwidth_gbs  = 2 * mem_clock_ghz * mem_bus_bits / 8  # DDR ×2
+            l2_bw_gbs      = _cuda_l2_bw_gbs(major, minor, bandwidth_gbs)
 
             devices.append(DevicePeak(
                 name=name or f"CUDA device {i}",
@@ -182,6 +231,7 @@ def query_cuda_devices() -> list[DevicePeak]:
                 vram_gb=total_mem.value / 1e9,
                 compute_cap=f"{major}.{minor}",
                 tensor_tflops=tensor_tflops,
+                l2_bandwidth_gbs=l2_bw_gbs,
             ))
         return devices
     except Exception:
@@ -241,6 +291,8 @@ def query_rocm_devices() -> list[DevicePeak]:
 
             mem_clock_ghz  = mem_clock_khz / 1e6
             bandwidth_gbs  = 2 * mem_clock_ghz * mem_bus_bits / 8
+            gfx_str2       = f"gfx{gfx_major}{gfx_minor:02d}"
+            l2_bw_gbs      = _rocm_l2_bw_gbs(gfx_str2, bandwidth_gbs)
 
             devices.append(DevicePeak(
                 name=name or f"ROCm device {i}",
@@ -254,7 +306,8 @@ def query_rocm_devices() -> list[DevicePeak]:
                 mem_clock_ghz=mem_clock_ghz,
                 mem_bus_bits=mem_bus_bits,
                 vram_gb=total_mem.value / 1e9,
-                compute_cap=f"gfx{gfx_major}{gfx_minor:02d}",
+                compute_cap=gfx_str2,
+                l2_bandwidth_gbs=l2_bw_gbs,
             ))
         return devices
     except Exception:
@@ -317,6 +370,11 @@ def query_cpu_device() -> Optional[DevicePeak]:
         except Exception:
             pass
 
+        # L3 bandwidth: typically 3–5× DRAM BW on modern x86.
+        # This is a rough architecture estimate; actual value depends on core count
+        # and cache topology. Shown as "~estimate" in the roofline tooltip.
+        l3_bw_gbs = bw_gbs * 4.0
+
         return DevicePeak(
             name=name or "CPU",
             backend="cpu",
@@ -330,6 +388,7 @@ def query_cpu_device() -> Optional[DevicePeak]:
             mem_bus_bits=0,
             vram_gb=0.0,
             compute_cap="",
+            l3_bandwidth_gbs=l3_bw_gbs,
         )
     except Exception:
         return None

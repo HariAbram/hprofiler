@@ -269,12 +269,15 @@ def _open_browser(path: str) -> None:
 @click.option("--backend", "-b", default=None,
               help="Backend to use when running command  (cuda | rocm | cpu | openmp)")
 @click.option("--output", "-o", default=None,
-              help="Output HTML file")
-@click.option("--open/--no-open", "open_browser", default=True,
-              help="Open the chart in the default browser  [default: yes]")
+              help="Output file path  (HTML when --html; ignored for TUI)")
+@click.option("--html", "use_html", is_flag=True, default=False,
+              help="Write an HTML file and open it in the browser instead of the TUI")
 @click.argument("target", nargs=-1, type=click.UNPROCESSED)
-def roofline(backend, output, open_browser, target):
+def roofline(backend, output, use_html, target):
     """Generate an interactive roofline chart using hardware performance counters.
+
+    By default the chart opens as a native TUI (works on HPC clusters without
+    a browser).  Pass --html to write an HTML file and open it in the browser.
 
     Two modes:
 
@@ -293,10 +296,9 @@ def roofline(backend, output, open_browser, target):
 
     If the tool lacks permission to access counters, a fix is shown.
     """
-    import os, webbrowser, time
+    import os, time
     from src.analysis.device import query_devices
     from src.analysis.roofline import metrics_from_counters
-    from src.output.roofline_html import write
 
     # ── Mode 1: run command with hardware counters ────────────────────────────
     if backend:
@@ -306,8 +308,6 @@ def roofline(backend, output, open_browser, target):
                 "Specify the command to profile after --:\n"
                 "  hprofiler roofline --backend cuda -- ./app"
             )
-
-        out = output or (Path(args[0]).name + ".roofline.html")
 
         click.echo(
             f"[hprofiler] Collecting hardware counters via {backend} backend ...",
@@ -364,21 +364,30 @@ def roofline(backend, output, open_browser, target):
             raise SystemExit(1)
 
         name = Path(args[0]).name
+
+        out = output or (Path(args[0]).name + ".roofline.html")
+        from src.output.roofline_html import write as _rl_write
         try:
-            write(device, metrics, out, trace_name=name)
+            _rl_write(device, metrics, out, trace_name=name)
         except PermissionError:
             click.echo(
-                f"\n[hprofiler] ✗  Cannot write '{out}' — file is owned by another user "
-                f"(probably a previous sudo run).\n"
+                f"\n[hprofiler] ✗  Cannot write '{out}' — file is owned by another "
+                f"user (probably a previous sudo run).\n"
                 f"  Fix:  rm {out}\n"
-                f"  Or:   hprofiler roofline --backend {backend} -o out.html -- {' '.join(args)}",
+                f"  Or:   hprofiler roofline --backend {backend} -o out.html -- "
+                f"{' '.join(args)}",
                 err=True,
             )
             raise SystemExit(1)
         click.echo(f"[hprofiler] Roofline chart → {out}", err=True)
 
-        if open_browser:
+        if use_html:
             _open_browser(out)
+        else:
+            from src.output.roofline_tui import show as _rl_tui
+            click.echo("[hprofiler] Opening TUI roofline  (q to quit, w to open HTML) ...",
+                       err=True)
+            _rl_tui(device, metrics, trace_name=name, html_path=out)
         return
 
     # ── Mode 2: from saved trace (disasm-based) ───────────────────────────────
@@ -392,8 +401,6 @@ def roofline(backend, output, open_browser, target):
     trace_file = target[0]
     if not Path(trace_file).exists():
         raise click.BadParameter(f"File not found: {trace_file}")
-
-    out = output or (Path(trace_file).stem + ".roofline.html")
 
     click.echo(
         f"[hprofiler] Loading {trace_file} (disasm-based estimates — "
@@ -418,6 +425,7 @@ def roofline(backend, output, open_browser, target):
         )
         raise SystemExit(1)
 
+    out = output or (Path(trace_file).stem + ".roofline.html")
     n = write_from_trace(trace, out)
     if n == 0:
         click.echo(
@@ -427,13 +435,40 @@ def roofline(backend, output, open_browser, target):
             err=True,
         )
         raise SystemExit(1)
-
     click.echo(
         f"[hprofiler] Roofline chart ({n} kernels, disasm estimates) → {out}",
         err=True,
     )
-    if open_browser:
+
+    if use_html:
         _open_browser(out)
+    else:
+        # TUI mode: collect device/metrics from the trace and show TUI
+        from src.analysis.roofline import metrics_from_counters as _mfc
+        from src.output.roofline_tui import show as _rl_tui
+
+        device_metrics = []
+        for dev in trace.devices:
+            dev_metrics = [
+                m for kc in trace.kernel_counters.get(dev.name, [])
+                if (m := _mfc(kc, dev)) is not None
+            ]
+            if dev_metrics:
+                device_metrics.append((dev, dev_metrics))
+
+        if not device_metrics:
+            click.echo(
+                "[hprofiler] Nothing to display. "
+                "Try --html to see what was estimated.",
+                err=True,
+            )
+            raise SystemExit(1)
+
+        # Show first device (most common case)
+        dev, mets = device_metrics[0]
+        click.echo("[hprofiler] Opening TUI roofline  (q to quit, w to open HTML) ...",
+                   err=True)
+        _rl_tui(dev, mets, trace_name=Path(trace_file).stem, html_path=out)
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -442,7 +477,9 @@ def roofline(backend, output, open_browser, target):
                    "API call overhead appears in the CPU flame graph.  "
                    "Comma-separated; same names as 'hprofiler run --backend'.")
 @click.option("--output", "-o", default=None,
-              help="Output HTML file  [default: <program>.flamegraph.html]")
+              help="Output HTML file path  (only used with --html)")
+@click.option("--html", "use_html", is_flag=True, default=False,
+              help="Write an HTML flamegraph and open in the browser instead of the TUI")
 @click.option("--callgraph", default="fp", show_default=True,
               type=click.Choice(["fp", "dwarf", "lbr"]),
               help="perf call-graph method.  fp = frame-pointer (fast, needs "
@@ -450,22 +487,24 @@ def roofline(backend, output, open_browser, target):
                    "works with any binary).")
 @click.option("--freq", "-F", default=99, show_default=True,
               help="perf sampling frequency (Hz)")
-@click.option("--open/--no-open", "open_browser", default=True,
-              help="Open the HTML file in the default browser  [default: yes]")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
-def flamegraph(backend, output, callgraph, freq, open_browser, command):
-    """Generate an interactive flame graph HTML page by profiling COMMAND.
+def flamegraph(backend, output, use_html, callgraph, freq, command):
+    """Profile COMMAND and show an interactive flame graph in the terminal.
 
-    Runs COMMAND under 'perf record --call-graph' and renders a self-contained
-    HTML file. Open it in any browser — no server needed.
+    By default opens a native TUI flamegraph (works on HPC clusters without a
+    browser).  Pass --html to write an HTML file and open it in the browser.
+
+    Runs COMMAND under 'perf record --call-graph' to collect CPU stack samples,
+    then renders the call tree interactively.
 
     \b
-    Controls in the browser:
-      Click frame      → zoom in (that frame fills the full width)
-      Right-click / ↑  → zoom out one level
-      Esc / ⟲ Reset   → return to full view
-      Search box       → regex highlight (matching frames gold, rest dimmed)
-      Hover            → tooltip with name, sample count, and percentages
+    TUI controls:
+      click / Enter    zoom into frame (fills full width)
+      Esc / u          zoom out one level
+      r                reset to full view
+      /                search / highlight frames by name
+      w                write HTML and open in browser
+      q                quit
 
     Use --backend to inject GPU/MPI/OpenMP hooks alongside perf so the flame
     graph shows time spent inside CUDA, OpenCL, ROCm, MPI, etc. API calls
@@ -475,10 +514,10 @@ def flamegraph(backend, output, callgraph, freq, open_browser, command):
     Examples:
       hprofiler flamegraph -- ./my_program
       hprofiler flamegraph --backend cuda -- ./cuda_app
-      hprofiler flamegraph --backend cuda,openmp -- ./acpp_app
+      hprofiler flamegraph --html -- ./my_program        (browser mode)
       hprofiler flamegraph --callgraph dwarf -- ./my_program
     """
-    import os, webbrowser, shutil as _shutil
+    import os, shutil as _shutil
 
     if not _shutil.which("perf"):
         click.echo("[hprofiler] ✗  perf not found — install linux-tools-$(uname -r)",
@@ -489,7 +528,6 @@ def flamegraph(backend, output, callgraph, freq, open_browser, command):
     if not cmd:
         raise click.UsageError("Specify a command after --:\n  hprofiler flamegraph -- ./app")
 
-    out = output or (Path(cmd[0]).name + ".flamegraph.html")
     env = dict(os.environ)
 
     # ── Inject backend hooks into the environment ─────────────────────────────
@@ -551,18 +589,29 @@ def flamegraph(backend, output, callgraph, freq, open_browser, command):
         for ln in folded.splitlines()
         if ln.strip() and ln.rsplit(" ", 1)[-1].isdigit()
     )
-    click.echo(f"[hprofiler] Collected {total:,} samples — rendering ...", err=True)
+    click.echo(f"[hprofiler] Collected {total:,} samples.", err=True)
 
     title = f"{Path(cmd[0]).name} — flame graph ({callgraph})"
+
+    out = output or (Path(cmd[0]).name + ".flamegraph.html")
     try:
         fg_save(folded, out, title)
     except ValueError as e:
         click.echo(f"[hprofiler] ✗  {e}", err=True)
         raise SystemExit(1)
-
     click.echo(f"[hprofiler] Flame graph → {out}  (open in any browser)", err=True)
-    if open_browser:
+
+    if use_html:
         _open_browser(out)
+    else:
+        from src.output.flamegraph_tui import show as _fg_tui
+        click.echo("[hprofiler] Opening TUI flamegraph  (q to quit, w to open HTML) ...",
+                   err=True)
+        try:
+            _fg_tui(folded, title=title, html_path=out)
+        except ValueError as e:
+            click.echo(f"[hprofiler] ✗  {e}", err=True)
+            raise SystemExit(1)
 
 
 @cli.command()

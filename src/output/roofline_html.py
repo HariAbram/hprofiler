@@ -31,8 +31,7 @@ def _axis_id(idx: int) -> str:
 
 
 _AXIS_STYLE = {
-    "type":  "log",
-    "range": [-3, 5],
+    "type":       "log",
     "gridcolor":  "#374151",
     "tickcolor":  "#6b7280",
     "tickfont":   {"color": "#9ca3af"},
@@ -40,6 +39,52 @@ _AXIS_STYLE = {
     "showline": True, "linecolor": "#4b5563",
     "zeroline": False,
 }
+
+
+def _axis_ranges(
+    device: "DevicePeak",
+    metrics: list["KernelMetrics"],
+) -> tuple[list[float], list[float]]:
+    """
+    Auto-fit log10 [lo, hi] ranges for the X (AI) and Y (TFLOPs/s) axes.
+
+    Strategy:
+      X — left edge is the minimum of (data_ai / 5) and (ridge / 50), so the
+          chart always shows both the memory-slope context AND any memory-bound
+          data points that sit left of the ridge.  Right edge is one decade
+          beyond the rightmost data point or ridge.
+      Y — from below the lowest TFLOPs value to above the FP32 peak.
+      Kernels with unmeasured FLOPs (est_flops == 0, clamped to left edge) are
+      excluded from AI range computation to avoid distorting the X range.
+    """
+    peak  = max(device.fp32_tflops, 1e-9)
+    ridge = device.ridge_point if device.ridge_point > 0 else 1.0
+
+    # Exclude FLOPs-unmeasured kernels (their AI is a clamped placeholder, not real)
+    ai_vals = [m.arith_intensity for m in metrics
+               if 0 < m.arith_intensity < 1e9 and m.est_flops > 0]
+    tp_vals = [m.achieved_tflops for m in metrics if m.achieved_tflops > 0]
+
+    min_ai = min(ai_vals) if ai_vals else ridge
+    max_ai = max(ai_vals) if ai_vals else ridge
+
+    # X range ─────────────────────────────────────────────────────────────────
+    # Left: show left of data AND enough BW slope for visual context
+    x_left = min(min_ai / 5, ridge / 50)
+    x_lo   = math.log10(max(x_left, 1e-5))
+    # Right: one decade beyond the rightmost point or ridge
+    x_hi   = math.log10(max(max_ai, ridge) * 10)
+    if x_hi - x_lo < 2:    # enforce minimum 2-decade span
+        x_hi = x_lo + 2
+
+    # Y range ─────────────────────────────────────────────────────────────────
+    min_tp = min(tp_vals) if tp_vals else peak * 0.01
+    y_lo = math.log10(max(min_tp / 5, 1e-9))
+    y_hi = math.log10(peak * 3)
+    if y_hi - y_lo < 2:
+        y_lo = y_hi - 2
+
+    return [x_lo, x_hi], [y_lo, y_hi]
 
 
 def _make_traces(device: "DevicePeak",
@@ -90,14 +135,46 @@ def _make_traces(device: "DevicePeak",
             t["customdata"] = custom
         return t
 
+    def _bw_ridge(bw_gbs: float) -> float:
+        """AI (FLOPs/byte) where the BW slope at bw_gbs meets the FP32 compute ceiling."""
+        return peak * 1e12 / (bw_gbs * 1e9) if bw_gbs > 0 else ridge
+
+    # Read cache BW values upfront so we can compute ridge_start before the traces list.
+    l2_bw = device.l2_bandwidth_gbs
+    l3_bw = device.l3_bandwidth_gbs
+
+    # The FP32 compute ceiling must start from the leftmost ridge — whichever memory
+    # level has the highest bandwidth terminates its BW slope first (lowest AI), and
+    # the flat compute ceiling must connect there.  Without this, a gap appears between
+    # the top of the L3/L2 BW line and the start of the FP32 ceiling.
+    ridge_start = ridge                                           # DRAM ridge by default
+    if l2_bw > 0: ridge_start = min(ridge_start, _bw_ridge(l2_bw))
+    if l3_bw > 0: ridge_start = min(ridge_start, _bw_ridge(l3_bw))
+
     traces = [
-        _tr(f"BW ceiling  ({bw:.0f} GB/s)",
+        _tr(f"DRAM BW  ({bw:.0f} GB/s)",
             [1e-3, ridge], [v * bw / 1000 for v in [1e-3, ridge]],
             "rgba(34,211,238,0.9)"),
         _tr(f"FP32 ceiling  ({peak:.2f} TFLOPs/s)",
-            [ridge, 1e5], [peak, peak],
+            [max(ridge_start, 1e-3), 1e5], [peak, peak],
             "rgba(250,204,21,0.9)", dash="dash"),
     ]
+
+    # L2 cache bandwidth ceiling (GPU: architecture estimate)
+    if l2_bw > 0:
+        r_l2 = _bw_ridge(l2_bw)
+        traces.append(_tr(f"L2 BW  ({l2_bw:.0f} GB/s)",
+                          [1e-3, max(r_l2, 1e-3)],
+                          [v * l2_bw / 1000 for v in [1e-3, max(r_l2, 1e-3)]],
+                          "rgba(56,189,248,0.65)", width=1.8))
+
+    # L3 cache bandwidth ceiling (CPU only)
+    if l3_bw > 0:
+        r_l3 = _bw_ridge(l3_bw)
+        traces.append(_tr(f"L3 BW  (~{l3_bw:.0f} GB/s, est.)",
+                          [1e-3, max(r_l3, 1e-3)],
+                          [v * l3_bw / 1000 for v in [1e-3, max(r_l3, 1e-3)]],
+                          "rgba(56,189,248,0.5)", width=1.5, dash="dot"))
 
     if device.fp64_tflops > 0 and device.fp64_tflops < peak * 0.95:
         r64 = _ridge(device.fp64_tflops)
@@ -122,6 +199,25 @@ def _make_traces(device: "DevicePeak",
                           [device.tensor_tflops, device.tensor_tflops],
                           "rgba(52,211,153,0.85)", dash="dot", width=1.8))
 
+    _AXIS_MIN_X = 1e-3   # matches _AXIS_STYLE range [-3, 5]
+    _AXIS_MIN_Y = 1e-3
+
+    # Occupancy-limited compute ceiling: when average occupancy < 100%, the
+    # achievable peak is reduced proportionally (wave-front latency hiding).
+    # Only draw when counters report < 80% occupancy (above that, the effect
+    # is usually negligible compared to other bottlenecks).
+    all_occ = [m.occupancy_pct for m in metrics if m.occupancy_pct > 0]
+    if all_occ:
+        avg_occ = sum(all_occ) / len(all_occ)
+        if avg_occ < 80.0:
+            occ_peak = peak * (avg_occ / 100.0)
+            r_occ    = _ridge(occ_peak) if occ_peak > 0 else ridge
+            traces.append(_tr(
+                f"Occupancy ceiling  ({avg_occ:.0f}% → {occ_peak:.3f} TFLOPs/s)",
+                [max(r_occ, 1e-3), 1e5], [occ_peak, occ_peak],
+                "rgba(251,191,36,0.7)", dash="longdash", width=1.5,
+            ))
+
     for bound, color, symbol in [
         ("compute", "rgba(74,222,128,1.0)", "circle"),
         ("memory",  "rgba(248,113,113,1.0)", "diamond"),
@@ -134,13 +230,19 @@ def _make_traces(device: "DevicePeak",
                for m in metrics if m.bound == bound]
         if not pts:
             continue
-        xs, ys, ms = zip(*[(p[0], max(p[1], 1e-9), p[2]) for p in pts])
-        sizes = [max(10, 8 + 4 * math.log10(max(m.duration_ns, 1) / 1e6)) for m in ms]
+        # Clamp both axes to the visible minimum so points with ai=0 or tflops=0
+        # (e.g. FLOPs not measurable on hybrid-core CPUs) still appear on the chart.
+        xs, ys, ms = zip(*[(max(p[0], _AXIS_MIN_X), max(p[1], _AXIS_MIN_Y), p[2]) for p in pts])
         hover = []
         for m in ms:
+            flops_unmeasured = m.est_flops == 0.0
             bw_note = ("<br><i>⚠ BW counter includes L2 write-backs — may exceed peak</i>"
                        if m.bw_pct >= 90 else "")
-            ceil_t = min(m.arith_intensity * bw / 1000, peak)
+            fp_note = ("<br><b>⚠ FLOPs not measured</b> — point placed at chart left edge.<br>"
+                       "<i>On hybrid Intel CPUs, pin to P-cores: taskset -c 0-7 ./app<br>"
+                       "Or use LIKWID for accurate hybrid-core FP counting.</i>"
+                       if flops_unmeasured else "")
+            ceil_t = min(m.arith_intensity * bw / 1000, peak) if m.arith_intensity > 0 else 0.0
             hr = ceil_t / m.achieved_tflops if m.achieved_tflops > 0 else float("inf")
             prec = (f"FP64: {m.fp64_fraction*100:.1f}%  FP16: {m.fp16_fraction*100:.1f}%<br>"
                     if m.fp64_fraction > 0.01 or m.fp16_fraction > 0.01 else "")
@@ -148,28 +250,97 @@ def _make_traces(device: "DevicePeak",
                         if "disasm" not in m.data_source
                         else f"Est FLOPs: {m.est_flops/1e9:.3f} GFLOPs <i>(disasm)</i><br>"
                              f"Est DRAM: {m.est_bytes/1e9:.3f} GB <i>(disasm)</i><br>")
+            ai_str = "N/A (FLOPs not measured)" if flops_unmeasured else f"{m.arith_intensity:.4f} FLOPs/byte"
+
+            # Multi-level AI lines
+            cache_lines = ""
+            if m.l2_ai > 0:
+                l2_bw_gbs = device.l2_bandwidth_gbs
+                l2_achieved_gbs = (m.l2_bytes / (m.duration_ns / 1e9)) / 1e9 if m.duration_ns > 0 else 0.0
+                l2_bw_str = (f"  ({l2_achieved_gbs:.1f} GB/s, {100*l2_achieved_gbs/l2_bw_gbs:.1f}% peak)"
+                             if l2_bw_gbs > 0 else "")
+                cache_lines += f"L2 AI: {m.l2_ai:.4f} F/B  ({m.l2_bytes/1e9:.3f} GB){l2_bw_str}<br>"
+            if m.l1_ai > 0:
+                cache_lines += f"L1 AI: {m.l1_ai:.4f} F/B  ({m.l1_bytes/1e9:.3f} GB)<br>"
+            if m.l3_ai > 0:
+                l3_bw_gbs = device.l3_bandwidth_gbs
+                l3_achieved_gbs = (m.l3_bytes / (m.duration_ns / 1e9)) / 1e9 if m.duration_ns > 0 else 0.0
+                l3_bw_str = (f"  ({l3_achieved_gbs:.1f} GB/s, ~{100*l3_achieved_gbs/l3_bw_gbs:.1f}% est. peak)"
+                             if l3_bw_gbs > 0 else "")
+                cache_lines += f"L3 AI: {m.l3_ai:.4f} F/B  ({m.l3_bytes/1e9:.3f} GB){l3_bw_str}<br>"
+
+            # Occupancy and IPC
+            occ_line = ""
+            if m.occupancy_pct > 0:
+                occ_warn = "  ⚠ low" if m.occupancy_pct < 50 else ""
+                occ_line += f"Occupancy: {m.occupancy_pct:.1f}%{occ_warn}<br>"
+            if m.ipc > 0:
+                occ_line += f"IPC: {m.ipc:.2f}<br>"
+
             hover.append(
                 f"<b>{m.kernel_name}</b><br>Arch: {m.arch}<br>"
                 f"Duration: {m.duration_ns/1e6:.3f} ms  Threads: {m.threads:,}<br>"
-                f"AI: {m.arith_intensity:.4f} FLOPs/byte<br>{src_line}{prec}"
-                f"Perf: {m.achieved_tflops:.4f} TFLOPs/s ({m.flops_pct:.1f}% peak)<br>"
-                f"BW: {m.achieved_gbs:.1f} GB/s ({m.bw_pct:.1f}% peak){bw_note}<br>"
-                f"<b>FP32 ceiling: {ceil_t:.4f} TFLOPs/s ({hr:.1f}× headroom)</b><br>"
-                f"<b>Bound: {m.bound}</b>  ridge: {m.ridge:.1f} F/B<br>"
-                f"<i>Source: {m.data_source}</i>"
+                f"AI (DRAM): {ai_str}<br>{cache_lines}{src_line}{prec}"
+                f"DRAM BW: {m.achieved_gbs:.1f} GB/s ({m.bw_pct:.1f}% peak){bw_note}"
+                + ("" if flops_unmeasured else
+                   f"<br>Perf: {m.achieved_tflops:.4f} TFLOPs/s ({m.flops_pct:.1f}% peak)<br>"
+                   f"<b>FP32 ceiling: {ceil_t:.4f} TFLOPs/s ({hr:.1f}× headroom)</b><br>"
+                   f"<b>Bound: {m.bound}</b>  ridge: {m.ridge:.1f} F/B") +
+                (f"<br>{occ_line}" if occ_line else "") +
+                f"{fp_note}<br><i>Source: {m.data_source}</i>"
             )
-        traces.append(_tr(f"{bound}-bound", list(xs), list(ys), color,
-                          sym=symbol, sizes=list(sizes),
-                          text=[m.kernel_name[:20] for m in ms], custom=hover))
+        # Split into measured (show normally) and unmeasured-FLOPs (gray x-mark)
+        measured   = [(x, y, m, h) for x, y, m, h in zip(xs, ys, ms, hover)
+                      if m.est_flops > 0]
+        unmeasured = [(x, y, m, h) for x, y, m, h in zip(xs, ys, ms, hover)
+                      if m.est_flops == 0]
+        if measured:
+            mxs, mys, mms, mhov = zip(*measured)
+            msz = [max(10, 8 + 4 * math.log10(max(m.duration_ns, 1) / 1e6)) for m in mms]
+            traces.append(_tr(f"{bound}-bound", list(mxs), list(mys), color,
+                              sym=symbol, sizes=msz,
+                              text=[m.kernel_name[:20] for m in mms], custom=list(mhov)))
+        if unmeasured:
+            uxs, uys, ums, uhov = zip(*unmeasured)
+            usz = [max(10, 8 + 4 * math.log10(max(m.duration_ns, 1) / 1e6)) for m in ums]
+            traces.append(_tr("BW only (FLOPs unmeasured)", list(uxs), list(uys),
+                              "rgba(180,180,180,0.85)",
+                              sym="x", sizes=usz,
+                              text=[m.kernel_name[:20] for m in ums], custom=list(uhov)))
 
     annotations = [{
         "x": math.log10(ridge), "y": math.log10(peak),
         "xref": xref, "yref": yref,
-        "text": f"Ridge<br>{ridge:.1f} F/B",
+        "text": f"DRAM ridge<br>{ridge:.1f} F/B",
         "showarrow": True, "arrowhead": 2, "arrowcolor": "rgba(250,204,21,0.8)",
         "ax": 30, "ay": -30,
         "font": {"color": "rgba(250,204,21,0.9)", "size": 11},
     }]
+
+    # Ridge annotations for L2 and L3 ceilings — mark where each slope terminates
+    if l2_bw > 0:
+        r_l2_ann = peak * 1e12 / (l2_bw * 1e9)
+        annotations.append({
+            "x": math.log10(r_l2_ann), "y": math.log10(peak),
+            "xref": xref, "yref": yref,
+            "text": f"L2 ridge<br>{r_l2_ann:.2f} F/B",
+            "showarrow": True, "arrowhead": 2,
+            "arrowcolor": "rgba(56,189,248,0.8)",
+            "ax": -30, "ay": -30,
+            "font": {"color": "rgba(56,189,248,0.9)", "size": 10},
+        })
+    if l3_bw > 0:
+        r_l3_ann = peak * 1e12 / (l3_bw * 1e9)
+        annotations.append({
+            "x": math.log10(r_l3_ann), "y": math.log10(peak),
+            "xref": xref, "yref": yref,
+            "text": f"L3 ridge<br>{r_l3_ann:.2f} F/B",
+            "showarrow": True, "arrowhead": 2,
+            "arrowcolor": "rgba(56,189,248,0.6)",
+            "ax": -30, "ay": 30,
+            "font": {"color": "rgba(56,189,248,0.7)", "size": 10},
+        })
+
     return traces, annotations
 
 
@@ -182,6 +353,7 @@ def _make_figure(device: "DevicePeak",
     bw    = device.bandwidth_gbs
 
     traces, annotations = _make_traces(device, metrics)
+    x_range, y_range = _axis_ranges(device, metrics)
 
     layout = {
         "title": {
@@ -198,8 +370,10 @@ def _make_figure(device: "DevicePeak",
         "paper_bgcolor": "#111827",
         "plot_bgcolor":  "#1f2937",
         "font":          {"color": "#d1d5db", "family": "monospace"},
-        "xaxis": {"title": "Arithmetic Intensity (FLOPs / byte)", **_AXIS_STYLE},
-        "yaxis": {"title": "Performance (TFLOPs/s)", **_AXIS_STYLE},
+        "xaxis": {"title": "Arithmetic Intensity (FLOPs / byte)",
+                  **_AXIS_STYLE, "range": x_range},
+        "yaxis": {"title": "Performance (TFLOPs/s)",
+                  **_AXIS_STYLE, "range": y_range},
         "legend": {"bgcolor": "#1f2937", "bordercolor": "#374151",
                    "borderwidth": 1, "font": {"color": "#d1d5db"}},
         "annotations": annotations,
@@ -258,18 +432,21 @@ def _make_combined_figure(device_metrics: list[tuple["DevicePeak", list["KernelM
         sub_title = (f"{dev.name}  ({dev.backend})<br>"
                      f"FP32: {dev.fp32_tflops:.2f} TFLOPs/s  "
                      f"BW: {dev.bandwidth_gbs:.0f} GB/s")
+        x_range, y_range = _axis_ranges(dev, mets)
         layout[axis_key_x] = {
             "title": ("Arithmetic Intensity (FLOPs / byte)"
                       if col == n // 2 else ""),
             "domain": domain_x,
             "anchor": yref,
             **_AXIS_STYLE,
+            "range": x_range,
         }
         layout[axis_key_y] = {
             "title": "Performance (TFLOPs/s)" if col == 0 else "",
             "domain": domain_y,
             "anchor": xref,
             **_AXIS_STYLE,
+            "range": y_range,
         }
         # Per-subplot title via annotation at the top of each subplot
         all_annotations.append({
@@ -338,8 +515,19 @@ def _html_page(fig: dict, title: str,
     // Fallback for single-plot (axis id "x")
     var BW   = {device_info[0][0]};
     var PEAK = {device_info[0][1]};
-    var SKIP = ["BW ceiling", "FP32 ceiling", "FP64 ceiling", "FP16 ceiling",
-                "Tensor ceiling", ""];
+    // Ceiling/BW line traces — skip crosshair for these (they have no point data).
+    // Match by prefix so e.g. "DRAM BW  (900 GB/s)" matches "DRAM BW".
+    var SKIP_PREFIXES = ["DRAM BW", "BW ceiling", "FP32 ceiling", "FP64 ceiling",
+                         "FP16 ceiling", "Tensor ceiling", "L2 BW", "L3 BW",
+                         "Occupancy ceiling", ""];
+    function _skipTrace(name) {{
+      if (!name) return true;   // empty-string trace (unnamed ceiling segments)
+      for (var i = 0; i < SKIP_PREFIXES.length; i++) {{
+        var p = SKIP_PREFIXES[i];
+        if (p && name.indexOf(p) === 0) return true;
+      }}
+      return false;
+    }}
 
     // ── SVG overlay helpers ───────────────────────────────────────────────────
     // Draw crosshairs directly on the chart SVG so Plotly's hover state and
@@ -439,7 +627,7 @@ def _html_page(fig: dict, title: str,
 
     chart.on("plotly_hover", function(ev) {{
       var pt = ev.points[0];
-      if (SKIP.indexOf(pt.data.name) !== -1) return;
+      if (_skipTrace(pt.data.name)) return;
       // Resolve per-subplot BW and PEAK using the trace's axis id
       var axId  = pt.data.xaxis || "x";
       var bw    = BW_MAP[axId]   || BW;

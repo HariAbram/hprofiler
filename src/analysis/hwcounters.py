@@ -58,6 +58,9 @@ class KernelCounters:
     sm_cycles_elapsed: float = 0.0  # sm__cycles_elapsed.sum (legacy, used only as last fallback)
     sm_cycles_max:     float = 0.0  # sm__cycles_elapsed.max = wall-clock cycles for duration
     source: str = ""     # "ncu" | "rocprof" | "likwid" | "perf_uncore" | "perf_llcproxy"
+    l3_bytes:      float = 0.0   # LLC (L3) cache traffic bytes — CPU only (LLC-loads × 64)
+    occupancy_pct: float = 0.0   # SM occupancy percentage 0–100 (GPU, from ncu)
+    ipc:           float = 0.0   # instructions per clock cycle (GPU, from ncu)
 
     @property
     def arith_intensity(self) -> float:
@@ -161,6 +164,10 @@ _NCU_METRICS_EXT = _NCU_METRICS_CORE + [
     "sm__cycles_active.sum",
     # Tensor cores — Volta+ HMMA: each inst = 512 FP16 ops on Ampere 16×8×16
     "sm__inst_executed_pipe_tensor_op_hmma_pred_on.sum",
+    # Occupancy — average active warps as % of peak (0–100)
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    # IPC — instructions executed per clock (divide by sm__cycles_elapsed.sum)
+    "sm__inst_executed.sum",
 ]
 
 _NCU_METRICS      = ",".join(_NCU_METRICS_EXT)
@@ -283,6 +290,11 @@ def collect_cuda(command: list[str],
             pass
 
 
+_NCU_AVG_METRICS = {
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+}
+
+
 def _parse_ncu_csv(csv_text: str) -> list[KernelCounters]:
     """Accumulate ncu --csv rows into per-kernel KernelCounters."""
     # ncu writes ==PROF== / ==ERROR== / ==WARNING== status lines to the log
@@ -293,6 +305,10 @@ def _parse_ncu_csv(csv_text: str) -> list[KernelCounters]:
     csv_text = "\n".join(clean_lines)
 
     accum: dict[str, dict] = {}
+    # Track per-invocation count to correctly average metrics like occupancy.
+    # We count invocations by the number of rows seen for sm__cycles_elapsed.max
+    # (one row per kernel invocation).
+    inv_count: dict[str, int] = {}
     try:
         reader = csv.DictReader(io.StringIO(csv_text))
         for row in reader:
@@ -309,11 +325,15 @@ def _parse_ncu_csv(csv_text: str) -> list[KernelCounters]:
                 continue
             accum.setdefault(kname, {})[metric] = \
                 accum.get(kname, {}).get(metric, 0.0) + val
+            if metric == "sm__cycles_elapsed.max":
+                inv_count[kname] = inv_count.get(kname, 0) + 1
     except Exception:
         return []
 
     results = []
     for kname, m in accum.items():
+        n_inv = max(inv_count.get(kname, 1), 1)
+
         def g(k: str) -> float: return m.get(k, 0.0)
 
         fp32 = (g("sm__sass_thread_inst_executed_op_ffma_pred_on.sum") * 2
@@ -339,6 +359,14 @@ def _parse_ncu_csv(csv_text: str) -> list[KernelCounters]:
         active  = g("sm__cycles_active.sum")
         util = active / elapsed if elapsed > 0 else 0.0
 
+        # Occupancy is reported as percentage per invocation; average across invocations.
+        occupancy = g("sm__warps_active.avg.pct_of_peak_sustained_active") / n_inv
+
+        # IPC: instructions executed / elapsed cycles (summed; ratio is preserved).
+        inst_exec = g("sm__inst_executed.sum")
+        cycles_el = g("sm__cycles_elapsed.sum")
+        ipc = inst_exec / cycles_el if cycles_el > 0 else 0.0
+
         results.append(KernelCounters(
             kernel_name=kname,
             fp32_ops=fp32, fp64_ops=fp64, fp16_ops=fp16,
@@ -349,6 +377,8 @@ def _parse_ncu_csv(csv_text: str) -> list[KernelCounters]:
             sm_cycles_max=g("sm__cycles_elapsed.max"),
             sm_cycles_elapsed=g("sm__cycles_elapsed.sum"),
             source="ncu",
+            occupancy_pct=occupancy,
+            ipc=ipc,
         ))
     return results
 
@@ -586,6 +616,32 @@ def _cpu_count() -> int:
         return 1
 
 
+def _p_core_cpus() -> list[int]:
+    """
+    Return logical CPU IDs that are P-cores (Performance cores) on hybrid Intel CPUs.
+
+    Detects by comparing max frequency: P-cores run at a higher max frequency than
+    E-cores.  Returns all CPUs if the topology cannot be determined.
+    """
+    try:
+        freqs: dict[int, int] = {}
+        import glob as _glob
+        for path in _glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq"):
+            cpu_id = int(path.split("/cpu")[2].split("/")[0])
+            with open(path) as f:
+                freqs[cpu_id] = int(f.read().strip())
+        if not freqs:
+            return list(range(_cpu_count()))
+        max_freq = max(freqs.values())
+        # P-cores run at max_freq; E-cores are typically 20–40% slower.
+        # Use 95% of max_freq as threshold to be robust against turbo variance.
+        threshold = max_freq * 0.95
+        p_cores = sorted(cpu for cpu, freq in freqs.items() if freq >= threshold)
+        return p_cores if p_cores else list(range(_cpu_count()))
+    except Exception:
+        return list(range(_cpu_count()))
+
+
 def collect_cpu_likwid(command: list[str],
                        env: dict | None = None) -> Optional[KernelCounters]:
     """
@@ -784,10 +840,14 @@ def _cpu_vendor() -> str:
 
 
 def _perf_run(events: list[str], command: list[str],
-              env: dict | None) -> tuple[str, int]:
+              env: dict | None,
+              taskset_cpus: list[int] | None = None) -> tuple[str, int]:
     """Run perf stat with events, return (combined_output, returncode)."""
+    prefix: list[str] = []
+    if taskset_cpus and shutil.which("taskset"):
+        prefix = ["taskset", "-c", ",".join(str(c) for c in taskset_cpus)]
     r = subprocess.run(
-        ["perf", "stat", "-e", ",".join(events), "--"] + command,
+        prefix + ["perf", "stat", "-e", ",".join(events), "--"] + command,
         capture_output=True, text=True,
         env=env, timeout=600,
     )
@@ -842,6 +902,33 @@ def collect_cpu(command: list[str],
             result = _parse_perf_stat(combined, uncore_ok)
             if result is not None:
                 result.source = "perf_uncore" if uncore_ok else "perf_llcproxy"
+                if result.fp32_ops == 0 and result.fp64_ops == 0:
+                    # FP events returned 0 — likely hybrid CPU (E-cores don't have
+                    # fp_arith_inst_retired).  Retry pinned to P-cores only.
+                    p_cores = _p_core_cpus()
+                    all_cores = list(range(_cpu_count()))
+                    if p_cores != all_cores and shutil.which("taskset"):
+                        combined2, _ = _perf_run_with_retry(events, command, env,
+                                                            taskset_cpus=p_cores)
+                        if combined2:
+                            result2 = _parse_perf_stat(combined2, uncore_ok)
+                            if result2 is not None and (result2.fp32_ops > 0 or result2.fp64_ops > 0):
+                                result2.source = result.source
+                                return result2
+                    # All retries failed: FP truly not measurable
+                    import sys
+                    p_str = f"0-{p_cores[-1]}" if p_cores else "0"
+                    print(
+                        "[hprofiler] Warning: FP operation counters returned 0.\n"
+                        "  Possible causes:\n"
+                        f"    • Hybrid Intel CPU: program ran on E-cores (FP events require P-cores).\n"
+                        f"      Fix: pin to P-cores manually:  taskset -c {p_str} ./your_program\n"
+                        "           or install LIKWID for hybrid-aware FP counting.\n"
+                        "    • Program runs too fast for perf multiplexing (< 200 ms).\n"
+                        "    • Program uses no FP instructions.\n"
+                        "  The roofline chart will show bandwidth measurement only.",
+                        file=sys.stderr,
+                    )
                 return result
 
     # ── Tier 2: AMD FP + LLC ──────────────────────────────────────────────
@@ -893,10 +980,11 @@ def _probe_uncore_events() -> bool:
 
 
 def _perf_run_with_retry(events: list[str], command: list[str],
-                         env: dict | None) -> tuple[str, int]:
+                         env: dict | None,
+                         taskset_cpus: list[int] | None = None) -> tuple[str, int]:
     """Run perf stat, dropping unrecognised events until it succeeds or list is empty."""
     while events:
-        combined, rc = _perf_run(events, command, env)
+        combined, rc = _perf_run(events, command, env, taskset_cpus)
         if "Permission denied" in combined or "perf_event_paranoid" in combined:
             raise CounterPermissionError(
                 "perf cannot access hardware performance counters.\n"
@@ -936,6 +1024,7 @@ def _parse_perf_stat(text: str, uncore_events: bool = False) -> Optional[KernelC
         except ValueError:
             continue
         key = re.sub(r"^[\w-]+/", "", parts[1].rstrip("/")).lower().strip()
+        key = re.sub(r":[ukpHG]+$", "", key)   # strip perf qualifiers (:u, :k, :p, etc.)
         if key:
             ev[key] = ev.get(key, 0.0) + val
 
@@ -961,6 +1050,9 @@ def _parse_perf_stat(text: str, uncore_events: bool = False) -> Optional[KernelC
     else:
         dram_bytes = g("llc-load-misses") * 64   # read-only proxy
 
+    # L3 traffic: all LLC loads (hits + misses) × 64-byte cache line
+    l3_bytes = g("llc-loads") * 64
+
     if fp32_ops == 0 and fp64_ops == 0 and dram_bytes == 0:
         return None
 
@@ -977,6 +1069,7 @@ def _parse_perf_stat(text: str, uncore_events: bool = False) -> Optional[KernelC
         fp32_ops=fp32_ops, fp64_ops=fp64_ops, fp16_ops=0.0,
         dram_bytes=dram_bytes, l2_bytes=0.0, l1_bytes=0.0,
         duration_ns=duration_ns,
+        l3_bytes=l3_bytes,
         source="",   # caller sets this
     )
 
@@ -1003,6 +1096,7 @@ def _parse_perf_stat_amd(text: str) -> Optional[KernelCounters]:
         except ValueError:
             continue
         key = re.sub(r"^[\w-]+/", "", parts[1].rstrip("/")).lower().strip()
+        key = re.sub(r":[ukpHG]+$", "", key)   # strip perf qualifiers (:u, :k, :p, etc.)
         if key:
             ev[key] = ev.get(key, 0.0) + val
 
@@ -1017,6 +1111,7 @@ def _parse_perf_stat_amd(text: str) -> Optional[KernelCounters]:
     fp32_ops = max(0.0, all_ops - fp64_ops)   # remainder is FP32
 
     dram_bytes = g("llc-load-misses") * 64
+    l3_bytes   = g("llc-loads") * 64
 
     if all_ops == 0 and dram_bytes == 0:
         return None
@@ -1034,6 +1129,7 @@ def _parse_perf_stat_amd(text: str) -> Optional[KernelCounters]:
         fp32_ops=fp32_ops, fp64_ops=fp64_ops, fp16_ops=0.0,
         dram_bytes=dram_bytes, l2_bytes=0.0, l1_bytes=0.0,
         duration_ns=duration_ns,
+        l3_bytes=l3_bytes,
         source="",
     )
 
