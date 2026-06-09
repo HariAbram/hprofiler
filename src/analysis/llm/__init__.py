@@ -8,7 +8,10 @@ from .base import LLMProvider
 def _ollama_reachable(base_url: str) -> bool:
     import urllib.request
     try:
-        url = base_url.rstrip("/").removesuffix("/v1") + "/api/tags"
+        base = base_url.rstrip("/")
+        if "://" not in base:
+            base = "http://" + base
+        url = base.removesuffix("/v1") + "/api/tags"
         with urllib.request.urlopen(url, timeout=2):
             return True
     except Exception:

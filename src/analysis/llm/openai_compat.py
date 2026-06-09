@@ -14,6 +14,9 @@ class OpenAICompatProvider(LLMProvider):
 
     def __init__(self, model: str, api_key: str | None = None, endpoint: str | None = None) -> None:
         base = (endpoint or _OPENAI_BASE).rstrip("/")
+        # Add http:// if no scheme — e.g. OLLAMA_HOST=127.0.0.1:11434
+        if base and "://" not in base:
+            base = "http://" + base
         # Normalise: append /chat/completions if endpoint is a base URL
         if not base.endswith("/chat/completions"):
             if not base.endswith("/v1"):

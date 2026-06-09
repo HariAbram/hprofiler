@@ -137,15 +137,21 @@ class Runner:
         # ── Inject hooks via backend interface ───────────────────────────────
         from ..backends import ALL_BACKENDS
         preload_libs: list[str] = []
+        _hook_backends: list[str] = []   # backends that expect LD_PRELOAD
+        _PRELOAD_BACKENDS = {"cuda", "opencl", "rocm", "nccl", "mpi"}
         for bname in self.backends:
             backend_cls = ALL_BACKENDS.get(bname)
             if backend_cls is None:
                 continue
             try:
                 b = backend_cls()
+                added = False
                 for lib_path in b.preload_libs():
                     if lib_path and Path(lib_path).exists():
                         preload_libs.append(lib_path)
+                        added = True
+                if bname in _PRELOAD_BACKENDS and not added:
+                    _hook_backends.append(bname)
                 for k, v in b.env_vars().items():
                     # OMP_TOOL_LIBRARIES uses ":" separator
                     if k == "OMP_TOOL_LIBRARIES":
@@ -155,6 +161,18 @@ class Runner:
                         env.setdefault(k, v)
             except Exception:
                 pass
+
+        # Warn when a hook-based backend was requested but the .so is missing
+        for bname in _hook_backends:
+            hook_path = HOOKS_DIR / f"libhprofiler_{bname}.so"
+            import sys as _sys
+            if not hook_path.exists():
+                print(
+                    f"[hprofiler][warn] {bname} hook not found at {hook_path}\n"
+                    f"  Run 'hprofiler build' in the hprofiler directory to compile it.\n"
+                    f"  On clusters: load the ROCm/CUDA module first, then build.",
+                    file=_sys.stderr,
+                )
 
         if preload_libs:
             existing = env.get("LD_PRELOAD", "")
