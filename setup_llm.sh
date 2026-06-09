@@ -117,13 +117,17 @@ except: pass
             DOWNLOAD_OK=0
 
             _extract_zst() {
-                # Try zstd -d | tar (works with old tar < 1.31 which lacks --zstd).
-                # Falls back to tar --zstd if zstd command is missing.
+                # Tarball layout: bin/ollama  +  lib/ollama/llama-server  +  lib/ollama/*.so
+                # Extract straight to ~/.local/ (no --strip-components) so that:
+                #   bin/ollama              → ~/.local/bin/ollama
+                #   lib/ollama/llama-server → ~/.local/lib/ollama/llama-server
+                # Using --strip-components=1 would strip the first component (bin/ or lib/)
+                # and create a name collision between the ollama binary and the ollama/ lib dir.
                 local src="$1" dst="$2"
                 if command -v zstd &>/dev/null; then
-                    zstd -d --stdout "$src" | tar -xf - -C "$dst" --strip-components=1
+                    zstd -d --stdout "$src" | tar -xf - -C "$dst"
                 else
-                    tar --zstd -xf "$src" -C "$dst" --strip-components=1
+                    tar --zstd -xf "$src" -C "$dst"
                 fi
             }
 
@@ -153,11 +157,11 @@ except: pass
                 echo "  # Download the full tarball:"
                 echo "  curl -fLO '${VERSIONED_URL:-https://github.com/ollama/ollama/releases/latest/download/${TARBALL_NAME}}'"
                 echo
-                echo "  # Extract (use zstd if your tar doesn't support --zstd):"
+                echo "  # Extract to ~/.local/ (no --strip-components — tarball has bin/ + lib/):"
                 echo "  mkdir -p ~/.local"
-                echo "  zstd -d ${TARBALL_NAME} --stdout | tar -xf - -C ~/.local --strip-components=1"
+                echo "  zstd -d ${TARBALL_NAME} --stdout | tar -xf - -C ~/.local"
                 echo "  # OR (if tar >= 1.31):"
-                echo "  tar --zstd -xf ${TARBALL_NAME} -C ~/.local --strip-components=1"
+                echo "  tar --zstd -xf ${TARBALL_NAME} -C ~/.local"
                 echo
                 echo "  # Verify:"
                 echo "  ls ~/.local/bin/ollama ~/.local/lib/ollama/llama-server"
