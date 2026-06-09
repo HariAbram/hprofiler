@@ -87,13 +87,18 @@ else
             model_dir="${model_dir:-${HOME}/.ollama/models}"
             mkdir -p "$model_dir"
 
-            OLLAMA_BIN="${INSTALL_DIR}/ollama"
-            RELEASE_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-${ARCH}"
+            TARBALL_URL="https://ollama.com/download/ollama-linux-${ARCH}.tgz"
 
-            info "Downloading Ollama binary (linux-${ARCH}) to ${OLLAMA_BIN} …"
-            if curl -fL --progress-bar "$RELEASE_URL" -o "$OLLAMA_BIN"; then
-                chmod +x "$OLLAMA_BIN"
-                success "Ollama binary installed at ${OLLAMA_BIN}"
+            info "Downloading Ollama (linux-${ARCH}) to ${INSTALL_DIR} …"
+            info "URL: ${TARBALL_URL}"
+            if curl -fL --progress-bar "$TARBALL_URL" | tar -xzf - -C "$INSTALL_DIR" --strip-components=1 bin/ollama 2>/dev/null \
+               || curl -fL --progress-bar "$TARBALL_URL" | tar -xzf - -C "$INSTALL_DIR" 2>/dev/null; then
+                # The tarball extracts bin/ollama and lib/ollama/ — move binary if nested
+                if [[ -f "${INSTALL_DIR}/bin/ollama" && ! -f "${INSTALL_DIR}/ollama" ]]; then
+                    mv "${INSTALL_DIR}/bin/ollama" "${INSTALL_DIR}/ollama"
+                fi
+                chmod +x "${INSTALL_DIR}/ollama"
+                success "Ollama installed at ${INSTALL_DIR}/ollama"
 
                 # Ensure ~/.local/bin is on PATH
                 if ! echo "$PATH" | grep -q "${INSTALL_DIR}"; then
@@ -109,7 +114,7 @@ else
                 OLLAMA_INSTALLED=1
             else
                 error "Download failed. Try manually:"
-                echo "  curl -fL ${RELEASE_URL} -o ${OLLAMA_BIN} && chmod +x ${OLLAMA_BIN}"
+                echo "  curl -fL ${TARBALL_URL} | tar -xzf - -C ${INSTALL_DIR}"
             fi
         fi
     fi
