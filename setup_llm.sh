@@ -116,31 +116,51 @@ except: pass
 
             DOWNLOAD_OK=0
 
-            if [[ -n "$VERSIONED_URL" ]]; then
-                info "Downloading Ollama from: ${VERSIONED_URL}"
-                info "(Extracting ~1.3 GB tarball to ${INSTALL_ROOT} — includes llama-server + GPU libs)"
-                if curl -fL --progress-bar "$VERSIONED_URL" \
-                   | tar --zstd -xf - -C "$INSTALL_ROOT" --strip-components=1 2>/dev/null \
-                   && [[ -f "${INSTALL_ROOT}/bin/ollama" ]]; then
-                    DOWNLOAD_OK=1
-                    INSTALL_DIR="${INSTALL_ROOT}/bin"
+            _extract_zst() {
+                # Try zstd -d | tar (works with old tar < 1.31 which lacks --zstd).
+                # Falls back to tar --zstd if zstd command is missing.
+                local src="$1" dst="$2"
+                if command -v zstd &>/dev/null; then
+                    zstd -d --stdout "$src" | tar -xf - -C "$dst" --strip-components=1
+                else
+                    tar --zstd -xf "$src" -C "$dst" --strip-components=1
                 fi
+            }
+
+            if [[ -n "$VERSIONED_URL" ]]; then
+                TMP_TAR=$(mktemp /tmp/ollama_XXXXXX.tar.zst)
+                info "Downloading Ollama from: ${VERSIONED_URL}"
+                info "(~1.3 GB — includes llama-server + GPU libs)"
+                if curl -fL --progress-bar "$VERSIONED_URL" -o "$TMP_TAR"; then
+                    info "Extracting to ${INSTALL_ROOT} …"
+                    if _extract_zst "$TMP_TAR" "$INSTALL_ROOT" \
+                       && [[ -f "${INSTALL_ROOT}/bin/ollama" ]]; then
+                        DOWNLOAD_OK=1
+                        INSTALL_DIR="${INSTALL_ROOT}/bin"
+                    else
+                        warn "Extraction failed. tar version: $(tar --version | head -1)"
+                        warn "Try extracting manually (see instructions below)."
+                    fi
+                fi
+                rm -f "$TMP_TAR"
             fi
 
             if [[ "$DOWNLOAD_OK" == "0" ]]; then
-                warn "Automatic download failed (no internet access or blocked by cluster firewall)."
+                warn "Automatic install failed."
                 echo
-                echo -e "${BOLD}  ── Manual install — run on your LOCAL machine ───────────────${NC}"
+                echo -e "${BOLD}  ── Manual install — run directly on the cluster ─────────────${NC}"
                 echo
-                echo "  # Download the full tarball (~1.3 GB):"
-                echo "  curl -fLO https://github.com/ollama/ollama/releases/latest/download/${TARBALL_NAME}"
+                echo "  # Download the full tarball:"
+                echo "  curl -fLO '${VERSIONED_URL:-https://github.com/ollama/ollama/releases/latest/download/${TARBALL_NAME}}'"
                 echo
-                echo "  # Copy to cluster:"
-                echo "  scp ${TARBALL_NAME} ${USER}@<login-node>:~/"
-                echo
-                echo "  # On cluster — extract to ~/.local/ (gets bin/ollama + lib/ollama/llama-server):"
+                echo "  # Extract (use zstd if your tar doesn't support --zstd):"
                 echo "  mkdir -p ~/.local"
-                echo "  tar --zstd -xf ~/${TARBALL_NAME} -C ~/.local --strip-components=1"
+                echo "  zstd -d ${TARBALL_NAME} --stdout | tar -xf - -C ~/.local --strip-components=1"
+                echo "  # OR (if tar >= 1.31):"
+                echo "  tar --zstd -xf ${TARBALL_NAME} -C ~/.local --strip-components=1"
+                echo
+                echo "  # Verify:"
+                echo "  ls ~/.local/bin/ollama ~/.local/lib/ollama/llama-server"
                 echo -e "${BOLD}  ─────────────────────────────────────────────────────────────${NC}"
                 echo
                 ask "  Already extracted? Press Enter to continue, or Ctrl-C to abort:"
