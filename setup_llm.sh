@@ -106,15 +106,24 @@ try:
 except: pass
 " 2>/dev/null || true)
 
+            # Ollama needs bin/ollama + lib/ollama/llama-server + GPU libs.
+            # Extract the full tarball to ~/.local/ with --strip-components=1 so that:
+            #   bin/ollama              → ~/.local/bin/ollama
+            #   lib/ollama/llama-server → ~/.local/lib/ollama/llama-server
+            #   lib/ollama/lib*.so      → ~/.local/lib/ollama/lib*.so
+            INSTALL_ROOT="${HOME}/.local"
+            mkdir -p "${INSTALL_ROOT}/bin" "${INSTALL_ROOT}/lib"
+
             DOWNLOAD_OK=0
 
             if [[ -n "$VERSIONED_URL" ]]; then
-                info "Downloading Ollama binary from: ${VERSIONED_URL}"
-                info "(Streaming 1.3 GB tarball — extracting only bin/ollama)"
+                info "Downloading Ollama from: ${VERSIONED_URL}"
+                info "(Extracting ~1.3 GB tarball to ${INSTALL_ROOT} — includes llama-server + GPU libs)"
                 if curl -fL --progress-bar "$VERSIONED_URL" \
-                   | tar --zstd -xf - -C "$INSTALL_DIR" bin/ollama --strip-components=1 2>/dev/null \
-                   && [[ -f "${INSTALL_DIR}/ollama" ]]; then
+                   | tar --zstd -xf - -C "$INSTALL_ROOT" --strip-components=1 2>/dev/null \
+                   && [[ -f "${INSTALL_ROOT}/bin/ollama" ]]; then
                     DOWNLOAD_OK=1
+                    INSTALL_DIR="${INSTALL_ROOT}/bin"
                 fi
             fi
 
@@ -123,19 +132,22 @@ except: pass
                 echo
                 echo -e "${BOLD}  ── Manual install — run on your LOCAL machine ───────────────${NC}"
                 echo
-                echo "  # Download and extract just the binary (~30 MB extracted):"
-                echo "  curl -fL https://github.com/ollama/ollama/releases/latest/download/${TARBALL_NAME} \\"
-                echo "    | tar --zstd -xf - bin/ollama --strip-components=1"
+                echo "  # Download the full tarball (~1.3 GB):"
+                echo "  curl -fLO https://github.com/ollama/ollama/releases/latest/download/${TARBALL_NAME}"
                 echo
                 echo "  # Copy to cluster:"
-                echo "  scp ollama ${USER}@<login-node>:${INSTALL_DIR}/ollama"
+                echo "  scp ${TARBALL_NAME} ${USER}@<login-node>:~/"
+                echo
+                echo "  # On cluster — extract to ~/.local/ (gets bin/ollama + lib/ollama/llama-server):"
+                echo "  mkdir -p ~/.local"
+                echo "  tar --zstd -xf ~/${TARBALL_NAME} -C ~/.local --strip-components=1"
                 echo -e "${BOLD}  ─────────────────────────────────────────────────────────────${NC}"
                 echo
-                ask "  Already copied the binary? Paste its full path here (or Enter to skip):"
-                read -r local_bin
-                if [[ -n "${local_bin:-}" && -f "$local_bin" ]]; then
-                    cp "$local_bin" "${INSTALL_DIR}/ollama"
+                ask "  Already extracted? Press Enter to continue, or Ctrl-C to abort:"
+                read -r _dummy
+                if [[ -f "${INSTALL_ROOT}/bin/ollama" ]]; then
                     DOWNLOAD_OK=1
+                    INSTALL_DIR="${INSTALL_ROOT}/bin"
                 fi
             fi
 
