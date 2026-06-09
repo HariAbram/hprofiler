@@ -112,8 +112,7 @@ except: pass
                 info "Downloading Ollama binary from: ${VERSIONED_URL}"
                 info "(Streaming 1.3 GB tarball — extracting only bin/ollama)"
                 if curl -fL --progress-bar "$VERSIONED_URL" \
-                   | tar --zstd -xf - -C "$INSTALL_DIR" --wildcards "*/bin/ollama" \
-                        --strip-components=2 2>/dev/null \
+                   | tar --zstd -xf - -C "$INSTALL_DIR" bin/ollama --strip-components=1 2>/dev/null \
                    && [[ -f "${INSTALL_DIR}/ollama" ]]; then
                     DOWNLOAD_OK=1
                 fi
@@ -126,7 +125,7 @@ except: pass
                 echo
                 echo "  # Download and extract just the binary (~30 MB extracted):"
                 echo "  curl -fL https://github.com/ollama/ollama/releases/latest/download/${TARBALL_NAME} \\"
-                echo "    | tar --zstd -xf - --wildcards '*/bin/ollama' --strip-components=2"
+                echo "    | tar --zstd -xf - bin/ollama --strip-components=1"
                 echo
                 echo "  # Copy to cluster:"
                 echo "  scp ollama ${USER}@<login-node>:${INSTALL_DIR}/ollama"
