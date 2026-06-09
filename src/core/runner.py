@@ -429,7 +429,7 @@ def _poll_nvidia_smi(trace: Trace, stop: threading.Event) -> None:
                     mem_mib  = float(parts[3])
                 except ValueError:
                     continue
-                suf = f"[gpu{idx}]" if idx else ""
+                suf = f"[gpu{idx}]"
                 trace.add(CounterEvent(f"gpu_utilization_pct{suf}",
                                         Category.MEMORY, ts, util_gpu, "%"))
                 trace.add(CounterEvent(f"gpu_mem_util_pct{suf}",
@@ -444,8 +444,6 @@ def _poll_nvidia_smi(trace: Trace, stop: threading.Event) -> None:
 def _poll_rocm_smi(trace: Trace, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
-            # Use separate queries so column positions are unambiguous.
-            # --showuse gives "GPU use (%)" and --showmeminfo gives VRAM used/total.
             r_use = subprocess.run(
                 ["rocm-smi", "--showuse", "--csv"],
                 capture_output=True, text=True, timeout=3,
@@ -456,38 +454,58 @@ def _poll_rocm_smi(trace: Trace, stop: threading.Event) -> None:
             )
             ts = time.monotonic_ns()
 
-            # Parse GPU utilization: header has "GPU use (%)"
-            for line in r_use.stdout.strip().splitlines():
-                if not line or line.startswith("#"):
-                    continue
-                parts = [p.strip() for p in line.split(",")]
-                if parts[0].lower() == "device":   # header row
-                    continue
-                try:
-                    idx      = int(parts[0].replace("card", ""))
-                    util_pct = float(parts[1].rstrip("%"))
-                    suf      = f"[gpu{idx}]" if idx else ""
-                    trace.add(CounterEvent(f"gpu_utilization_pct{suf}",
-                                            Category.MEMORY, ts, util_pct, "%"))
-                except (ValueError, IndexError):
-                    pass
+            # Parse GPU utilization — find "use"/"utiliz" column from header
+            use_lines = [l.strip() for l in r_use.stdout.strip().splitlines()
+                         if l.strip() and not l.startswith("#")]
+            if len(use_lines) >= 2:
+                hdr = [h.lower() for h in use_lines[0].split(",")]
+                use_col = next(
+                    (i for i, h in enumerate(hdr)
+                     if ("use" in h or "utiliz" in h) and "mem" not in h and i > 0),
+                    1,
+                )
+                for line in use_lines[1:]:
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) <= use_col:
+                        continue
+                    try:
+                        idx      = int(parts[0].replace("card", ""))
+                        util_pct = float(parts[use_col].rstrip("%"))
+                        trace.add(CounterEvent(f"gpu_utilization_pct[gpu{idx}]",
+                                               Category.MEMORY, ts, util_pct, "%"))
+                    except (ValueError, IndexError):
+                        pass
 
-            # Parse VRAM: header has "VRAM Used (MB)" and "VRAM Total (MB)"
-            for line in r_mem.stdout.strip().splitlines():
-                if not line or line.startswith("#"):
-                    continue
-                parts = [p.strip() for p in line.split(",")]
-                if parts[0].lower() == "device":
-                    continue
-                try:
-                    idx = int(parts[0].replace("card", ""))
-                    # Find "used" and "total" columns by header; fallback: parts[1]
-                    used_mb  = float(parts[1])
-                    suf = f"[gpu{idx}]" if idx else ""
-                    trace.add(CounterEvent(f"gpu_mem_used_bytes{suf}",
-                                            Category.MEMORY, ts, used_mb * 1024**2, "bytes"))
-                except (ValueError, IndexError):
-                    pass
+            # Parse VRAM — find "used" column from header and detect its unit
+            mem_lines = [l.strip() for l in r_mem.stdout.strip().splitlines()
+                         if l.strip() and not l.startswith("#")]
+            if len(mem_lines) >= 2:
+                hdr = [h.lower() for h in mem_lines[0].split(",")]
+                used_col = next(
+                    (i for i, h in enumerate(hdr) if "used" in h and i > 0),
+                    None,
+                )
+                if used_col is not None:
+                    h = hdr[used_col]
+                    if "(gb)" in h:
+                        mult = 1024 ** 3
+                    elif "(mb)" in h:
+                        mult = 1024 ** 2
+                    elif "(kb)" in h:
+                        mult = 1024
+                    else:
+                        mult = 1  # assume bytes (rocm-smi typically uses bytes)
+                    for line in mem_lines[1:]:
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) <= used_col:
+                            continue
+                        try:
+                            idx        = int(parts[0].replace("card", ""))
+                            used_bytes = float(parts[used_col]) * mult
+                            trace.add(CounterEvent(f"gpu_mem_used_bytes[gpu{idx}]",
+                                                   Category.MEMORY, ts, used_bytes, "bytes"))
+                        except (ValueError, IndexError):
+                            pass
         except Exception:
             pass
         stop.wait(timeout=1.0)

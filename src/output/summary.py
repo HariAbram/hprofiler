@@ -84,14 +84,17 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
                   f"{len(gpu_spans)} launches)")
 
     if gpu_util_peak:
-        print(f"\n  GPU utilisation (nvidia-smi peak, 100 ms poll):")
+        _amd_backends = {"rocm"}
+        smi_tool = "rocm-smi" if any(b in _amd_backends for b in (meta.backends_used or [])) \
+                   else "nvidia-smi"
+        print(f"\n  GPU utilisation ({smi_tool} peak, 1 s poll):")
         for key, val in sorted(gpu_util_peak.items()):
-            lbl = key.replace("gpu_utilization_pct", "").strip("[]") or "0"
-            print(f"    GPU {lbl:<4}  compute  : {val:.0f}%  "
+            lbl = key.replace("gpu_utilization_pct", "").strip("[]") or "gpu0"
+            print(f"    {lbl:<6}  compute  : {val:.0f}%  "
                   f"(0% expected if kernels are shorter than the poll interval)")
         for key, val in sorted(gpu_mem_peak.items()):
-            lbl = key.replace("gpu_mem_used_bytes", "").strip("[]") or "0"
-            print(f"    GPU {lbl:<4}  mem used : {_fmt_bytes(val)}")
+            lbl = key.replace("gpu_mem_used_bytes", "").strip("[]") or "gpu0"
+            print(f"    {lbl:<6}  mem used : {_fmt_bytes(val)}")
 
     # ── Category breakdown ──────────────────────────────────────────────────
     by_cat = trace.spans_by_category()
