@@ -53,6 +53,8 @@ def _parse_record(line: str) -> AnyEvent | None:
                     if "=" in kv:
                         k, v = kv.split("=", 1)
                         tags[k] = v
+            span_id       = tags.pop("sid",  "")
+            parent_span_id = tags.pop("psid", "")
             return SpanEvent(
                 name=name,
                 category=Category(cat) if cat in Category._value2member_map_ else Category.OTHER,
@@ -61,6 +63,8 @@ def _parse_record(line: str) -> AnyEvent | None:
                 pid=pid,
                 tid=tid,
                 tags=tags,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
             )
         if kind == "span" and len(parts) == 6:
             _, cat, pid, tid, start_ns, dur_ns_name = parts
@@ -118,7 +122,8 @@ class Runner:
         import socket as sock_mod
         import platform
 
-        sock_path = tempfile.mktemp(suffix=".sock", prefix="hprofiler_")
+        _sock_dir = tempfile.mkdtemp(prefix="hprofiler_")
+        sock_path = os.path.join(_sock_dir, "s.sock")
 
         server_sock = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
         server_sock.bind(sock_path)
@@ -194,6 +199,7 @@ class Runner:
                                         span = _last_span.get((pid, tid))
                                         if span is not None and span.start_ns == start_ns:
                                             span.stack_frames = frames
+                                            trace._has_stacks = True
                             except Exception:
                                 pass
                         else:
@@ -248,7 +254,8 @@ class Runner:
         perf_record_proc: subprocess.Popen | None = None
         perf_data: str | None = None
         if "cpu" in self.backends and shutil.which("perf"):
-            perf_data = tempfile.mktemp(suffix=".perf.data", prefix="hprofiler_")
+            fd, perf_data = tempfile.mkstemp(suffix=".perf.data", prefix="hprofiler_")
+            os.close(fd)
             perf_cmd = [
                 "perf", "record",
                 f"-F{self.perf_freq}", "-e", "cycles:u",
@@ -271,7 +278,8 @@ class Runner:
         perf_stat_file: str | None = None
         _cpu_backends = {"cpu", "openmp", "likwid"}
         if shutil.which("perf") and any(b in self.backends for b in _cpu_backends):
-            perf_stat_file = tempfile.mktemp(suffix=".perf_stat.txt", prefix="hprofiler_")
+            fd, perf_stat_file = tempfile.mkstemp(suffix=".perf_stat.txt", prefix="hprofiler_")
+            os.close(fd)
             _MICROARCH_EVENTS = (
                 "cycles,instructions,cache-references,cache-misses,"
                 "branches,branch-misses,task-clock"
@@ -325,6 +333,10 @@ class Runner:
         server_sock.close()
         try:
             os.unlink(sock_path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(_sock_dir)
         except OSError:
             pass
 
@@ -741,10 +753,11 @@ def _parse_perf_script(perf_data: str, trace: Trace, trace_start_ns: int) -> Non
             return
         rel_ts = max(0, cur_ts - trace_start_ns)
         if cur_stack:
-            # insert(0, sym) means cur_stack[0] = outermost caller.
-            # depth=0 for outermost matches call-tree display convention.
-            folded = ";".join(cur_stack)   # outer-to-inner, flamegraph.pl convention
-            for depth, sym in enumerate(cur_stack):
+            # cur_stack is built with append() so it's innermost-first;
+            # reverse once to get outermost-first (flamegraph.pl convention).
+            outer_first = list(reversed(cur_stack))
+            folded = ";".join(outer_first)
+            for depth, sym in enumerate(outer_first):
                 if sym:
                     trace.add(SpanEvent(
                         name=sym, category=Category.CPU,
@@ -801,7 +814,7 @@ def _parse_perf_script(perf_data: str, trace: Trace, trace_start_ns: int) -> Non
             if m:
                 sym = _sym_from_match(m.group(1), m.group(2))
                 if sym:
-                    cur_stack.insert(0, sym)
+                    cur_stack.append(sym)
 
     if has_stacks:
         _flush()

@@ -4,6 +4,7 @@ Provides analysis helpers (totals, top-N, flame-graph data).
 """
 
 from __future__ import annotations
+import heapq
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -27,7 +28,13 @@ class Trace:
 
     def __init__(self, metadata: TraceMetadata | None = None) -> None:
         self.metadata = metadata or TraceMetadata()
-        self._events: list[AnyEvent] = []
+        self._events:   list[AnyEvent]     = []
+        self._spans:    list[SpanEvent]    = []
+        self._instants: list[InstantEvent] = []
+        self._counters: list[CounterEvent] = []
+        # Fast-path flags for compose() checks
+        self._has_stacks: bool = False
+        self._has_cpu:    bool = False
         # Populated post-run by the disasm collector
         self._disasm: dict[str, "KernelDisasm"] = {}  # type: ignore[type-arg]
         # Populated post-run by device capability queries
@@ -49,21 +56,32 @@ class Trace:
 
     def add(self, event: AnyEvent) -> None:
         self._events.append(event)
+        if isinstance(event, SpanEvent):
+            self._spans.append(event)
+            if event.stack_frames:
+                self._has_stacks = True
+            if event.category == Category.CPU:
+                self._has_cpu = True
+        elif isinstance(event, InstantEvent):
+            self._instants.append(event)
+        elif isinstance(event, CounterEvent):
+            self._counters.append(event)
 
     def add_many(self, events: list[AnyEvent]) -> None:
-        self._events.extend(events)
+        for event in events:
+            self.add(event)
 
     @property
     def spans(self) -> list[SpanEvent]:
-        return [e for e in self._events if isinstance(e, SpanEvent)]
+        return self._spans
 
     @property
     def instants(self) -> list[InstantEvent]:
-        return [e for e in self._events if isinstance(e, InstantEvent)]
+        return self._instants
 
     @property
     def counters(self) -> list[CounterEvent]:
-        return [e for e in self._events if isinstance(e, CounterEvent)]
+        return self._counters
 
     @property
     def all_events(self) -> list[AnyEvent]:
@@ -78,12 +96,12 @@ class Trace:
 
     def spans_by_category(self) -> dict[Category, list[SpanEvent]]:
         result: dict[Category, list[SpanEvent]] = defaultdict(list)
-        for s in self.spans:
+        for s in self._spans:
             result[s.category].append(s)
         return dict(result)
 
     def top_spans(self, n: int = 20) -> list[SpanEvent]:
-        return sorted(self.spans, key=lambda s: s.duration_ns, reverse=True)[:n]
+        return heapq.nlargest(n, self._spans, key=lambda s: s.duration_ns)
 
     def aggregated_stats(self) -> list[dict]:
         """Group spans by name, return sorted by total time desc."""
@@ -91,7 +109,7 @@ class Trace:
             "name": "", "category": "", "count": 0,
             "total_ns": 0, "min_ns": float("inf"), "max_ns": 0
         })
-        for s in self.spans:
+        for s in self._spans:
             key = f"{s.category.value}::{s.name}"
             r = totals[key]
             r["name"] = s.name
@@ -121,7 +139,7 @@ class Trace:
         All other spans keep the existing (category/thread-TID) grouping.
         """
         lanes: dict[str, list[SpanEvent]] = defaultdict(list)
-        for s in self.spans:
+        for s in self._spans:
             if s.category.value in ("cuda", "rocm") and "stream" in s.tags:
                 key = f"{s.category.value}/stream-{s.tags['stream']}"
             elif s.tid:

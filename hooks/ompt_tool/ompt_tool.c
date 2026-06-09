@@ -272,7 +272,8 @@ static __thread int          tls_target_depth    = 0;
 static __thread uint64_t     tls_task_start[MAX_TASK_DEPTH];
 static __thread uint64_t     tls_task_id[MAX_TASK_DEPTH];
 static __thread int          tls_task_depth = 0;
-static uint64_t              g_task_id_seq  = 1;
+static uint64_t              g_task_id_seq     = 1;
+static uint64_t              g_parallel_id_seq = 1;
 
 /* ── Callbacks ───────────────────────────────────────────────────────── */
 
@@ -294,8 +295,13 @@ static void cb_parallel_begin(
 {
     (void)encountering_task_data; (void)encountering_task_frame; (void)flags;
     if (tls_parallel_depth < MAX_DEPTH) {
+        /* Assign a tool-unique ID to this parallel region.  The OMPT spec allows
+         * the tool to write parallel_data->value; we store it so cb_work and
+         * cb_sync_region callbacks on worker threads can read it back. */
+        uint64_t par_unique = (uint64_t)__sync_fetch_and_add(&g_parallel_id_seq, 1);
+        if (parallel_data) parallel_data->value = par_unique;
         tls_parallel_start[tls_parallel_depth]   = now_ns();
-        tls_parallel_id[tls_parallel_depth]      = parallel_data ? parallel_data->value : 0;
+        tls_parallel_id[tls_parallel_depth]      = par_unique;
         tls_parallel_codeptr[tls_parallel_depth] = codeptr_ra;
         tls_parallel_depth++;
     }
@@ -317,15 +323,16 @@ static void cb_parallel_end(
         char extra[512];
         if (resolve_codeptr_full(cptr, &sym, lib, sizeof(lib), &off)) {
             if (sym)
-                snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sym=%s",
-                         (unsigned long long)pid, sym);
+                snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu,sym=%s",
+                         (unsigned long long)pid, (unsigned long long)pid, sym);
             else
                 snprintf(extra, sizeof(extra),
-                         "type=parallel,id=%llu,lib=%s,offset=0x%llx",
-                         (unsigned long long)pid, lib, (unsigned long long)off);
+                         "type=parallel,id=%llu,sid=%llu,lib=%s,offset=0x%llx",
+                         (unsigned long long)pid, (unsigned long long)pid,
+                         lib, (unsigned long long)off);
         } else {
-            snprintf(extra, sizeof(extra), "type=parallel,id=%llu",
-                     (unsigned long long)pid);
+            snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu",
+                     (unsigned long long)pid, (unsigned long long)pid);
         }
         emit_span("openmp", gettid_compat(), t0, now_ns() - t0,
                   "parallel_region", extra);
@@ -338,7 +345,8 @@ static void cb_work(
     ompt_data_t *parallel_data, ompt_data_t *task_data,
     uint64_t count, const void *codeptr_ra)
 {
-    (void)parallel_data; (void)task_data;
+    (void)task_data;
+    uint64_t par_id = (parallel_data && parallel_data->value) ? parallel_data->value : 0;
     static const char *wnames[] = {
         "", "omp_loop", "omp_sections", "omp_single_exec", "omp_single_other",
         "omp_workshare", "omp_distribute", "omp_taskloop", "omp_scope",
@@ -359,16 +367,31 @@ static void cb_work(
         const char *sym = NULL; char lib[256]; uint64_t off = 0;
         char extra[512];
         if (resolve_codeptr_full(tls_work_codeptr[tls_work_depth], &sym, lib, sizeof(lib), &off)) {
-            if (sym)
-                snprintf(extra, sizeof(extra), "type=work,count=%llu,sym=%s",
-                         (unsigned long long)count, sym);
-            else
-                snprintf(extra, sizeof(extra),
-                         "type=work,count=%llu,lib=%s,offset=0x%llx",
-                         (unsigned long long)count, lib, (unsigned long long)off);
+            if (sym) {
+                if (par_id)
+                    snprintf(extra, sizeof(extra), "type=work,count=%llu,psid=%llu,sym=%s",
+                             (unsigned long long)count, (unsigned long long)par_id, sym);
+                else
+                    snprintf(extra, sizeof(extra), "type=work,count=%llu,sym=%s",
+                             (unsigned long long)count, sym);
+            } else {
+                if (par_id)
+                    snprintf(extra, sizeof(extra),
+                             "type=work,count=%llu,psid=%llu,lib=%s,offset=0x%llx",
+                             (unsigned long long)count, (unsigned long long)par_id,
+                             lib, (unsigned long long)off);
+                else
+                    snprintf(extra, sizeof(extra),
+                             "type=work,count=%llu,lib=%s,offset=0x%llx",
+                             (unsigned long long)count, lib, (unsigned long long)off);
+            }
         } else {
-            snprintf(extra, sizeof(extra), "type=work,count=%llu",
-                     (unsigned long long)count);
+            if (par_id)
+                snprintf(extra, sizeof(extra), "type=work,count=%llu,psid=%llu",
+                         (unsigned long long)count, (unsigned long long)par_id);
+            else
+                snprintf(extra, sizeof(extra), "type=work,count=%llu",
+                         (unsigned long long)count);
         }
         emit_span("openmp", gettid_compat(),
                   tls_work_start[tls_work_depth], now_ns() - tls_work_start[tls_work_depth],
@@ -381,7 +404,8 @@ static void cb_sync_region(
     ompt_data_t *parallel_data, ompt_data_t *task_data,
     const void *codeptr_ra)
 {
-    (void)parallel_data; (void)task_data;
+    (void)task_data;
+    uint64_t par_id = (parallel_data && parallel_data->value) ? parallel_data->value : 0;
     static const char *snames[] = {
         "", "omp_barrier", "omp_barrier_implicit", "omp_barrier_explicit",
         "omp_barrier_impl", "", "omp_taskwait", "omp_taskgroup",
@@ -404,14 +428,28 @@ static void cb_sync_region(
         const char *sym = NULL; char lib[256]; uint64_t off = 0;
         char extra[512];
         if (resolve_codeptr_full(cptr, &sym, lib, sizeof(lib), &off)) {
-            if (sym)
-                snprintf(extra, sizeof(extra), "type=sync,sym=%s", sym);
-            else
-                snprintf(extra, sizeof(extra),
-                         "type=sync,lib=%s,offset=0x%llx",
-                         lib, (unsigned long long)off);
+            if (sym) {
+                if (par_id)
+                    snprintf(extra, sizeof(extra), "type=sync,psid=%llu,sym=%s",
+                             (unsigned long long)par_id, sym);
+                else
+                    snprintf(extra, sizeof(extra), "type=sync,sym=%s", sym);
+            } else {
+                if (par_id)
+                    snprintf(extra, sizeof(extra),
+                             "type=sync,psid=%llu,lib=%s,offset=0x%llx",
+                             (unsigned long long)par_id, lib, (unsigned long long)off);
+                else
+                    snprintf(extra, sizeof(extra),
+                             "type=sync,lib=%s,offset=0x%llx",
+                             lib, (unsigned long long)off);
+            }
         } else {
-            snprintf(extra, sizeof(extra), "type=sync");
+            if (par_id)
+                snprintf(extra, sizeof(extra), "type=sync,psid=%llu",
+                         (unsigned long long)par_id);
+            else
+                snprintf(extra, sizeof(extra), "type=sync");
         }
         emit_span("sync", gettid_compat(), t0, now_ns() - t0,
                   sname, extra);

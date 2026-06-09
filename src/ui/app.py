@@ -851,6 +851,13 @@ class TimelineWidget(Widget):
         })
         self._stream_seq: dict[int, int] = {sid: sid for sid in all_sids}
 
+        # Build span_id → name lookup for hover parent annotation.
+        self._sid_name: dict[str, str] = {
+            s.span_id: s.name
+            for s in trace.spans
+            if s.span_id
+        }
+
         # Sort: group by thread first, then by category within the thread.
         # CUDA stream lanes are sorted together by stream ID.
         def _sort_key(name: str) -> tuple[int, str]:
@@ -1121,7 +1128,11 @@ class TimelineWidget(Widget):
         dur   = _fmt_ns(span.duration_ns)
         start = _fmt_ns(span.start_ns - self._view_start)
         cat   = lane_name.split("/")[0]
-        self._hover = f"{span.name}  [{cat}]  @{start}  dur {dur}"
+        hover = f"{span.name}  [{cat}]  @{start}  dur {dur}"
+        if span.parent_span_id:
+            parent_name = self._sid_name.get(span.parent_span_id, span.parent_span_id[:8])
+            hover += f"  ↑{parent_name}"
+        self._hover = hover
 
     def on_leave(self, _event: Any) -> None:
         self._hover = ""
@@ -1396,14 +1407,46 @@ class _RawNode:
 
 
 def _ct_build_raw(spans: list[SpanEvent]) -> list[_RawNode]:
-    """Containment tree for one thread via stack algorithm (O(n log n))."""
+    """Containment tree for one thread via stack algorithm (O(n log n)).
+
+    When spans carry explicit span_id / parent_span_id links (emitted by hooks),
+    those take precedence over temporal containment for spans that stay within
+    the same input set.
+    """
+    sorted_spans = sorted(spans, key=lambda s: s.start_ns)
+    # Map from span_id → node for explicit linking.
+    nodes_by_sid: dict[str, _RawNode] = {
+        s.span_id: _RawNode(span=s)
+        for s in sorted_spans
+        if s.span_id
+    }
+    # Remaining spans without a span_id get plain nodes.
+    all_nodes: dict[int, _RawNode] = {}  # id(span) → node
+    for s in sorted_spans:
+        if s.span_id and s.span_id in nodes_by_sid:
+            all_nodes[id(s)] = nodes_by_sid[s.span_id]
+        else:
+            all_nodes[id(s)] = _RawNode(span=s)
+
+    explicitly_parented: set[int] = set()  # id(span) of spans handled via explicit link
+    for s in sorted_spans:
+        if s.parent_span_id and s.parent_span_id in nodes_by_sid:
+            parent_node = nodes_by_sid[s.parent_span_id]
+            child_node  = all_nodes[id(s)]
+            if child_node is not parent_node:
+                parent_node.children.append(child_node)
+                explicitly_parented.add(id(s))
+
+    # Temporal containment for spans not already parented explicitly.
     stack: list[_RawNode] = []
     roots: list[_RawNode] = []
-    for span in sorted(spans, key=lambda s: s.start_ns):
-        while stack and stack[-1].span.end_ns <= span.start_ns:
+    for s in sorted_spans:
+        if id(s) in explicitly_parented:
+            continue
+        while stack and stack[-1].span.end_ns <= s.start_ns:
             stack.pop()
-        node = _RawNode(span=span)
-        if stack and stack[-1].span.end_ns >= span.end_ns:
+        node = all_nodes[id(s)]
+        if stack and stack[-1].span.end_ns >= s.end_ns:
             stack[-1].children.append(node)
         else:
             roots.append(node)
@@ -1494,7 +1537,12 @@ def _ct_build_from_stacks(spans: list[SpanEvent]) -> list[_CTNode]:
 
 
 def _ct_build(spans: list[SpanEvent]) -> list[_CTNode]:
-    """Call tree: uses CPU stack frames when available, temporal containment otherwise."""
+    """Call tree: uses CPU stack frames when available, temporal containment otherwise.
+
+    Explicit parent_span_id links (from hooks) are preferred over temporal
+    containment within the same thread, and are shown as cross-thread connections
+    in the tree when the parent and child live on different threads.
+    """
     duration_spans = [s for s in spans if s.duration_ns > 0]
     if not duration_spans:
         return []
@@ -1503,7 +1551,7 @@ def _ct_build(spans: list[SpanEvent]) -> list[_CTNode]:
     if stacked:
         return _ct_build_from_stacks(stacked)
 
-    # Fallback: temporal containment per thread.
+    # Per-thread temporal containment (explicit same-thread links handled inside).
     by_thread: dict[tuple[int, int], list[SpanEvent]] = defaultdict(list)
     for s in duration_spans:
         by_thread[(s.pid, s.tid)].append(s)
@@ -1511,15 +1559,42 @@ def _ct_build(spans: list[SpanEvent]) -> list[_CTNode]:
     if len(by_thread) == 1:
         return _ct_aggregate(_ct_build_raw(next(iter(by_thread.values()))))
 
-    all_roots: list[_CTNode] = []
+    # Build per-thread roots first.
+    thread_roots: dict[tuple[int, int], list[_CTNode]] = {}
     for (pid, tid), thread_spans in sorted(by_thread.items()):
-        children = _ct_aggregate(_ct_build_raw(thread_spans))
+        thread_roots[(pid, tid)] = _ct_aggregate(_ct_build_raw(thread_spans))
+
+    # Identify spans that are explicit children of spans in a *different* thread.
+    # We use the span_id → (pid, tid) map to detect cross-thread links.
+    sid_to_thread: dict[str, tuple[int, int]] = {
+        s.span_id: (s.pid, s.tid)
+        for s in duration_spans
+        if s.span_id
+    }
+    cross_thread_children: dict[tuple[int, int], list[SpanEvent]] = defaultdict(list)
+    orphan_threads: set[tuple[int, int]] = set()
+    for s in duration_spans:
+        if s.parent_span_id:
+            parent_thread = sid_to_thread.get(s.parent_span_id)
+            my_thread = (s.pid, s.tid)
+            if parent_thread and parent_thread != my_thread:
+                cross_thread_children[parent_thread].append(s)
+                orphan_threads.add(my_thread)
+
+    all_roots: list[_CTNode] = []
+    for (pid, tid), children in sorted(thread_roots.items()):
         total_ns = sum(c.total_ns for c in children)
+        # Attach cross-thread children (e.g. GPU kernels under their NVTX parent thread).
+        extra = cross_thread_children.get((pid, tid), [])
+        if extra:
+            extra_nodes = _ct_aggregate(_ct_build_raw(extra))
+            children = children + extra_nodes
+            total_ns = sum(c.total_ns for c in children)
         all_roots.append(_CTNode(
             name=f"Thread {tid} (pid {pid})",
             category="other",
             total_ns=total_ns, count=1, self_ns=0,
-            children=children,
+            children=sorted(children, key=lambda n: -n.total_ns),
         ))
     return sorted(all_roots, key=lambda n: -n.total_ns)
 
@@ -1933,11 +2008,11 @@ class ProfilerApp(App):
             with TabPane("Hotspots  [H]", id="tab-hotspots"):
                 yield HotspotsWidget(self.trace, id="hotspots")
 
-            if any(s.stack_frames for s in self.trace.spans):
+            if self.trace._has_stacks:
                 with TabPane("Call Tree  [C]", id="tab-calltree"):
                     yield CallTreeWidget(self.trace)
 
-            if any(s.category == Category.CPU for s in self.trace.spans):
+            if self.trace._has_cpu:
                 with TabPane("Flame  [F]", id="tab-flame"):
                     with ScrollableContainer():
                         yield FlameGraphWidget(self.trace)

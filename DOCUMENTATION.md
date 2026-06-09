@@ -46,11 +46,14 @@ python3 hprofiler run --backend cuda,cpu -- ./my_cuda_app
 # Profile with per-kernel disassembly (adds Disasm tab to TUI)
 python3 hprofiler run --backend cuda --disasm -- ./my_cuda_app
 
-# Roofline chart using hardware counters (CUDA)
+# Roofline chart — TUI viewer by default (requires plotly + kaleido)
 python3 hprofiler roofline --backend cuda -- ./my_cuda_app
-
-# Roofline chart using hardware counters (CPU/OpenMP)
 python3 hprofiler roofline --backend openmp -- ./my_omp_program
+python3 hprofiler roofline --html --backend cuda -- ./my_cuda_app  # browser instead
+
+# Flame graph — TUI viewer by default (requires plotly + kaleido)
+python3 hprofiler flamegraph -- ./my_program
+python3 hprofiler flamegraph --html -- ./my_program                # browser instead
 
 # Profile a ROCm/HIP program
 python3 hprofiler run --backend rocm -- ./my_hip_app
@@ -101,6 +104,7 @@ python3 hprofiler run --no-ui -- ./my_program
 
 ```bash
 pip install click textual rich capstone
+pip install plotly kaleido   # required for TUI flamegraph/roofline viewers
 ```
 
 ### Build the C hook libraries
@@ -202,9 +206,15 @@ the TUI opens immediately and the Disasm tab populates after a few seconds.
 
 ### `hprofiler roofline`
 
-Generate an interactive roofline chart using **hardware performance counters**.
+Generate a roofline chart using **hardware performance counters**.
 This re-runs the application under a profiling tool (`ncu`, `rocprof`, or
 `perf stat`) to collect exact FLOPs and DRAM bandwidth measurements.
+
+By default a **native TUI viewer** is opened inline in the terminal using the
+Kitty graphics protocol (or Sixel/iTerm2 as fallback). Pass `--html` to skip
+the TUI and open the HTML file in a browser instead.
+
+Requires: `pip install plotly kaleido`
 
 ```
 hprofiler roofline [OPTIONS] [-- COMMAND [ARGS...] | TRACE_FILE]
@@ -213,8 +223,25 @@ hprofiler roofline [OPTIONS] [-- COMMAND [ARGS...] | TRACE_FILE]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--backend`, `-b` | — | Backend for hardware counters: `cuda`, `rocm`, `openmp`, or `cpu` |
-| `--output`, `-o` | `<prog>.roofline.html` | Output HTML file |
-| `--open / --no-open` | `--open` | Open the chart in the default browser |
+| `--output`, `-o` | `<prog>.roofline.html` | Output HTML file (always written) |
+| `--html` | off | Open browser instead of TUI viewer |
+
+**TUI keyboard controls:**
+
+| Key | Action |
+|-----|--------|
+| `n` / `p` | Cycle kernels — show crosshairs with headroom annotation |
+| Esc | Deselect kernel / hide crosshairs |
+| `+` / `=` | Zoom in |
+| `-` | Zoom out |
+| `←` `→` `↑` `↓` | Pan |
+| `r` | Reset zoom |
+| `w` | Open HTML version in browser |
+| `q` | Quit |
+
+**Terminal requirements:** kitty, WezTerm, Ghostty (Kitty graphics protocol),
+iTerm2, or xterm/mlterm (Sixel). Falls back to browser-open when no inline-image
+protocol is detected.
 
 **Mode 1 — run with hardware counters (recommended):**
 
@@ -300,14 +327,22 @@ Available backends:
   opencl       ✓ available   OpenCL command-queue profiling via LD_PRELOAD
   rocm         ✗ unavailable ROCm/HIP kernel tracing via LD_PRELOAD
   openmp       ✓ available   OpenMP parallel region / task tracing via OMPT
+  likwid       ✓ available   Hardware PMU counters via likwid-perfctr
+  mpi          ✓ available   MPI operation tracing via PMPI
+  nccl         ✗ unavailable NCCL collective tracing via LD_PRELOAD
 ```
 
 ---
 
 ### `hprofiler flamegraph`
 
-Generate a self-contained interactive HTML flame graph by profiling COMMAND
-with Linux `perf record`.
+Generate an interactive flame graph by profiling COMMAND with Linux `perf record`.
+
+By default a **native TUI viewer** is opened inline in the terminal using the
+Kitty graphics protocol (or Sixel/iTerm2 as fallback). Pass `--html` to skip
+the TUI and open the HTML file in a browser instead.
+
+Requires: `pip install plotly kaleido`
 
 ```
 hprofiler flamegraph [OPTIONS] -- COMMAND [ARGS...]
@@ -315,29 +350,39 @@ hprofiler flamegraph [OPTIONS] -- COMMAND [ARGS...]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--backend`, `-b` | — | Inject backend hooks (same names as `run`) so GPU/MPI API overhead appears in CPU stacks |
-| `--output`, `-o` | `<prog>.flamegraph.html` | Output HTML file |
+| `--backend`, `-b` | — | Inject backend hooks so GPU/MPI API overhead appears in CPU stacks |
+| `--output`, `-o` | `<prog>.flamegraph.html` | Output HTML file (always written) |
 | `--callgraph` | `fp` | Call-graph method: `fp` (frame-pointer), `dwarf`, or `lbr` |
 | `--freq`, `-F` | `99` | perf sampling frequency in Hz |
-| `--open / --no-open` | `--open` | Open the HTML in the default browser |
+| `--html` | off | Open browser instead of TUI viewer |
 
-**Output format:** A single self-contained HTML file. Open in any browser — no
-server or internet connection required. All rendering and interactivity is done
-in a `<canvas>` element with embedded JavaScript.
+**TUI keyboard controls:**
 
-**Browser controls:**
+| Key | Action |
+|-----|--------|
+| click | Zoom into that frame |
+| `u` / Esc | Zoom out one level |
+| `r` | Reset to full view |
+| `/` | Search — highlight frames matching substring |
+| `w` | Open HTML version in browser |
+| `q` | Quit |
 
-| Action | Effect |
-|--------|--------|
-| Click a frame | Zoom in — the clicked frame expands to fill the full width |
-| Right-click | Zoom out one level |
-| ↑ Up button | Zoom out one level |
-| Esc / ⟲ Reset | Return to the full unzoomed view |
-| Hover | Tooltip: name, sample count, % of total, % of current view |
-| Search box | Regex search — matching frames highlighted gold, others dimmed |
+**Terminal requirements:** kitty, WezTerm, Ghostty (Kitty graphics protocol),
+iTerm2, or xterm/mlterm (Sixel). Falls back to browser-open when no inline-image
+protocol is detected.
 
-**Orientation:** Root frame (process name) at the bottom, hottest leaf frames
-at the top — standard Brendan Gregg flame graph convention.
+**HTML output:** A single self-contained HTML file (Plotly-based icicle chart).
+Open in any browser — no server or internet connection required.
+
+**Orientation:** Root frame at top, leaf frames at bottom (icicle / top-down convention).
+
+**With `--backend`:** Backend hooks are injected via `LD_PRELOAD` so the CPU
+stacks captured by `perf` include time spent inside GPU API calls:
+
+- `cudaLaunchKernel` / `clEnqueueNDRangeKernel` — kernel launch overhead
+- `cudaDeviceSynchronize` / `clFinish` — CPU blocking while GPU runs
+- `MPI_Allreduce` / `MPI_Barrier` — collective synchronisation wait
+- `hipLaunchKernel` — ROCm launch overhead
 
 **With `--backend`:** Backend hooks are injected via `LD_PRELOAD` so the CPU
 stacks captured by `perf` include time spent inside GPU API calls:
@@ -652,22 +697,34 @@ HPROFILER_LIKWID_GROUP=MEM hprofiler run --backend likwid -- ./my_program
 
 ## 5. TUI Viewer
 
-The TUI is built with [Textual](https://textual.textualize.io/). Three tabs are
+The TUI is built with [Textual](https://textual.textualize.io/). Four tabs are
 always present; additional tabs appear conditionally based on recorded data:
 
 | Tab | When shown |
 |-----|-----------|
-| Overview | Always |
+| System | Always |
+| Profile | Always |
 | Timeline | Always |
 | Hotspots | Always |
 | Flame | Only when CPU/perf samples are present (`--backend cpu` or `auto`) |
 | Call Tree | Only when `--call-tree` was passed during `hprofiler run` |
 | Disasm | Only when `--disasm` is passed to `run` or `view` |
 
-### Overview Tab
+### System Tab
 
-Dashboard showing: command, duration, backend breakdown with time bars, and
-the top 10 hotspots with inline % bars.
+Hardware info card: command, hostname, total duration, active backends. Per-device
+block showing: compute capability, SM/core count, clock speed, FP16/FP32/FP64/
+Tensor TFLOP/s peaks, memory bandwidth, VRAM, and ridge point with a
+compute-vs-memory-bound hint. CPU section (when CPU data present): IPC, LLC miss
+rate, branch miss rate, and peak RSS.
+
+### Profile Tab
+
+Activity dashboard: for CUDA/ROCm backends shows kernel active %, sync overhead %,
+GPU efficiency %, kernel count and average duration. Time breakdown by category
+with proportional bars. Top-12 hotspots table with name, category, share%, total,
+average, and invocation count. A **Bottleneck Advisor** section provides actionable
+tips derived from the hardware counter and activity data.
 
 ### Timeline Tab
 
@@ -813,6 +870,72 @@ any browser; no server required.
 
 Printed to stdout after each run (unless `--no-summary`). Groups spans by
 (name, category), sorts by total time, shows count / total / avg / pct.
+
+### OpenTelemetry (OTLP) Export
+
+hprofiler can export profiling data to any
+[OTLP](https://opentelemetry.io/docs/specs/otlp/)-compatible collector via HTTP
+or to a JSON file. No extra Python packages required — the exporter is built on
+the standard library.
+
+**CLI options (on `run` and `view`):**
+
+| Option | Description |
+|--------|-------------|
+| `--otlp-endpoint URL` | POST to an OTLP HTTP collector, e.g. `http://localhost:4318` |
+| `--otlp-file PATH` | Write OTLP traces JSON to a file |
+
+Both options can be combined (export to file *and* send live).
+
+**Usage:**
+
+```bash
+# Send live during a profiling run
+hprofiler run --backend cuda --otlp-endpoint http://localhost:4318 -- ./app
+
+# Write to file
+hprofiler run --backend cuda --otlp-file trace.otlp.json -- ./app
+
+# Export from a saved trace (no re-run)
+hprofiler view --otlp-endpoint http://localhost:4318 app.hprofiler.json
+hprofiler view --otlp-file trace.otlp.json app.hprofiler.json
+
+# Replay a saved OTLP file to any collector
+curl -X POST http://localhost:4318/v1/traces \
+     -H 'Content-Type: application/json' -d @trace.otlp.json
+```
+
+**Compatible backends (OTLP/HTTP port 4318):**
+[Grafana Alloy](https://grafana.com/docs/alloy/),
+[otelcol](https://opentelemetry.io/docs/collector/),
+[Jaeger ≥ 1.35](https://www.jaegertracing.io/),
+[Grafana Tempo](https://grafana.com/docs/tempo/),
+DataDog Agent, Honeycomb, New Relic, and any other OTLP receiver.
+
+**Data model mapping:**
+
+| hprofiler | OTLP |
+|-----------|------|
+| `SpanEvent` | Span — all root-level (no parent inference) |
+| `InstantEvent` | Zero-duration Span |
+| `CounterEvent` | Gauge metric (POSTed to `/v1/metrics`) |
+| `TraceMetadata` | Resource attributes (`service.name`, `host.name`, `process.pid`, …) |
+| `Category` | InstrumentationScope name (`hprofiler.cuda`, `hprofiler.openmp`, …) |
+| `SpanEvent.tags` | Span attributes (`hprofiler.tag.<key>`) |
+| `SpanEvent.pid/tid` | `process.pid`, `thread.id` attributes |
+
+**Flat span structure:** hprofiler spans have no parent-child relationships —
+CUDA kernels are not linked to the host thread that launched them in the OTLP
+output. All spans appear as independent root spans grouped by category
+(InstrumentationScope). This is a known limitation of v1; parent inference from
+timing overlap is a future extension.
+
+**Time alignment:** hprofiler timestamps are monotonic-relative and are
+converted to Unix epoch nanoseconds at export time using
+`time.time_ns() − time.monotonic_ns()`. The error is sub-millisecond for
+immediately post-run exports.
+
+**Implementation:** `src/output/otlp.py`
 
 ---
 
@@ -1070,7 +1193,7 @@ flowchart TB
             direction LR
             J["Chrome Trace JSON\nPerfetto / chrome://tracing"]
             S["Text\nSummary"]
-            T["TUI Viewer\nOverview · Timeline · Hotspots\n[Flame — CPU data]\n[Call Tree — --call-tree]\n[Disasm — --disasm]"]
+            T["TUI Viewer\nSystem · Profile · Timeline · Hotspots\n[Flame — CPU data]\n[Call Tree — --call-tree]\n[Disasm — --disasm]"]
             FG["Flame Graph HTML\ncanvas · zoom · search\nhprofiler flamegraph"]
         end
 
@@ -1518,3 +1641,230 @@ for name, kd in trace.disasm.items():
           f"fma={mix.get(InsnType.COMPUTE, 0):.0f}%  "
           f"mem={mix.get(InsnType.MEMORY, 0):.0f}%")
 ```
+
+## 15. AI Performance Analysis
+
+The `analyze` command and `--analyze` flag on `run` drive an agentic LLM workflow that reads profiling data, calls analysis tools to drill into bottlenecks, and writes a structured performance report.
+
+---
+
+### 15.1 CLI Reference
+
+#### `hprofiler analyze`
+
+```
+hprofiler analyze [OPTIONS] [TRACE_FILE | -- COMMAND...]
+
+Two modes:
+  1. Existing trace:  hprofiler analyze trace.hprofiler.json
+  2. Profile first:   hprofiler analyze --backend cuda -- ./app
+```
+
+| Option | Description |
+|--------|-------------|
+| `--llm PROVIDER` | `anthropic` \| `openai` \| `ollama` \| `openai-compat`  (default: auto-detect) |
+| `--llm-model MODEL` | Model name accepted by the provider (see §15.2) |
+| `--llm-endpoint URL` | Base URL for `openai-compat` or custom Ollama host |
+| `--llm-api-key KEY` | API key (overrides env-var defaults) |
+| `--output-report PATH` | Save Markdown report to file |
+| `--compare TRACE_B` | Compare two traces — report improvements and regressions |
+| `--backend BACKENDS` | Backends when profiling a new command (same as `run`) |
+| `--output PATH` | Trace file path when profiling a new command |
+
+#### `hprofiler run --analyze`
+
+```
+hprofiler run --analyze [--llm ...] [--llm-model ...] ... -- COMMAND
+```
+
+Runs the profiler normally, then immediately analyses the captured trace. All `analyze` LLM options are available:
+
+| Option | Description |
+|--------|-------------|
+| `--analyze` | Enable AI analysis after profiling |
+| `--llm PROVIDER` | Provider (same as `analyze` command) |
+| `--llm-model MODEL` | Model name |
+| `--llm-endpoint URL` | Base URL override |
+| `--llm-api-key KEY` | API key override |
+| `--analysis-report PATH` | Save report to Markdown file |
+
+---
+
+### 15.2 Provider and Model Selection
+
+#### Auto-detection order
+
+When `--llm` is not set, hprofiler detects the provider from the environment in this order:
+
+1. `ANTHROPIC_API_KEY` is set → use Anthropic (`claude-sonnet-4-6` default)
+2. `OPENAI_API_KEY` is set → use OpenAI (`gpt-4o` default)
+3. Ollama responds at `http://localhost:11434` → use Ollama (`llama3.1:8b` default)
+4. None found → error with setup instructions
+
+#### Supported providers and models
+
+| Provider | `--llm` value | Default model | Notes |
+|----------|--------------|---------------|-------|
+| Anthropic | `anthropic` | `claude-sonnet-4-6` | Best tool-use quality |
+| OpenAI | `openai` | `gpt-4o` | Standard function calling |
+| Ollama | `ollama` | `llama3.1:8b` | Local, free, private |
+| Any OpenAI-compat | `openai-compat` | (required) | vLLM, LM Studio, Groq, Together.ai, … |
+
+**Using any model:** pass any model string the provider accepts via `--llm-model`:
+
+```bash
+# Anthropic
+hprofiler analyze --llm anthropic --llm-model claude-opus-4-8 trace.json
+hprofiler analyze --llm anthropic --llm-model claude-haiku-4-5-20251001 trace.json
+
+# OpenAI
+hprofiler analyze --llm openai --llm-model o1 trace.json
+hprofiler analyze --llm openai --llm-model gpt-4o-mini trace.json
+
+# Ollama — any locally pulled model
+ollama pull qwen2.5:32b
+hprofiler analyze --llm ollama --llm-model qwen2.5:32b trace.json
+
+ollama pull deepseek-r1:7b
+hprofiler analyze --llm ollama --llm-model deepseek-r1:7b trace.json
+
+# Custom endpoint (vLLM, Groq, Together.ai, …)
+hprofiler analyze \
+  --llm openai-compat \
+  --llm-endpoint https://api.groq.com/openai/v1 \
+  --llm-api-key gsk_... \
+  --llm-model llama-3.1-70b-versatile \
+  trace.json
+```
+
+#### Persistent configuration via environment variables
+
+```bash
+export HPROFILER_LLM_PROVIDER=ollama
+export HPROFILER_LLM_MODEL=qwen2.5:32b
+# HPROFILER_LLM_API_KEY  — use instead of / alongside ANTHROPIC_API_KEY / OPENAI_API_KEY
+# HPROFILER_LLM_ENDPOINT — base URL for openai-compat or custom Ollama host
+# OLLAMA_HOST            — Ollama server URL (default: http://localhost:11434)
+```
+
+Command-line flags take priority over environment variables.
+
+---
+
+### 15.3 How the Agent Works
+
+The analysis runs as a multi-turn agentic loop:
+
+```
+1. Build Tier-1 context (always included):
+   run metadata, hardware caps, time breakdown by category, top-15 hotspots,
+   GPU utilisation, memory transfer summary, hardware counters, roofline data,
+   and parent→child span hierarchy sample
+
+2. Send context + system prompt to LLM with tool definitions
+
+3. LLM reasons about the data and may call tools:
+   - get_hotspots        — top N spans, filtered by category or minimum duration
+   - get_kernel_details  — p50/p90 latency, tag details for a named kernel
+   - get_memory_profile  — H2D/D2H/D2D breakdown with effective bandwidth
+   - get_timeline_phases — per-bucket activity % (finds idle gaps and bubbles)
+   - get_sync_analysis   — synchronisation overhead with parent-link attribution
+   - get_mpi_communication — MPI operation breakdown, bytes, send-wait pairs
+   - query_spans         — flexible filter/sort query across all spans
+
+4. Tool results are fed back as the next turn
+
+5. Loop runs for up to 8 turns (configurable), then the LLM writes its report
+
+6. Report is rendered to the terminal via Rich markdown
+```
+
+**Graceful degradation:** if the model does not support tool use (some base models, very small quantised models), the agent automatically falls back to a single-shot analysis with the full Tier-1 context in the prompt — no tools are called, but the report is still produced.
+
+**No new dependencies:** all HTTP calls use Python's standard-library `urllib.request`. The `rich` library (already a hprofiler dependency) renders the report.
+
+---
+
+### 15.4 Report Format
+
+The LLM is instructed to produce a structured Markdown report:
+
+```markdown
+## Executive Summary
+2–3 sentences on the biggest bottleneck and root cause.
+
+## Top Bottlenecks (ranked by impact)
+### 1. [Name] — [Root Cause Category]
+- **Evidence:** specific timing and percentage
+- **Root cause:** WHY it is slow
+- **Fix:** specific code change or configuration
+- **Estimated impact:** rough speedup or saved time
+
+## Secondary Observations
+Brief bullets on other issues worth addressing.
+
+## Optimization Roadmap
+[HIGH] most impactful change
+[MED]  moderate impact
+[LOW]  low-effort cleanup
+```
+
+---
+
+### 15.5 Trace Comparison
+
+```bash
+# Profile two variants and compare
+hprofiler run --no-ui -o before.json -- ./app --naive
+hprofiler run --no-ui -o after.json  -- ./app --optimised
+hprofiler analyze --compare before.json after.json
+```
+
+The comparison context includes:
+- Wall time delta (absolute and %)
+- Per-category time deltas
+- Hotspot-level before/after table
+
+The LLM reports on: improvements, regressions, unchanged areas, and likely causes.
+
+---
+
+### 15.6 Code Structure
+
+```
+src/analysis/
+  llm/
+    __init__.py          factory + auto-detection (create_provider, auto_detect)
+    base.py              LLMProvider ABC, ToolCall, ChatResponse dataclasses
+    anthropic.py         Anthropic Messages API via urllib.request
+    openai_compat.py     OpenAI / Ollama / vLLM / any compatible endpoint
+  context.py             Trace → structured profile dict (Tier-1 context)
+  agent_tools.py         Tool definitions (OpenAI format) + implementations
+  agent.py               Multi-turn agentic loop + compare_traces
+  report.py              Rich terminal output + Markdown file writer
+```
+
+#### Adding a new tool
+
+1. Add a tool definition to `TOOL_DEFINITIONS` in `agent_tools.py` (OpenAI function-calling format)
+2. Add a handler function `_my_tool(trace, **kwargs) -> str` (returns JSON string)
+3. Register it in the `_handlers` dict inside `execute_tool`
+
+The handler receives the `Trace` object and any arguments the LLM passes. Return a compact JSON string (the LLM reads it as a tool result).
+
+#### Adding a new LLM provider
+
+Subclass `LLMProvider` from `src/analysis/llm/base.py` and implement `chat()`. The method receives messages in OpenAI internal format; translate to your provider's wire format and back. Register the new provider name in `create_provider()` in `src/analysis/llm/__init__.py`.
+
+---
+
+### 15.7 Privacy Considerations
+
+All profiling data sent to the LLM includes:
+- Kernel/function names from the profiled binary
+- Timing and counter data
+- Hostname, command-line arguments, and backends used
+
+**Ollama is fully local** — no data leaves your machine. For cloud providers (Anthropic, OpenAI, any openai-compat endpoint), review the provider's data handling policy before profiling sensitive workloads.
+
+To avoid sending sensitive argument values, use `--no-summary` and review what `context_to_str()` would include for your trace before enabling cloud analysis.

@@ -143,10 +143,21 @@ def annotate_trace(trace: "Trace", binary: str | None = None) -> int:
         if not Path(lib).exists():
             continue
         addrs = list({p[0] for p in pairs})
-        cache_key = (lib, ",".join(sorted(addrs)))
-        if cache_key in _SYMBOLIZER_CACHE:
-            resolved = {}  # rebuild from single cache entries
-        resolved = _resolve_batch(tool, lib, addrs)
+
+        resolved: dict[str, tuple[str, str]] = {}
+        uncached: list[str] = []
+        for addr in addrs:
+            key = (lib, addr)
+            if key in _SYMBOLIZER_CACHE:
+                resolved[addr] = _SYMBOLIZER_CACHE[key]
+            else:
+                uncached.append(addr)
+        if uncached:
+            fresh = _resolve_batch(tool, lib, uncached)
+            for addr, loc in fresh.items():
+                _SYMBOLIZER_CACHE[(lib, addr)] = loc
+                resolved[addr] = loc
+
         for hex_addr, span in pairs:
             if hex_addr in resolved:
                 file_, line_ = resolved[hex_addr]

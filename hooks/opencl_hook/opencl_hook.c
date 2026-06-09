@@ -166,7 +166,7 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
 #endif
 
 /* Heap-allocated context passed to the OpenCL event callback. */
-typedef struct { char name[128]; char extra[64]; } event_cb_data_t;
+typedef struct { char name[128]; char extra[128]; } event_cb_data_t;
 
 typedef void (*event_cb_fn_t)(cl_event, cl_int, void *);
 typedef cl_int (*SetCB_t)(cl_event, cl_int, event_cb_fn_t, void *);
@@ -198,9 +198,11 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
     free(d);
 }
 
-/* Register an async GPU-profiling callback.  Returns immediately. */
+/* Register an async GPU-profiling callback.  Returns immediately.
+   parent_sid: if non-zero, appends psid=<parent_sid> to the GPU span's extra tags. */
 static void register_event_callback(cl_event ev,
-                                    const char *name, const char *extra) {
+                                    const char *name, const char *extra,
+                                    uint64_t parent_sid) {
     static SetCB_t      real_setcb  = NULL;
     static RetainEvent_t real_retain = NULL;
     if (!real_setcb)  real_setcb  = (SetCB_t)dlsym(RTLD_NEXT, "clSetEventCallback");
@@ -210,7 +212,11 @@ static void register_event_callback(cl_event ev,
     event_cb_data_t *d = (event_cb_data_t *)malloc(sizeof(*d));
     if (!d) return;
     snprintf(d->name,  sizeof(d->name),  "%s", name  ? name  : "");
-    snprintf(d->extra, sizeof(d->extra), "%s", extra ? extra : "");
+    if (parent_sid)
+        snprintf(d->extra, sizeof(d->extra), "%s,psid=%llu",
+                 extra ? extra : "", (unsigned long long)parent_sid);
+    else
+        snprintf(d->extra, sizeof(d->extra), "%s", extra ? extra : "");
 
     if (real_retain) real_retain(ev);
     if (real_setcb(ev, 0 /* CL_COMPLETE */, on_event_complete, d) != CL_SUCCESS) {
@@ -311,11 +317,14 @@ cl_int clEnqueueNDRangeKernel(
     if (g_dbg) { fprintf(g_dbg, "[opencl-hook] enqueue ret=%d event=%p\n", ret, event ? *event : NULL); fflush(g_dbg); }
 
     if (ret == CL_SUCCESS && *event) {
-        /* CPU-side span: time from enqueue call to return (scheduling latency). */
-        emit_span("opencl", gettid_compat(), cpu_t0, cpu_dur, kname,
-                  "type=kernel,side=cpu");
-        /* GPU-side span: registered as async callback — does NOT block the queue. */
-        register_event_callback(*event, kname, "type=kernel,side=gpu");
+        /* CPU-side span: time from enqueue call to return (scheduling latency).
+           cpu_t0 doubles as a unique span ID for linking to the GPU execution span. */
+        char cpu_extra[64];
+        snprintf(cpu_extra, sizeof(cpu_extra), "type=kernel,side=cpu,sid=%llu",
+                 (unsigned long long)cpu_t0);
+        emit_span("opencl", gettid_compat(), cpu_t0, cpu_dur, kname, cpu_extra);
+        /* GPU-side span: async callback carries psid= linking back to the CPU span. */
+        register_event_callback(*event, kname, "type=kernel,side=gpu", cpu_t0);
         /* Release our internal event reference if the caller didn't want it. */
         if (our_event) {
             typedef cl_int (*ReleaseEvent_t)(cl_event);
@@ -345,7 +354,7 @@ cl_int clEnqueueSVMMemcpy(
     cl_int ret = real(q, blocking, dst, src, size, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueSVMMemcpy", extra);
     if (ret == CL_SUCCESS && *ev)
-        register_event_callback(*ev, "clEnqueueSVMMemcpy", extra);
+        register_event_callback(*ev, "clEnqueueSVMMemcpy", extra, 0);
     return ret;
 }
 
@@ -367,7 +376,7 @@ cl_int clEnqueueReadBuffer(
     cl_int ret = real(q, buf, blocking, offset, size, ptr, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueReadBuffer", extra);
     if (ret == CL_SUCCESS && *ev)
-        register_event_callback(*ev, "clReadBuffer_gpu", extra);
+        register_event_callback(*ev, "clReadBuffer_gpu", extra, 0);
     return ret;
 }
 
@@ -387,7 +396,7 @@ cl_int clEnqueueWriteBuffer(
     cl_int ret = real(q, buf, blocking, offset, size, ptr, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueWriteBuffer", extra);
     if (ret == CL_SUCCESS && *ev)
-        register_event_callback(*ev, "clWriteBuffer_gpu", extra);
+        register_event_callback(*ev, "clWriteBuffer_gpu", extra, 0);
     return ret;
 }
 

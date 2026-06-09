@@ -41,6 +41,8 @@ class SpanEvent:
     tid: int = 0
     tags: dict[str, Any] = field(default_factory=dict)
     stack_frames: list[str] = field(default_factory=list)  # innermost→outermost (backtrace order)
+    span_id: str = ""         # hook-assigned unique ID (uint64 decimal string from C)
+    parent_span_id: str = ""  # parent's span_id; empty = root span
 
     @property
     def end_ns(self) -> int:

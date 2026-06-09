@@ -15,7 +15,7 @@ JIT cubin path (CUDA):
 """
 
 from __future__ import annotations
-import re, os, subprocess
+import re, os, shutil, subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -72,12 +72,31 @@ def _run(cmd: list[str], timeout: int = 45) -> str:
         return ""
 
 
+_tool_cache: dict[tuple[str, ...], Optional[str]] = {}
+_nm_cache: dict[str, dict[str, tuple[int, int]]] = {}
+
+
 def _tool(*names: str) -> Optional[str]:
-    """Return the first tool name that exists on PATH."""
-    for n in names:
-        if subprocess.run(["which", n], capture_output=True).returncode == 0:
-            return n
-    return None
+    """Return the first tool name that exists on PATH (cached)."""
+    if names not in _tool_cache:
+        _tool_cache[names] = next((n for n in names if shutil.which(n)), None)
+    return _tool_cache[names]
+
+
+def _nm_load(binary_path: str) -> dict[str, tuple[int, int]]:
+    """Parse nm output for binary_path, caching by path."""
+    if binary_path not in _nm_cache:
+        text = _run(["nm", "-S", "--defined-only", binary_path])
+        syms: dict[str, tuple[int, int]] = {}
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 4 and parts[2] in ("T", "t", "W", "w"):
+                try:
+                    syms[parts[3]] = (int(parts[0], 16), int(parts[1], 16))
+                except ValueError:
+                    pass
+        _nm_cache[binary_path] = syms
+    return _nm_cache[binary_path]
 
 
 # ── x86-64 ELF (CPU + .jit.so) ───────────────────────────────────────────────
@@ -469,35 +488,18 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
 def _symbol_at_addr(binary_path: str, addr: int) -> Optional[tuple[str, int, int]]:
     """
     Return (mangled_name, sym_addr, sym_size) for the function containing `addr`.
-    Uses `nm -S --defined-only` which reports address + size.
+    Uses the cached nm symbol table.
     Falls back to the nearest preceding symbol if size is unavailable.
     """
-    text = _run(["nm", "-S", "--defined-only", binary_path])
+    syms = _nm_load(binary_path)
     best: Optional[tuple[str, int, int]] = None
     best_addr = -1
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) == 4 and parts[2] in ("T", "t", "W", "w"):
-            try:
-                sym_addr = int(parts[0], 16)
-                sym_size = int(parts[1], 16)
-                sym_name = parts[3]
-            except ValueError:
-                continue
-            if sym_size > 0 and sym_addr <= addr < sym_addr + sym_size:
-                return (sym_name, sym_addr, sym_size)
-            if sym_addr <= addr and sym_addr > best_addr:
-                best_addr = sym_addr
-                best = (sym_name, sym_addr, sym_size)
-        elif len(parts) == 3 and parts[1] in ("T", "t", "W", "w"):
-            try:
-                sym_addr = int(parts[0], 16)
-                sym_name = parts[2]
-            except ValueError:
-                continue
-            if sym_addr <= addr and sym_addr > best_addr:
-                best_addr = sym_addr
-                best = (sym_name, sym_addr, 0)
+    for sym_name, (sym_addr, sym_size) in syms.items():
+        if sym_size > 0 and sym_addr <= addr < sym_addr + sym_size:
+            return (sym_name, sym_addr, sym_size)
+        if sym_addr <= addr and sym_addr > best_addr:
+            best_addr = sym_addr
+            best = (sym_name, sym_addr, sym_size)
     return best
 
 
@@ -709,18 +711,10 @@ def collect_disasm(
                     continue
                 seen_keys.add(key)
                 sym_name = ""
-                nm_text = _run(["nm", "-S", "--defined-only", lib_path])
-                for line in nm_text.splitlines():
-                    parts = line.split()
-                    if len(parts) == 4 and parts[2] in ("T", "t", "W", "w"):
-                        try:
-                            s_addr = int(parts[0], 16)
-                            s_size = int(parts[1], 16)
-                        except ValueError:
-                            continue
-                        if s_size > 0 and s_addr <= static_off < s_addr + s_size:
-                            sym_name = parts[3]
-                            break
+                for s_name, (s_addr, s_size) in _nm_load(lib_path).items():
+                    if s_size > 0 and s_addr <= static_off < s_addr + s_size:
+                        sym_name = s_name
+                        break
                 if not sym_name:
                     continue
                 target_path = lib_path
@@ -733,17 +727,7 @@ def collect_disasm(
                 continue   # duplicate function — suppress redundant entry
 
             # Look up sym address+size, then disassemble.
-            nm_text = _run(["nm", "-S", "--defined-only", target_path])
-            sym_addr, sym_size = 0, 0
-            for line in nm_text.splitlines():
-                parts = line.split()
-                if len(parts) == 4 and parts[3] == sym_name:
-                    try:
-                        sym_addr = int(parts[0], 16)
-                        sym_size = int(parts[1], 16)
-                    except ValueError:
-                        pass
-                    break
+            sym_addr, sym_size = _nm_load(target_path).get(sym_name, (0, 0))
 
             kd = (
                 _disasm_elf_capstone(target_path, sym_addr, sym_size, span_name)
@@ -764,16 +748,7 @@ def collect_disasm(
     # don't go through the OMPT path above.  Try to look up each unique name
     # in the main binary's symbol table and disassemble it.
     if cpu_names and binary and Path(binary).exists():
-        nm_syms: dict[str, tuple[int, int]] = {}
-        nm_text = _run(["nm", "-S", "--defined-only", binary])
-        for line in nm_text.splitlines():
-            parts = line.split()
-            if len(parts) == 4 and parts[2] in ("T", "t", "W", "w"):
-                try:
-                    nm_syms[parts[3]] = (int(parts[0], 16), int(parts[1], 16))
-                except ValueError:
-                    pass
-
+        nm_syms = _nm_load(binary)
         elf_arch = _elf_arch(binary)
         for fn_name in cpu_names:
             if fn_name in result:

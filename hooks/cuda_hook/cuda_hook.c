@@ -55,6 +55,11 @@ static void           *g_cudart_handle = NULL;
 /* Thread-local recursion guard: prevents profiling our own CUDA event calls */
 static __thread int in_hook = 0;
 
+/* Span ID of the innermost active NVTX range on this thread (0 = none).
+ * Set/cleared by nvtxRangePushA / nvtxRangePop.
+ * Read by cudaLaunchKernel / cudaMemcpyAsync to stamp child spans. */
+static __thread uint64_t tls_nvtx_span_id = 0;
+
 /* ── Core helpers ───────────────────────────────────────────────────────── */
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -414,10 +419,17 @@ cudaError_t cudaLaunchKernel(
     pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
     char extra[256];
-    snprintf(extra, sizeof(extra),
-             "type=kernel,grid=%ux%ux%u,block=%ux%ux%u,stream=%d",
-             gridDim.x, gridDim.y, gridDim.z,
-             blockDim.x, blockDim.y, blockDim.z, sid);
+    if (tls_nvtx_span_id)
+        snprintf(extra, sizeof(extra),
+                 "type=kernel,grid=%ux%ux%u,block=%ux%ux%u,stream=%d,psid=%llu",
+                 gridDim.x, gridDim.y, gridDim.z,
+                 blockDim.x, blockDim.y, blockDim.z, sid,
+                 (unsigned long long)tls_nvtx_span_id);
+    else
+        snprintf(extra, sizeof(extra),
+                 "type=kernel,grid=%ux%ux%u,block=%ux%ux%u,stream=%d",
+                 gridDim.x, gridDim.y, gridDim.z,
+                 blockDim.x, blockDim.y, blockDim.z, sid);
 
     cudaEvent_t ev_s, ev_e;
     int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
@@ -467,8 +479,12 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
 
     pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[128];
-    snprintf(extra, sizeof(extra), "type=memcpy_async,bytes=%zu,stream=%d", count, sid);
+    char extra[192];
+    if (tls_nvtx_span_id)
+        snprintf(extra, sizeof(extra), "type=memcpy_async,bytes=%zu,stream=%d,psid=%llu",
+                 count, sid, (unsigned long long)tls_nvtx_span_id);
+    else
+        snprintf(extra, sizeof(extra), "type=memcpy_async,bytes=%zu,stream=%d", count, sid);
 
     cudaEvent_t ev_s, ev_e;
     int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
@@ -1061,12 +1077,14 @@ CUresult cuCtxSynchronize(void) {
 
 typedef struct {
     uint64_t start_ns;
+    uint64_t span_id;   /* unique ID = start_ns at push time */
     char     name[256];
     pid_t    tid;
 } NvtxEntry;
 
 static __thread NvtxEntry nvtx_stack[MAX_NVTX_DEPTH];
 static __thread int       nvtx_depth = 0;
+/* tls_nvtx_span_id is declared near the top of this file (before the wrappers). */
 
 typedef struct {
     uint16_t version;
@@ -1085,10 +1103,12 @@ int nvtxRangePushA(const char *message) {
     if (nvtx_depth < MAX_NVTX_DEPTH) {
         NvtxEntry *e = &nvtx_stack[nvtx_depth];
         e->start_ns = now_ns();
+        e->span_id  = e->start_ns;   /* unique: nanosecond timestamp */
         e->tid      = gettid_compat();
         strncpy(e->name, message ? message : "<nvtx>", sizeof(e->name) - 1);
         e->name[sizeof(e->name) - 1] = '\0';
         nvtx_depth++;
+        tls_nvtx_span_id = e->span_id;
     }
     return nvtx_depth - 1;
 }
@@ -1122,7 +1142,12 @@ int nvtxRangePop(void) {
     nvtx_depth--;
     NvtxEntry *e = &nvtx_stack[nvtx_depth];
     uint64_t dur = now_ns() - e->start_ns;
-    emit_span("nvtx", e->tid, e->start_ns, dur, e->name, "type=nvtx_range");
+    char nvtx_extra[64];
+    snprintf(nvtx_extra, sizeof(nvtx_extra), "type=nvtx_range,sid=%llu",
+             (unsigned long long)e->span_id);
+    emit_span("nvtx", e->tid, e->start_ns, dur, e->name, nvtx_extra);
+    /* Restore parent NVTX span ID (0 if no enclosing range). */
+    tls_nvtx_span_id = (nvtx_depth > 0) ? nvtx_stack[nvtx_depth - 1].span_id : 0;
     return 0;
 }
 

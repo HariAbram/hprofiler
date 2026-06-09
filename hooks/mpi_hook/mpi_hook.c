@@ -246,7 +246,7 @@ int MPI_Isend(const void *buf, int count, MPI_Datatype datatype,
                       ? req_register(*request, "isend", dest, tag, nb) : 0;
     char extra[160];
     if (req_id)
-        snprintf(extra, sizeof(extra), "type=isend,bytes=%zu,rank=%d,peer=%d,tag=%d,req_id=%llu",
+        snprintf(extra, sizeof(extra), "type=isend,bytes=%zu,rank=%d,peer=%d,tag=%d,sid=%llu",
                  nb, g_mpi_rank, dest, tag, (unsigned long long)req_id);
     else
         snprintf(extra, sizeof(extra), "type=isend,bytes=%zu,rank=%d,peer=%d,tag=%d",
@@ -264,7 +264,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype,
                       ? req_register(*request, "irecv", source, tag, nb) : 0;
     char extra[160];
     if (req_id)
-        snprintf(extra, sizeof(extra), "type=irecv,bytes=%zu,rank=%d,peer=%d,tag=%d,req_id=%llu",
+        snprintf(extra, sizeof(extra), "type=irecv,bytes=%zu,rank=%d,peer=%d,tag=%d,sid=%llu",
                  nb, g_mpi_rank, source, tag, (unsigned long long)req_id);
     else
         snprintf(extra, sizeof(extra), "type=irecv,bytes=%zu,rank=%d,peer=%d,tag=%d",
@@ -281,7 +281,7 @@ int MPI_Wait(MPI_Request *request, MPI_Status *status) {
     req_lookup(saved, &req_id);
     char extra[96];
     if (req_id)
-        snprintf(extra, sizeof(extra), "type=wait,rank=%d,req_id=%llu",
+        snprintf(extra, sizeof(extra), "type=wait,rank=%d,psid=%llu",
                  g_mpi_rank, (unsigned long long)req_id);
     else
         snprintf(extra, sizeof(extra), "type=wait,rank=%d", g_mpi_rank);
