@@ -26,6 +26,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/syscall.h>
@@ -81,7 +82,14 @@ static pid_t gettid_compat(void) { return (pid_t)syscall(SYS_gettid); }
 static void ensure_connected(void) {
     if (g_sock >= 0) return;
     const char *path = getenv("HPROFILER_SOCKET");
-    if (!path) return;
+    if (!path) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[hprofiler/rocm] HPROFILER_SOCKET not set — no events will be recorded\n");
+        }
+        return;
+    }
     int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (s < 0) return;
     struct sockaddr_un addr = {0};
@@ -89,6 +97,9 @@ static void ensure_connected(void) {
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
     if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
         g_sock = s; g_pid = getpid();
+    } else {
+        close(s);
+        fprintf(stderr, "[hprofiler/rocm] connect(%s) failed: %s\n", path, strerror(errno));
     }
 }
 
@@ -777,36 +788,12 @@ hipError_t hipDeviceReset(void) {
     return ret;
 }
 
-/* ── JIT binary capture + kernel name table ──────────────────────────────── */
-static void _save_rocm_image(const void *image) {
-    if (!image) return;
-    static int counter = 0;
-    char path[256];
-    snprintf(path, sizeof(path), "/tmp/hprofiler_rocm_%d_%d.bin",
-             (int)getpid(), counter++);
-    const uint8_t *p = (const uint8_t *)image;
-    size_t sz = 0;
-    if (p[0]==0x7f && p[1]=='E' && p[2]=='L' && p[3]=='F' && p[4]==2) {
-        uint64_t shoff; memcpy(&shoff, p+40, 8);
-        uint16_t shesz; memcpy(&shesz, p+58, 2);
-        uint16_t shnum; memcpy(&shnum, p+60, 2);
-        size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
-        if (end > 64 && end < 512ULL*1024*1024) sz = end;
-    } else if ((p[0]=='/' && p[1]=='/') || p[0]=='.' || p[0]==';') {
-        sz = strnlen((const char *)image, 64*1024*1024);
-        if (sz > 0) sz++;
-    }
-    if (sz == 0) return;
-    FILE *f = fopen(path, "wb");
-    if (f) { fwrite(image, 1, sz, f); fclose(f); }
-}
-
+/* ── JIT module load + kernel name table ─────────────────────────────────── */
 hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {
     typedef hipError_t (*fn_t)(hipModule_t *, const void *);
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadData");
     if (!real) return -1;
-    _save_rocm_image(image);
     uint64_t t0 = now_ns();
     hipError_t ret = real(module, image);
     emit_span("jit", gettid_compat(), t0, now_ns()-t0,
@@ -821,7 +808,6 @@ hipError_t hipModuleLoadDataEx(hipModule_t *module, const void *image,
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadDataEx");
     if (!real) return -1;
-    _save_rocm_image(image);
     uint64_t t0 = now_ns();
     hipError_t ret = real(module, image, numOptions, options, optionValues);
     emit_span("jit", gettid_compat(), t0, now_ns()-t0,
