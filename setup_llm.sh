@@ -87,16 +87,60 @@ else
             model_dir="${model_dir:-${HOME}/.ollama/models}"
             mkdir -p "$model_dir"
 
-            TARBALL_URL="https://ollama.com/download/ollama-linux-${ARCH}.tgz"
+            # Ollama v0.28+ ships as a .tar.zst bundle (includes GPU libs).
+            # We fetch only the bin/ollama binary — the cluster already has CUDA/ROCm.
+            GH_API="https://api.github.com/repos/ollama/ollama/releases/latest"
+            TARBALL_NAME="ollama-linux-${ARCH}.tar.zst"
 
-            info "Downloading Ollama (linux-${ARCH}) to ${INSTALL_DIR} …"
-            info "URL: ${TARBALL_URL}"
-            if curl -fL --progress-bar "$TARBALL_URL" | tar -xzf - -C "$INSTALL_DIR" --strip-components=1 bin/ollama 2>/dev/null \
-               || curl -fL --progress-bar "$TARBALL_URL" | tar -xzf - -C "$INSTALL_DIR" 2>/dev/null; then
-                # The tarball extracts bin/ollama and lib/ollama/ — move binary if nested
-                if [[ -f "${INSTALL_DIR}/bin/ollama" && ! -f "${INSTALL_DIR}/ollama" ]]; then
-                    mv "${INSTALL_DIR}/bin/ollama" "${INSTALL_DIR}/ollama"
+            # Resolve the versioned download URL via GitHub API
+            info "Resolving latest Ollama release …"
+            VERSIONED_URL=$(curl -fsSL --max-time 15 "$GH_API" 2>/dev/null \
+                | python3 -c "
+import sys, json
+try:
+    r = json.load(sys.stdin)
+    for a in r.get('assets', []):
+        if a['name'] == '${TARBALL_NAME}':
+            print(a['browser_download_url'])
+            break
+except: pass
+" 2>/dev/null || true)
+
+            DOWNLOAD_OK=0
+
+            if [[ -n "$VERSIONED_URL" ]]; then
+                info "Downloading Ollama binary from: ${VERSIONED_URL}"
+                info "(Streaming 1.3 GB tarball — extracting only bin/ollama)"
+                if curl -fL --progress-bar "$VERSIONED_URL" \
+                   | tar --zstd -xf - -C "$INSTALL_DIR" --wildcards "*/bin/ollama" \
+                        --strip-components=2 2>/dev/null \
+                   && [[ -f "${INSTALL_DIR}/ollama" ]]; then
+                    DOWNLOAD_OK=1
                 fi
+            fi
+
+            if [[ "$DOWNLOAD_OK" == "0" ]]; then
+                warn "Automatic download failed (no internet access or blocked by cluster firewall)."
+                echo
+                echo -e "${BOLD}  ── Manual install — run on your LOCAL machine ───────────────${NC}"
+                echo
+                echo "  # Download and extract just the binary (~30 MB extracted):"
+                echo "  curl -fL https://github.com/ollama/ollama/releases/latest/download/${TARBALL_NAME} \\"
+                echo "    | tar --zstd -xf - --wildcards '*/bin/ollama' --strip-components=2"
+                echo
+                echo "  # Copy to cluster:"
+                echo "  scp ollama ${USER}@<login-node>:${INSTALL_DIR}/ollama"
+                echo -e "${BOLD}  ─────────────────────────────────────────────────────────────${NC}"
+                echo
+                ask "  Already copied the binary? Paste its full path here (or Enter to skip):"
+                read -r local_bin
+                if [[ -n "${local_bin:-}" && -f "$local_bin" ]]; then
+                    cp "$local_bin" "${INSTALL_DIR}/ollama"
+                    DOWNLOAD_OK=1
+                fi
+            fi
+
+            if [[ "$DOWNLOAD_OK" == "1" ]]; then
                 chmod +x "${INSTALL_DIR}/ollama"
                 success "Ollama installed at ${INSTALL_DIR}/ollama"
 
@@ -104,7 +148,6 @@ else
                 if ! echo "$PATH" | grep -q "${INSTALL_DIR}"; then
                     _add_export "PATH" "${INSTALL_DIR}:\$PATH"
                     export PATH="${INSTALL_DIR}:${PATH}"
-                    warn "Added ${INSTALL_DIR} to PATH in ${PROFILE}"
                 fi
 
                 # Set model storage location
@@ -113,8 +156,7 @@ else
 
                 OLLAMA_INSTALLED=1
             else
-                error "Download failed. Try manually:"
-                echo "  curl -fL ${TARBALL_URL} | tar -xzf - -C ${INSTALL_DIR}"
+                warn "Skipping Ollama — install the binary manually and re-run this script."
             fi
         fi
     fi
