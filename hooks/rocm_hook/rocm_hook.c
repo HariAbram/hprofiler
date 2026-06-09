@@ -59,10 +59,9 @@ static __thread int in_hook = 0;
 static void *g_hip_lib = NULL;
 
 static void *_real_hip_sym(const char *name) {
-    /* Fast path: already in global namespace via RTLD_NEXT */
-    void *sym = _real_hip_sym(name);
-    if (sym) return sym;
-    /* Slow path: libamdhip64 loaded with RTLD_LOCAL — try our explicit handle */
+    /* Use the explicit handle opened with RTLD_GLOBAL in the constructor.
+     * dlsym(specific_handle, name) bypasses our LD_PRELOAD wrappers and
+     * returns the real symbol from libamdhip64.so directly. */
     if (!g_hip_lib) {
         g_hip_lib = dlopen("libamdhip64.so",   RTLD_LAZY | RTLD_GLOBAL);
         if (!g_hip_lib)
