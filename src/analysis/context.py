@@ -44,10 +44,18 @@ def build_profile_context(trace: "Trace") -> dict:
         "thread_count": thread_count or None,
     }
     if thread_count > 1:
-        run["note"] = (
-            "Span durations sum per-thread, so category totals can exceed 100% of wall time "
-            "in multi-threaded profiling. Percentages reflect cumulative thread time, not elapsed time."
-        )
+        run["parallelism"] = {
+            "thread_count": thread_count,
+            "thread_aggregate_ms": _ms(sum(s.duration_ns for s in trace.spans)),
+            "parallel_efficiency_pct": round(
+                100.0 * sum(s.duration_ns for s in trace.spans) / (thread_count * max(wall_ns, 1)), 1
+            ),
+            "note": (
+                "Category breakdowns use pct_of_thread_aggregate (not pct_wall_time) "
+                "to keep percentages meaningful. parallel_efficiency_pct shows how busy "
+                "threads are on average relative to wall time."
+            ),
+        }
 
     hardware = _build_hardware(trace)
 
@@ -56,15 +64,32 @@ def build_profile_context(trace: "Trace") -> dict:
     for s in trace.spans:
         by_cat[s.category.value] = by_cat.get(s.category.value, 0) + s.duration_ns
 
+    # For parallel workloads, use thread-aggregate total so percentages sum to ~100%
+    # and don't overflow wall time. GPU categories (cuda/rocm) run on a single timeline
+    # so they still compare against wall time.
+    _GPU_CATS = {"cuda", "rocm"}
+    thread_aggregate_ns = max(sum(by_cat.values()), 1)
+    is_parallel = thread_count > 1
+
     breakdown: dict = {}
     for cat, ns in sorted(by_cat.items(), key=lambda kv: -kv[1]):
-        pct = 100.0 * ns / wall_ns
-        if pct >= 0.1:
-            breakdown[cat] = {
-                "total_ms": _ms(ns),
-                "pct_wall_time": round(pct, 2),
-                "span_count": sum(1 for s in trace.spans if s.category.value == cat),
-            }
+        pct_wall = 100.0 * ns / wall_ns
+        if pct_wall < 0.1:
+            continue
+        entry: dict = {
+            "total_ms": _ms(ns),
+            "span_count": sum(1 for s in trace.spans if s.category.value == cat),
+        }
+        if is_parallel and cat not in _GPU_CATS:
+            # Express as share of all thread-work so the model gets a sane percentage
+            entry["pct_of_thread_aggregate"] = round(100.0 * ns / thread_aggregate_ns, 2)
+            entry["thread_aggregate_note"] = (
+                "percentage of total thread-time (sums to ~100% across categories); "
+                f"wall time is {_ms(wall_ns)} ms with {thread_count} threads"
+            )
+        else:
+            entry["pct_wall_time"] = round(pct_wall, 2)
+        breakdown[cat] = entry
 
     gpu_util: dict[str, object] = {}
     gpu_mem_peak: dict[str, float] = {}
@@ -90,7 +115,9 @@ def build_profile_context(trace: "Trace") -> dict:
             gpu_util[f"gpu{lbl}_mem_used"] = _fmt_bytes(b)
 
     memory = _build_memory(trace)
-    hotspots = _build_hotspots(trace, wall_ns, n=15)
+    hotspots = _build_hotspots(trace, wall_ns, n=15,
+                               thread_aggregate_ns=thread_aggregate_ns,
+                               thread_count=thread_count)
 
     hw_counters: dict[str, float] = {}
     for c in trace.counters:
@@ -173,18 +200,25 @@ def _build_memory(trace: "Trace") -> dict:
     return mem
 
 
-def _build_hotspots(trace: "Trace", wall_ns: int, n: int = 15) -> list[dict]:
+def _build_hotspots(trace: "Trace", wall_ns: int, n: int = 15,
+                    thread_aggregate_ns: int = 0, thread_count: int = 1) -> list[dict]:
+    _GPU_CATS = {"cuda", "rocm"}
     stats = trace.aggregated_stats()
     result: list[dict] = []
     for row in stats[:n]:
+        cat = row["category"]
+        total_ns = row["total_ns"]
         entry: dict = {
             "name": row["name"],
-            "category": row["category"],
+            "category": cat,
             "count": row["count"],
-            "total_ms": round(row["total_ns"] / 1e6, 3),
+            "total_ms": round(total_ns / 1e6, 3),
             "avg_ms": round(row["avg_ns"] / 1e6, 3),
-            "pct_wall_time": round(100.0 * row["total_ns"] / wall_ns, 2),
         }
+        if thread_count > 1 and cat not in _GPU_CATS and thread_aggregate_ns > 0:
+            entry["pct_of_thread_aggregate"] = round(100.0 * total_ns / thread_aggregate_ns, 2)
+        else:
+            entry["pct_wall_time"] = round(100.0 * total_ns / wall_ns, 2)
         rep = next(
             (s for s in trace.spans if s.name == row["name"] and s.category.value == row["category"]),
             None,

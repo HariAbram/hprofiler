@@ -47,6 +47,29 @@ static pid_t           g_pid         = 0;
 /* Thread-local recursion guard */
 static __thread int in_hook = 0;
 
+/*
+ * Explicit handle to libamdhip64.so opened with RTLD_GLOBAL.
+ *
+ * AdaptiveCpp SSCP loads libamdhip64.so via dlopen(RTLD_LOCAL), which makes
+ * its symbols invisible to _real_hip_sym(...) from within this library.
+ * We pre-open it with RTLD_GLOBAL in the constructor so our wrappers can
+ * always resolve the real HIP symbols regardless of load order.
+ */
+static void *g_hip_lib = NULL;
+
+static void *_real_hip_sym(const char *name) {
+    /* Fast path: already in global namespace via RTLD_NEXT */
+    void *sym = _real_hip_sym(name);
+    if (sym) return sym;
+    /* Slow path: libamdhip64 loaded with RTLD_LOCAL — try our explicit handle */
+    if (!g_hip_lib) {
+        g_hip_lib = dlopen("libamdhip64.so",   RTLD_LAZY | RTLD_GLOBAL);
+        if (!g_hip_lib)
+            g_hip_lib = dlopen("libamdhip64.so.5", RTLD_LAZY | RTLD_GLOBAL);
+    }
+    return g_hip_lib ? dlsym(g_hip_lib, name) : NULL;
+}
+
 /* ── Core helpers ───────────────────────────────────────────────────────── */
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -269,16 +292,11 @@ static fn_EvSync_t    f_evSync    = NULL;
 
 static int ev_api_ok(void) {
     if (!f_evCreate) {
-        f_evCreate  = (fn_EvCreate_t) dlsym(RTLD_DEFAULT, "hipEventCreate");
-        f_evRecord  = (fn_EvRecord_t) dlsym(RTLD_DEFAULT, "hipEventRecord");
-        f_evElapsed = (fn_EvElapsed_t)dlsym(RTLD_DEFAULT, "hipEventElapsedTime");
-        f_evDestroy = (fn_EvDestroy_t)dlsym(RTLD_DEFAULT, "hipEventDestroy");
-        f_evSync    = (fn_EvSync_t)   dlsym(RTLD_DEFAULT, "hipEventSynchronize");
-        if (!f_evCreate)  f_evCreate  = (fn_EvCreate_t) dlsym(RTLD_NEXT, "hipEventCreate");
-        if (!f_evRecord)  f_evRecord  = (fn_EvRecord_t) dlsym(RTLD_NEXT, "hipEventRecord");
-        if (!f_evElapsed) f_evElapsed = (fn_EvElapsed_t)dlsym(RTLD_NEXT, "hipEventElapsedTime");
-        if (!f_evDestroy) f_evDestroy = (fn_EvDestroy_t)dlsym(RTLD_NEXT, "hipEventDestroy");
-        if (!f_evSync)    f_evSync    = (fn_EvSync_t)   dlsym(RTLD_NEXT, "hipEventSynchronize");
+        f_evCreate  = (fn_EvCreate_t) _real_hip_sym("hipEventCreate");
+        f_evRecord  = (fn_EvRecord_t) _real_hip_sym("hipEventRecord");
+        f_evElapsed = (fn_EvElapsed_t)_real_hip_sym("hipEventElapsedTime");
+        f_evDestroy = (fn_EvDestroy_t)_real_hip_sym("hipEventDestroy");
+        f_evSync    = (fn_EvSync_t)   _real_hip_sym("hipEventSynchronize");
     }
     return f_evCreate && f_evRecord && f_evElapsed && f_evDestroy && f_evSync;
 }
@@ -381,7 +399,7 @@ hipError_t hipLaunchKernel(const void *fn, dim3 grid, dim3 block,
                             void **args, size_t sharedMem, hipStream_t stream) {
     typedef hipError_t (*fn_t)(const void*, dim3, dim3, void**, size_t, hipStream_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipLaunchKernel");
+    if (!real) real = (fn_t)_real_hip_sym("hipLaunchKernel");
     if (!real) return -1;
     if (in_hook) return real(fn, grid, block, args, sharedMem, stream);
     in_hook = 1;
@@ -412,7 +430,7 @@ hipError_t hipLaunchKernelGGL(hipFunction_t fn,
     typedef hipError_t (*fn_t)(hipFunction_t, dim3, dim3, unsigned int,
                                 hipStream_t, void**);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipLaunchKernelGGL");
+    if (!real) real = (fn_t)_real_hip_sym("hipLaunchKernelGGL");
     if (!real) return -1;
     if (in_hook) return real(fn, grid, block, sharedMem, stream, kernelParams);
     in_hook = 1;
@@ -446,7 +464,7 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f,
                                 unsigned, unsigned, unsigned,
                                 unsigned, hipStream_t, void**, void**);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipModuleLaunchKernel");
+    if (!real) real = (fn_t)_real_hip_sym("hipModuleLaunchKernel");
     if (!real) return -1;
     if (in_hook) return real(f, gx,gy,gz, bx,by,bz, sharedMem, stream,
                              kernelParams, extra_params);
@@ -475,7 +493,7 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f,
 hipError_t hipMemcpy(void *dst, const void *src, size_t size, hipMemcpyKind kind) {
     typedef hipError_t (*fn_t)(void*, const void*, size_t, hipMemcpyKind);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipMemcpy");
+    if (!real) real = (fn_t)_real_hip_sym("hipMemcpy");
     if (!real) return -1;
     if (in_hook) return real(dst, src, size, kind);
     in_hook = 1;
@@ -497,7 +515,7 @@ hipError_t hipMemcpyAsync(void *dst, const void *src, size_t size,
                            hipMemcpyKind kind, hipStream_t stream) {
     typedef hipError_t (*fn_t)(void*, const void*, size_t, hipMemcpyKind, hipStream_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipMemcpyAsync");
+    if (!real) real = (fn_t)_real_hip_sym("hipMemcpyAsync");
     if (!real) return -1;
     if (in_hook) return real(dst, src, size, kind, stream);
     in_hook = 1;
@@ -521,7 +539,7 @@ hipError_t hipMemcpyAsync(void *dst, const void *src, size_t size,
 hipError_t hipMemcpyHtoD(void *dst, const void *src, size_t size) {
     typedef hipError_t (*fn_t)(void*, const void*, size_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipMemcpyHtoD");
+    if (!real) real = (fn_t)_real_hip_sym("hipMemcpyHtoD");
     if (!real) return -1;
     if (in_hook) return real(dst, src, size);
     in_hook = 1;
@@ -539,7 +557,7 @@ hipError_t hipMemcpyHtoD(void *dst, const void *src, size_t size) {
 hipError_t hipMemcpyDtoH(void *dst, const void *src, size_t size) {
     typedef hipError_t (*fn_t)(void*, const void*, size_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipMemcpyDtoH");
+    if (!real) real = (fn_t)_real_hip_sym("hipMemcpyDtoH");
     if (!real) return -1;
     if (in_hook) return real(dst, src, size);
     in_hook = 1;
@@ -557,7 +575,7 @@ hipError_t hipMemcpyDtoH(void *dst, const void *src, size_t size) {
 hipError_t hipMalloc(void **ptr, size_t size) {
     typedef hipError_t (*fn_t)(void**, size_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipMalloc");
+    if (!real) real = (fn_t)_real_hip_sym("hipMalloc");
     if (!real) return -1;
     if (in_hook) return real(ptr, size);
     in_hook = 1;
@@ -576,7 +594,7 @@ hipError_t hipMalloc(void **ptr, size_t size) {
 hipError_t hipMallocManaged(void **ptr, size_t size, unsigned int flags) {
     typedef hipError_t (*fn_t)(void**, size_t, unsigned int);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipMallocManaged");
+    if (!real) real = (fn_t)_real_hip_sym("hipMallocManaged");
     if (!real) return -1;
     if (in_hook) return real(ptr, size, flags);
     in_hook = 1;
@@ -595,7 +613,7 @@ hipError_t hipMallocManaged(void **ptr, size_t size, unsigned int flags) {
 hipError_t hipMallocAsync(void **ptr, size_t size, hipStream_t stream) {
     typedef hipError_t (*fn_t)(void**, size_t, hipStream_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipMallocAsync");
+    if (!real) real = (fn_t)_real_hip_sym("hipMallocAsync");
     if (!real) return -1;
     if (in_hook) return real(ptr, size, stream);
     in_hook = 1;
@@ -615,7 +633,7 @@ hipError_t hipMallocAsync(void **ptr, size_t size, hipStream_t stream) {
 hipError_t hipFree(void *ptr) {
     typedef hipError_t (*fn_t)(void*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipFree");
+    if (!real) real = (fn_t)_real_hip_sym("hipFree");
     if (!real) return -1;
     if (in_hook) return real(ptr);
     in_hook = 1;
@@ -632,7 +650,7 @@ hipError_t hipFree(void *ptr) {
 hipError_t hipFreeAsync(void *ptr, hipStream_t stream) {
     typedef hipError_t (*fn_t)(void*, hipStream_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipFreeAsync");
+    if (!real) real = (fn_t)_real_hip_sym("hipFreeAsync");
     if (!real) return -1;
     if (in_hook) return real(ptr, stream);
     in_hook = 1;
@@ -651,7 +669,7 @@ hipError_t hipFreeAsync(void *ptr, hipStream_t stream) {
 hipError_t hipHostMalloc(void **ptr, size_t size, unsigned int flags) {
     typedef hipError_t (*fn_t)(void**, size_t, unsigned int);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipHostMalloc");
+    if (!real) real = (fn_t)_real_hip_sym("hipHostMalloc");
     if (!real) return -1;
     if (in_hook) return real(ptr, size, flags);
     in_hook = 1;
@@ -670,7 +688,7 @@ hipError_t hipHostMalloc(void **ptr, size_t size, unsigned int flags) {
 hipError_t hipHostFree(void *ptr) {
     typedef hipError_t (*fn_t)(void*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipHostFree");
+    if (!real) real = (fn_t)_real_hip_sym("hipHostFree");
     if (!real) return -1;
     if (in_hook) return real(ptr);
     in_hook = 1;
@@ -688,7 +706,7 @@ hipError_t hipHostFree(void *ptr) {
 hipError_t hipDeviceSynchronize(void) {
     typedef hipError_t (*fn_t)(void);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipDeviceSynchronize");
+    if (!real) real = (fn_t)_real_hip_sym("hipDeviceSynchronize");
     if (!real) return -1;
     if (in_hook) return real();
     in_hook = 1;
@@ -706,7 +724,7 @@ hipError_t hipDeviceSynchronize(void) {
 hipError_t hipStreamSynchronize(hipStream_t stream) {
     typedef hipError_t (*fn_t)(hipStream_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipStreamSynchronize");
+    if (!real) real = (fn_t)_real_hip_sym("hipStreamSynchronize");
     if (!real) return -1;
     if (in_hook) return real(stream);
     in_hook = 1;
@@ -726,7 +744,7 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
 hipError_t hipEventSynchronize(hipEvent_t event) {
     typedef hipError_t (*fn_t)(hipEvent_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipEventSynchronize");
+    if (!real) real = (fn_t)_real_hip_sym("hipEventSynchronize");
     if (!real) return -1;
     if (in_hook) return real(event);
     in_hook = 1;
@@ -744,7 +762,7 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
 hipError_t hipDeviceReset(void) {
     typedef hipError_t (*fn_t)(void);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipDeviceReset");
+    if (!real) real = (fn_t)_real_hip_sym("hipDeviceReset");
     if (!real) return -1;
     if (in_hook) return real();
     in_hook = 1;
@@ -786,7 +804,7 @@ static void _save_rocm_image(const void *image) {
 hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {
     typedef hipError_t (*fn_t)(hipModule_t *, const void *);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipModuleLoadData");
+    if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadData");
     if (!real) return -1;
     _save_rocm_image(image);
     uint64_t t0 = now_ns();
@@ -801,7 +819,7 @@ hipError_t hipModuleLoadDataEx(hipModule_t *module, const void *image,
                                 void *options, void *optionValues) {
     typedef hipError_t (*fn_t)(hipModule_t *, const void *, unsigned, void *, void *);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipModuleLoadDataEx");
+    if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadDataEx");
     if (!real) return -1;
     _save_rocm_image(image);
     uint64_t t0 = now_ns();
@@ -815,7 +833,7 @@ hipError_t hipModuleGetFunction(hipFunction_t *hfunc, hipModule_t hmod,
                                  const char *name) {
     typedef hipError_t (*fn_t)(hipFunction_t *, hipModule_t, const char *);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipModuleGetFunction");
+    if (!real) real = (fn_t)_real_hip_sym("hipModuleGetFunction");
     if (!real) return -1;
     hipError_t ret = real(hfunc, hmod, name);
     if (ret == 0 && hfunc && *hfunc && name) {
@@ -837,7 +855,7 @@ typedef void *hipGraphExec_t;
 hipError_t hipGraphLaunch(hipGraphExec_t graphExec, hipStream_t stream) {
     typedef hipError_t (*fn_t)(hipGraphExec_t, hipStream_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hipGraphLaunch");
+    if (!real) real = (fn_t)_real_hip_sym("hipGraphLaunch");
     if (!real) return -1;
     if (in_hook) return real(graphExec, stream);
     in_hook = 1;
@@ -869,7 +887,7 @@ static __thread int      roctx_depth = 0;
 roctx_range_id_t roctxRangePushA(const char *message) {
     typedef roctx_range_id_t (*fn_t)(const char *);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "roctxRangePushA");
+    if (!real) real = (fn_t)_real_hip_sym("roctxRangePushA");
     roctx_range_id_t id = real ? real(message) : (roctx_range_id_t)roctx_depth;
     if (roctx_depth < ROCTX_STACK_DEPTH) {
         roctx_stack_ts[roctx_depth] = now_ns();
@@ -882,7 +900,7 @@ roctx_range_id_t roctxRangePushA(const char *message) {
 roctx_range_id_t roctxRangePop(void) {
     typedef roctx_range_id_t (*fn_t)(void);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "roctxRangePop");
+    if (!real) real = (fn_t)_real_hip_sym("roctxRangePop");
     if (roctx_depth > 0) {
         roctx_depth--;
         emit_span("annotation", gettid_compat(),
@@ -896,14 +914,23 @@ roctx_range_id_t roctxRangePop(void) {
 void roctxMarkA(const char *message) {
     typedef void (*fn_t)(const char *);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "roctxMarkA");
+    if (!real) real = (fn_t)_real_hip_sym("roctxMarkA");
     emit_span("annotation", gettid_compat(), now_ns(), 0,
               message ? message : "roctx_mark", "type=roctx_mark");
     if (real) real(message);
 }
 
 /* ── Constructor / Destructor ───────────────────────────────────────────── */
-__attribute__((constructor)) static void init(void) { ensure_connected(); cs_init(); }
+__attribute__((constructor)) static void init(void) {
+    /* Pre-load libamdhip64 with RTLD_GLOBAL so dlsym(RTLD_NEXT, ...) finds HIP
+     * symbols even if AdaptiveCpp SSCP later loads the same library RTLD_LOCAL. */
+    if (!g_hip_lib)
+        g_hip_lib = dlopen("libamdhip64.so",   RTLD_LAZY | RTLD_GLOBAL);
+    if (!g_hip_lib)
+        g_hip_lib = dlopen("libamdhip64.so.5", RTLD_LAZY | RTLD_GLOBAL);
+    ensure_connected();
+    cs_init();
+}
 __attribute__((destructor))  static void fini(void) {
     pk_flush(NULL, 1);
     /* Detect unreleased GPU allocations (R4: memory leak detection) */
@@ -914,4 +941,5 @@ __attribute__((destructor))  static void fini(void) {
     if (leaked > 0)
         emit_ctr("memory", "gpu_memory_leaked_bytes", leaked, "bytes");
     if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+    if (g_hip_lib)   { dlclose(g_hip_lib); g_hip_lib = NULL; }
 }
