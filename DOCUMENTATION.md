@@ -25,6 +25,7 @@ intercepted without requiring libnvToolsExt.
 12. [Wire Protocol](#12-wire-protocol)
 13. [Performance Overhead](#13-performance-overhead)
 14. [Extending the Profiler](#14-extending-the-profiler)
+15. [AI Performance Analysis](#15-ai-performance-analysis)
 
 ---
 
@@ -375,14 +376,6 @@ protocol is detected.
 Open in any browser — no server or internet connection required.
 
 **Orientation:** Root frame at top, leaf frames at bottom (icicle / top-down convention).
-
-**With `--backend`:** Backend hooks are injected via `LD_PRELOAD` so the CPU
-stacks captured by `perf` include time spent inside GPU API calls:
-
-- `cudaLaunchKernel` / `clEnqueueNDRangeKernel` — kernel launch overhead
-- `cudaDeviceSynchronize` / `clFinish` — CPU blocking while GPU runs
-- `MPI_Allreduce` / `MPI_Barrier` — collective synchronisation wait
-- `hipLaunchKernel` — ROCm launch overhead
 
 **With `--backend`:** Backend hooks are injected via `LD_PRELOAD` so the CPU
 stacks captured by `perf` include time spent inside GPU API calls:
@@ -1858,7 +1851,32 @@ Subclass `LLMProvider` from `src/analysis/llm/base.py` and implement `chat()`. T
 
 ---
 
-### 15.7 Privacy Considerations
+### 15.7 Planned: LLM-Triggered Re-Profiling
+
+**Current limitation:** the agent only has access to data already captured in the loaded trace. If it identifies a bottleneck that requires a different profiling strategy — e.g., "I need roofline data for this kernel" or "re-run with `--backend mpi` to see communication breakdown" — it cannot act on that insight; it can only describe what additional profiling *would* show.
+
+**Planned feature:** expose a `run_profile` tool that lets the agent trigger a new profiling run during the analysis loop.
+
+```
+run_profile(command, backends, extra_env) → trace_id
+```
+
+The agent would be able to:
+- Re-run with a different backend combination (e.g., add `cpu` to an existing `rocm` run)
+- Re-run with `--backend likwid` to collect hardware counters it's missing
+- Re-run with `HPROFILER_LIKWID_GROUP=MEM` to measure DRAM bandwidth specifically
+- Launch a roofline pass (`ncu`/`rocprof`) on a suspected compute-bound kernel
+
+Results from the new run would be loaded into a secondary `Trace` and made available to subsequent tool calls. The agent would then compare the original and follow-up traces to build a more complete picture.
+
+**Design considerations:**
+- Re-running is destructive for benchmarks (warm caches, GPU state, MPI startup cost) — the tool needs a `dry_run` preview mode so the agent can show the user what it intends to run before executing
+- Some profiling passes (e.g., `ncu`) require elevated permissions or add significant overhead — the agent must surface this as a warning
+- The loop turn limit (`max_turns`) would need to account for the latency of re-runs (could be seconds to minutes)
+
+---
+
+### 15.9 Privacy Considerations
 
 All profiling data sent to the LLM includes:
 - Kernel/function names from the profiled binary
