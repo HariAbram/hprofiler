@@ -25,6 +25,10 @@ def _detect_protocol() -> str:
     """Return 'kitty', 'iterm2', 'sixel', or 'none'."""
     env = os.environ
 
+    # VS Code integrated terminal — does not support any image protocol
+    if any(k.startswith("VSCODE_") for k in env):
+        return "none"
+
     # Kitty
     if env.get("KITTY_WINDOW_ID") or "kitty" in env.get("TERM", "").lower():
         return "kitty"
@@ -128,11 +132,10 @@ def _display_iterm2(png: bytes) -> None:
     sys.stdout.flush()
 
 
-def _display_sixel(png: bytes) -> None:
+def _display_sixel(png: bytes) -> bool:
     """
-    Convert PNG to sixel using Pillow (if available), else skip.
-    Sixel encoding: each column of 6 pixels → one sixel character (0x3F + bitmask).
-    We use a fast 16-colour dither via Pillow.
+    Convert PNG to sixel using Pillow (if available).
+    Returns True on success, False if Pillow is missing or the terminal rejects it.
     """
     try:
         from PIL import Image
@@ -185,25 +188,28 @@ def _display_sixel(png: bytes) -> None:
         out.append("\x1b\\")  # ST
         sys.stdout.write("".join(out))
         sys.stdout.flush()
+        return True
     except Exception:
-        # Sixel not possible — show a placeholder
-        sys.stdout.write("[image could not be displayed — install Pillow for sixel]\n")
-        sys.stdout.flush()
+        return False
 
 
 def display_image(png: bytes, cols: int, rows: int) -> None:
     """Display *png* bytes inline in the terminal using the best available protocol."""
+    global _PROTOCOL
     proto = get_protocol()
     if proto == "kitty":
         _display_kitty(png, cols, rows)
     elif proto == "iterm2":
         _display_iterm2(png)
     elif proto == "sixel":
-        _display_sixel(png)
-    else:
+        if not _display_sixel(png):
+            # Sixel failed (Pillow missing or terminal rejected it) — downgrade
+            _PROTOCOL = "none"
+            proto = "none"
+    if proto == "none":
         sys.stdout.write(
             "[No inline image support detected.\n"
-            " Run in kitty, WezTerm, or xterm with sixel support.]\n"
+            " Run in kitty, WezTerm, Ghostty, or use --html to open in a browser.]\n"
         )
         sys.stdout.flush()
 

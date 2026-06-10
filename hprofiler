@@ -242,6 +242,13 @@ def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, call_tr
     elif ui and not trace.all_events:
         click.echo("[hprofiler] No events to display.", err=True)
 
+    # After TUI closes (or --no-ui), wait for background disasm and update JSON.
+    if disasm and runner._disasm_thread is not None:
+        runner._disasm_thread.join()
+        if trace.disasm:
+            chrome_trace.write(trace, out_path)
+            click.echo(f"[hprofiler] Disasm added to: {out_path}", err=True)
+
 
 # ── AI analysis helper ────────────────────────────────────────────────────────
 

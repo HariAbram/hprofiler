@@ -389,14 +389,40 @@ def analyze_trace(trace: "Trace") -> list[tuple[DevicePeak, KernelMetrics]]:
 
     disasm = trace.disasm
 
+    # Build a secondary lookup: short/demangled name → disasm key.
+    # ACPP stores disasm under _acpp_kernel_short() names (e.g. "test_Relax")
+    # but span names are full mangled symbols (_Z18__acpp_sscp_kernel...).
+    # Also index by any suffix after the last '::' for general C++ demangling.
+    from ..disasm.extractor import _acpp_kernel_short
+    _short_to_key: dict[str, str] = {}
+    for key in disasm:
+        _short_to_key[_acpp_kernel_short(key)] = key
+        if "::" in key:
+            _short_to_key[key.rsplit("::", 1)[-1]] = key
+
+    def _disasm_key(span_name: str) -> str | None:
+        if span_name in disasm:
+            return span_name
+        short = _acpp_kernel_short(span_name)
+        if short in disasm:
+            return short
+        if short in _short_to_key:
+            return _short_to_key[short]
+        # fallback: check if any disasm key is a substring of the span name
+        for key in disasm:
+            if key in span_name or span_name in key:
+                return key
+        return None
+
     # Group spans by name, pick the one with max duration per name
     best_span: dict[str, "SpanEvent"] = {}
     for span in trace.spans:
-        if span.name not in disasm:
+        key = _disasm_key(span.name)
+        if key is None:
             continue
-        prev = best_span.get(span.name)
+        prev = best_span.get(key)
         if prev is None or span.duration_ns > prev.duration_ns:
-            best_span[span.name] = span
+            best_span[key] = span
 
     results: list[tuple[DevicePeak, KernelMetrics]] = []
     for name, span in best_span.items():

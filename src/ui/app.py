@@ -2128,7 +2128,34 @@ def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trac
         except Exception:
             pass
 
-    if collect_disasm:
+    # Restore serialized disasm if present in the JSON.
+    disasm_raw = data.get("disasm")
+    if disasm_raw:
+        try:
+            from ..disasm.extractor import KernelDisasm, DisasmLine
+            from ..disasm.classifier import InsnType
+            for name, kd_raw in disasm_raw.items():
+                lines = [
+                    DisasmLine(
+                        addr=ln.get("addr", 0),
+                        mnemonic=ln.get("mnemonic", ""),
+                        operands=ln.get("operands", ""),
+                        itype=InsnType(ln.get("itype", "other")),
+                        comment=ln.get("comment", ""),
+                        raw=ln.get("raw", ""),
+                    )
+                    for ln in kd_raw.get("lines", [])
+                ]
+                trace.add_disasm(KernelDisasm(
+                    name=name,
+                    arch=kd_raw.get("arch", ""),
+                    source=kd_raw.get("source", ""),
+                    lines=lines,
+                ))
+        except Exception:
+            pass
+
+    if collect_disasm and not trace.disasm:
         import threading as _threading
         def _bg_disasm():
             try:

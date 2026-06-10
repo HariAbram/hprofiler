@@ -99,6 +99,26 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
         },
     }
 
+    if trace.disasm:
+        payload["disasm"] = {
+            name: {
+                "arch": kd.arch,
+                "source": kd.source,
+                "lines": [
+                    {
+                        "addr": ln.addr,
+                        "mnemonic": ln.mnemonic,
+                        "operands": ln.operands,
+                        "itype": ln.itype.value,
+                        "comment": ln.comment,
+                        "raw": ln.raw,
+                    }
+                    for ln in kd.lines
+                ],
+            }
+            for name, kd in trace.disasm.items()
+        }
+
     indent = 2 if pretty else None
     if isinstance(out, (str, Path)):
         with open(out, "w") as f:

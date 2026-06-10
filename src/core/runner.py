@@ -117,6 +117,7 @@ class Runner:
         self.on_event = on_event
         self.collect_disasm = collect_disasm
         self._trace: Trace | None = None
+        self._disasm_thread: threading.Thread | None = None
 
     def run(self) -> Trace:
         import socket as sock_mod
@@ -387,12 +388,12 @@ class Runner:
             pass
 
         if self.collect_disasm:
-            import threading as _threading
-            _threading.Thread(
+            self._disasm_thread = threading.Thread(
                 target=_collect_disasm,
                 args=(trace, self.command, self.backends, pid),
                 daemon=True,
-            ).start()
+            )
+            self._disasm_thread.start()
         return trace
 
 
