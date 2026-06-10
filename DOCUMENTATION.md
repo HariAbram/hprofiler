@@ -105,7 +105,8 @@ python3 hprofiler run --no-ui -- ./my_program
 
 ```bash
 pip install click textual rich capstone
-pip install plotly kaleido   # required for TUI flamegraph/roofline viewers
+pip install plotly "kaleido==0.2.1"   # required for TUI flamegraph/roofline viewers
+# kaleido 0.2.1 specifically — 0.3+ requires an external Chrome install and breaks on clusters
 ```
 
 ### Build the C hook libraries
@@ -215,7 +216,7 @@ By default a **native TUI viewer** is opened inline in the terminal using the
 Kitty graphics protocol (or Sixel/iTerm2 as fallback). Pass `--html` to skip
 the TUI and open the HTML file in a browser instead.
 
-Requires: `pip install plotly kaleido`
+Requires: `pip install plotly "kaleido==0.2.1"`
 
 ```
 hprofiler roofline [OPTIONS] [-- COMMAND [ARGS...] | TRACE_FILE]
@@ -343,7 +344,7 @@ By default a **native TUI viewer** is opened inline in the terminal using the
 Kitty graphics protocol (or Sixel/iTerm2 as fallback). Pass `--html` to skip
 the TUI and open the HTML file in a browser instead.
 
-Requires: `pip install plotly kaleido`
+Requires: `pip install plotly "kaleido==0.2.1"`
 
 ```
 hprofiler flamegraph [OPTIONS] -- COMMAND [ARGS...]

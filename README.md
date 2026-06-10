@@ -6,7 +6,7 @@ Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, Open
 
 - Python 3.10+, CMake 3.16+, GCC/Clang
 - `pip install click textual rich capstone`
-- TUI flamegraph/roofline viewers: `pip install plotly kaleido`
+- TUI flamegraph/roofline viewers: `pip install plotly "kaleido==0.2.1"` (0.2.1 specifically — later versions require Chrome and break on clusters)
 - Backend-specific: CUDA toolkit, ROCm at `/opt/rocm`, LLVM `libomp`, `mpicc`, or `perf`
 
 ## Build

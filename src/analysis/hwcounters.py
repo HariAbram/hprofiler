@@ -278,7 +278,10 @@ def collect_cuda(command: list[str],
                 "Possible causes:\n"
                 "  • No CUDA kernels executed (check the program ran correctly)\n"
                 "  • ncu version mismatch — try upgrading Nsight Compute\n"
-                "  • Running inside a container without GPU counter access\n\n"
+                "  • Running inside a container without GPU counter access\n"
+                "  • LibraryNotLoaded: the ncu binary can't find the CUDA profiling\n"
+                "    libraries at runtime — check that ncu and the driver are compatible\n"
+                "    ('ncu --version' vs 'nvidia-smi | head -1')\n\n"
                 f"ncu diagnostic output (last 2000 chars):\n{ncu_diag}"
             )
 
