@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
@@ -76,6 +77,54 @@ class AnalysisReport:
 ProgressFn = Callable[[str], None]
 
 
+def _extract_text_tool_calls(content: str, known_names: set[str]) -> list:
+    """
+    Some smaller models (e.g. llama3.1:8b) emit tool calls as JSON in content
+    rather than using the structured tool_calls field.  Try to parse them out.
+    Returns a list of ToolCall objects (may be empty).
+    """
+    from .llm.base import ToolCall
+    results: list[ToolCall] = []
+    # Find all {...} blocks — including nested braces via a simple depth counter
+    i = 0
+    while i < len(content):
+        if content[i] != '{':
+            i += 1
+            continue
+        depth = 0
+        j = i
+        while j < len(content):
+            if content[j] == '{':
+                depth += 1
+            elif content[j] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        candidate = content[i:j+1]
+        i = j + 1
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        name = obj.get("name") or obj.get("function") or obj.get("tool")
+        if not isinstance(name, str) or name not in known_names:
+            continue
+        args = obj.get("arguments") or obj.get("parameters") or obj.get("args") or {}
+        if not isinstance(args, dict):
+            try:
+                args = json.loads(args) if isinstance(args, str) else {}
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        # Strip null values — models often emit {"category": null} which confuses tools
+        args = {k: v for k, v in args.items() if v is not None}
+        tc_id = f"text_{len(results)}"
+        results.append(ToolCall(id=tc_id, name=name, arguments=args))
+    return results
+
+
 def analyze(
     trace: "Trace",
     provider: "LLMProvider",
@@ -109,6 +158,7 @@ def analyze(
     last_content = ""
     turns = 0
     use_tools = True
+    known_tool_names = {td["function"]["name"] for td in TOOL_DEFINITIONS}
 
     for turn in range(cfg.max_turns):
         turns = turn + 1
@@ -142,6 +192,33 @@ def analyze(
 
         if response.content:
             last_content = response.content
+
+        if not response.tool_calls and use_tools:
+            # Some smaller models (e.g. llama3.1:8b) write tool calls as JSON
+            # in the content rather than using the structured field.  Try to
+            # extract them before giving up.
+            extracted = _extract_text_tool_calls(response.content, known_tool_names)
+            if extracted:
+                if on_progress:
+                    on_progress("  (extracted text-format tool calls from content)")
+                from .llm.base import ChatResponse
+                response = ChatResponse(content=response.content, tool_calls=extracted)
+            elif turn == 0:
+                # Model produced no usable tool calls on the first turn — it
+                # likely cannot follow the tool schema.  Retry without tools
+                # to get a direct single-shot analysis.
+                if on_progress:
+                    on_progress("Model did not use tool calls — retrying as single-shot")
+                use_tools = False
+                response = provider.chat(
+                    messages=messages,
+                    system=_SYSTEM_PROMPT,
+                    tools=None,
+                    max_tokens=cfg.max_tokens,
+                    temperature=cfg.temperature,
+                )
+                last_content = response.content
+                break
 
         if not response.tool_calls:
             break
