@@ -68,6 +68,11 @@ def _axis_ranges(
     min_ai = min(ai_vals) if ai_vals else ridge
     max_ai = max(ai_vals) if ai_vals else ridge
 
+    # Kernels with infinite AI (no memory ops) are plotted at ridge*100 — ensure
+    # the axis extends far enough to show them.
+    if any(m.est_flops > 0 and m.arith_intensity >= 1e9 for m in metrics):
+        max_ai = max(max_ai, ridge * 100)
+
     # X range ─────────────────────────────────────────────────────────────────
     # Left: show left of data AND enough BW slope for visual context
     x_left = min(min_ai / 5, ridge / 50)
