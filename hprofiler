@@ -236,11 +236,11 @@ def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, call_tr
             report_path=analysis_report,
         )
 
-    if ui and trace.all_events:
+    if ui and trace.spans:
         from src.ui.app import launch_viewer
         launch_viewer(trace, collect_disasm=disasm)
-    elif ui and not trace.all_events:
-        click.echo("[hprofiler] No events to display.", err=True)
+    elif ui:
+        click.echo("[hprofiler] No spans captured — skipping TUI.", err=True)
 
     # After TUI closes (or --no-ui), wait for background disasm and update JSON.
     if disasm and runner._disasm_thread is not None:

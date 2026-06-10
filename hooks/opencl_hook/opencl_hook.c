@@ -568,7 +568,17 @@ void *dlopen(const char *filename, int flags) {
                 filename, flags, !!(flags & RTLD_DEEPBIND));
         fflush(g_dbg);
     }
-    flags &= ~RTLD_DEEPBIND;
+    /* Strip RTLD_DEEPBIND ONLY for ACPP/SYCL libraries so their OpenCL calls
+     * resolve through our wrappers.  Leave it intact for Intel's internal
+     * runtime plugins — they depend on RTLD_DEEPBIND for symbol isolation and
+     * crash when it is removed (intermittent Intel OpenCL abort). */
+    if (filename && (strstr(filename, ".jit.so") ||
+                     strstr(filename, "acpp")    ||
+                     strstr(filename, "sycl")    ||
+                     strstr(filename, "hipsycl") ||
+                     strstr(filename, "sscp"))) {
+        flags &= ~RTLD_DEEPBIND;
+    }
 
     /* For ACPP SSCP .jit.so files: copy to /tmp BEFORE dlopen so the file
        still exists for the disassembler even if ACPP unlinks it after load. */

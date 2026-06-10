@@ -485,6 +485,22 @@ is saved to `/tmp/hprofiler_cubin_<pid>_<n>.bin` for post-run disassembly.
 
 **Requirements:** `libcuda.so.1` on the library path, or `nvidia-smi` present.
 
+**Static CUDA runtime support:** Binaries compiled with `libcudart_static.a`
+(nvcc default) don't resolve `cudaXxx` symbols from LD_PRELOAD.  hprofiler
+works around this by intercepting `dlopen`/`dlsym`: the static runtime still
+calls `dlopen("libcuda.so.1")` + `dlsym(handle, "cuLaunchKernel")` to reach
+the driver API, and hprofiler redirects those lookups to its own wrappers.
+If the binary was linked before this was supported, rebuild with
+`-cudart shared` in LDFLAGS for guaranteed coverage.
+
+**TODO — CUPTI backend (issue for future work):** NVIDIA's
+[CUPTI](https://docs.nvidia.com/cuda/cupti/) provides a subscriber/callback
+API (`cuptiSubscribe`, `cuptiEnableDomain`) that hooks at the driver level,
+works regardless of static/dynamic linking, and gives hardware-accurate
+timestamps.  A CUPTI backend would be a more robust alternative to the
+current `dlsym` intercept for static-runtime binaries.  Requires
+`cupti.h` + `libcupti.so` from the CUDA toolkit.
+
 ```bash
 hprofiler run --backend cuda -- ./my_cuda_program
 ```

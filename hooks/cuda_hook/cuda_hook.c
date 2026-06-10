@@ -52,6 +52,19 @@ static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pid_t           g_pid         = 0;
 static void           *g_cudart_handle = NULL;
 
+/* ── dlsym/dlopen intercept for static-cudart support ──────────────────── *
+ * When a binary links the CUDA runtime statically (libcudart_static.a),    *
+ * the cudaXxx symbols are resolved at compile time and LD_PRELOAD wrappers *
+ * are never called.  However, the static runtime still calls               *
+ * dlopen("libcuda.so.1") + dlsym(handle, "cuLaunchKernel") to reach the   *
+ * driver API.  By intercepting dlopen and dlsym we redirect those lookups  *
+ * to our wrappers, giving us full profiling coverage.                       */
+static void *(*g_real_dlsym)(void *, const char *) = NULL;
+#define CUDA_DRV_HANDLE_CAP 8
+static void           *g_cuda_drv_handles[CUDA_DRV_HANDLE_CAP];
+static int             g_cuda_drv_n = 0;
+static pthread_mutex_t g_cuda_drv_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* Thread-local recursion guard: prevents profiling our own CUDA event calls */
 static __thread int in_hook = 0;
 
@@ -72,11 +85,14 @@ static pid_t gettid_compat(void) {
 }
 
 static void *find_cuda_sym(const char *name) {
-    void *sym = dlsym(RTLD_NEXT, name);
+    /* Use g_real_dlsym directly to bypass our own dlsym override. */
+    void *(*real)(void *, const char *) = g_real_dlsym ? g_real_dlsym
+        : (void*(*)(void*,const char*))dlsym;   /* fallback before init */
+    void *sym = real(RTLD_NEXT, name);
     if (sym) return sym;
-    sym = dlsym(RTLD_DEFAULT, name);
+    sym = real(RTLD_DEFAULT, name);
     if (sym) return sym;
-    if (g_cudart_handle) return dlsym(g_cudart_handle, name);
+    if (g_cudart_handle) return real(g_cudart_handle, name);
     return NULL;
 }
 
@@ -878,7 +894,10 @@ CUresult cuMemcpyHtoDAsync(CUdeviceptr dst, const void *src,
                             size_t bytes, CUstream stream) {
     typedef CUresult (*fn_t)(CUdeviceptr, const void*, size_t, CUstream);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)find_cuda_sym("cuMemcpyHtoDAsync");
+    if (!real) {
+        real = (fn_t)find_cuda_sym("cuMemcpyHtoDAsync_v2");
+        if (!real) real = (fn_t)find_cuda_sym("cuMemcpyHtoDAsync");
+    }
     if (!real) return -1;
     if (in_hook) return real(dst, src, bytes, stream);
     in_hook = 1;
@@ -906,7 +925,10 @@ CUresult cuMemcpyDtoHAsync(void *dst, CUdeviceptr src,
                             size_t bytes, CUstream stream) {
     typedef CUresult (*fn_t)(void*, CUdeviceptr, size_t, CUstream);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)find_cuda_sym("cuMemcpyDtoHAsync");
+    if (!real) {
+        real = (fn_t)find_cuda_sym("cuMemcpyDtoHAsync_v2");
+        if (!real) real = (fn_t)find_cuda_sym("cuMemcpyDtoHAsync");
+    }
     if (!real) return -1;
     if (in_hook) return real(dst, src, bytes, stream);
     in_hook = 1;
@@ -933,7 +955,10 @@ CUresult cuMemcpyDtoHAsync(void *dst, CUdeviceptr src,
 CUresult cuMemAlloc(CUdeviceptr *dptr, size_t bytes) {
     typedef CUresult (*fn_t)(CUdeviceptr*, size_t);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)find_cuda_sym("cuMemAlloc");
+    if (!real) {
+        real = (fn_t)find_cuda_sym("cuMemAlloc_v2");
+        if (!real) real = (fn_t)find_cuda_sym("cuMemAlloc");
+    }
     if (!real) return -1;
     if (in_hook) return real(dptr, bytes);
     in_hook = 1;
@@ -994,7 +1019,10 @@ CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytes, CUstream stream) {
 CUresult cuMemFree(CUdeviceptr dptr) {
     typedef CUresult (*fn_t)(CUdeviceptr);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)find_cuda_sym("cuMemFree");
+    if (!real) {
+        real = (fn_t)find_cuda_sym("cuMemFree_v2");
+        if (!real) real = (fn_t)find_cuda_sym("cuMemFree");
+    }
     if (!real) return -1;
     if (in_hook) return real(dptr);
     in_hook = 1;
@@ -1226,19 +1254,174 @@ CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
     return ret;
 }
 
+/* ── dlopen / dlsym overrides for static-cudart interception ────────────── */
+
+void *dlopen(const char *filename, int flags) {
+    typedef void *(*fn_t)(const char *, int);
+    static fn_t real = NULL;
+    if (!real && g_real_dlsym)
+        real = (fn_t)g_real_dlsym(RTLD_NEXT, "dlopen");
+    void *h = real ? real(filename, flags) : NULL;
+    /* Record handles for libcuda.so so dlsym can redirect driver API calls. */
+    if (h && filename &&
+        (strstr(filename, "libcuda.so") || strstr(filename, "nvcuda.so"))) {
+        pthread_mutex_lock(&g_cuda_drv_mutex);
+        int found = 0;
+        for (int i = 0; i < g_cuda_drv_n; i++)
+            if (g_cuda_drv_handles[i] == h) { found = 1; break; }
+        if (!found && g_cuda_drv_n < CUDA_DRV_HANDLE_CAP)
+            g_cuda_drv_handles[g_cuda_drv_n++] = h;
+        pthread_mutex_unlock(&g_cuda_drv_mutex);
+    }
+    return h;
+}
+
+static int is_cuda_drv_handle(void *h) {
+    pthread_mutex_lock(&g_cuda_drv_mutex);
+    for (int i = 0; i < g_cuda_drv_n; i++)
+        if (g_cuda_drv_handles[i] == h) {
+            pthread_mutex_unlock(&g_cuda_drv_mutex);
+            return 1;
+        }
+    pthread_mutex_unlock(&g_cuda_drv_mutex);
+    return 0;
+}
+
+/* cuGetProcAddress / cuGetProcAddress_v2 ─────────────────────────────────
+ * CUDA 11+ static runtimes fetch all driver API pointers through this
+ * single lookup instead of individual dlsym calls.  We intercept both
+ * variants and substitute our wrappers for known symbols.
+ *
+ * Layout: forward-declare both functions → define intercept table →
+ * define function bodies (which reference the now-visible table).      */
+
+typedef unsigned long long cuuint64_t;
+
+/* Forward declarations so the intercept table can hold their addresses. */
+CUresult cuGetProcAddress(const char*, void**, int, cuuint64_t);
+CUresult cuGetProcAddress_v2(const char*, void**, int, cuuint64_t, void*);
+
+/* Driver API symbol names looked up by the static CUDA runtime.
+ * Versioned aliases (_v2) map to the same wrapper.                     */
+typedef struct { const char *name; void *fn; } DriveIntercept;
+static const DriveIntercept g_drv_intercepts[] = {
+    /* cuGetProcAddress itself — so dlsym(handle,"cuGetProcAddress")
+     * returns our wrapper and all subsequent lookups go through it.    */
+    {"cuGetProcAddress",      (void*)cuGetProcAddress},
+    {"cuGetProcAddress_v2",   (void*)cuGetProcAddress_v2},
+    {"cuLaunchKernel",        (void*)cuLaunchKernel},
+    {"cuMemcpyAsync",         (void*)cuMemcpyAsync},
+    {"cuMemcpyHtoDAsync",     (void*)cuMemcpyHtoDAsync},
+    {"cuMemcpyHtoDAsync_v2",  (void*)cuMemcpyHtoDAsync},
+    {"cuMemcpyDtoHAsync",     (void*)cuMemcpyDtoHAsync},
+    {"cuMemcpyDtoHAsync_v2",  (void*)cuMemcpyDtoHAsync},
+    {"cuMemAlloc",            (void*)cuMemAlloc},
+    {"cuMemAlloc_v2",         (void*)cuMemAlloc},
+    {"cuMemAllocManaged",     (void*)cuMemAllocManaged},
+    {"cuMemAllocAsync",       (void*)cuMemAllocAsync},
+    {"cuMemFree",             (void*)cuMemFree},
+    {"cuMemFree_v2",          (void*)cuMemFree},
+    {"cuMemFreeAsync",        (void*)cuMemFreeAsync},
+    {"cuStreamSynchronize",   (void*)cuStreamSynchronize},
+    {"cuModuleLoadData",      (void*)cuModuleLoadData},
+    {"cuModuleLoadDataEx",    (void*)cuModuleLoadDataEx},
+    {"cuModuleGetFunction",   (void*)cuModuleGetFunction},
+    {NULL, NULL},
+};
+
+/* cuGetProcAddress function bodies — placed after the table they reference. */
+
+static void *_real_cuGetProcAddress(const char *vname) {
+    void *fn = NULL;
+    pthread_mutex_lock(&g_cuda_drv_mutex);
+    for (int i = 0; i < g_cuda_drv_n && !fn; i++)
+        fn = g_real_dlsym ? g_real_dlsym(g_cuda_drv_handles[i], vname) : NULL;
+    pthread_mutex_unlock(&g_cuda_drv_mutex);
+    /* RTLD_NEXT bypasses our own export and finds the symbol in libcuda.so. */
+    if (!fn && g_real_dlsym)
+        fn = g_real_dlsym(RTLD_NEXT, vname);
+    return fn;
+}
+
+CUresult cuGetProcAddress(const char *symbol, void **pfn,
+                           int cudaVersion, cuuint64_t flags) {
+    typedef CUresult (*fn_t)(const char*, void**, int, cuuint64_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_cuGetProcAddress("cuGetProcAddress");
+    if (!real || !pfn) return -1;
+    CUresult ret = real(symbol, pfn, cudaVersion, flags);
+    if (ret == 0 && *pfn)
+        for (int i = 0; g_drv_intercepts[i].name; i++)
+            if (strcmp(symbol, g_drv_intercepts[i].name) == 0)
+                { *pfn = g_drv_intercepts[i].fn; break; }
+    return ret;
+}
+
+CUresult cuGetProcAddress_v2(const char *symbol, void **pfn,
+                              int cudaVersion, cuuint64_t flags,
+                              void *status) {
+    typedef CUresult (*fn_t)(const char*, void**, int, cuuint64_t, void*);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_cuGetProcAddress("cuGetProcAddress_v2");
+    if (!real || !pfn) return -1;
+    CUresult ret = real(symbol, pfn, cudaVersion, flags, status);
+    if (ret == 0 && *pfn)
+        for (int i = 0; g_drv_intercepts[i].name; i++)
+            if (strcmp(symbol, g_drv_intercepts[i].name) == 0)
+                { *pfn = g_drv_intercepts[i].fn; break; }
+    return ret;
+}
+
+void *dlsym(void *handle, const char *symbol) {
+    if (!g_real_dlsym) return NULL;
+    if (handle == RTLD_NEXT || handle == RTLD_DEFAULT || !symbol)
+        return g_real_dlsym(handle, symbol);
+
+    void *real_sym = g_real_dlsym(handle, symbol);
+
+    if (is_cuda_drv_handle(handle) && real_sym)
+        for (int i = 0; g_drv_intercepts[i].name; i++)
+            if (strcmp(symbol, g_drv_intercepts[i].name) == 0)
+                return g_drv_intercepts[i].fn;
+    return real_sym;
+}
+
+/* Priority 50: initialise g_real_dlsym before any dlsym call is made
+ * (including the RTLD_NEXT lookups inside our own wrapper functions).  */
+__attribute__((constructor(50)))
+static void hprofiler_cuda_dlsym_init(void) {
+    static const char *vers[] = {
+        "GLIBC_2.2.5", "GLIBC_2.17", "GLIBC_2.34", NULL
+    };
+    for (int i = 0; vers[i] && !g_real_dlsym; i++)
+        g_real_dlsym = (void*(*)(void*, const char*))
+            dlvsym(RTLD_NEXT, "dlsym", vers[i]);
+}
+
 /* ── Constructor / Destructor ───────────────────────────────────────────── */
 
 __attribute__((constructor))
 static void hprofiler_cuda_init(void) {
     ensure_connected();
     cs_init();
-    static const char *candidates[] = {
-        "libcudart.so.12", "libcudart.so.11", "libcudart.so",
-        "libcuda.so.1",    "libcuda.so",       NULL
+    /* libcudart: only use if already loaded — force-loading it alongside a
+     * statically-linked CUDA runtime causes dual-runtime conflicts
+     * (CUDA_ERROR_INVALID_CONTEXT) because both runtimes try to own the
+     * device context independently.  libcuda.so (driver) is safe to load
+     * unconditionally; it is always shared and there is only one copy.   */
+    static const char *rt_candidates[] = {
+        "libcudart.so.12", "libcudart.so.11", "libcudart.so", NULL
     };
-    for (int i = 0; candidates[i]; i++) {
-        void *h = dlopen(candidates[i], RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
-        if (!h) h = dlopen(candidates[i], RTLD_LAZY | RTLD_GLOBAL);
+    for (int i = 0; rt_candidates[i]; i++) {
+        void *h = dlopen(rt_candidates[i], RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
+        if (h && !g_cudart_handle) g_cudart_handle = h;
+    }
+    static const char *drv_candidates[] = {
+        "libcuda.so.1", "libcuda.so", NULL
+    };
+    for (int i = 0; drv_candidates[i]; i++) {
+        void *h = dlopen(drv_candidates[i], RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
+        if (!h) h = dlopen(drv_candidates[i], RTLD_LAZY | RTLD_GLOBAL);
         if (h && !g_cudart_handle) g_cudart_handle = h;
     }
 }

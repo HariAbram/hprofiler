@@ -164,9 +164,9 @@ class Runner:
                 pass
 
         # Warn when a hook-based backend was requested but the .so is missing
+        import sys as _sys
         for bname in _hook_backends:
             hook_path = HOOKS_DIR / f"libhprofiler_{bname}.so"
-            import sys as _sys
             if not hook_path.exists():
                 print(
                     f"[hprofiler][warn] {bname} hook not found at {hook_path}\n"
@@ -174,6 +174,34 @@ class Runner:
                     f"  On clusters: load the ROCm/CUDA module first, then build.",
                     file=_sys.stderr,
                 )
+
+        # Warn when the target binary has a statically-linked CUDA runtime —
+        # LD_PRELOAD hooks cannot intercept static symbols, so 0 events will
+        # be captured even though the program runs normally.
+        if "cuda" in self.backends and self.command:
+            _target = shutil.which(self.command[0]) or self.command[0]
+            try:
+                r = subprocess.run(
+                    ["ldd", _target], capture_output=True, text=True, timeout=5
+                )
+                ldd_out = r.stdout + r.stderr
+                has_cudart = "libcudart" in ldd_out or "libcuda" in ldd_out
+                if not has_cudart and Path(_target).exists():
+                    # Double-check: are CUDA symbols statically baked in?
+                    nm_r = subprocess.run(
+                        ["nm", _target], capture_output=True, text=True, timeout=10
+                    )
+                    if "T cudaLaunchKernel" in nm_r.stdout or "T cuLaunchKernel" in nm_r.stdout:
+                        print(
+                            f"[hprofiler][warn] '{self.command[0]}' appears to be linked with "
+                            f"the STATIC CUDA runtime (libcudart_static.a).\n"
+                            f"  Direct symbol interception via LD_PRELOAD is not possible, "
+                            f"but hprofiler will attempt to capture events via "
+                            f"cuGetProcAddress/dlsym intercept.",
+                            file=_sys.stderr,
+                        )
+            except Exception:
+                pass
 
         if preload_libs:
             existing = env.get("LD_PRELOAD", "")
