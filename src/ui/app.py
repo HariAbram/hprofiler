@@ -1037,6 +1037,17 @@ class TimelineWidget(Widget):
         np.clip(activity, 0.0, 1.0, out=activity)
         util_pct = float(activity.sum()) / width * 100.0
 
+        # Minimum visibility: sub-pixel spans contribute << 0.05 to activity
+        # and render as invisible dots.  Boost any pixel actually touched by a
+        # span to just above the IDLE threshold (0.05) so it always draws as a
+        # coloured block.  util_pct is computed before this expansion so it
+        # reflects the real GPU utilisation, not the inflated render width.
+        cov = np.zeros(width + 1, dtype=np.int32)
+        np.add.at(cov, ix0, 1)
+        np.add.at(cov, np.minimum(ix1 + 1, width), -1)
+        activity = np.where(np.cumsum(cov[:width]) > 0,
+                            np.maximum(activity, 0.06), activity)
+
         # ── 4. Dominant color per pixel via searchsorted — O(width) ──────
         # ix0 is monotonically non-decreasing (sorted spans → sorted start pixels).
         # For pixel p, the candidate span is the last one whose left edge ≤ p.
