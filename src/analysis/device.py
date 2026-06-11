@@ -395,12 +395,27 @@ def query_cpu_device() -> Optional[DevicePeak]:
 
 
 def query_devices(backends: list[str]) -> list[DevicePeak]:
-    """Query all relevant device peaks for the given backend set."""
+    """Query all relevant device peaks for the given backend set.
+
+    For the opencl backend we also probe the CUDA and ROCm drivers: an OpenCL
+    program running on an NVIDIA or AMD GPU benefits from the same roofline /
+    peak-info display as a native CUDA/ROCm run.  The device entries are tagged
+    with their true backend ("cuda"/"rocm") so the UI can label them correctly.
+    """
     devices: list[DevicePeak] = []
     if "cuda" in backends:
         devices.extend(query_cuda_devices())
     if "rocm" in backends:
         devices.extend(query_rocm_devices())
+
+    if "opencl" in backends:
+        # Opportunistically probe whichever GPU drivers are present.
+        # Skip if already populated (e.g. user also requested cuda/rocm explicitly).
+        if not any(d.backend == "cuda" for d in devices):
+            devices.extend(query_cuda_devices())
+        if not any(d.backend == "rocm" for d in devices):
+            devices.extend(query_rocm_devices())
+
     if any(b in backends for b in ("cpu", "openmp", "opencl")):
         cpu = query_cpu_device()
         if cpu:

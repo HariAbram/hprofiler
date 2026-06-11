@@ -83,6 +83,20 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
                   f"({_fmt_ns(kernel_ns)} total kernel time, "
                   f"{len(gpu_spans)} launches)")
 
+    # OpenCL: use side=gpu spans only (GPU-accurate via event callback).
+    # CPU-side spans (scheduling latency) carry side=cpu and are excluded.
+    opencl_gpu_spans = [s for s in trace.spans
+                        if s.category.value == "opencl"
+                        and s.tags.get("type") == "kernel"
+                        and s.tags.get("side") == "gpu"]
+    if opencl_gpu_spans:
+        kernel_ns = sum(s.duration_ns for s in opencl_gpu_spans)
+        pct = 100.0 * kernel_ns / wall_ns
+        print(f"\n  OpenCL kernel active   : "
+              f"{pct:.2f}% of wall time  "
+              f"({_fmt_ns(kernel_ns)} total kernel time, "
+              f"{len(opencl_gpu_spans)} launches)")
+
     if gpu_util_peak:
         _amd_backends = {"rocm"}
         smi_tool = "rocm-smi" if any(b in _amd_backends for b in (meta.backends_used or [])) \

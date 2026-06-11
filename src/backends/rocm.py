@@ -46,6 +46,7 @@ def _hip_lib_exists() -> bool:
         _ROCM_PATH / "lib",
         _ROCM_PATH / "lib64",
         Path("/usr/lib/x86_64-linux-gnu"),
+        Path("/usr/lib/aarch64-linux-gnu"),
         Path("/usr/lib64"),
         Path("/usr/lib"),
     ]:

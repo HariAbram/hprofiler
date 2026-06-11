@@ -319,11 +319,12 @@ class Runner:
                 perf_data = None
 
         # ── Attach perf stat for CPU microarch counters ───────────────────────
-        # Only run when a CPU-side backend is active — GPU-only workloads don't
-        # benefit and we'd waste PMU counter slots + add a second process.
+        # Run for any backend where CPU-side behaviour is interesting:
+        # cpu/openmp/likwid are obviously CPU-bound; opencl dispatches from the
+        # CPU so IPC/cache-miss still give useful context.
         perf_stat_proc: subprocess.Popen | None = None
         perf_stat_file: str | None = None
-        _cpu_backends = {"cpu", "openmp", "likwid"}
+        _cpu_backends = {"cpu", "openmp", "likwid", "opencl"}
         if shutil.which("perf") and any(b in self.backends for b in _cpu_backends):
             fd, perf_stat_file = tempfile.mkstemp(suffix=".perf_stat.txt", prefix="hprofiler_")
             os.close(fd)
@@ -405,6 +406,25 @@ class Runner:
         # ── LIKWID counter post-processing ────────────────────────────────────
         if _likwid_backend is not None:
             _likwid_backend.post_process(trace)
+
+        # ── OpenMP zero-event sanity check ────────────────────────────────────
+        # GCC libgomp does not implement OMPT 5.0 — the hook loads but callbacks
+        # never fire.  Warn early so the user isn't left wondering why all OpenMP
+        # rows are empty in the timeline.
+        if "openmp" in self.backends:
+            import sys as _sys2
+            omp_spans = [s for s in trace.spans if s.category.value == "openmp"]
+            if not omp_spans:
+                print(
+                    "[hprofiler][warn] openmp backend active but 0 OpenMP events "
+                    "were captured.\n"
+                    "  Most likely cause: binary compiled with GCC libgomp instead of "
+                    "clang/LLVM libomp.\n"
+                    "  OMPT 5.0 callbacks only fire with LLVM libomp — recompile with "
+                    "clang++ and link -lomp (not -lgomp).\n"
+                    "  To verify: ldd <binary> | grep -E 'omp|gomp'",
+                    file=_sys2.stderr,
+                )
 
         # ── Query device theoretical peaks ────────────────────────────────────
         try:
