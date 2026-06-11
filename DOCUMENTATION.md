@@ -485,13 +485,18 @@ is saved to `/tmp/hprofiler_cubin_<pid>_<n>.bin` for post-run disassembly.
 
 **Requirements:** `libcuda.so.1` on the library path, or `nvidia-smi` present.
 
-**Static CUDA runtime support:** Binaries compiled with `libcudart_static.a`
-(nvcc default) don't resolve `cudaXxx` symbols from LD_PRELOAD.  hprofiler
-works around this by intercepting `dlopen`/`dlsym`: the static runtime still
-calls `dlopen("libcuda.so.1")` + `dlsym(handle, "cuLaunchKernel")` to reach
-the driver API, and hprofiler redirects those lookups to its own wrappers.
-If the binary was linked before this was supported, rebuild with
-`-cudart shared` in LDFLAGS for guaranteed coverage.
+**Static CUDA runtime support — known limitation:** Binaries compiled with
+`libcudart_static.a` (nvcc default) don't resolve `cudaXxx` symbols from
+LD_PRELOAD and will show **0 events**.  Workaround: rebuild with
+`-cudart shared` in LDFLAGS so the dynamic runtime is used instead.
+
+A `dlopen`/`dlsym` intercept approach was attempted (commit `9de75e3`) but
+caused a ~25× JIT slowdown for SYCL runtimes (ACPP/AdaptiveCpp): exporting
+`cuGetProcAddress` via LD_PRELOAD caused `libcudart.so.12` to route all of its
+internal driver calls through the profiling wrappers during PTX JIT compilation.
+The root fix requires either a CUPTI-based backend or careful visibility
+control to prevent `cuGetProcAddress` interposition from affecting `libcudart`
+internals.  Left as future work — see the CUPTI note below.
 
 **TODO — CUPTI backend (issue for future work):** NVIDIA's
 [CUPTI](https://docs.nvidia.com/cuda/cupti/) provides a subscriber/callback
