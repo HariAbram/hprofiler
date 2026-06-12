@@ -37,11 +37,20 @@ class Trace:
         self._has_cpu:    bool = False
         # Populated post-run by the disasm collector
         self._disasm: dict[str, "KernelDisasm"] = {}  # type: ignore[type-arg]
+        self._disasm_version: int = 0  # incremented by add_disasm; lets poller detect annotation updates
+        # Populated by cuda_hook CUPTI PC sampling records
+        self._pc_samples: dict[str, list[tuple[int, int, int]]] = {}  # func → [(pc_offset, stall_reason, count)]
         # Populated post-run by device capability queries
         self._devices: list["DevicePeak"] = []  # type: ignore[type-arg]
 
     def add_disasm(self, kd: "KernelDisasm") -> None:  # type: ignore[type-arg]
         self._disasm[kd.name] = kd
+        self._disasm_version += 1
+
+    def add_pc_sample(self, func_name: str, pc_offset: int, stall_reason: int, count: int) -> None:
+        if func_name not in self._pc_samples:
+            self._pc_samples[func_name] = []
+        self._pc_samples[func_name].append((pc_offset, stall_reason, count))
 
     @property
     def disasm(self) -> dict[str, "KernelDisasm"]:  # type: ignore[type-arg]
@@ -130,6 +139,11 @@ class Trace:
             r["pct"] = 100.0 * r["total_ns"] / total_time
 
         return sorted(rows, key=lambda r: r["total_ns"], reverse=True)
+
+    def cct(self) -> "CCT":  # type: ignore[name-defined]
+        """Build and return a Calling Context Tree from all stacked spans."""
+        from ..analysis.cct import CCT
+        return CCT.build(self)
 
     def lanes(self) -> dict[str, list[SpanEvent]]:
         """Return spans grouped into display lanes.

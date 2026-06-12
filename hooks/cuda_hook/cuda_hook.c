@@ -1226,11 +1226,170 @@ CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
     return ret;
 }
 
+/* ── CUPTI PC sampling — loaded at runtime via dlopen to avoid header
+   conflicts with the hand-rolled CUDA type stubs above.  The code is
+   always compiled in; it silently does nothing if libcupti.so is absent
+   or HPROFILER_GPU_PCSAMPLING is not set. ─────────────────────────────── */
+
+#define _CUPTI_KIND_PC_SAMPLING 30
+#define _CUPTI_KIND_FUNCTION    26
+#define _CUPTI_SUCCESS           0
+
+/* Manually-matched struct layouts (x86_64 / CUPTILP64=1).
+   Verified against /usr/include/cupti_activity.h. */
+typedef struct {
+    uint32_t kind;
+    uint32_t flags;
+    uint32_t sourceLocatorId;
+    uint32_t correlationId;
+    uint32_t functionId;
+    uint32_t latencySamples;
+    uint32_t samples;
+    uint32_t stallReason;
+    uint64_t pcOffset;
+} _CuptiPCSample;
+
+typedef struct {
+    uint32_t    kind;
+    uint32_t    id;
+    uint32_t    contextId;
+    uint32_t    moduleId;
+    uint32_t    functionIndex;
+    uint32_t    pad;           /* CUPTILP64 padding */
+    const char *name;
+} _CuptiFunction;
+
+typedef struct { uint32_t kind; } _CuptiActivity;
+
+/* Function pointer types for dlopen */
+typedef uint32_t (*cuptiRegCbs_fn)(
+    void (*)(uint8_t**, size_t*, size_t*),
+    void (*)(void*, uint32_t, uint8_t*, size_t, size_t));
+typedef uint32_t (*cuptiEnable_fn)(uint32_t);
+typedef uint32_t (*cuptiFlushAll_fn)(uint32_t);
+typedef uint32_t (*cuptiGetNext_fn)(uint8_t*, size_t, _CuptiActivity**);
+
+static cuptiRegCbs_fn  g_cuptiRegCbs  = NULL;
+static cuptiEnable_fn  g_cuptiEnable  = NULL;
+static cuptiFlushAll_fn g_cuptiFlush  = NULL;
+static cuptiGetNext_fn  g_cuptiGetNext = NULL;
+
+#define CUPTI_BUF_SIZE    (8 * 1024 * 1024)
+#define CUPTI_MAX_FUNCS   4096
+#define CUPTI_MAX_SAMPLES 262144
+
+typedef struct { uint32_t id; char name[128]; } _CuptiFuncEntry;
+typedef struct { uint32_t func_id; uint64_t pc_offset; uint8_t stall; uint32_t count; } _CuptiSampleEntry;
+
+static _CuptiFuncEntry   g_cupti_funcs[CUPTI_MAX_FUNCS];
+static int               g_cupti_nfuncs   = 0;
+static _CuptiSampleEntry g_cupti_samples[CUPTI_MAX_SAMPLES];
+static int               g_cupti_nsamples = 0;
+static pthread_mutex_t   g_cupti_mutex    = PTHREAD_MUTEX_INITIALIZER;
+
+static void _cupti_buf_req(uint8_t **buf, size_t *sz, size_t *max_rec) {
+    *buf = (uint8_t *)malloc(CUPTI_BUF_SIZE);
+    *sz  = CUPTI_BUF_SIZE;
+    *max_rec = 0;
+}
+
+static void _cupti_buf_done(void *ctx, uint32_t stream_id,
+                             uint8_t *buf, size_t valid_sz, size_t total_sz) {
+    if (!buf || !g_cuptiGetNext) { free(buf); return; }
+    (void)ctx; (void)stream_id; (void)total_sz;
+    _CuptiActivity *rec = NULL;
+    pthread_mutex_lock(&g_cupti_mutex);
+    while (g_cuptiGetNext(buf, valid_sz, &rec) == _CUPTI_SUCCESS) {
+        if (rec->kind == _CUPTI_KIND_PC_SAMPLING) {
+            _CuptiPCSample *ps = (_CuptiPCSample *)rec;
+            if (g_cupti_nsamples < CUPTI_MAX_SAMPLES) {
+                g_cupti_samples[g_cupti_nsamples].func_id   = ps->functionId;
+                g_cupti_samples[g_cupti_nsamples].pc_offset = ps->pcOffset;
+                g_cupti_samples[g_cupti_nsamples].stall     = (uint8_t)ps->stallReason;
+                g_cupti_samples[g_cupti_nsamples].count     = ps->samples;
+                g_cupti_nsamples++;
+            }
+        } else if (rec->kind == _CUPTI_KIND_FUNCTION) {
+            _CuptiFunction *fn = (_CuptiFunction *)rec;
+            if (g_cupti_nfuncs < CUPTI_MAX_FUNCS && fn->name) {
+                g_cupti_funcs[g_cupti_nfuncs].id = fn->id;
+                strncpy(g_cupti_funcs[g_cupti_nfuncs].name, fn->name,
+                        sizeof(g_cupti_funcs[0].name) - 1);
+                g_cupti_nfuncs++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_cupti_mutex);
+    free(buf);
+}
+
+static void _cupti_init(void) {
+    const char *env = getenv("HPROFILER_GPU_PCSAMPLING");
+    if (!env || env[0] != '1') return;
+    /* Try to load libcupti.so at runtime */
+    static const char *cupti_candidates[] = {
+        "libcupti.so.12", "libcupti.so.11", "libcupti.so", NULL
+    };
+    void *h = NULL;
+    for (int i = 0; !h && cupti_candidates[i]; i++)
+        h = dlopen(cupti_candidates[i], RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
+    if (!h) {
+        for (int i = 0; !h && cupti_candidates[i]; i++)
+            h = dlopen(cupti_candidates[i], RTLD_LAZY | RTLD_GLOBAL);
+    }
+    if (!h) return;
+
+    g_cuptiRegCbs  = (cuptiRegCbs_fn)  dlsym(h, "cuptiActivityRegisterCallbacks");
+    g_cuptiEnable  = (cuptiEnable_fn)  dlsym(h, "cuptiActivityEnable");
+    g_cuptiFlush   = (cuptiFlushAll_fn)dlsym(h, "cuptiActivityFlushAll");
+    g_cuptiGetNext = (cuptiGetNext_fn) dlsym(h, "cuptiActivityGetNextRecord");
+
+    if (!g_cuptiRegCbs || !g_cuptiEnable || !g_cuptiFlush || !g_cuptiGetNext) return;
+    g_cuptiRegCbs(_cupti_buf_req, _cupti_buf_done);
+    g_cuptiEnable(_CUPTI_KIND_FUNCTION);
+    g_cuptiEnable(_CUPTI_KIND_PC_SAMPLING);
+}
+
+static void _cupti_flush_and_send(int sock_fd) {
+    const char *env = getenv("HPROFILER_GPU_PCSAMPLING");
+    if (!env || env[0] != '1' || !g_cuptiFlush) return;
+    g_cuptiFlush(0);
+    if (sock_fd < 0) return;
+
+    pthread_mutex_lock(&g_cupti_mutex);
+    for (int i = 0; i < g_cupti_nsamples; i++) {
+        const char *fname = NULL;
+        for (int j = 0; j < g_cupti_nfuncs; j++) {
+            if (g_cupti_funcs[j].id == g_cupti_samples[i].func_id) {
+                fname = g_cupti_funcs[j].name;
+                break;
+            }
+        }
+        if (!fname) continue;
+        char line[512];
+        int n = snprintf(line, sizeof(line),
+                         "pcsa:%d:%llu:%s:%llx:%d:%u\n",
+                         (int)g_pid,
+                         (unsigned long long)now_ns(),
+                         fname,
+                         (unsigned long long)g_cupti_samples[i].pc_offset,
+                         (int)g_cupti_samples[i].stall,
+                         g_cupti_samples[i].count);
+        if (n > 0 && n < (int)sizeof(line)) {
+            pthread_mutex_lock(&g_sock_mutex);
+            if (sock_fd >= 0) send_all(line, n);
+            pthread_mutex_unlock(&g_sock_mutex);
+        }
+    }
+    pthread_mutex_unlock(&g_cupti_mutex);
+}
+
 /* ── Constructor / Destructor ───────────────────────────────────────────── */
 
 __attribute__((constructor))
 static void hprofiler_cuda_init(void) {
     ensure_connected();
+    _cupti_init();
     cs_init();
     static const char *candidates[] = {
         "libcudart.so.12", "libcudart.so.11", "libcudart.so",
@@ -1245,6 +1404,7 @@ static void hprofiler_cuda_init(void) {
 
 __attribute__((destructor))
 static void hprofiler_cuda_fini(void) {
+    _cupti_flush_and_send(g_sock);
     pk_flush(NULL, 1);
 
     /* Report leaked GPU allocations (cudaMalloc without matching cudaFree). */

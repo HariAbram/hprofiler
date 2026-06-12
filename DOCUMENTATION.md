@@ -26,6 +26,7 @@ intercepted without requiring libnvToolsExt.
 13. [Performance Overhead](#13-performance-overhead)
 14. [Extending the Profiler](#14-extending-the-profiler)
 15. [AI Performance Analysis](#15-ai-performance-analysis)
+16. [Call-Path Analysis, CCT, and GPU Starvation](#16-call-path-analysis-cct-and-gpu-starvation)
 
 ---
 
@@ -94,6 +95,7 @@ python3 hprofiler run --no-ui -- ./my_program
 | ROCm backend | ROCm installed at `/opt/rocm` |
 | NCCL backend | CUDA Runtime + `libnccl.so` at runtime |
 | MPI backend | Any MPI implementation (`mpicc` at build time) |
+| Call-path unwinding (optional) | `libunwind-dev` (apt) / `libunwind-devel` (dnf) — for accurate C++ stack capture without frame pointers |
 | Disasm (CUDA AoT) | `cuobjdump` (CUDA toolkit) |
 | Disasm (CPU/ELF) | `capstone>=5.0` (fast path) or `objdump` / `llvm-objdump` |
 | Disasm (ROCm) | `llvm-objdump` |
@@ -156,7 +158,8 @@ hprofiler run [OPTIONS] -- COMMAND [ARGS...]
 | `--perf-freq` | `9999` | Sampling frequency in Hz (CPU/perf backend only) |
 | `--perf-callgraph` | — | Call-graph method: `fp`, `dwarf`, or `lbr` |
 | `--disasm / --no-disasm` | `--no-disasm` | Collect per-kernel disassembly after the run; adds the Disasm tab to the TUI |
-| `--call-tree / --no-call-tree` | `--no-call-tree` | Capture CPU call stacks at every API interception point; adds the Call Tree tab to the TUI. Requires the profiled binary to be compiled with `-fno-omit-frame-pointer -rdynamic`. Adds ~50 µs per intercepted call — do not use during benchmarking. |
+| `--gpu-pc-sampling` | off | Enable CUPTI PC sampling for per-instruction GPU heat and stall annotation (CUDA only; **AoT-compiled kernels only** — see note). `libcupti.so` is loaded at runtime via `dlopen` — no recompile or CUPTI headers needed. Adds **Heat %** and **Stall** columns to the Disasm tab. Requires `--disasm`. |
+| `--call-tree / --no-call-tree` | `--no-call-tree` | Capture C++ call stacks at every API interception point; adds the Call Tree tab to the TUI and a CCT hotspot section to the text summary. When libunwind is available (detected at build time), unwinding is accurate without requiring `-fno-omit-frame-pointer`. Source file:line annotations are resolved automatically via `addr2line` / `llvm-symbolizer` when available. Adds ~5–50 µs per intercepted call — do not use during benchmarking. |
 
 Always separate the profiler's options from the target program with `--`:
 
@@ -485,29 +488,36 @@ is saved to `/tmp/hprofiler_cubin_<pid>_<n>.bin` for post-run disassembly.
 
 **Requirements:** `libcuda.so.1` on the library path, or `nvidia-smi` present.
 
-**Static CUDA runtime support — known limitation:** Binaries compiled with
-`libcudart_static.a` (nvcc default) don't resolve `cudaXxx` symbols from
-LD_PRELOAD and will show **0 events**.  Workaround: rebuild with
-`-cudart shared` in LDFLAGS so the dynamic runtime is used instead.
+**Required: link with the shared CUDA runtime.** hprofiler injects itself via
+LD_PRELOAD, which only intercepts symbols resolved at runtime from shared
+libraries.  Your binary **must** be linked against the dynamic CUDA runtime:
 
-A `dlopen`/`dlsym` intercept approach was attempted (commit `9de75e3`) but
-caused a ~25× JIT slowdown for SYCL runtimes (ACPP/AdaptiveCpp): exporting
-`cuGetProcAddress` via LD_PRELOAD caused `libcudart.so.12` to route all of its
-internal driver calls through the profiling wrappers during PTX JIT compilation.
-The root fix requires either a CUPTI-based backend or careful visibility
-control to prevent `cuGetProcAddress` interposition from affecting `libcudart`
-internals.  Left as future work — see the CUPTI note below.
+```bash
+# nvcc
+nvcc -cudart shared -o myapp myapp.cu
 
-**TODO — CUPTI backend (issue for future work):** NVIDIA's
-[CUPTI](https://docs.nvidia.com/cuda/cupti/) provides a subscriber/callback
-API (`cuptiSubscribe`, `cuptiEnableDomain`) that hooks at the driver level,
-works regardless of static/dynamic linking, and gives hardware-accurate
-timestamps.  A CUPTI backend would be a more robust alternative to the
-current `dlsym` intercept for static-runtime binaries.  Requires
-`cupti.h` + `libcupti.so` from the CUDA toolkit.
+# CMake (add to CMakeLists.txt)
+set_target_properties(myapp PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
+```
+
+The default (`libcudart_static.a`) bakes the runtime into the binary at compile
+time, so LD_PRELOAD wrappers are never called and hprofiler will capture
+**0 events**.  Switching to `-cudart shared` has no runtime performance impact —
+kernel execution, memory bandwidth, and timing are identical either way; only
+the binary size changes (~10–20 MB smaller).
+
+**Known limitation (static runtime):** If you cannot recompile, binaries linked
+with `libcudart_static.a` will show 0 events. The CUPTI PC sampling path
+(`--gpu-pc-sampling`) also requires the hook to be loaded, so it has the same
+requirement.
+
+**CUPTI PC sampling** is available via `--gpu-pc-sampling` (see §3 and §8).
+`libcupti.so` is loaded at runtime with `dlopen` — no recompile or CUPTI
+headers are needed. When `libcupti.so` is absent, the flag is silently ignored.
 
 ```bash
 hprofiler run --backend cuda -- ./my_cuda_program
+hprofiler run --backend cuda --disasm --gpu-pc-sampling -- ./my_cuda_program
 ```
 
 ---
@@ -812,7 +822,8 @@ path from `main`.
 
 ### Disasm Tab *(only shown when `--disasm` is passed)*
 
-Per-kernel disassembly with instruction-level color coding.
+Per-kernel disassembly with instruction-level color coding, runtime heat
+annotation, and static optimization hints.
 
 **Left pane** — kernel list:
 - `✓` prefix when disassembly is available
@@ -833,10 +844,50 @@ Per-kernel disassembly with instruction-level color coding.
 | Magenta | Branch / call / return | `ctl` |
 | Red | Barrier / fence / sync | `syn` |
 
+**Heat column** *(shown when perf annotation or CUPTI PC sampling data is available)*
+
+Each instruction row gains a **Heat %** column showing its share of runtime
+samples. Color thresholds:
+
+| Heat % | Color |
+|--------|-------|
+| ≥ 10% | Bold red — critical hot instruction |
+| ≥ 5% | Red |
+| ≥ 1% | Yellow |
+| > 0% | White |
+| 0% | Blank |
+
+For CPU and OpenCL-CPU kernels, heat comes from `perf annotate` run against
+the `perf.data` recording. For CUDA kernels, heat comes from CUPTI PC sampling
+(requires `--gpu-pc-sampling`).
+
+**Stall column** *(CUDA only, with `--gpu-pc-sampling`)*
+
+Shows the average stall cycle count at each instruction. Stall values ≥ 10 are
+red; ≥ 5 are yellow; others are dimmed. A high stall count alongside a hot
+instruction pinpoints the exact bottleneck within the kernel.
+
 **Bottom bar** — instruction-mix percentages. The sub-type breakdown for vector
 instructions lets you see the FP32 (`vsp`), FP64 (`vdp`), memory (`vld`), and
 integer (`vec`) fractions at a glance. Percentages always cover the complete
 function, not just the visible 500-line window.
+
+**Optimization hints panel** — up to four static analysis hints from the
+assembly advisor (`src/analysis/asm_advisor.py`) appear below the assembly
+view, color-coded by severity:
+
+| Severity | Color | Example |
+|----------|-------|---------|
+| `error` | Red | SASS global loads with no shared memory |
+| `warn` | Yellow | x86-64 compute < 10% vectorised |
+| `info` | Cyan | PTX no `.v2`/`.v4` vector loads |
+| `ok` | Green | No issues detected |
+
+Hints cover x86-64 (vectorisation, spills, scalar FP without FMA, SSE vs AVX),
+SASS (memory access patterns, compute fraction, stall density, barriers,
+atomics, HMMA, LDGSTS), PTX (global vs shared, atomics, vector loads), and
+AMDGCN (VALU fraction, LDS usage, `waitcnt` density). See §8 for the full rule
+set.
 
 **Keyboard controls:**
 
@@ -846,6 +897,9 @@ function, not just the visible 500-line window.
 
 **Loading behavior:** Disassembly runs in a background thread immediately after
 the run. The TUI opens instantly; the Disasm tab populates within a few seconds.
+Annotation data (heat, stall) is applied to already-displayed disassembly once
+available — the TUI detects the update via a version counter and refreshes
+without requiring a re-render.
 
 ---
 
@@ -1001,6 +1055,24 @@ hprofiler run --backend opencl,cpu -- ./acpp_sscp_program
 OpenCL queues get profiling forced on. `clBuildProgram` time appears as `jit`
 spans. For SSCP CPU execution, add `--backend cpu` for actual compute timing.
 
+**OpenCL CPU runtime — instruction-level profiling:**
+
+When ACPP uses the OpenCL CPU backend (`ACPP_VISIBILITY_MASK=ocl`), SYCL
+kernels compile to JIT x86-64 code executed via the OpenCL CPU runtime. Because
+the kernels run on the host CPU they are profiled by `perf record` like any
+native function. Adding `--disasm` runs `perf annotate` after the profiling
+run and populates instruction-level heat in the Disasm tab:
+
+```bash
+ACPP_VISIBILITY_MASK=ocl \
+  hprofiler run --backend opencl,cpu --disasm -- ./my_sycl_app
+```
+
+This combination gives you:
+- **OpenCL event timing** (GPU-accurate kernel duration from `clGetEventProfilingInfo`)
+- **CPU sampling** (which CPU functions are hot during kernel execution)
+- **Instruction heat** (per-instruction sample % for the JIT-compiled kernel body)
+
 ---
 
 ## 8. Disassembly
@@ -1088,6 +1160,133 @@ RVV (RISC-V Vector Extension) mnemonics are classified as:
 - `vfmadd.vv`, `vfwmacc.vv` → COMPUTE (FP vector FMA)
 - `vadd.vv`, `vmul.vx`, `vsetvli` → VECTOR (integer RVV)
 
+### Instruction-level heat annotation
+
+After disassembly is collected, the profiler overlays runtime hotness data on
+each instruction line. This requires no extra flags for CPU kernels; for CUDA
+it requires `--gpu-pc-sampling`.
+
+#### CPU and OpenCL-CPU kernels
+
+`perf annotate` is run against the `perf.data` file retained from the `perf
+record` pass. It outputs per-instruction sample percentages, which are stored
+in `DisasmLine.sample_pct` and displayed in the Heat column of the Disasm tab.
+
+For SYCL programs using the OpenCL CPU runtime (`ACPP_VISIBILITY_MASK=ocl`),
+kernels compile to JIT x86-64 code and are profiled by `perf` like any native
+CPU function. Use `--backend opencl,cpu --disasm` to get both OpenCL event
+timing and instruction-level heat:
+
+```bash
+ACPP_VISIBILITY_MASK=ocl hprofiler run --backend opencl,cpu --disasm -- ./app
+```
+
+#### ROCm kernels — PC sampling *(not yet implemented)*
+
+> **TODO:** AMD GPU PC sampling requires `librocprofiler-sdk.so` (ROCm 6.x) or
+> `librocprofiler.so` (ROCm 5.x). The wire record format (`pcsa:`) and
+> Python-side annotation (`annotate_with_cupti`) are already arch-agnostic and
+> can be reused; only the hook-side implementation in `hooks/rocm_hook/rocm_hook.c`
+> needs to be added, using `dlopen("librocprofiler-sdk.so.1")` and
+> `rocprofiler_configure_pc_sampling_service()`. Currently `--gpu-pc-sampling`
+> is silently ignored for ROCm runs.
+
+#### CUDA kernels — CUPTI PC sampling *(AoT only)*
+
+> **Limitation:** CUPTI samples the SASS (compiled machine code) that actually
+> executes on the GPU. For JIT-compiled kernels (ACPP/SYCL targeting CUDA via
+> `cuModuleLoadDataEx`, or any program that compiles PTX at runtime), the GPU
+> driver compiles PTX → SASS internally and CUPTI reports SASS PC offsets.
+> hprofiler only captures the PTX source in these cases, not the SASS. PTX
+> instruction positions and SASS PC offsets have no correspondence, so heat
+> annotation is silently skipped and a warning is printed.
+>
+> `--gpu-pc-sampling` is only effective for **AoT-compiled CUDA programs**
+> (NVCC-compiled binaries with a fatbinary embedded in the ELF), where
+> `cuobjdump --dump-sass` gives SASS with addresses that match CUPTI samples.
+> ACPP/SYCL users: compile with `--cuda-arch=sm_XX` and the `--cuda-format=fat`
+> option to embed SASS in the binary, then use `--backend cuda --disasm
+> --gpu-pc-sampling`.
+
+Passing `--gpu-pc-sampling` activates the CUPTI PC sampling subsystem in the
+CUDA hook. At runtime the hook:
+
+1. Calls `dlopen("libcupti.so.12")` (or `.11` / `.so` fallback) — no CUPTI
+   headers or compile-time linkage required.
+2. Registers buffer callbacks and enables `CUPTI_ACTIVITY_KIND_PC_SAMPLING`
+   and `CUPTI_ACTIVITY_KIND_FUNCTION`.
+3. At program exit, flushes all CUPTI buffers and emits `pcsa:` records over
+   the profiler socket (see §12).
+
+PC offset values are matched to `DisasmLine.addr` fields. Matched lines get
+`sample_pct` (fraction of total samples) and `stall_cycles` (CUPTI stall
+count, 0–15 from the SASS control word on Volta+) populated. The `stall_reason`
+string encodes the CUPTI stall category:
+
+| Code | Reason | Meaning |
+|------|--------|---------|
+| 1 | `none` | No stall |
+| 2 | `inst_fetch` | Instruction cache miss |
+| 3 | `exec_dep` | Execution dependency (data hazard) |
+| 4 | `mem_dep` | Memory dependency (L1/L2/HBM latency) |
+| 5 | `texture` | Texture unit busy |
+| 6 | `sync` | Warp synchronization |
+| 7 | `const_mem` | Constant memory bank conflict |
+| 8 | `pipe_busy` | Functional unit pipeline busy |
+| 9 | `mem_throttle` | Memory throttling |
+| 10 | `not_selected` | Warp eligible but not selected by scheduler |
+| 11 | `other` | Other / unknown |
+| 12 | `sleeping` | Warp sleeping |
+
+A stall of `exec_dep` (3) alongside a high heat% on a load instruction is the
+classic symptom of dependent loads with insufficient ILP — a candidate for
+software pipelining or prefetching.
+
+#### Static optimization hints — assembly advisor
+
+`src/analysis/asm_advisor.py` produces up to four actionable hints from a
+static analysis of the instruction mix, independent of runtime data. The
+advisor runs for every kernel in the Disasm tab when the kernel is selected.
+
+**x86-64 rules:**
+
+| Condition | Severity | Hint |
+|-----------|----------|------|
+| `vsp + vdp + fma < 10%` of non-branch instructions | warn | Low vectorisation — check auto-vec or add intrinsics |
+| `mem > 35%` | warn | Memory-bound — consider cache blocking or prefetch |
+| Spill instructions > 8% | warn | Register spills — reduce live variables or split loops |
+| Scalar FP (`addss/mulss`) without FMA | info | Use FMA (`vfmadd`) for 2× throughput |
+| SSE instructions present in otherwise AVX kernel | info | Mixed SSE/AVX — avoid `_mm_` in AVX context |
+| `ctl > 15%` (high branch density) | info | Consider branch-free patterns |
+
+**SASS rules:**
+
+| Condition | Severity | Hint |
+|-----------|----------|------|
+| Global loads (`LDG/STG`) > 15% with no shared memory (`STS/LDS`) | error | Missing shared-memory tiling |
+| Compute instructions < 15% | warn | Compute-light kernel — likely memory-bound |
+| Instructions with stall ≥ 10 are > 20% of all instructions | warn | High stall density — check instruction-level parallelism |
+| `BAR` (barriers) > 4% | warn | Excessive `__syncthreads()` — reduce barrier frequency |
+| Atomics > 5% | info | High atomic rate — consider warp-level reduction |
+| FP16 multiply (`HMUL`) without tensor (`HMMA`) | info | Use `wmma` / `mma` ops for tensor-core throughput |
+| No `LDGSTS` (async copy) on Ampere+ | info | Use `cuda::memcpy_async` / `__pipeline_memcpy_async` |
+
+**PTX rules:**
+
+| Condition | Severity | Hint |
+|-----------|----------|------|
+| `ld.global` without `ld.shared` | warn | No shared memory — add tiling |
+| Atomics > 5% | info | High atomic use — consider warp reduction |
+| No `.v2`/`.v4` vector loads | info | Use vector load instructions for better memory throughput |
+
+**AMDGCN rules:**
+
+| Condition | Severity | Hint |
+|-----------|----------|------|
+| VALU instructions < 30% | warn | Low VALU occupancy |
+| `global_load` without `ds_read` (LDS) | warn | No LDS tiling |
+| `s_waitcnt` > 5% | info | Frequent wait instructions — check memory access pattern |
+
 ### Tips
 
 - **CUDA AoT:** install `cuobjdump` from the CUDA toolkit.
@@ -1095,6 +1294,8 @@ RVV (RISC-V Vector Extension) mnemonics are classified as:
 - **ROCm disasm:** install `llvm-objdump` (`apt install llvm`).
 - **Instruction-mix percentages** always count the complete function, including
   instructions not visible due to the 500-line display cap.
+- **CUDA heat map:** add `--gpu-pc-sampling` to a `--disasm` run for AoT-compiled (NVCC fatbinary) kernels. Has no effect on JIT/PTX kernels — a warning is printed in that case.
+- **OpenCL CPU heat:** use `--backend opencl,cpu --disasm` — perf profiles the JIT x86-64 code and annotates instruction heat automatically.
 
 ---
 
@@ -1171,7 +1372,7 @@ flowchart TB
 
         subgraph HK["  Hook libraries  "]
             direction LR
-            H1["libhprofiler_cuda\n─────────────\nGPU event timing\nNVTX interception\nstream ID tagging\nmemory counters\nJIT cubin capture"]
+            H1["libhprofiler_cuda\n─────────────\nGPU event timing\nNVTX interception\nstream ID tagging\nmemory counters\nJIT cubin capture\nCUPTI PC sampling (opt)"]
             H2["libhprofiler_opencl\n─────────────\nforce queue profiling\nGPU-side timestamps\nJIT span timing"]
             H3["libhprofiler_ompt\n─────────────\nOMPT callbacks\ndladdr + /proc/maps\ncodeptr → symbol"]
             H4["libhprofiler_rocm\n─────────────\nGPU event timing\nstream ID tagging\nmemory counters\nJIT binary capture"]
@@ -1187,7 +1388,7 @@ flowchart TB
         R6 -->|PMPI link| H6
     end
 
-    WIRE(["🔌  Unix domain socket\nspan: · ctr: · inst:\nnewline-delimited ASCII"])
+    WIRE(["🔌  Unix domain socket\nspan: · ctr: · inst: · stk: · pcsa:\nnewline-delimited ASCII"])
 
     H1 & H2 & H3 & H4 & H5 & H6 --> WIRE
 
@@ -1252,8 +1453,17 @@ flowchart TB
    - OpenCL JIT: disassembles ACPP `.jit.so` files
    - OpenMP/CPU: resolves `sym=` / `lib=,offset=` tags to ELF symbols; auto-detects
      x86-64, AArch64, or RISC-V from `e_machine`; uses capstone (fast) or objdump
-6. The TUI's Disasm tab (shown only when `--disasm`) polls `trace.disasm` every 0.5 s.
-7. `profiler roofline` is a separate pass that re-runs the application under
+6. After disassembly, `_collect_disasm` runs annotation passes:
+   - CPU/OpenCL-CPU kernels: `annotate_with_perf(kd, perf_data)` — runs `perf annotate`
+     and sets `DisasmLine.sample_pct` from the `perf.data` recording (then deletes it).
+   - CUDA kernels (when `--gpu-pc-sampling`): `annotate_with_cupti(kd, samples)` — matches
+     accumulated `pcsa:` records to `DisasmLine.addr`, setting `sample_pct`,
+     `stall_cycles`, and `stall_reason`.
+   Each annotation increments `trace._disasm_version` so the TUI can detect the change.
+7. The TUI's Disasm tab (shown only when `--disasm`) polls `trace._disasm_version` every
+   0.5 s. A version change clears the render cache and refreshes heat/stall columns and
+   the optimization hints panel without requiring user interaction.
+8. `profiler roofline` is a separate pass that re-runs the application under
    `ncu` / `rocprof` / `perf stat` to collect exact hardware counter measurements.
 
 ---
@@ -1286,11 +1496,35 @@ for CUDA/ROCm, per-thread for others); `disasm` dict populated post-run.
 `TraceMetadata` stores command, args, backends, hostname, and `cwd` (working
 directory at run time — used to resolve relative binary paths when reloading).
 
+Additional fields used by instruction-level annotation:
+
+- `_disasm_version: int` — incremented on every `add_disasm()` call. The TUI
+  Disasm poller compares this value each tick; a change means either a new
+  kernel was added *or* existing `DisasmLine` fields (heat, stall) were updated
+  by annotation, and the view is refreshed accordingly.
+- `_pc_samples: dict[str, list[tuple[int, int, int]]]` — per-function list of
+  `(pc_offset, stall_reason, count)` tuples accumulated from `pcsa:` socket
+  records. Consumed by `annotate_with_cupti` after disassembly is complete.
+- `add_pc_sample(func_name, pc_offset, stall_reason, count)` — appends a CUPTI
+  PC sample record; called from the socket receive loop when a `pcsa:` line
+  arrives.
+
 ### `src/core/runner.py` — Process runner
 
 `Runner.run()` creates a Unix socket, injects hooks via env vars, starts the
 accept/parse loop, waits for the process to exit, then optionally runs
 `_collect_disasm` in a daemon background thread and returns immediately.
+
+When `--gpu-pc-sampling` is active, `HPROFILER_GPU_PCSAMPLING=1` is exported
+into the child environment, which activates the CUPTI subsystem in the CUDA
+hook. Incoming `pcsa:` lines from the socket are parsed by `handle_client` and
+forwarded to `trace.add_pc_sample()` under the events lock.
+
+`perf.data` is no longer deleted immediately after the profiled process exits.
+Instead, `_collect_disasm` receives the path as `perf_data` and calls
+`annotate_with_perf` on each CPU-arch kernel before deleting the file in a
+`finally` block. This preserves the recording for post-run annotation without
+keeping it on disk longer than necessary.
 
 ### `src/disasm/extractor.py` — Disassembly engine
 
@@ -1305,6 +1539,8 @@ accept/parse loop, waits for the process to exit, then optionally runs
 | `disasm_rocm_binary(path)` | `llvm-objdump` on AMDGCN ELF |
 | `_parse_ptx_text(text, source)` | Parse PTX source into `KernelDisasm` |
 | `_acpp_kernel_short(mangled)` | Demangle ACPP kernel name |
+| `annotate_with_perf(kd, perf_data)` | Run `perf annotate` against `perf.data`; set `DisasmLine.sample_pct` on matching addresses |
+| `annotate_with_cupti(kd, samples)` | Match `(pc_offset, stall_reason, count)` tuples to `DisasmLine.addr`; set `sample_pct`, `stall_cycles`, `stall_reason` |
 
 `_disasm_elf_capstone` reads only the target function's bytes (ELF section
 header walk, no subprocess). Typical time: ~40ms regardless of binary size.
@@ -1313,6 +1549,27 @@ RISC-V 64 (`CS_ARCH_RISCV/CS_MODE_RISCV64`, requires capstone ≥ 5.0).
 
 The CPU/OpenMP objdump fallback now calls `_elf_arch(target_path)` instead of
 hard-coding `"x86-64"`, so AArch64 and RISC-V binaries get the right classifier.
+
+### `src/analysis/asm_advisor.py` — Assembly optimization advisor
+
+`advise(kd: KernelDisasm) → list[AsmAdvice]` dispatches to an arch-specific
+advisor and returns up to four `AsmAdvice` items.
+
+```python
+@dataclass
+class AsmAdvice:
+    severity: str          # "error" | "warn" | "info" | "ok"
+    category: str          # short label, e.g. "vectorisation", "memory"
+    message: str           # one-line description
+    detail: str            # optional longer explanation
+    icon: str              # derived: "✗" / "!" / "i" / "✓"
+    rich_color: str        # derived: "red" / "yellow" / "cyan" / "green"
+```
+
+Advisor functions: `_advise_cpu(kd)`, `_advise_sass(kd)`, `_advise_ptx(kd)`,
+`_advise_amdgcn(kd)`. Each analyses `kd.itype_pcts()` and walks `kd.lines` for
+architecture-specific patterns (stall counts, mnemonic patterns). Rules are
+documented in §8.
 
 ### `src/disasm/classifier.py` — Instruction type classifier
 
@@ -1431,13 +1688,34 @@ still held. The `start_ns` field matches the preceding span for correlation.
 stk:<pid>:<tid>:<start_ns>:<frame0>;<frame1>;...
 ```
 
-Frames are in **innermost-first** order (as returned by `backtrace()`). The
-Python receiver reverses them to build a root→leaf call tree. Frame names are
-extracted from `backtrace_symbols()`, with `dladdr()` as a fallback for PIE
-binaries. C++ names are demangled via `__cxa_demangle`. Hook and runtime frames
-are filtered out using a prefix skip-list (`libhprofiler_`, `libcuda`, `libmpi`,
-`libgomp`, `libomp`, etc.). Semicolons within names are replaced with commas
-to avoid ambiguity with the field separator.
+Each frame has one of two forms:
+
+```
+sym_name                             # symbol name only (demangled C++)
+sym_name|/path/to/lib.so|0xoffset   # symbol + library path + IP offset from load base
+```
+
+The `lib.so` and `offset` fields are present when the hook was built with
+libunwind or when `dladdr()` successfully resolved the address. The offset is
+suitable for `addr2line -e /path/to/lib.so 0xoffset` to get source file:line
+without re-running the program. hprofiler automatically runs this resolution
+after the profiled process exits (best-effort — requires addr2line or
+llvm-symbolizer in PATH).
+
+Frames are in **innermost-first** order. The Python receiver reverses them to
+build a root→leaf call path.
+
+**Unwinding strategy (in priority order):**
+
+| Condition | Unwinder | Requirement |
+|-----------|----------|-------------|
+| Built with libunwind | `unw_step` loop | `libunwind-dev` at build time |
+| Fallback | glibc `backtrace()` | Binary built with `-fno-omit-frame-pointer` |
+
+C++ names are demangled via `__cxa_demangle`. Hook and runtime frames are
+filtered out via a prefix skip-list (`libhprofiler_`, `libcuda`, `libmpi`,
+`libgomp`, `libomp`, etc.). Characters `|` and `;` within names are replaced
+with `,` to preserve the field/frame separator semantics.
 
 **Set by** `--call-tree` flag → `HPROFILER_CALLSTACK=1` in the child environment.
 
@@ -1452,6 +1730,41 @@ ctr:<cat>:<pid>:<ts_ns>:<name>:<value>[:<unit>]
 ```
 inst:<cat>:<pid>:<tid>:<ts_ns>:<name>
 ```
+
+### PC sample record *(emitted only when `HPROFILER_GPU_PCSAMPLING=1`)*
+
+Sent in a batch from the CUDA hook's destructor after all CUPTI buffers are
+flushed. One record per unique `(function, pc_offset, stall_reason)` tuple:
+
+```
+pcsa:<pid>:<ts_ns>:<func_name>:<pc_offset_hex>:<stall_reason_int>:<count>
+```
+
+| Field | Description |
+|-------|-------------|
+| `pid` | Process ID |
+| `ts_ns` | Timestamp at flush (nanoseconds, `CLOCK_MONOTONIC`) |
+| `func_name` | Kernel function name (from CUPTI `CUpti_ActivityFunction.name`) |
+| `pc_offset_hex` | PC byte offset within the function, hex (e.g. `0x1a0`) |
+| `stall_reason_int` | CUPTI stall reason code (1–12, see §8) |
+| `count` | Number of samples at this `(pc_offset, stall_reason)` |
+
+The Python receiver calls `trace.add_pc_sample(func_name, pc_offset, stall_reason, count)`
+for each record. After `_collect_disasm` finishes, `annotate_with_cupti` walks
+the accumulated samples and sets `DisasmLine.sample_pct`, `stall_cycles`, and
+`stall_reason` on matching lines.
+
+**CUPTI implementation notes:**
+- `libcupti.so` is loaded at runtime via `dlopen` — no compile-time CUPTI
+  linkage required. The hook tries `libcupti.so.12`, then `.11`, then `.so`.
+  If none is found, the PC sampling block is silently skipped.
+- Struct layouts are manually defined in `cuda_hook.c` to match
+  `cupti_activity.h` with `CUPTILP64=1` (the x86-64 layout). No CUPTI headers
+  are included, avoiding type conflicts with the hook's `void*` CUDA stubs.
+- `CUPTI_ACTIVITY_KIND_PC_SAMPLING` (kind 30) and
+  `CUPTI_ACTIVITY_KIND_FUNCTION` (kind 26) are enabled. The function activity
+  builds a `funcId → name` map; the PC sampling activity provides
+  `(funcId, pcOffset, stallReason, samples)` tuples.
 
 ### C-side socket management
 
@@ -1508,19 +1821,34 @@ For most programs this is invisible. It becomes measurable when:
 ### `--call-tree` overhead
 
 When `--call-tree` is active (`HPROFILER_CALLSTACK=1`), each intercepted API
-call additionally runs `emit_callstack()` while the socket mutex is held. This
-adds:
+call additionally runs `emit_callstack()` while the socket mutex is held. Overhead
+depends on which unwinder was compiled in:
 
-| Operation | Measured cost (this machine) |
-|-----------|------------------------------|
+**With libunwind (recommended — detected automatically at build time):**
+
+| Operation | Cost |
+|-----------|------|
+| `unw_getcontext` + `unw_init_local` | ~1 µs |
+| `unw_step` per frame (up to 32) | ~0.5 µs/frame |
+| `unw_get_proc_name` (symbol) | ~1 µs/frame |
+| `dladdr` (lib + offset) | ~0.5 µs/frame |
+| `__cxa_demangle` | <1 µs (first call; cached) |
+| **Total per intercepted call (~8 frames)** | **~5–15 µs** |
+
+libunwind works on optimised binaries without `-fno-omit-frame-pointer`. It also
+provides raw IP addresses used for `addr2line` source-level resolution post-run.
+
+**Without libunwind (glibc `backtrace()` fallback):**
+
+| Operation | Measured cost |
+|-----------|---------------|
 | `backtrace()` (up to 32 frames) | ~4 µs |
 | `backtrace_symbols()` (malloc + symbol lookup) | ~47 µs |
-| `dladdr()` fallback (PIE binaries without `-rdynamic`) | ~44 µs |
-| `__cxa_demangle()` per frame | <1 µs (cached after first call) |
+| `dladdr()` fallback (PIE without `-rdynamic`) | ~44 µs |
 | **Total per intercepted call** | **~50 µs** (with `-rdynamic`) or **~90 µs** (without) |
 
-`backtrace_symbols()` dominates — it performs a `malloc` and a `/proc/self/maps`
-scan per frame. Building with `-rdynamic` eliminates the `dladdr` fallback path.
+`backtrace_symbols()` dominates and requires `-fno-omit-frame-pointer` to unwind
+correctly. Install `libunwind-dev` and rebuild to use the faster path.
 
 **Impact by workload:**
 
@@ -1901,6 +2229,221 @@ Results from the new run would be loaded into a secondary `Trace` and made avail
 ### 15.9 Privacy Considerations
 
 All profiling data sent to the LLM includes:
+
+---
+
+## 16. Call-Path Analysis, CCT, and GPU Starvation
+
+This section covers the three analysis features added for C/C++ HPC workloads:
+accurate C++ call paths via libunwind, the Calling Context Tree (CCT), and
+GPU starvation detection.
+
+---
+
+### 16.1 C++ Call Path via libunwind
+
+hprofiler can capture the full C++ call stack at every API interception point
+(kernel launches, memory transfers, MPI collectives, etc.) and attribute time
+back to the source code that initiated each operation.
+
+**Enabling call-path capture:**
+
+```bash
+# Capture call stacks alongside profiling
+hprofiler run --backend cuda --call-tree -- ./my_cuda_app
+
+# Combined with other backends
+hprofiler run --backend cuda,openmp --call-tree -- ./app
+```
+
+Setting `--call-tree` exports `HPROFILER_CALLSTACK=1` into the child process,
+which activates `emit_callstack()` in every hook.
+
+**Build requirements:**
+
+```bash
+# Install libunwind (recommended — accurate stacks without frame pointers)
+apt install libunwind-dev          # Debian/Ubuntu
+dnf install libunwind-devel        # RHEL/Fedora/Rocky
+```
+
+When `libunwind` is found at CMake configure time, all hooks are built with
+`HPROFILER_USE_LIBUNWIND` and link against `libunwind`. The CMake output shows:
+
+```
+hprofiler: libunwind found (/usr/lib/.../libunwind.so) — accurate C++ stack unwinding enabled
+```
+
+Without libunwind the fallback is glibc's `backtrace()`, which requires the
+profiled binary to be compiled with `-fno-omit-frame-pointer`:
+
+```bash
+# When not using libunwind: compile the target with frame pointers
+gcc -O2 -fno-omit-frame-pointer -g -rdynamic -o myapp myapp.c
+```
+
+**Source file:line resolution:**
+
+When `addr2line` or `llvm-symbolizer` is in PATH, hprofiler automatically
+resolves raw IP addresses (captured in the `sym|lib|offset` frame format) to
+source file and line number after the profiled process exits. This happens
+transparently — no user action required.
+
+```
+# Frame in trace before resolution:
+solve_pressure|/home/user/sim/build/libsolver.so|0x4a2f0
+
+# After addr2line resolution:
+solve_pressure (pressure_solver.cpp:142)|/home/user/sim/build/libsolver.so|0x4a2f0
+```
+
+The CCT and summary output display the resolved form automatically.
+
+**What is filtered:** Hook-internal frames, CUDA/HIP/MPI/OpenCL runtime frames,
+and C library frames are stripped. Only user application and user library frames
+appear in call paths.
+
+---
+
+### 16.2 Calling Context Tree (CCT)
+
+The CCT aggregates profiling events by their full call path, collapsing
+repeated invocations from the same source location into a single node. This
+solves two problems:
+
+1. **Attribution**: instead of "cudaLaunchKernel called 10,000 times", the CCT
+   shows "solver.cpp:247 → integrate_step → cudaLaunchKernel, 10,000 calls,
+   3.2 s total".
+2. **Scalability**: long-running simulations with many repeated operations
+   produce a compact tree rather than an unbounded flat event list.
+
+**CCT hotspots appear in the text summary** when `--call-tree` was active:
+
+```
+  Call-path hotspots (CCT, top 15):
+  Function                                   Cat      Calls      Total        Avg  %wall
+  -----------------------------------------------------------------------------------------
+  …/integrate/cudaLaunchKernel               cuda      8000    2.341s     292µs   46.8%
+  …/transfer/cudaMemcpyAsync                 cuda       800  487.3ms     609µs    9.7%
+  …/init/cudaMalloc                          memory      12   23.1ms    1.93ms    0.5%
+  …/main/MPI_Allreduce                       mpi         40  145.6ms    3.64ms    2.9%
+```
+
+The path shown is compressed to 2–3 callers above the leaf for readability.
+The full call path is available in the TUI's Call Tree tab.
+
+**Programmatic CCT access:**
+
+```python
+from src.ui.app import load_trace_from_json
+from src.analysis.cct import CCT
+
+trace = load_trace_from_json("my_app.hprofiler.json")
+cct = trace.cct()   # builds CCT from all stacked spans
+
+# Top-10 GPU hotspots by exclusive time
+for node in cct.top_self(n=10, category="cuda"):
+    path = " → ".join(node.call_path()[-3:])   # last 3 callers
+    print(f"{path:60}  {node.self_ns/1e6:.2f}ms  x{node.self_count}")
+
+# Top call paths by inclusive time (hot subtrees)
+for node in cct.top_incl(n=5):
+    print(f"{node.display_name:40}  incl={node.incl_ns/1e6:.2f}ms")
+```
+
+**CCT node fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `frame` | str | Raw frame string (`sym` or `sym\|lib\|offset`) |
+| `display_name` | str | Symbol name only |
+| `lib_path` | str | Library path (from frame info, or `""`) |
+| `lib_offset` | str | Hex offset string (or `""`) |
+| `self_count` | int | Invocations where this is the leaf |
+| `self_ns` | int | Exclusive (self) time in nanoseconds |
+| `self_min_ns` / `self_max_ns` | int | Min / max exclusive duration |
+| `incl_ns` | int | Inclusive time (subtree sum) |
+| `incl_count` | int | Invocations in this subtree |
+| `categories` | set[str] | Categories of spans charged here |
+
+---
+
+### 16.3 GPU Starvation Detection
+
+The GPU starvation analysis identifies time the GPU spent idle while the CPU
+was doing work, and separates it into two root causes:
+
+- **Sync stalls**: CPU explicitly waiting for GPU via `cudaDeviceSynchronize`,
+  `hipDeviceSynchronize`, `clFinish`, etc. The GPU is busy; the CPU is blocked.
+  Too many sync calls serialize the CPU dispatch pipeline.
+- **Launch gaps**: gaps between consecutive GPU kernel intervals where neither
+  GPU nor a sync call is active. Typically caused by CPU-side compute (e.g.
+  data preparation, boundary condition updates, I/O) between GPU launches.
+
+**Output section in the text summary** (shown automatically for CUDA/ROCm/OpenCL):
+
+```
+  GPU timeline analysis:
+    GPU kernel active      :   62.3%  (3.115s)
+    CPU sync stalls        :   18.7%  (0.935s, 42 sync calls)
+    GPU idle (launch gaps) :   19.0%  (0.950s)
+    [!] High sync stall — consider async launches or batching kernel submissions
+```
+
+The `[!]` advisory lines fire when:
+- Sync stall > 20% of wall time → suggests overlapping transfers with
+  asynchronous launches and using `cudaStreamSynchronize` per-stream instead
+  of `cudaDeviceSynchronize`.
+- Launch gap > 30% of wall time → suggests CPU-side bottleneck; profile the
+  CPU work between launches with `--backend cpu` or `--call-tree`.
+
+**Programmatic access:**
+
+```python
+from src.analysis.cct import gpu_starvation
+
+stats = gpu_starvation(trace)
+print(f"GPU active:   {stats['gpu_active_pct']:.1f}%")
+print(f"Sync stalls:  {stats['sync_stall_pct']:.1f}%  ({stats['sync_calls']} calls)")
+print(f"Launch gaps:  {stats['launch_gap_pct']:.1f}%")
+```
+
+**CPU microarch counters for GPU workloads:**
+
+Starting from this release, `perf stat` (IPC, cache miss rate, branch miss rate)
+is automatically collected for CUDA, ROCm, NCCL, and MPI backends in addition to
+the CPU/OpenMP/OpenCL backends. This makes CPU-side bottleneck metrics available
+without needing to explicitly add `--backend cpu`:
+
+```
+  CPU microarch:
+    IPC                 : 1.43
+    LLC cache miss rate : 8.21%
+    Branch miss rate    : 0.54%
+```
+
+A low IPC (<1.0) alongside high launch gaps indicates the CPU is stalling on
+memory accesses (e.g., reading particle positions before each kernel launch) —
+a candidate for prefetching or restructuring data layout.
+
+---
+
+### 16.4 Recommended workflow for HPC C++ programs
+
+```bash
+# Step 1: baseline run without call trees (low overhead)
+hprofiler run --backend cuda,cpu -- ./sim --steps 100
+
+# Step 2: check GPU starvation in the summary output
+#   → If launch_gap_pct > 30%, investigate what the CPU does between launches
+
+# Step 3: enable call trees to attribute GPU time to source locations
+HPROFILER_CALLSTACK=1 hprofiler run --backend cuda --call-tree -- ./sim --steps 10
+#   → The CCT section in the summary shows which functions are launching hot kernels
+
+# Step 4: check the Call Tree tab in the TUI for full call-path detail
+#   → Drill down to find the exact file:line responsible for each bottleneck
+```
 - Kernel/function names from the profiled binary
 - Timing and counter data
 - Hostname, command-line arguments, and backends used

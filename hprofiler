@@ -125,6 +125,8 @@ def cli():
               help="Collect per-kernel disassembly after profiling  [default: no]")
 @click.option("--call-tree/--no-call-tree", default=False,
               help="Capture CPU call stacks to build a from-main call tree  [default: no]")
+@click.option("--gpu-pc-sampling", is_flag=True, default=False,
+              help="Enable CUPTI PC sampling for per-instruction GPU heat (CUDA only, requires CUPTI)  [default: no]")
 @click.option("--otlp-endpoint", default=None, metavar="URL",
               help="Export to OTLP HTTP collector, e.g. http://localhost:4318")
 @click.option("--otlp-file", default=None, metavar="PATH",
@@ -143,6 +145,7 @@ def cli():
               help="Save AI analysis report to a Markdown file")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, call_tree,
+        gpu_pc_sampling,
         otlp_endpoint, otlp_file, do_analyze, llm_provider, llm_model,
         llm_endpoint, llm_api_key, analysis_report, command):
     """Profile COMMAND with the selected backends.
@@ -193,6 +196,8 @@ def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, call_tr
         env_extra["HPROFILER_CALLGRAPH"] = perf_callgraph
     if call_tree:
         env_extra["HPROFILER_CALLSTACK"] = "1"
+    if gpu_pc_sampling:
+        env_extra["HPROFILER_GPU_PCSAMPLING"] = "1"
 
     runner = Runner(
         command=cmd,

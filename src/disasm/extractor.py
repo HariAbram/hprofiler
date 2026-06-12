@@ -27,12 +27,19 @@ from .classifier import InsnType, classify, ITYPE_COLOR, ITYPE_LABEL
 
 @dataclass
 class DisasmLine:
-    addr:     int      = 0
-    mnemonic: str      = ""
-    operands: str      = ""
-    itype:    InsnType = InsnType.OTHER
-    comment:  str      = ""
-    raw:      str      = ""   # full original text line
+    addr:         int      = 0
+    mnemonic:     str      = ""
+    operands:     str      = ""
+    itype:        InsnType = InsnType.OTHER
+    comment:      str      = ""
+    raw:          str      = ""   # full original text line
+    # Source location (populated by source_ann.annotate_disasm if debug info present)
+    source_file:  str      = ""
+    source_line:  int      = 0
+    # Runtime annotation fields (populated post-run)
+    sample_pct:   float    = 0.0  # % of samples landing on this instruction
+    stall_cycles: int      = -1   # SASS: compiler-estimated stall count (0-15); -1 = unknown
+    stall_reason: str      = ""   # CUPTI dominant stall reason string
 
     @property
     def text(self) -> str:
@@ -41,10 +48,12 @@ class DisasmLine:
 
 @dataclass
 class KernelDisasm:
-    name:   str
-    arch:   str                       # 'x86-64' | 'sass' | 'ptx' | 'amdgcn'
-    source: str                       # path to the file that was disassembled
-    lines:  list[DisasmLine] = field(default_factory=list)
+    name:          str
+    arch:          str                       # 'x86-64' | 'sass' | 'ptx' | 'amdgcn'
+    source:        str                       # path to the file that was disassembled
+    lines:         list[DisasmLine] = field(default_factory=list)
+    ptxas_derived: bool = False              # True when SASS was compiled from PTX via ptxas
+    mangled_name:  str  = ""                 # original mangled symbol (for pc_sample lookup)
 
     def itype_counts(self) -> dict[InsnType, int]:
         counts: dict[InsnType, int] = {}
@@ -305,31 +314,67 @@ def disasm_elf(path: str, symbol: Optional[str] = None,
 
 _SASS_KERN = re.compile(r'^\s*Function\s*:\s*(\S+)')
 _SASS_LINE = re.compile(
-    r'/\*([0-9a-f]+)\*/\s+([A-Z][A-Z0-9_]+(?:\.[A-Z0-9_.]+)*)\s*(.*?)\s*;?$',
+    r'/\*([0-9a-f]+)\*/\s+(?:@!?[A-Z]\w*,\s*)?'   # /*offset*/ + optional predicate
+    r'([A-Z][A-Z0-9_]+(?:\.[A-Z0-9_.]+)*)\s*'      # mnemonic
+    r'(.*?)\s*;',                                    # operands up to semicolon
     re.I,
 )
+# Bare control-word line (second line of each 128-bit SASS instruction on Volta+):
+#   /* 0x000fc40000000f00 */
+_SASS_CTRL = re.compile(r'^\s*/\*\s*(0x[0-9a-f]+)\s*\*/\s*$', re.I)
+
+
+def _sass_stall(ctrl_hex: str) -> int:
+    """Extract stall cycle count from a SASS control word (Volta/Turing/Ampere/Ada).
+
+    cuobjdump emits each 128-bit instruction as two lines:
+      line 1: /*offset*/  MNEMONIC operands;   /* instruction_word */
+      line 2:                                  /* control_word     */
+
+    In the control word, bits [11:8] encode the warp-scheduler stall count
+    (0 = issue next cycle; 15 = maximum latency/stall).  High stall on a load
+    instruction indicates latency-critical memory access.
+    """
+    try:
+        ctrl = int(ctrl_hex, 16)
+        return (ctrl >> 8) & 0xF
+    except (ValueError, TypeError):
+        return -1
 
 
 def _parse_sass(text: str) -> dict[str, list[DisasmLine]]:
     kernels: dict[str, list[DisasmLine]] = {}
     current: Optional[str] = None
+    last_line: Optional[DisasmLine] = None   # for attaching the control-word stall
+
     for raw in text.splitlines():
         m = _SASS_KERN.match(raw)
         if m:
             current = m.group(1)
             kernels.setdefault(current, [])
+            last_line = None
             continue
         if current is None:
             continue
+
+        # Instruction line
         m = _SASS_LINE.search(raw)
         if m:
-            addr_s, mnem, ops = m.groups()
+            addr_s, mnem, ops = m.group(1), m.group(2), m.group(3)
             itype = classify("sass", mnem, ops)
-            kernels[current].append(DisasmLine(
+            last_line = DisasmLine(
                 addr=int(addr_s, 16),
                 mnemonic=mnem, operands=ops.strip(),
                 itype=itype, raw=raw,
-            ))
+            )
+            kernels[current].append(last_line)
+            continue
+
+        # Control-word line (Volta+ two-line format): attach stall to previous insn
+        m = _SASS_CTRL.match(raw)
+        if m and last_line is not None:
+            last_line.stall_cycles = _sass_stall(m.group(1))
+
     return kernels
 
 
@@ -547,6 +592,55 @@ def _acpp_kernel_short(mangled: str) -> str:
     return mangled
 
 
+# ── PTX → SASS via ptxas ─────────────────────────────────────────────────────
+
+def ptxas_compile_to_sass(ptx_path: str, sm_arch: str) -> dict[str, KernelDisasm]:
+    """Compile a PTX file to a SASS cubin using ptxas, then disassemble with cuobjdump.
+
+    sm_arch: ptxas -arch argument, e.g. "sm_86".
+    Returns {short_name: KernelDisasm(arch="sass", ptxas_derived=True)}.
+    Returns {} if ptxas/cuobjdump is unavailable or compilation fails.
+
+    NOTE: The SASS produced by ptxas may differ slightly from the SASS the CUDA
+    driver generates at runtime.  PC offsets from CUPTI samples (runtime SASS)
+    are therefore approximate matches against this offline-compiled SASS.
+    """
+    if not _tool("ptxas") or not _tool("cuobjdump"):
+        return {}
+    if not Path(ptx_path).exists():
+        return {}
+
+    import tempfile as _tf
+    fd, cubin_path = _tf.mkstemp(suffix=".cubin", prefix="hprofiler_ptxas_")
+    os.close(fd)
+    try:
+        r = subprocess.run(
+            ["ptxas", f"-arch={sm_arch}", ptx_path, "-o", cubin_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            return {}
+        if not Path(cubin_path).exists() or Path(cubin_path).stat().st_size == 0:
+            return {}
+
+        sass_raw = disasm_cuda_sass(cubin_path)
+        result: dict[str, KernelDisasm] = {}
+        for mangled, kd in sass_raw.items():
+            short = _acpp_kernel_short(mangled)
+            kd.name          = short
+            kd.mangled_name  = mangled
+            kd.ptxas_derived = True
+            result[short]    = kd
+        return result
+    except Exception:
+        return {}
+    finally:
+        try:
+            Path(cubin_path).unlink()
+        except OSError:
+            pass
+
+
 # ── Top-level collection ──────────────────────────────────────────────────────
 
 def collect_disasm(
@@ -556,6 +650,7 @@ def collect_disasm(
     omp_syms:     dict[str, tuple] | None = None,  # {span_name: ("sym",name)|("lib",(path,off))}
     profiled_pid: int = 0,              # PID of the profiled process; used to filter /tmp files
     cpu_names:    set[str] | None = None,  # CPU function names from perf sampling
+    sm_version:   str = "",             # e.g. "sm_86" — enables ptxas PTX→SASS for JIT kernels
 ) -> dict[str, KernelDisasm]:
     """
     Collect disassembly for all profiled kernels.
@@ -594,7 +689,25 @@ def collect_disasm(
         import glob
         pid_pat = str(profiled_pid) if profiled_pid else "*"
         for cubin_path in glob.glob(f"/tmp/hprofiler_cubin_{pid_pat}_*.bin"):
-            jit_kd = disasm_cuda_cubin(cubin_path)
+            # Detect PTX content (ACPP JIT passes raw PTX text)
+            try:
+                with open(cubin_path, "rb") as _cf:
+                    _magic = _cf.read(2)
+                _is_ptx = _magic in (b"//", b".v") or (
+                    _magic[:1] == b"." and _magic != b"\x7f"
+                )
+            except OSError:
+                _is_ptx = False
+
+            jit_kd: dict[str, KernelDisasm] = {}
+            if _is_ptx and sm_version:
+                # Try ptxas → SASS so CUPTI PC offsets can be matched
+                jit_kd = ptxas_compile_to_sass(cubin_path, sm_version)
+
+            if not jit_kd:
+                # Fallback: PTX parse (or non-PTX cubin via cuobjdump/nvdisasm)
+                jit_kd = disasm_cuda_cubin(cubin_path)
+
             for name, kd in jit_kd.items():
                 result.setdefault(name, kd)
             try:
@@ -767,3 +880,112 @@ def collect_disasm(
                 result[fn_name] = kd
 
     return result
+
+
+# ── Post-run annotation: perf annotate (CPU) ──────────────────────────────────
+
+# perf annotate --stdio output line:  "  12.34  :      40a100:   mov  rax, [rbx]"
+_PERF_ANNOT = re.compile(r'^\s*([\d.]+)\s*:\s+([0-9a-f]+):\s', re.I)
+
+
+def annotate_with_perf(kd: KernelDisasm, perf_data: str, binary: str = "") -> int:
+    """Attach CPU sample percentages to DisasmLines by running perf annotate --stdio.
+
+    Reads perf.data produced by 'perf record -e cycles:u', maps sample counts
+    to instruction addresses using perf's own ASLR/PIE remapping, and sets
+    DisasmLine.sample_pct.  Returns the number of lines annotated.
+    """
+    if not shutil.which("perf"):
+        return 0
+    if not Path(perf_data).exists():
+        return 0
+
+    addr_to_line: dict[int, DisasmLine] = {
+        ln.addr: ln for ln in kd.lines if ln.addr
+    }
+    if not addr_to_line:
+        return 0
+
+    # Try with --no-source first (skips source interleaving), fall back without it
+    base = ["perf", "annotate", "--stdio", "-s", kd.name, "-i", perf_data]
+    if binary:
+        base.append(binary)
+    out = _run(base + ["--no-source", "-q"], timeout=30)
+    if not out.strip():
+        out = _run(base, timeout=30)
+    if not out.strip():
+        return 0
+
+    annotated = 0
+    for raw in out.splitlines():
+        m = _PERF_ANNOT.match(raw)
+        if not m:
+            continue
+        try:
+            pct  = float(m.group(1))
+            addr = int(m.group(2), 16)
+        except ValueError:
+            continue
+        if pct > 0.0 and addr in addr_to_line:
+            addr_to_line[addr].sample_pct = pct
+            annotated += 1
+
+    return annotated
+
+
+# ── Post-run annotation: CUPTI PC sampling (GPU) ─────────────────────────────
+
+# Stall reason index → short string (from CUpti_ActivityPCSamplingStallReason)
+_CUPTI_STALL_NAMES: dict[int, str] = {
+    1:  "none",
+    2:  "inst_fetch",
+    3:  "exec_dep",
+    4:  "mem_dep",
+    5:  "texture",
+    6:  "sync",
+    7:  "const_mem",
+    8:  "pipe_busy",
+    9:  "mem_throttle",
+    10: "not_sel",
+    11: "other",
+    12: "sleeping",
+}
+
+
+def annotate_with_cupti(
+    kd: KernelDisasm,
+    samples: "list[tuple[int, int, int]]",
+) -> int:
+    """Attach CUPTI PC sample percentages to DisasmLines.
+
+    samples: list of (pc_offset, stall_reason_int, count) tuples collected by
+             the CUPTI activity hook in cuda_hook.c.  pc_offset is a byte offset
+             from the start of the kernel function, matching DisasmLine.addr.
+
+    Sets DisasmLine.sample_pct (% of all samples for this kernel) and
+    DisasmLine.stall_reason (dominant stall reason string).
+    Returns the number of lines annotated.
+    """
+    if not samples:
+        return 0
+
+    # Accumulate per-pc: {pc_offset: {stall_reason: count}}
+    pc_counts: dict[int, int] = {}
+    pc_stall:  dict[int, dict[int, int]] = {}
+    for pc, stall, count in samples:
+        pc_counts[pc] = pc_counts.get(pc, 0) + count
+        pc_stall.setdefault(pc, {})[stall] = pc_stall[pc].get(stall, 0) + count
+
+    total = sum(pc_counts.values()) or 1
+    addr_to_line = {ln.addr: ln for ln in kd.lines if ln.addr is not None}
+
+    annotated = 0
+    for pc, count in pc_counts.items():
+        if pc in addr_to_line:
+            ln = addr_to_line[pc]
+            ln.sample_pct = 100.0 * count / total
+            dom = max(pc_stall[pc], key=pc_stall[pc].get)
+            ln.stall_reason = _CUPTI_STALL_NAMES.get(dom, "")
+            annotated += 1
+
+    return annotated

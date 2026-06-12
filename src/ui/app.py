@@ -5,7 +5,6 @@ Tabs:
   Overview  — dashboard: duration, backend breakdown, top-10 hotspots
   Timeline  — Paraver-style Gantt: one row per (category, thread), zoomable
   Hotspots  — VTune-style: function table with bar visualization, sortable
-  Flame     — ASCII flame graph of CPU samples
 
 Keyboard shortcuts:
   Tab / Shift+Tab  cycle tabs
@@ -21,6 +20,7 @@ Keyboard shortcuts:
 
 from __future__ import annotations
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,6 +104,15 @@ def _fmt_ns(ns: float) -> str:
 def _bar(frac: float, width: int, filled: str = "█", empty: str = "░") -> str:
     n = max(0, min(width, int(frac * width)))
     return filled * n + empty * (width - n)
+
+_JIT_HASH_RE = re.compile(r'^(\d+)\.(\d+)\.jit\.so$')
+
+def _fmt_kernel_name(name: str) -> str:
+    """Shorten ACPP SSCP hash-named JIT kernels to a readable form."""
+    m = _JIT_HASH_RE.match(name)
+    if m:
+        return f"[jit:{m.group(1)[-6:]}…{m.group(2)[-4:]}]"
+    return name
 
 def _grad_bar(frac: float, width: int) -> str:
     """Gradient block bar using sub-character resolution (▏▎▍▌▋▊▉█)."""
@@ -882,9 +891,14 @@ class TimelineWidget(Widget):
         self._lane_names = sorted(self._lanes.keys(), key=_sort_key)
 
         all_spans = trace.spans
-        if all_spans:
-            self._view_start = min(s.start_ns for s in all_spans)
-            self._view_end   = max(s.end_ns   for s in all_spans)
+        # Anchor the visible window to timed spans only; CPU sample spans
+        # (duration_ns=0) may use a different clock base (e.g. CLOCK_BOOTTIME
+        # vs CLOCK_MONOTONIC on suspended machines) and would bloat the window.
+        timed_spans = [s for s in all_spans if s.duration_ns > 0]
+        anchor = timed_spans if timed_spans else all_spans
+        if anchor:
+            self._view_start = min(s.start_ns for s in anchor)
+            self._view_end   = max(s.end_ns   for s in anchor)
         else:
             self._view_start = trace.metadata.start_time_ns
             self._view_end   = trace.metadata.end_time_ns or self._view_start + 1
@@ -1317,22 +1331,41 @@ class HotspotsWidget(Widget):
             sort_label, "Avg", "Min", "Max", "%", "Distribution (% of total)",
         )
 
-        stats     = sorted(self.trace.aggregated_stats(),
+        all_stats = sorted(self.trace.aggregated_stats(),
                            key=lambda r: r.get(sort_col, 0), reverse=True)
-        flt       = self.filter_text.lower()
+        # Hide zero-duration CPU samples unless the user is actively filtering
+        flt = self.filter_text.lower()
+        if flt:
+            stats = all_stats
+        else:
+            stats = [r for r in all_stats if r["total_ns"] > 0 or r["category"] != "cpu"]
         total_all = sum(r["total_ns"] for r in stats) or 1
         bar_w     = 24
+
+        # Build source-location lookup from annotated spans (file/line tags)
+        src_loc: dict[str, str] = {}
+        for s in self.trace.spans:
+            if s.name not in src_loc and s.tags.get("file"):
+                f = Path(s.tags["file"]).name
+                src_loc[s.name] = f"{f}:{s.tags.get('line', '?')}"
 
         for row in stats:
             if flt and flt not in row["name"].lower():
                 continue
+            display_name = _fmt_kernel_name(row["name"])
             color = _cat_color(row["category"])
             frac  = row["total_ns"] / total_all
             bar   = _bar(frac, bar_w)
 
+            name_text = Text()
+            name_text.append(f"  {display_name[:46]}", style=f"bold {color}")
+            loc = src_loc.get(row["name"])
+            if loc:
+                name_text.append(f"\n  {loc}", style="dim cyan")
+
             dt.add_row(
-                Text(f"  {row['name'][:46]}", style=f"bold {color}"),
-                Text(row["category"],         style=color),
+                name_text,
+                Text(row["category"],          style=color),
                 str(row["count"]),
                 _fmt_ns(row["total_ns"]),
                 _fmt_ns(row["avg_ns"]),
@@ -1722,6 +1755,13 @@ class DisasmWidget(Widget):
         padding: 0 1;
         background: $boost;
     }
+    #disasm-hints {
+        height: auto;
+        max-height: 6;
+        dock: bottom;
+        padding: 0 1;
+        background: $boost;
+    }
     """
 
     can_focus = True
@@ -1754,14 +1794,16 @@ class DisasmWidget(Widget):
             with ScrollableContainer(id="disasm-asm"):
                 yield RichLog(id="disasm-log", highlight=False, markup=True,
                               wrap=False, auto_scroll=False)
+        yield Static("", id="disasm-hints")
         yield Static("", id="disasm-mix")
 
     def on_mount(self) -> None:
         self._rebuild_kernel_list()
         self._show_disasm()
         self._show_mix()
-        self._last_disasm_count = 0
-        # Poll until background disasm collection finishes, then refresh.
+        self._show_hints()
+        self._last_disasm_version = -1  # track _disasm_version to catch annotation updates
+        # Poll until background disasm collection + annotation finishes, then refresh.
         self.set_interval(0.5, self._poll_disasm_ready)
 
     # ── Kernel list (left pane) ───────────────────────────────────────────────
@@ -1778,8 +1820,9 @@ class DisasmWidget(Widget):
             total = _fmt_ns(stat["total_ns"]) if stat else "—"
             has_d = "✓" if name in disasm else " "
             color = _cat_color(stat["category"]) if stat else "grey70"
+            disp = _fmt_kernel_name(name)
             dt.add_row(
-                Text(f"{has_d} {name[:22]}", style=f"bold {color}"),
+                Text(f"{has_d} {disp[:22]}", style=f"bold {color}"),
                 Text(arch, style="dim"),
                 Text(total),
                 key=name,
@@ -1788,15 +1831,16 @@ class DisasmWidget(Widget):
     # ── Background disasm poller ──────────────────────────────────────────────
 
     def _poll_disasm_ready(self) -> None:
-        """Refresh kernel list and current disasm once background collection completes."""
-        disasm = self._trace.disasm
-        cur_count = len(disasm)
-        # Rebuild whenever disasm grows — covers both new kernel names (JIT kernels
-        # that weren't in the profiled list) and existing names that now have arch
-        # data (e.g. OpenMP spans that were profiled but disasm arrived later).
-        if cur_count <= self._last_disasm_count:
+        """Refresh kernel list and disasm panes when background collection updates."""
+        cur_version = self._trace._disasm_version
+        if cur_version <= self._last_disasm_version:
             return
-        self._last_disasm_count = cur_count
+        # If only annotations changed (version bumped but set of names didn't grow),
+        # invalidate the render cache so heat/stall columns are re-drawn.
+        disasm = self._trace.disasm
+        if cur_version != self._last_disasm_version:
+            self._disasm_cache.clear()
+        self._last_disasm_version = cur_version
         stats = self._trace.aggregated_stats()
         profiled_names = [r["name"] for r in stats]
         disasm_only = [n for n in disasm if n not in profiled_names]
@@ -1805,6 +1849,7 @@ class DisasmWidget(Widget):
         self._rebuild_kernel_list()
         self._show_disasm()
         self._show_mix()
+        self._show_hints()
 
     # ── Disassembly pane (right) ──────────────────────────────────────────────
 
@@ -1854,9 +1899,23 @@ class DisasmWidget(Widget):
 
         sep = Text("─" * 80, style="dim")
 
+        ptxas_caveat: Text | None = None
+        if getattr(kd, "ptxas_derived", False):
+            ptxas_caveat = Text()
+            ptxas_caveat.append("⚠ ", style="yellow")
+            ptxas_caveat.append(
+                "SASS compiled offline from PTX via ptxas — not the actual runtime-JIT SASS. "
+                "PC heat offsets are approximate.",
+                style="dim yellow",
+            )
+
         if not kd.lines:
             body = Text("(no instructions decoded)", style="dim")
-            self._disasm_cache[name] = [hdr, sep, body]
+            cache = [hdr, sep]
+            if ptxas_caveat:
+                cache.append(ptxas_caveat)
+            cache.append(body)
+            self._disasm_cache[name] = cache
             for obj in self._disasm_cache[name]:
                 log.write(obj)
             return
@@ -1864,22 +1923,75 @@ class DisasmWidget(Widget):
         _MAX_LINES = 500
         addr_w, mne_w, ops_w = 8, 12, 36
 
+        # Determine whether to show heat / stall / source columns
+        has_heat   = any(ln.sample_pct > 0.0 for ln in kd.lines)
+        has_stall  = any(ln.stall_cycles >= 0 for ln in kd.lines)
+        has_source = any(ln.source_file for ln in kd.lines)
+
         # Build a single Text object with style spans — avoids all markup
         # parsing overhead and is an order of magnitude faster than
         # per-line log.write() calls or markup string formatting.
         body = Text()
+        prev_src: tuple[str, int] = ("", 0)
         for ln in kd.lines[:_MAX_LINES]:
             color = ITYPE_COLOR.get(ln.itype, "grey70")
             label = ITYPE_LABEL.get(ln.itype, "   ")
+
+            # Source annotation: emit a dim comment when file:line changes
+            if has_source and ln.source_file:
+                cur_src = (ln.source_file, ln.source_line)
+                if cur_src != prev_src:
+                    prev_src = cur_src
+                    indent = " " * (
+                        (7 if has_heat else 0) +
+                        (3 if has_stall else 0) +
+                        addr_w + 2
+                    )
+                    short_file = Path(ln.source_file).name
+                    body.append(
+                        f"{indent}// {short_file}:{ln.source_line}\n",
+                        style="dim cyan",
+                    )
 
             addr_s = f"{ln.addr:0{addr_w}x}" if ln.addr else " " * addr_w
             mne_s  = f"{ln.mnemonic:<{mne_w}}"[:mne_w]
             ops_s  = f"{ln.operands:<{ops_w}}"[:ops_w]
 
+            # Heat column
+            if has_heat:
+                p = ln.sample_pct
+                if p >= 10.0:
+                    heat_s = f"{p:5.1f}%"
+                    heat_style = "bold red"
+                elif p >= 5.0:
+                    heat_s = f"{p:5.1f}%"
+                    heat_style = "red"
+                elif p >= 1.0:
+                    heat_s = f"{p:5.1f}%"
+                    heat_style = "yellow"
+                elif p > 0.0:
+                    heat_s = f"{p:5.1f}%"
+                    heat_style = "white"
+                else:
+                    heat_s = "      "
+                    heat_style = "dim"
+                body.append(heat_s + " ", style=heat_style)
+
+            # Stall column
+            if has_stall:
+                sc = ln.stall_cycles
+                if sc >= 0:
+                    stall_col = "red" if sc >= 10 else ("yellow" if sc >= 5 else "dim")
+                    body.append(f"{sc:2d} ", style=stall_col)
+                else:
+                    body.append("   ", style="dim")
+
             body.append(addr_s + "  ", style="dim")
             body.append(mne_s + "  " + ops_s, style=color)
             body.append("  " + label, style=color)
-            if ln.comment:
+            if ln.stall_reason:
+                body.append(f"  [{ln.stall_reason}]", style="dim yellow")
+            elif ln.comment:
                 body.append(f"  ; {ln.comment}", style="dim")
             body.append("\n")
 
@@ -1889,7 +2001,11 @@ class DisasmWidget(Widget):
                 style="dim"
             )
 
-        self._disasm_cache[name] = [hdr, sep, body]
+        cache = [hdr, sep]
+        if ptxas_caveat:
+            cache.append(ptxas_caveat)
+        cache.append(body)
+        self._disasm_cache[name] = cache
         for obj in self._disasm_cache[name]:
             log.write(obj)
 
@@ -1935,6 +2051,46 @@ class DisasmWidget(Widget):
             if parts else f"  [dim]insns: {total}[/dim]"
         )
 
+    # ── Assembly optimization hints (bottom) ─────────────────────────────────
+
+    def _show_hints(self) -> None:
+        hints_bar: Static = self.query_one("#disasm-hints", Static)
+
+        if not self._kernel_names:
+            hints_bar.update("")
+            return
+
+        idx  = min(self._sel, len(self._kernel_names) - 1)
+        name = self._kernel_names[idx]
+        disasm = self._trace.disasm
+
+        if name not in disasm or not disasm[name].lines:
+            hints_bar.update("")
+            return
+
+        try:
+            from ..analysis.asm_advisor import advise, AsmAdvice
+            advices = advise(disasm[name])
+        except Exception:
+            hints_bar.update("")
+            return
+
+        if not advices:
+            hints_bar.update("")
+            return
+
+        parts: list[str] = []
+        _SEV_COLOR = {"crit": "bold red", "warn": "yellow", "info": "cyan"}
+        for adv in advices[:4]:  # show at most 4 hints
+            col = _SEV_COLOR.get(adv.severity, "white")
+            msg = adv.message[:72]
+            parts.append(
+                f"[{col}]{adv.icon}[/{col}] "
+                f"[dim]{adv.category:<8}[/dim] "
+                f"[{col}]{msg}[/{col}]"
+            )
+        hints_bar.update("\n".join(parts))
+
     # ── Navigation ───────────────────────────────────────────────────────────
 
     def _move(self, delta: int) -> None:
@@ -1945,6 +2101,7 @@ class DisasmWidget(Widget):
         dt.move_cursor(row=self._sel)
         self._show_disasm()
         self._show_mix()
+        self._show_hints()
 
     def action_prev_kernel(self) -> None:
         self._move(-1)
@@ -1958,6 +2115,7 @@ class DisasmWidget(Widget):
             self._sel = idx
             self._show_disasm()
             self._show_mix()
+            self._show_hints()
         except (ValueError, AttributeError):
             pass
 
@@ -2022,11 +2180,6 @@ class ProfilerApp(App):
             if self.trace._has_stacks:
                 with TabPane("Call Tree  [C]", id="tab-calltree"):
                     yield CallTreeWidget(self.trace)
-
-            if self.trace._has_cpu:
-                with TabPane("Flame  [F]", id="tab-flame"):
-                    with ScrollableContainer():
-                        yield FlameGraphWidget(self.trace)
 
             if self._collect_disasm:
                 with TabPane("Disasm  [D]", id="tab-disasm"):

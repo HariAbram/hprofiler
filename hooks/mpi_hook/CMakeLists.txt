@@ -24,9 +24,9 @@ if(_MPI_INCLUDE)
     target_compile_options(hprofiler_mpi PRIVATE -fPIC -O2 -Wall -fno-omit-frame-pointer)
     target_include_directories(hprofiler_mpi PRIVATE "${_MPI_INCLUDE}")
     if(_MPI_LIB)
-        target_link_libraries(hprofiler_mpi PRIVATE "${_MPI_LIB}" pthread dl)
+        target_link_libraries(hprofiler_mpi PRIVATE "${_MPI_LIB}" pthread dl hprofiler_callstack)
     else()
-        target_link_libraries(hprofiler_mpi PRIVATE pthread dl)
+        target_link_libraries(hprofiler_mpi PRIVATE pthread dl hprofiler_callstack)
     endif()
     set_target_properties(hprofiler_mpi PROPERTIES
         OUTPUT_NAME hprofiler_mpi

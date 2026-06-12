@@ -120,18 +120,61 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
             print(f"    {cat.value:<12} {len(spans):>6} events   {_fmt_ns(total):>12}")
 
     stats = trace.aggregated_stats()
-    if stats:
-        print(f"\n  Top {min(top_n, len(stats))} hotspots:")
+    timed  = [r for r in stats if r["total_ns"] > 0]
+    samples = [r for r in stats if r["total_ns"] == 0 and r["category"] == "cpu"]
+    if timed:
+        has_omp = any(r["category"] in ("openmp", "sync", "opencl") for r in timed)
+        total_note = " (accumulated device/thread time, not wall time)" if has_omp else ""
+        print(f"\n  Top {min(top_n, len(timed))} hotspots{total_note}:")
         hdr = (f"  {'Function':<40} {'Cat':<8} {'Count':>6}"
-               f" {'Total':>10} {'Avg':>10} {'%':>6}")
+               f" {'Total':>10} {'Avg/call':>10} {'%':>6}")
         print(hdr)
         print(f"  {'-'*80}")
-        for row in stats[:top_n]:
+        for row in timed[:top_n]:
             name = row["name"][:38]
             print(
                 f"  {name:<40} {row['category']:<8} {row['count']:>6}"
                 f" {_fmt_ns(row['total_ns']):>10} {_fmt_ns(row['avg_ns']):>10}"
                 f" {row['pct']:>5.1f}%"
             )
+    if samples:
+        top_s = sorted(samples, key=lambda r: -r["count"])[:10]
+        print(f"\n  Top CPU sample functions (use `hprofiler flamegraph` for full view):")
+        print(f"  {'Function':<50} {'Samples':>8}")
+        print(f"  {'-'*60}")
+        for row in top_s:
+            print(f"  {row['name'][:48]:<50} {row['count']:>8}")
+
+    # ── CCT call-path hotspots (only when HPROFILER_CALLSTACK captured stacks) ─
+    if trace._has_stacks:
+        try:
+            cct = trace.cct()
+            cct.print_summary(wall_ns=trace.duration_ns, top_n=top_n)
+        except Exception:
+            pass
+
+    # ── GPU starvation analysis ────────────────────────────────────────────────
+    _GPU_BACKENDS = {"cuda", "rocm", "opencl"}
+    if any(b in (meta.backends_used or []) for b in _GPU_BACKENDS):
+        try:
+            from ..analysis.cct import gpu_starvation
+            sv = gpu_starvation(trace)
+            if sv["gpu_active_pct"] > 0 or sv["sync_stall_pct"] > 0:
+                print(f"\n  GPU timeline analysis:")
+                print(f"    GPU kernel active      : {sv['gpu_active_pct']:>6.1f}%"
+                      f"  ({_fmt_ns(sv['gpu_active_ns'])})")
+                print(f"    CPU sync stalls        : {sv['sync_stall_pct']:>6.1f}%"
+                      f"  ({_fmt_ns(sv['sync_stall_ns'])}"
+                      f", {sv['sync_calls']} sync calls)")
+                print(f"    GPU idle (launch gaps) : {sv['launch_gap_pct']:>6.1f}%"
+                      f"  ({_fmt_ns(sv['launch_gap_ns'])})")
+                if sv['sync_stall_pct'] > 20:
+                    print(f"    [!] High sync stall — consider async launches "
+                          f"or batching kernel submissions")
+                if sv['launch_gap_pct'] > 30:
+                    print(f"    [!] High launch gap — GPU idle >30% of wall time; "
+                          f"check CPU-side compute between launches")
+        except Exception:
+            pass
 
     print(f"{'='*72}\n")

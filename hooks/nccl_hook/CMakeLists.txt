@@ -1,6 +1,6 @@
 add_library(hprofiler_nccl SHARED nccl_hook.c)
 target_compile_options(hprofiler_nccl PRIVATE -fPIC -O2 -Wall -fno-omit-frame-pointer)
-target_link_libraries(hprofiler_nccl PRIVATE pthread dl)
+target_link_libraries(hprofiler_nccl PRIVATE pthread dl hprofiler_callstack)
 set_target_properties(hprofiler_nccl PROPERTIES
     OUTPUT_NAME hprofiler_nccl
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"

@@ -37,6 +37,12 @@ python3 hprofiler run --call-tree --backend cuda -- ./app
 # Per-kernel disassembly (adds Disasm tab)
 python3 hprofiler run --backend cuda --disasm -- ./app
 
+# Instruction-level GPU heat map + stall annotation (CUDA, libcupti.so loaded at runtime)
+python3 hprofiler run --backend cuda --disasm --gpu-pc-sampling -- ./app
+
+# Instruction-level CPU heat (OpenCL CPU runtime via ACPP)
+ACPP_VISIBILITY_MASK=ocl python3 hprofiler run --backend opencl,cpu --disasm -- ./app
+
 # Save trace, skip TUI
 python3 hprofiler run --no-ui -o trace.json -- ./app
 
@@ -91,8 +97,7 @@ Opens automatically after `hprofiler run`. Tabs:
 | Timeline | Always | Gantt view with per-stream CUDA/ROCm lanes |
 | Hotspots | Always | Filterable/sortable function table |
 | Call Tree | Only with `--call-tree` | Stack-frame tree from captured call graphs |
-| Flame | Only with CPU/perf data | ASCII bar chart of top CPU-sampled functions |
-| Disasm | Only with `--disasm` | Per-kernel assembly with instruction-type breakdown |
+| Disasm | Only with `--disasm` | Per-kernel assembly with instruction-type color coding, runtime heat % and stall columns (CPU via perf, CUDA via `--gpu-pc-sampling`), and static optimization hints |
 
 ## Flamegraph TUI Controls
 
@@ -166,7 +171,7 @@ See [DOCUMENTATION.md](DOCUMENTATION.md) for the full CLI reference, backend det
 
 ## AI Performance Analysis
 
-hprofiler can use an LLM to analyse a profile and produce a written report of bottlenecks, root causes, and prioritised optimisation recommendations.
+hprofiler can use an LLM to analyse a profile and produce a written report of bottlenecks, root causes, and prioritized optimization recommendations.
 
 ### Quick start
 

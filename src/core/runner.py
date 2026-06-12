@@ -241,12 +241,26 @@ class Runner:
                                 parts = line.strip().split(":", 4)
                                 if len(parts) == 5:
                                     pid, tid, start_ns = int(parts[1]), int(parts[2]), int(parts[3])
+                                    # Frames may be plain "sym" or "sym|/lib.so|0xoffset"
                                     frames = [f for f in parts[4].split(";") if f]
                                     with events_lock:
                                         span = _last_span.get((pid, tid))
                                         if span is not None and span.start_ns == start_ns:
                                             span.stack_frames = frames
                                             trace._has_stacks = True
+                            except Exception:
+                                pass
+                        elif line.startswith("pcsa:"):
+                            # pcsa:<pid>:<ts_ns>:<func_name>:<pc_offset_hex>:<stall_reason_int>:<count>
+                            try:
+                                parts = line.strip().split(":", 6)
+                                if len(parts) == 7:
+                                    func_name = parts[3]
+                                    pc_offset = int(parts[4], 16)
+                                    stall_reason = int(parts[5])
+                                    count = int(parts[6])
+                                    with events_lock:
+                                        trace.add_pc_sample(func_name, pc_offset, stall_reason, count)
                             except Exception:
                                 pass
                         else:
@@ -306,6 +320,7 @@ class Runner:
             perf_cmd = [
                 "perf", "record",
                 f"-F{self.perf_freq}", "-e", "cycles:u",
+                "--clockid=monotonic",   # align with hook CLOCK_MONOTONIC
                 "-p", str(pid), "-o", perf_data,
             ]
             if callgraph:
@@ -324,7 +339,10 @@ class Runner:
         # CPU so IPC/cache-miss still give useful context.
         perf_stat_proc: subprocess.Popen | None = None
         perf_stat_file: str | None = None
-        _cpu_backends = {"cpu", "openmp", "likwid", "opencl"}
+        # Collect CPU microarch counters for any backend that dispatches from CPU.
+        # GPU backends (cuda/rocm/nccl/mpi) are included because IPC and cache-
+        # miss rates help diagnose CPU-side launch overhead and data-prep costs.
+        _cpu_backends = {"cpu", "openmp", "likwid", "opencl", "cuda", "rocm", "nccl", "mpi"}
         if shutil.which("perf") and any(b in self.backends for b in _cpu_backends):
             fd, perf_stat_file = tempfile.mkstemp(suffix=".perf_stat.txt", prefix="hprofiler_")
             os.close(fd)
@@ -390,11 +408,16 @@ class Runner:
 
         # ── Parse perf record output ──────────────────────────────────────────
         if perf_data and Path(perf_data).exists():
-            _parse_perf_script(perf_data, trace, metadata.start_time_ns)
-            try:
-                os.unlink(perf_data)
-            except OSError:
-                pass
+            _parse_perf_script(perf_data, trace)
+            # Do NOT delete perf_data yet — _collect_disasm needs it for
+            # perf annotate instruction-level heat.  It is deleted there.
+
+        # Annotate CPU/OpenMP spans with source file:line from DWARF
+        try:
+            from ..analysis.addr2line import annotate_trace as _ann_trace
+            _ann_trace(trace)
+        except Exception:
+            pass
 
         # ── Emit microarch counter events ─────────────────────────────────────
         if perf_stat_file:
@@ -438,10 +461,22 @@ class Runner:
         if self.collect_disasm:
             self._disasm_thread = threading.Thread(
                 target=_collect_disasm,
-                args=(trace, self.command, self.backends, pid),
+                args=(trace, self.command, self.backends, pid, perf_data),
                 daemon=True,
             )
             self._disasm_thread.start()
+
+        # ── Resolve stack frame addresses to file:line via addr2line ─────────
+        # If HPROFILER_CALLSTACK was set and the hooks captured lib+offset info
+        # in frames ("sym|/lib.so|0xoffset"), run addr2line to annotate them
+        # with source locations.  This is best-effort and never blocks the run.
+        if trace._has_stacks:
+            try:
+                from ..analysis.cct import annotate_stack_frames
+                annotate_stack_frames(trace)
+            except Exception:
+                pass
+
         return trace
 
 
@@ -647,6 +682,7 @@ def _collect_disasm(
     command: list[str],
     backends: list[str],
     profiled_pid: int = 0,
+    perf_data: str | None = None,
 ) -> None:
     """
     Post-run: extract disassembly for all profiled kernels and attach to trace.
@@ -705,8 +741,18 @@ def _collect_disasm(
             if span.category.value == "cpu" and span.name and span.name != "[cpu]":
                 cpu_names.add(span.name)
 
+    # Derive SM version string from device info for ptxas PTX→SASS compilation
+    sm_version = ""
+    for dev in trace.devices:
+        cc = getattr(dev, "compute_cap", "")
+        if cc and "." in cc:
+            major, minor = cc.split(".", 1)
+            sm_version = f"sm_{major}{minor}"
+            break
+
     try:
-        disasm_map = collect_disasm(command, backends, jit_spans, omp_syms, profiled_pid, cpu_names)
+        disasm_map = collect_disasm(command, backends, jit_spans, omp_syms, profiled_pid, cpu_names,
+                                    sm_version=sm_version)
 
         import copy as _copy
 
@@ -725,6 +771,64 @@ def _collect_disasm(
                     alias.name = _JIT_NAME
                     disasm_map[_JIT_NAME] = alias
                     break
+
+        # ── Instruction-level heat annotation ─────────────────────────────
+        # CPU kernels: perf annotate instruction percentages
+        _GPU_ARCHS = {"sass", "ptx", "amdgcn", "gcn", "rocm", "hip"}
+        if perf_data and Path(perf_data).exists():
+            try:
+                from ..disasm.extractor import annotate_with_perf
+                for kd in disasm_map.values():
+                    if kd.arch.lower() not in _GPU_ARCHS:
+                        annotate_with_perf(kd, perf_data)
+            except Exception:
+                pass
+            finally:
+                try:
+                    Path(perf_data).unlink()
+                except OSError:
+                    pass
+
+        # GPU kernels: CUPTI PC sampling (populated by pcsa: socket records)
+        # Only SASS disasm has addresses that match CUPTI PC offsets.
+        # ptxas_derived kernels also have SASS (compiled offline from PTX) so
+        # they are included — CUPTI name lookup tries both short name and
+        # the original mangled symbol stored in kd.mangled_name.
+        _has_pc_samples = bool(trace._pc_samples)
+        _ptx_only_warned = False
+        try:
+            from ..disasm.extractor import annotate_with_cupti
+            import sys as _sys
+            for kd in disasm_map.values():
+                if kd.arch.lower() != "sass":
+                    # Only warn for PTX kernels — if ptxas was available it would
+                    # have converted them already; reaching here means ptxas failed
+                    # or was not installed.
+                    if _has_pc_samples and kd.arch.lower() == "ptx" and not _ptx_only_warned:
+                        _ptx_only_warned = True
+                        print(
+                            "[hprofiler][warn] --gpu-pc-sampling: CUPTI samples SASS offsets but "
+                            "this kernel is PTX-only (ptxas not found or compilation failed).\n"
+                            "  Install ptxas (CUDA toolkit) so hprofiler can compile PTX → SASS "
+                            "offline and match CUPTI samples to instructions.",
+                            file=_sys.stderr,
+                        )
+                    continue
+                # Try short name first, then the original mangled symbol (for ptxas-derived SASS)
+                samples = trace._pc_samples.get(kd.name, [])
+                if not samples and kd.mangled_name:
+                    samples = trace._pc_samples.get(kd.mangled_name, [])
+                if samples:
+                    annotate_with_cupti(kd, samples)
+        except Exception:
+            pass
+
+        try:
+            from ..disasm.source_ann import annotate_disasm as _ann_src
+            for kd in disasm_map.values():
+                _ann_src(kd)
+        except Exception:
+            pass
 
         for kd in disasm_map.values():
             trace.add_disasm(kd)
@@ -775,7 +879,7 @@ def _resolve_jit_sym(addr: int, so_path: str) -> str:
     return name
 
 
-def _parse_perf_script(perf_data: str, trace: Trace, trace_start_ns: int) -> None:
+def _parse_perf_script(perf_data: str, trace: Trace) -> None:
     """
     Parse perf script output into SpanEvents.
 
@@ -836,7 +940,7 @@ def _parse_perf_script(perf_data: str, trace: Trace, trace_start_ns: int) -> Non
     def _flush():
         if not cur_ts:
             return
-        rel_ts = max(0, cur_ts - trace_start_ns)
+        rel_ts = cur_ts
         if cur_stack:
             # cur_stack is built with append() so it's innermost-first;
             # reverse once to get outermost-first (flamegraph.pl convention).
@@ -888,7 +992,7 @@ def _parse_perf_script(perf_data: str, trace: Trace, trace_start_ns: int) -> Non
                 name = sym or "[cpu]"
                 trace.add(SpanEvent(
                     name=name, category=Category.CPU,
-                    start_ns=max(0, cur_ts - trace_start_ns),
+                    start_ns=cur_ts,
                     duration_ns=0, pid=cur_pid, tid=cur_tid,
                 ))
             continue
