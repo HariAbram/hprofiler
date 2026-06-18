@@ -86,9 +86,18 @@ _nm_cache: dict[str, dict[str, tuple[int, int]]] = {}
 
 
 def _tool(*names: str) -> Optional[str]:
-    """Return the first tool name that exists on PATH (cached)."""
+    """Return the first tool name that exists on PATH or as an absolute path (cached)."""
     if names not in _tool_cache:
-        _tool_cache[names] = next((n for n in names if shutil.which(n)), None)
+        found = None
+        for n in names:
+            if Path(n).is_absolute():
+                if Path(n).exists():
+                    found = n
+                    break
+            elif shutil.which(n):
+                found = n
+                break
+        _tool_cache[names] = found
     return _tool_cache[names]
 
 
@@ -493,7 +502,12 @@ _AMDGCN_LINE = re.compile(
 
 def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     """Disassemble a ROCm/HIP binary with llvm-objdump."""
-    tool = _tool("llvm-objdump")
+    # Prefer the ROCm-bundled llvm-objdump which has AMDGCN target support.
+    tool = _tool(
+        "/opt/rocm/bin/llvm-objdump",
+        "/opt/rocm/llvm/bin/llvm-objdump",
+        "llvm-objdump",
+    )
     if not tool or not Path(binary_path).exists():
         return {}
     text = _run([
@@ -720,11 +734,28 @@ def collect_disasm(
         if binary and Path(binary).exists():
             rocm = disasm_rocm_binary(binary)
             result.update(rocm)
+
+        # Collect paths from the jit_spans path= tag (set by hipModuleLoadData hook)
+        rocm_jit_paths: set[str] = set()
+        for span in jit_spans:
+            p = span.get("path", "")
+            if p and "hprofiler_rocm_" in p:
+                rocm_jit_paths.add(p)
+
+        # Also glob /tmp for any files not yet picked up via span tags
         import glob as _rocm_glob
         pid_pat = str(profiled_pid) if profiled_pid else "*"
-        for rocm_path in _rocm_glob.glob(f"/tmp/hprofiler_rocm_{pid_pat}_*.bin"):
-            with open(rocm_path, "rb") as _rf:
-                _rm = _rf.read(4)
+        for p in _rocm_glob.glob(f"/tmp/hprofiler_rocm_{pid_pat}_*.bin"):
+            rocm_jit_paths.add(p)
+
+        for rocm_path in sorted(rocm_jit_paths):
+            if not Path(rocm_path).exists():
+                continue
+            try:
+                with open(rocm_path, "rb") as _rf:
+                    _rm = _rf.read(4)
+            except OSError:
+                continue
             if _rm[:2] in (b"//", b".v", b"; ") or _rm[:1] in (b".", b";"):
                 text = Path(rocm_path).read_text(errors="replace")
                 jit_kd = _parse_ptx_text(text, rocm_path)

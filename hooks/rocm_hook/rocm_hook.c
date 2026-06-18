@@ -788,15 +788,54 @@ hipError_t hipDeviceReset(void) {
 }
 
 /* ── JIT module load + kernel name table ─────────────────────────────────── */
+
+/* Save the AMDGCN ELF (or PTX text) passed to hipModuleLoad* so the Python
+ * disassembler can find it after the process exits.  Returns the saved path
+ * in out_path (capacity path_cap) or leaves it empty on failure. */
+static int _rocm_bin_counter = 0;
+static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
+    out_path[0] = '\0';
+    if (!image) return;
+    const uint8_t *p = (const uint8_t *)image;
+    size_t sz = 0;
+
+    if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F' && p[4] == 2) {
+        /* 64-bit ELF: estimate size from section header table end */
+        uint64_t shoff; memcpy(&shoff, p + 40, 8);
+        uint16_t shesz; memcpy(&shesz, p + 58, 2);
+        uint16_t shnum; memcpy(&shnum, p + 60, 2);
+        size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
+        if (end > 64 && end < 256ULL * 1024 * 1024) sz = end;
+    } else if ((p[0] == '/' && p[1] == '/') || p[0] == '.') {
+        /* PTX text */
+        sz = strnlen((const char *)image, 64 * 1024 * 1024);
+        if (sz > 0) sz++;
+    }
+    if (sz == 0) return;
+
+    int idx = __atomic_fetch_add(&_rocm_bin_counter, 1, __ATOMIC_RELAXED);
+    snprintf(out_path, path_cap, "/tmp/hprofiler_rocm_%d_%d.bin",
+             (int)getpid(), idx);
+    FILE *f = fopen(out_path, "wb");
+    if (f) { fwrite(image, 1, sz, f); fclose(f); }
+    else   { out_path[0] = '\0'; }
+}
+
 hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {
     typedef hipError_t (*fn_t)(hipModule_t *, const void *);
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadData");
     if (!real) return -1;
+    char saved_path[512];
+    _save_rocm_bin(image, saved_path, sizeof(saved_path));
     uint64_t t0 = now_ns();
     hipError_t ret = real(module, image);
-    emit_span("jit", gettid_compat(), t0, now_ns()-t0,
-              "hipModuleLoadData", "type=jit_compile");
+    char extra[640];
+    if (saved_path[0])
+        snprintf(extra, sizeof(extra), "type=jit_compile,path=%s", saved_path);
+    else
+        snprintf(extra, sizeof(extra), "type=jit_compile");
+    emit_span("jit", gettid_compat(), t0, now_ns()-t0, "hipModuleLoadData", extra);
     return ret;
 }
 
@@ -807,10 +846,16 @@ hipError_t hipModuleLoadDataEx(hipModule_t *module, const void *image,
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadDataEx");
     if (!real) return -1;
+    char saved_path[512];
+    _save_rocm_bin(image, saved_path, sizeof(saved_path));
     uint64_t t0 = now_ns();
     hipError_t ret = real(module, image, numOptions, options, optionValues);
-    emit_span("jit", gettid_compat(), t0, now_ns()-t0,
-              "hipModuleLoadDataEx", "type=jit_compile");
+    char extra[640];
+    if (saved_path[0])
+        snprintf(extra, sizeof(extra), "type=jit_compile,path=%s", saved_path);
+    else
+        snprintf(extra, sizeof(extra), "type=jit_compile");
+    emit_span("jit", gettid_compat(), t0, now_ns()-t0, "hipModuleLoadDataEx", extra);
     return ret;
 }
 

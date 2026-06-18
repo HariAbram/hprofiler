@@ -1048,8 +1048,16 @@ PTX, demangles ACPP kernel symbols (e.g. `_Z18__acpp_sscp_kernel...ZZ10test_Rela
 ACPP_VISIBILITY_MASK=hip hprofiler run --backend rocm -- ./acpp_program
 ```
 
-`hipModuleLoadData` is intercepted; the AMDGCN ELF blob is saved to
-`/tmp/hprofiler_rocm_<pid>_<n>.bin` and disassembled with `llvm-objdump`.
+`hipModuleLoadData` (and `hipModuleLoadDataEx`) are intercepted; the AMDGCN ELF
+blob is saved to `/tmp/hprofiler_rocm_<pid>_<n>.bin` and the path is recorded in
+the span's `path=` tag. After the run the disasm collector reads those paths (plus
+a glob of `/tmp/hprofiler_rocm_<pid>_*.bin` as a fallback) and disassembles each
+binary with `llvm-objdump`.
+
+**`llvm-objdump` selection order:** `/opt/rocm/bin/llvm-objdump` →
+`/opt/rocm/llvm/bin/llvm-objdump` → system `llvm-objdump`. The ROCm-bundled
+binary is preferred because the system `llvm-objdump` often lacks the AMDGCN
+target (built without GPU backend support).
 
 ### ACPP with OpenMP backend
 

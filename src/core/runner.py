@@ -731,6 +731,15 @@ def _collect_disasm(
                     "so_path": so_path,
                     "mangled": span.tags.get("mangled", ""),
                 })
+        # ROCm JIT: hipModuleLoadData emits type=jit_compile with path= of saved ELF
+        if span.category == Category.JIT and span.tags.get("type") == "jit_compile":
+            jit_path = span.tags.get("path", "")
+            if jit_path and "hprofiler_rocm_" in jit_path:
+                jit_spans.append({
+                    "name":    span.name,
+                    "so_path": "",
+                    "path":    jit_path,
+                })
         # OpenMP/CPU: extract the first resolved codeptr info per span name.
         # Hook emits sym=<mangled> (dladdr success) or lib=<path>,offset=0x<off>
         if span.category.value in ("openmp", "sync", "cpu") and span.name not in omp_syms:
