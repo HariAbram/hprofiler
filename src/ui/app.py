@@ -234,6 +234,31 @@ class HelpScreen(ModalScreen):
         self.dismiss()
 
 
+def _merged_ns(spans: list) -> int:
+    """Merged-interval sum of span durations — prevents >100% from concurrent streams."""
+    ivs = sorted((s.start_ns, s.start_ns + s.duration_ns)
+                 for s in spans if s.duration_ns > 0)
+    merged = cur_lo = cur_hi = 0
+    for lo, hi in ivs:
+        if lo > cur_hi:
+            merged += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+        else:
+            cur_hi = max(cur_hi, hi)
+    merged += cur_hi - cur_lo
+    return merged
+
+
+def _trace_wall_ns(trace: Any) -> int:
+    """Derive wall time from span timestamps (works for live runs and JSON-loaded traces)."""
+    timed = [s for s in trace.spans if s.duration_ns > 0]
+    if not timed:
+        return trace.duration_ns or 1
+    span_end   = max(s.start_ns + s.duration_ns for s in timed)
+    span_start = min(s.start_ns for s in timed)
+    return max(span_end - span_start, 1)
+
+
 # ── System tab ────────────────────────────────────────────────────────────────
 
 class SystemWidget(Static):
@@ -338,7 +363,7 @@ class ProfileWidget(Static):
     def render(self) -> Any:  # noqa: ANN401
         trace  = self._trace
         spans  = trace.spans
-        wall_ns = trace.duration_ns or 1
+        wall_ns = _trace_wall_ns(trace)
         L: list[str] = []
 
         def _sep(title: str = "") -> None:
@@ -353,11 +378,12 @@ class ProfileWidget(Static):
                       if s.category.value == cat_val and s.tags.get("type") == "kernel"]
             if not kspans:
                 continue
-            kern_ns  = sum(s.duration_ns for s in kspans)
-            sync_ns  = sum(s.duration_ns for s in spans if s.category.value == "sync")
+            kern_ns  = _merged_ns(kspans)
+            kern_acc = sum(s.duration_ns for s in kspans)
+            sync_ns  = _merged_ns([s for s in spans if s.category.value == "sync"])
             pct      = 100.0 * kern_ns / wall_ns
             sync_pct = 100.0 * sync_ns / wall_ns
-            avg_ns   = kern_ns / len(kspans)
+            avg_ns   = kern_acc / len(kspans)
             eff      = pct / (pct + sync_pct) * 100 if (pct + sync_pct) > 0 else 0
             color    = _cat_color(cat_val)
             grade, gc = _grade(pct)
@@ -378,7 +404,7 @@ class ProfileWidget(Static):
             L.append(
                 f"  [dim]{len(kspans)} kernel launches"
                 f"  ·  {_fmt_ns(avg_ns)} average"
-                f"  ·  {_fmt_ns(kern_ns)} total[/dim]"
+                f"  ·  {_fmt_ns(kern_acc)} total[/dim]"
             )
 
         # ── Time breakdown ────────────────────────────────────────────────
@@ -547,7 +573,7 @@ class OverviewWidget(Static):
             if c.name.startswith("gpu_mem_used_bytes"):
                 gpu_mem_peak[c.name] = max(gpu_mem_peak.get(c.name, 0.0), c.value)
 
-        wall_ns = trace.duration_ns or 1
+        wall_ns = _trace_wall_ns(trace)
         devices = trace.devices
 
         # ── DEVICES ───────────────────────────────────────────────────────
@@ -596,13 +622,14 @@ class OverviewWidget(Static):
                       if s.category.value == cat_val and s.tags.get("type") == "kernel"]
             if not kspans:
                 continue
-            kern_ns    = sum(s.duration_ns for s in kspans)
+            kern_ns    = _merged_ns(kspans)
+            kern_acc   = sum(s.duration_ns for s in kspans)
             pct        = 100.0 * kern_ns / wall_ns
             color      = _cat_color(cat_val)
             grade, gc  = _grade(pct)
             bar        = _grad_bar(pct / 100, BAR)
-            avg_ns     = kern_ns / len(kspans)
-            sync_ns    = sum(s.duration_ns for s in spans if s.category.value == "sync")
+            avg_ns     = kern_acc / len(kspans)
+            sync_ns    = _merged_ns([s for s in spans if s.category.value == "sync"])
             sync_pct   = 100.0 * sync_ns / wall_ns
             eff        = pct / (pct + sync_pct) * 100 if (pct + sync_pct) > 0 else 0
             # line 1: bar + pct + grade
@@ -615,7 +642,7 @@ class OverviewWidget(Static):
             # line 2: stats indented under the bar
             L.append(
                 f"  [dim]  {len(kspans)}×"
-                f"  total {_fmt_ns(kern_ns)}"
+                f"  total {_fmt_ns(kern_acc)}"
                 f"  avg {_fmt_ns(avg_ns)}"
                 f"  sync {sync_pct:.1f}%"
                 f"  eff {eff:.0f}%[/dim]"

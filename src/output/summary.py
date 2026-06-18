@@ -69,7 +69,13 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
 
     # GPU kernel active % — use merged intervals so concurrent streams don't
     # cause the percentage to exceed 100%.
-    wall_ns = trace.duration_ns or 1
+    timed_spans = [s for s in trace.spans if s.duration_ns > 0]
+    if timed_spans:
+        _sp_end   = max(s.start_ns + s.duration_ns for s in timed_spans)
+        _sp_start = min(s.start_ns for s in timed_spans)
+        wall_ns   = max(_sp_end - _sp_start, 1)
+    else:
+        wall_ns = trace.duration_ns or 1
 
     def _merged_active_ns(spans: list) -> int:
         ivs = sorted((s.start_ns, s.end_ns) for s in spans if s.duration_ns > 0)

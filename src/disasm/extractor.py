@@ -493,7 +493,7 @@ def disasm_cuda_ptx(binary_path: str) -> dict[str, KernelDisasm]:
 
 # ── ROCm / AMDGCN ────────────────────────────────────────────────────────────
 
-_AMDGCN_SYM  = re.compile(r'^<(\w+(?:\.kd)?)>:')
+_AMDGCN_SYM  = re.compile(r'^[0-9a-f]+\s+<([^>]+)>:')
 _AMDGCN_LINE = re.compile(
     r'^\s*([0-9a-f]+):\s+(?:[0-9a-f]{8}\s+)?([a-z_][a-z0-9_]+)\s*(.*)',
     re.I,
@@ -511,8 +511,7 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     if not tool or not Path(binary_path).exists():
         return {}
     text = _run([
-        tool, "-d", "--triple=amdgcn-amd-amdhsa",
-        "--no-show-raw-insn", binary_path,
+        tool, "-d", "--no-show-raw-insn", binary_path,
     ], timeout=60)
 
     kernels: dict[str, list[DisasmLine]] = {}
