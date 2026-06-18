@@ -326,6 +326,35 @@ class SystemWidget(Static):
                 _kv("Ridge point",
                     f"[dim]{dev.ridge_point:.0f} FLOPs/byte  ·  {hint}[/dim]")
 
+        # ── GPU utilisation (rocm-smi / nvidia-smi polling) ───────────────
+        gpu_util_peak: dict[str, float] = {}
+        gpu_mem_peak:  dict[str, float] = {}
+        for c in trace.counters:
+            if c.name.startswith("gpu_utilization_pct"):
+                gpu_util_peak[c.name] = max(gpu_util_peak.get(c.name, 0.0), c.value)
+            elif c.name.startswith("gpu_mem_used_bytes"):
+                gpu_mem_peak[c.name] = max(gpu_mem_peak.get(c.name, 0.0), c.value)
+
+        if gpu_util_peak or gpu_mem_peak:
+            _sep("GPU UTILISATION (peak, 1 s poll)")
+            all_gpu_ids = sorted(
+                set(k.replace("gpu_utilization_pct", "").replace("gpu_mem_used_bytes", "").strip("[]")
+                    for k in list(gpu_util_peak) + list(gpu_mem_peak))
+            )
+            for gid in all_gpu_ids:
+                util_key = f"gpu_utilization_pct[{gid}]"
+                mem_key  = f"gpu_mem_used_bytes[{gid}]"
+                util_val = gpu_util_peak.get(util_key, -1.0)
+                mem_val  = gpu_mem_peak.get(mem_key, -1.0)
+                util_str = (
+                    f"[{'bright_green' if util_val >= 80 else ('yellow' if util_val >= 20 else 'dim')}]"
+                    f"compute {util_val:.0f}%"
+                    f"[/{'bright_green' if util_val >= 80 else ('yellow' if util_val >= 20 else 'dim')}]"
+                ) if util_val >= 0 else ""
+                mem_str = f"[blue]{_fmt_bytes(mem_val)} VRAM[/blue]" if mem_val >= 0 else ""
+                parts = "  ".join(p for p in (util_str, mem_str) if p)
+                _kv(gid, parts)
+
         # ── CPU microarch ─────────────────────────────────────────────────
         ctrs: dict[str, float] = {c.name: c.value for c in trace.counters}
         ipc   = ctrs.get("ipc", 0.0)
@@ -393,6 +422,11 @@ class ProfileWidget(Static):
                 f"  [bold]Kernel active[/bold]   "
                 f"[yellow]{pct:.1f}%[/yellow] of wall time"
                 f"  [{gc}]({grade})[/{gc}]"
+            )
+            L.append(
+                f"  [dim]               "
+                f"  {_fmt_ns(kern_ns)} active (merged)"
+                f"  ·  {_fmt_ns(kern_acc)} accumulated[/dim]"
             )
             L.append(
                 f"  [dim]Sync overhead    {sync_pct:.1f}% of wall time[/dim]"

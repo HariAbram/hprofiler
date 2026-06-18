@@ -238,6 +238,62 @@ def query_cuda_devices() -> list[DevicePeak]:
         return []
 
 
+def _rocminfo_gpu_props() -> list[dict]:
+    """
+    Parse `rocminfo` output and return one dict per GPU agent with keys:
+    'arch' (e.g. 'gfx908'), 'name' (marketing name), 'cu_count' (int).
+    Returns [] if rocminfo is not available or fails.
+    """
+    try:
+        out = subprocess.run(
+            ["rocminfo"], capture_output=True, text=True, timeout=15
+        ).stdout
+    except Exception:
+        return []
+
+    agents: list[dict] = []
+    current: dict = {}
+    in_agent = False
+
+    for line in out.splitlines():
+        stripped = line.strip()
+        # Agent separator: a row of asterisks
+        if re.match(r'^\*{3,}\s*$', stripped):
+            if current and current.get("Device Type", "").upper() == "GPU":
+                agents.append(current)
+            current = {}
+            in_agent = True
+            continue
+        if not in_agent:
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            current[key.strip()] = val.strip()
+
+    if current and current.get("Device Type", "").upper() == "GPU":
+        agents.append(current)
+
+    result = []
+    for a in agents:
+        # 'Name' in rocminfo is the ISA arch name (e.g. 'gfx908')
+        arch = a.get("Name", "")
+        if not arch.startswith("gfx"):
+            # fall back to ISA Info Name: 'amdgcn-amd-amdhsa--gfx908'
+            m = re.search(r'gfx[0-9a-f]+', a.get("ISA 1", ""))
+            arch = m.group(0) if m else ""
+        cu_str = a.get("Compute Unit", "0")
+        try:
+            cu_count = int(cu_str.split("(")[0])
+        except ValueError:
+            cu_count = 0
+        result.append({
+            "arch":     arch,
+            "name":     a.get("Marketing Name", a.get("Name", "")),
+            "cu_count": cu_count,
+        })
+    return result
+
+
 def query_rocm_devices() -> list[DevicePeak]:
     """Query ROCm devices via the HIP runtime API using ctypes."""
     try:
@@ -256,23 +312,27 @@ def query_rocm_devices() -> list[DevicePeak]:
         if hip.hipGetDeviceCount(ctypes.byref(count)) != 0 or count.value == 0:
             return []
 
+        # rocminfo gives reliable arch name (e.g. 'gfx908') and CU count.
+        rocminfo = _rocminfo_gpu_props()
+
         devices: list[DevicePeak] = []
         for i in range(count.value):
-            def _attr(attr_id: int) -> int:
+            def _attr(attr_id: int, _i: int = i) -> int:
                 v = ctypes.c_int(0)
-                hip.hipDeviceGetAttribute(ctypes.byref(v), attr_id, i)
+                hip.hipDeviceGetAttribute(ctypes.byref(v), attr_id, _i)
                 return v.value
 
-            # hipDeviceAttribute_t IDs differ across ROCm versions.
-            # Probe for compute capability major by scanning candidate IDs
-            # (ROCm 5.x: 76/77, ROCm 6.x: 87/88) and picking the one that
-            # returns a plausible value (1–12).  Other attribute IDs are stable.
-            sm_count       = _attr(17)   # hipDeviceAttributeMultiprocessorCount
-            core_clock_khz = _attr(8)    # hipDeviceAttributeClockRate
-            mem_clock_khz  = _attr(31)   # hipDeviceAttributeMemoryClockRate
-            mem_bus_bits   = _attr(32)   # hipDeviceAttributeMemoryBusWidth
+            # Use CUDA-compatible attribute IDs — HIP maintains the same numbering:
+            #   16 = MULTIPROCESSOR_COUNT  13 = CLOCK_RATE (kHz)
+            #   36 = MEMORY_CLOCK_RATE     37 = GLOBAL_MEMORY_BUS_WIDTH
+            # Probe compute capability: ROCm 6.x uses 87/88, ROCm 5.x / CUDA use 75/76.
+            sm_count       = _attr(16)
+            core_clock_khz = _attr(13)
+            mem_clock_khz  = _attr(36)
+            mem_bus_bits   = _attr(37)
+
             gfx_major = gfx_minor = 0
-            for maj_id, min_id in ((87, 88), (76, 77)):
+            for maj_id, min_id in ((87, 88), (75, 76)):
                 maj = _attr(maj_id)
                 if 1 <= maj <= 12:
                     gfx_major = maj
@@ -286,21 +346,42 @@ def query_rocm_devices() -> list[DevicePeak]:
             total_mem = ctypes.c_size_t(0)
             hip.hipDeviceTotalMem(ctypes.byref(total_mem), i)
 
-            # AMD GCN/RDNA: 64 shader processors per CU.
-            # CDNA2 (MI200 series, gfx90a) has 2 shader engines per CU = 128 SPs/CU.
-            gfx_str = f"gfx{gfx_major}{gfx_minor:02d}"
-            shaders_per_cu = 128 if gfx_str in ("gfx90a", "gfx940", "gfx941", "gfx942") else 64
+            # Prefer rocminfo for arch name (includes stepping, e.g. 'gfx908' not 'gfx900')
+            # and CU count (attribute 16 may still fail on some ROCm versions).
+            ri = rocminfo[i] if i < len(rocminfo) else {}
+            gfx_str = ri.get("arch", "") or f"gfx{gfx_major}{gfx_minor:02d}"
+            if not gfx_str.startswith("gfx"):
+                gfx_str = f"gfx{gfx_major}{gfx_minor:02d}"
+            if ri.get("cu_count", 0) > 0 and sm_count == 0:
+                sm_count = ri["cu_count"]
+            if ri.get("name"):
+                name = ri["name"]
+
+            # Shader processors per CU:
+            #   CDNA1 (gfx908 MI100): 64 SPs/CU
+            #   CDNA2 (gfx90a MI200/MI250): 128 SPs/CU (2 matrix engines per CU)
+            #   CDNA3 (gfx940/941/942 MI300): 128 SPs/CU
+            _cdna2_plus = {"gfx90a", "gfx940", "gfx941", "gfx942"}
+            shaders_per_cu = 128 if gfx_str in _cdna2_plus else 64
             core_clock_ghz = core_clock_khz / 1e6
             fp32_tflops    = sm_count * shaders_per_cu * 2 * core_clock_ghz / 1000
-            # CDNA2 retains full FP64 (fp32/2); consumer RDNA is fp32/16
-            fp64_ratio     = 0.5 if gfx_str in ("gfx90a", "gfx940", "gfx941", "gfx942") else 1 / 16
-            fp64_tflops    = fp32_tflops * fp64_ratio
-            fp16_tflops    = fp32_tflops * 2
 
-            mem_clock_ghz  = mem_clock_khz / 1e6
-            bandwidth_gbs  = 2 * mem_clock_ghz * mem_bus_bits / 8
-            gfx_str2       = f"gfx{gfx_major}{gfx_minor:02d}"
-            l2_bw_gbs      = _rocm_l2_bw_gbs(gfx_str2, bandwidth_gbs)
+            # FP64 throughput ratios (relative to FP32 peak):
+            #   CDNA1 gfx908  (MI100):  1:2  (fp64 = fp32 / 2)
+            #   CDNA2 gfx90a  (MI200):  1:1  (fp64 = fp32)
+            #   CDNA3 gfx940+ (MI300):  1:1
+            #   RDNA consumer:          1:16
+            _full_fp64  = {"gfx90a", "gfx940", "gfx941", "gfx942"}
+            _half_fp64  = {"gfx908"}
+            fp64_ratio  = (1.0 if gfx_str in _full_fp64 else
+                           0.5 if gfx_str in _half_fp64 else
+                           1 / 16)
+            fp64_tflops = fp32_tflops * fp64_ratio
+            fp16_tflops = fp32_tflops * 2
+
+            mem_clock_ghz = mem_clock_khz / 1e6
+            bandwidth_gbs = 2 * mem_clock_ghz * mem_bus_bits / 8
+            l2_bw_gbs     = _rocm_l2_bw_gbs(gfx_str, bandwidth_gbs)
 
             devices.append(DevicePeak(
                 name=name or f"ROCm device {i}",
@@ -314,7 +395,7 @@ def query_rocm_devices() -> list[DevicePeak]:
                 mem_clock_ghz=mem_clock_ghz,
                 mem_bus_bits=mem_bus_bits,
                 vram_gb=total_mem.value / 1e9,
-                compute_cap=gfx_str2,
+                compute_cap=gfx_str,
                 l2_bandwidth_gbs=l2_bw_gbs,
             ))
         return devices

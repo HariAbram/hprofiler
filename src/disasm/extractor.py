@@ -515,12 +515,18 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     ], timeout=60)
 
     kernels: dict[str, list[DisasmLine]] = {}
+    kd_names: set[str] = set()   # symbols that have a .kd descriptor = real kernel entries
     current: Optional[str] = None
     for raw in text.splitlines():
         m = _AMDGCN_SYM.match(raw)
         if m:
-            current = m.group(1)
-            kernels.setdefault(current, [])
+            sym = m.group(1)
+            if sym.endswith(".kd"):
+                kd_names.add(sym[:-3])
+                current = None   # skip the descriptor data lines
+            else:
+                current = sym
+                kernels.setdefault(current, [])
             continue
         if current:
             m = _AMDGCN_LINE.match(raw)
@@ -534,6 +540,16 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
                     ))
                 except ValueError:
                     pass
+
+    # Only include true kernel entry points (those with a .kd descriptor).
+    # Device functions and ACPP runtime helpers do not have .kd counterparts.
+    # Fall back to all non-empty symbols if the ELF has no .kd sections (older format).
+    if kd_names:
+        return {
+            name: KernelDisasm(name=name, arch="amdgcn", source=binary_path, lines=lns)
+            for name, lns in kernels.items()
+            if name in kd_names and lns
+        }
     return {
         name: KernelDisasm(name=name, arch="amdgcn", source=binary_path, lines=lns)
         for name, lns in kernels.items()
