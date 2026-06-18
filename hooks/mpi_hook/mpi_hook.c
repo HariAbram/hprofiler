@@ -184,7 +184,14 @@ int MPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
 }
 
 int MPI_Finalize(void) {
-    if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+    if (g_sock >= 0) {
+        /* Flush the kernel send buffer before closing so no queued events are lost. */
+        shutdown(g_sock, SHUT_WR);
+        char drain[64];
+        while (recv(g_sock, drain, sizeof(drain), 0) > 0) {}
+        close(g_sock);
+        g_sock = -1;
+    }
     return PMPI_Finalize();
 }
 
@@ -298,14 +305,28 @@ int MPI_Waitall(int count, MPI_Request requests[], MPI_Status statuses[]) {
         for (int i = 0; i < count; i++) saved[i] = requests[i];
     uint64_t t0 = now_ns();
     int ret = PMPI_Waitall(count, requests, statuses);
+    /* Collect req IDs for cross-linking and emit psid list in extra tags. */
+    char psid_buf[256] = "";
+    int  psid_len = 0;
     if (saved) {
         for (int i = 0; i < count; i++) {
-            uint64_t dummy = 0; req_lookup(saved[i], &dummy);
+            uint64_t rid = 0;
+            if (req_lookup(saved[i], &rid) && rid) {
+                int w = snprintf(psid_buf + psid_len,
+                                 sizeof(psid_buf) - (size_t)psid_len,
+                                 "%s%llu", psid_len ? ";" : "",
+                                 (unsigned long long)rid);
+                if (w > 0) psid_len += w;
+            }
         }
         free(saved);
     }
-    char extra[96];
-    snprintf(extra, sizeof(extra), "type=waitall,count=%d,rank=%d", count, g_mpi_rank);
+    char extra[384];
+    if (psid_len)
+        snprintf(extra, sizeof(extra), "type=waitall,count=%d,rank=%d,psid=%s",
+                 count, g_mpi_rank, psid_buf);
+    else
+        snprintf(extra, sizeof(extra), "type=waitall,count=%d,rank=%d", count, g_mpi_rank);
     emit_span("mpi", t0, now_ns()-t0, "MPI_Waitall", extra);
     return ret;
 }

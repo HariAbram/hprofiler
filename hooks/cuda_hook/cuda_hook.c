@@ -80,6 +80,7 @@ static void *find_cuda_sym(const char *name) {
     return NULL;
 }
 
+/* Must be called with g_sock_mutex held. */
 static void ensure_connected(void) {
     if (g_sock >= 0) return;
     const char *path = getenv("HPROFILER_SOCKET");
@@ -92,6 +93,8 @@ static void ensure_connected(void) {
     if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
         g_sock = s;
         g_pid  = getpid();
+    } else {
+        close(s);
     }
 }
 
@@ -385,9 +388,10 @@ static void pk_commit(cudaEvent_t ev_s, cudaEvent_t ev_e,
                       cudaStream_t stream,
                       const char *cat, const char *kname, const char *extra,
                       uint64_t t0, pid_t tid) {
-    f_evRecord(ev_e, stream);
     pthread_mutex_lock(&g_pk_mutex);
     if (g_pk_n < MAX_PENDING) {
+        /* Record the end event only after we know the slot is available. */
+        f_evRecord(ev_e, stream);
         PendingKernel *pk = &g_pk[g_pk_n++];
         pk->ev_start = ev_s; pk->ev_end = ev_e;
         pk->stream = stream; pk->cpu_start_ns = t0; pk->tid = tid;
@@ -737,7 +741,8 @@ static void _save_cubin(const void *image) {
     static int cubin_counter = 0;
     char path[256];
     snprintf(path, sizeof(path), "/tmp/hprofiler_cubin_%d_%d.bin",
-             (int)getpid(), cubin_counter++);
+             (int)getpid(),
+             __atomic_fetch_add(&cubin_counter, 1, __ATOMIC_RELAXED));
     size_t sz = 0;
     const uint8_t *p = (const uint8_t *)image;
 
@@ -1281,11 +1286,12 @@ static cuptiGetNext_fn  g_cuptiGetNext = NULL;
 typedef struct { uint32_t id; char name[128]; } _CuptiFuncEntry;
 typedef struct { uint32_t func_id; uint64_t pc_offset; uint8_t stall; uint32_t count; } _CuptiSampleEntry;
 
-static _CuptiFuncEntry   g_cupti_funcs[CUPTI_MAX_FUNCS];
-static int               g_cupti_nfuncs   = 0;
-static _CuptiSampleEntry g_cupti_samples[CUPTI_MAX_SAMPLES];
-static int               g_cupti_nsamples = 0;
-static pthread_mutex_t   g_cupti_mutex    = PTHREAD_MUTEX_INITIALIZER;
+/* Allocated on first _cupti_init() call — only when GPU PC sampling is enabled. */
+static _CuptiFuncEntry   *g_cupti_funcs   = NULL;
+static int                g_cupti_nfuncs  = 0;
+static _CuptiSampleEntry *g_cupti_samples = NULL;
+static int                g_cupti_nsamples = 0;
+static pthread_mutex_t    g_cupti_mutex   = PTHREAD_MUTEX_INITIALIZER;
 
 static void _cupti_buf_req(uint8_t **buf, size_t *sz, size_t *max_rec) {
     *buf = (uint8_t *)malloc(CUPTI_BUF_SIZE);
@@ -1295,7 +1301,7 @@ static void _cupti_buf_req(uint8_t **buf, size_t *sz, size_t *max_rec) {
 
 static void _cupti_buf_done(void *ctx, uint32_t stream_id,
                              uint8_t *buf, size_t valid_sz, size_t total_sz) {
-    if (!buf || !g_cuptiGetNext) { free(buf); return; }
+    if (!buf || !g_cuptiGetNext || !g_cupti_samples) { free(buf); return; }
     (void)ctx; (void)stream_id; (void)total_sz;
     _CuptiActivity *rec = NULL;
     pthread_mutex_lock(&g_cupti_mutex);
@@ -1326,6 +1332,13 @@ static void _cupti_buf_done(void *ctx, uint32_t stream_id,
 static void _cupti_init(void) {
     const char *env = getenv("HPROFILER_GPU_PCSAMPLING");
     if (!env || env[0] != '1') return;
+    g_cupti_funcs   = (_CuptiFuncEntry *)  calloc(CUPTI_MAX_FUNCS,   sizeof(_CuptiFuncEntry));
+    g_cupti_samples = (_CuptiSampleEntry *)calloc(CUPTI_MAX_SAMPLES, sizeof(_CuptiSampleEntry));
+    if (!g_cupti_funcs || !g_cupti_samples) {
+        free(g_cupti_funcs);   g_cupti_funcs   = NULL;
+        free(g_cupti_samples); g_cupti_samples = NULL;
+        return;
+    }
     /* Try to load libcupti.so at runtime */
     static const char *cupti_candidates[] = {
         "libcupti.so.12", "libcupti.so.11", "libcupti.so", NULL
@@ -1388,7 +1401,9 @@ static void _cupti_flush_and_send(int sock_fd) {
 
 __attribute__((constructor))
 static void hprofiler_cuda_init(void) {
+    pthread_mutex_lock(&g_sock_mutex);
     ensure_connected();
+    pthread_mutex_unlock(&g_sock_mutex);
     _cupti_init();
     cs_init();
     static const char *candidates[] = {

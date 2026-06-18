@@ -67,20 +67,35 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
     if "process_max_rss_bytes" in ctrs:
         print(f"\n  Peak process RSS    : {_fmt_bytes(ctrs['process_max_rss_bytes'])}")
 
-    # GPU kernel active % — computed from span durations (accurate even for
-    # short-running workloads where nvidia-smi polling would read 0%).
+    # GPU kernel active % — use merged intervals so concurrent streams don't
+    # cause the percentage to exceed 100%.
     wall_ns = trace.duration_ns or 1
+
+    def _merged_active_ns(spans: list) -> int:
+        ivs = sorted((s.start_ns, s.end_ns) for s in spans if s.duration_ns > 0)
+        merged_ns = 0
+        cur_lo = cur_hi = 0
+        for lo, hi in ivs:
+            if lo > cur_hi:
+                merged_ns += cur_hi - cur_lo
+                cur_lo, cur_hi = lo, hi
+            else:
+                cur_hi = max(cur_hi, hi)
+        merged_ns += cur_hi - cur_lo
+        return merged_ns
+
     for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm")):
-        from ..core.events import Category
         gpu_spans = [s for s in trace.spans
                      if s.category.value == cat_val
                      and s.tags.get("type") == "kernel"]
         if gpu_spans:
-            kernel_ns = sum(s.duration_ns for s in gpu_spans)
-            pct = 100.0 * kernel_ns / wall_ns
+            active_ns = _merged_active_ns(gpu_spans)
+            total_ns  = sum(s.duration_ns for s in gpu_spans)
+            pct = 100.0 * active_ns / wall_ns
             print(f"\n  {label} kernel active      : "
                   f"{pct:.2f}% of wall time  "
-                  f"({_fmt_ns(kernel_ns)} total kernel time, "
+                  f"({_fmt_ns(active_ns)} active, "
+                  f"{_fmt_ns(total_ns)} accumulated, "
                   f"{len(gpu_spans)} launches)")
 
     # OpenCL: use side=gpu spans only (GPU-accurate via event callback).
@@ -90,11 +105,13 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
                         and s.tags.get("type") == "kernel"
                         and s.tags.get("side") == "gpu"]
     if opencl_gpu_spans:
-        kernel_ns = sum(s.duration_ns for s in opencl_gpu_spans)
-        pct = 100.0 * kernel_ns / wall_ns
+        active_ns = _merged_active_ns(opencl_gpu_spans)
+        total_ns  = sum(s.duration_ns for s in opencl_gpu_spans)
+        pct = 100.0 * active_ns / wall_ns
         print(f"\n  OpenCL kernel active   : "
               f"{pct:.2f}% of wall time  "
-              f"({_fmt_ns(kernel_ns)} total kernel time, "
+              f"({_fmt_ns(active_ns)} active, "
+              f"{_fmt_ns(total_ns)} accumulated, "
               f"{len(opencl_gpu_spans)} launches)")
 
     if gpu_util_peak:

@@ -210,7 +210,7 @@ class Runner:
         metadata = TraceMetadata(
             command=self.command[0],
             args=self.command[1:],
-            start_time_ns=time.monotonic_ns(),
+            start_time_ns=0,  # filled in after Popen below
             pid=os.getpid(),
             backends_used=list(self.backends),
             hostname=platform.node(),
@@ -309,6 +309,7 @@ class Runner:
         # Read HPROFILER_CALLGRAPH from env_extra without mutating caller's dict.
         callgraph = self.env_extra.get("HPROFILER_CALLGRAPH")
         proc = subprocess.Popen(run_command, env=env)
+        metadata.start_time_ns = time.monotonic_ns()
         pid = proc.pid
 
         # ── Attach perf record for CPU sampling ───────────────────────────────
@@ -329,7 +330,11 @@ class Runner:
                 perf_record_proc = subprocess.Popen(
                     perf_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-            except FileNotFoundError:
+            except Exception:
+                try:
+                    os.unlink(perf_data)
+                except OSError:
+                    pass
                 perf_record_proc = None
                 perf_data = None
 
@@ -356,7 +361,11 @@ class Runner:
                      "-e", _MICROARCH_EVENTS, "-o", perf_stat_file],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-            except FileNotFoundError:
+            except Exception:
+                try:
+                    os.unlink(perf_stat_file)
+                except OSError:
+                    pass
                 perf_stat_proc = None
                 perf_stat_file = None
 
@@ -607,7 +616,7 @@ def _parse_perf_stat_microarch(text: str) -> dict[str, float]:
         parts = re.split(r"\s{2,}", line, maxsplit=2)
         if len(parts) < 2:
             continue
-        raw = re.sub(r"[^\d]", "", parts[0])
+        raw = parts[0].replace(",", "")  # strip thousands separators only
         try:
             val = float(raw)
         except ValueError:

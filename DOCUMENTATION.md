@@ -675,6 +675,11 @@ hprofiler run --backend mpi -- mpirun -np 4 ./my_mpi_app
 MPI-3 RMA epochs or non-blocking collective progress; `MPI_Wait` / `MPI_Waitall`
 spans cover the wait time but not the underlying network transfer time.
 
+`MPI_Wait` and `MPI_Waitall` emit a `psid=` tag containing the span ID(s) of
+the originating `Isend`/`Irecv` so the Timeline can draw cross-link arrows
+between post and wait spans. `MPI_Finalize` flushes the socket send buffer
+before closing so no queued events are lost at program exit.
+
 ---
 
 ### `likwid` — Hardware PMU Counters
@@ -743,6 +748,12 @@ Tensor TFLOP/s peaks, memory bandwidth, VRAM, and ridge point with a
 compute-vs-memory-bound hint. CPU section (when CPU data present): IPC, LLC miss
 rate, branch miss rate, and peak RSS.
 
+**ROCm device query** probes `hipDeviceGetAttribute` using both the ROCm 5.x
+attribute IDs (76/77) and ROCm 6.x IDs (87/88) for compute capability, picking
+whichever returns a plausible value. **CPU FP16 peak** is reported as 0 unless
+`/proc/cpuinfo` flags include `avx512_bf16` or `avx512fp16` — pre-AVX-512BF16
+x86 CPUs have no native FP16 compute throughput.
+
 ### Profile Tab
 
 Activity dashboard: for CUDA/ROCm backends shows kernel active %, sync overhead %,
@@ -750,6 +761,11 @@ GPU efficiency %, kernel count and average duration. Time breakdown by category
 with proportional bars. Top-12 hotspots table with name, category, share%, total,
 average, and invocation count. A **Bottleneck Advisor** section provides actionable
 tips derived from the hardware counter and activity data.
+
+**GPU kernel active %** is computed from the merged union of all kernel span
+intervals so concurrent streams never produce a percentage above 100%. The
+summary output shows both `active` (merged wall-clock time) and `accumulated`
+(sum across all streams) so parallelism is visible.
 
 ### Timeline Tab
 
@@ -1043,7 +1059,9 @@ ACPP_VISIBILITY_MASK=omp hprofiler run --backend openmp -- ./acpp_omp_program
 
 ACPP maps SYCL kernels to `#pragma omp parallel for` in its runtime library.
 You will see `parallel_region` and `omp_loop` spans. The Disasm tab shows the
-ACPP runtime's OMP dispatch function (resolved via `/proc/self/maps`).
+ACPP runtime's OMP dispatch function (resolved via a VMA cache built from
+`/proc/self/maps` — the cache is populated once and reused across all callbacks
+to avoid re-parsing the file on every OMPT event).
 
 ### ACPP targeting OpenCL / SSCP
 
@@ -1090,6 +1108,8 @@ passed. Collection runs in a background thread — the TUI is not blocked.
 | ROCm JIT (ACPP) | AMDGCN ELF from `hipModuleLoadData` | `llvm-objdump` | `amdgcn` |
 | OpenCL JIT | `.jit.so` emitted by ACPP SSCP | `objdump` | `x86-64` / `aarch64` |
 | OpenMP / CPU | ELF symbol at `codeptr_ra` | `capstone` (fast) or `objdump` | `x86-64` / `aarch64` / `rv64` |
+
+> **Requirement for source-line annotation:** compile your binary with `-g` (full debug) or at minimum `-lineinfo` (`nvcc -lineinfo`) to embed DWARF line tables. Without debug info, source file:line annotations are silently skipped — disassembly still works, but no `// file.cpp:42` comments appear in the Disasm tab.
 
 ### CPU / OpenMP disasm pipeline
 
@@ -1618,6 +1638,11 @@ instruction. Added entries:
 - `aarch64`: VEC_SP=8.0 (NEON FP32 ×4), VEC_DP=4.0 (NEON FP64 ×2)
 - `rv64`: VEC_SP=4.0, VEC_DP=2.0 (LMUL=1 baseline)
 
+`compute_kernel_metrics` counts `InsnType.MEMORY` **and** `InsnType.VEC_MEM`
+toward estimated bytes transferred. VEC_MEM covers SIMD load/store instructions
+(`vmovups`, SASS `LDG`, etc.) which were previously excluded, causing arithmetic
+intensity to be overestimated for vector-heavy kernels.
+
 `metrics_from_counters(counters, device)` builds `KernelMetrics` from hardware
 counter data. `compute_kernel_metrics(span, kd, device)` uses disasm instruction
 counts as a fallback estimate.
@@ -1638,7 +1663,10 @@ selects between two tree-building strategies:
   into a trie (`_StackNode`). Nodes are aggregated by name + category.
 - **Temporal containment** (`_ct_build_raw` + `_ct_aggregate`): groups spans
   per thread, uses a stack algorithm to infer parent/child from start/end
-  nesting, then aggregates sibling nodes with the same name.
+  nesting, then aggregates sibling nodes with the same name. Spans with an
+  explicit `parent_span_id` link are assigned to their explicit parent and are
+  also pushed onto the containment stack so their temporally-nested children
+  are still placed under them correctly.
 
 Keyboard shortcuts: `e` = expand all, `u` = collapse all.
 

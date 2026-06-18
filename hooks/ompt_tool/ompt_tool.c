@@ -28,9 +28,68 @@
 #include <sys/un.h>
 #include <sys/syscall.h>
 
+/* VMA cache — built once on first miss, reused for all subsequent lookups.
+ * Avoids re-parsing /proc/self/maps on every OMPT callback. */
+#define VMA_CACHE_CAP 1024
+typedef struct { uintptr_t lo, hi; uint64_t file_off; char path[256]; } VmaEntry;
+static VmaEntry        g_vma[VMA_CACHE_CAP];
+static int             g_vma_n     = 0;
+static int             g_vma_ready = 0;
+static pthread_mutex_t g_vma_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void _vma_build(void) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[512];
+    g_vma_n = 0;
+    while (fgets(line, sizeof(line), f) && g_vma_n < VMA_CACHE_CAP) {
+        uintptr_t lo, hi, off;
+        char perms[8], dev[16], path[256];
+        int inode;
+        path[0] = '\0';
+        if (sscanf(line, "%lx-%lx %7s %lx %15s %d %255s",
+                   &lo, &hi, perms, &off, dev, &inode, path) < 6)
+            continue;
+        if (path[0] == '\0' || path[0] == '[') continue;
+        VmaEntry *e = &g_vma[g_vma_n++];
+        e->lo = lo; e->hi = hi; e->file_off = (uint64_t)off;
+        strncpy(e->path, path, sizeof(e->path) - 1);
+        e->path[sizeof(e->path) - 1] = '\0';
+    }
+    fclose(f);
+    g_vma_ready = 1;
+}
+
+static int _vma_lookup(uintptr_t addr, char *out_lib, size_t lib_sz, uint64_t *out_off) {
+    pthread_mutex_lock(&g_vma_mutex);
+    if (!g_vma_ready) _vma_build();
+    for (int i = 0; i < g_vma_n; i++) {
+        if (addr >= g_vma[i].lo && addr < g_vma[i].hi) {
+            *out_off = g_vma[i].file_off + (addr - g_vma[i].lo);
+            strncpy(out_lib, g_vma[i].path, lib_sz - 1);
+            out_lib[lib_sz - 1] = '\0';
+            pthread_mutex_unlock(&g_vma_mutex);
+            return 1;
+        }
+    }
+    /* Miss: rebuild once in case new libraries were loaded since last build. */
+    _vma_build();
+    for (int i = 0; i < g_vma_n; i++) {
+        if (addr >= g_vma[i].lo && addr < g_vma[i].hi) {
+            *out_off = g_vma[i].file_off + (addr - g_vma[i].lo);
+            strncpy(out_lib, g_vma[i].path, lib_sz - 1);
+            out_lib[lib_sz - 1] = '\0';
+            pthread_mutex_unlock(&g_vma_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_vma_mutex);
+    return 0;
+}
+
 /* Resolve a codeptr_ra:
  *  1. Try dladdr() — works when the symbol is exported.
- *  2. Fall back to /proc/self/maps — finds the library and computes the
+ *  2. Fall back to VMA cache — finds the library and computes the
  *     static file offset even for non-exported / internal symbols.
  *
  * On success, writes into `out_sym` (symbol name) or `out_lib`+`out_off`
@@ -53,31 +112,9 @@ static int resolve_codeptr_full(const void *codeptr,
         return 1;
     }
 
-    /* 2. /proc/self/maps — works for internal symbols in any .so */
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return 0;
+    /* 2. VMA cache — O(n) scan but cache is built only once per new library load */
     uintptr_t addr = (uintptr_t)codeptr;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        uintptr_t lo, hi, off;
-        char perms[8], dev[16], path[256];
-        int inode;
-        path[0] = '\0';
-        if (sscanf(line, "%lx-%lx %7s %lx %15s %d %255s",
-                   &lo, &hi, perms, &off, dev, &inode, path) < 6)
-            continue;
-        if (addr < lo || addr >= hi) continue;
-        if (path[0] == '\0' || path[0] == '[') break;  /* anon/stack */
-        /* static offset = file_offset_of_segment + (addr - segment_vaddr) */
-        uint64_t static_off = (uint64_t)off + (addr - lo);
-        strncpy(out_lib, path, lib_sz - 1);
-        out_lib[lib_sz - 1] = '\0';
-        *out_off = static_off;
-        fclose(f);
-        return 1;
-    }
-    fclose(f);
-    return 0;
+    return _vma_lookup(addr, out_lib, lib_sz, out_off);
 }
 
 /* ── Minimal OMPT types matching omp-tools.h ────────────────────────── */

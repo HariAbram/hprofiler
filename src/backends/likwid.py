@@ -64,7 +64,8 @@ class LIKWIDBackend(Backend):
         return ""
 
     def wrap_command(self, command: list[str]) -> list[str]:
-        self._output_file = tempfile.mktemp(suffix=".txt", prefix="hprofiler_likwid_")
+        fd, self._output_file = tempfile.mkstemp(suffix=".txt", prefix="hprofiler_likwid_")
+        os.close(fd)
         return [
             "likwid-perfctr",
             "-C", self.cores,

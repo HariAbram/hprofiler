@@ -331,7 +331,7 @@ def compute_kernel_metrics(
         counts[ln.itype] = counts.get(ln.itype, 0) + 1
 
     flops_per_thread  = sum(cnt * ftbl.get(itype, 0.0) for itype, cnt in counts.items())
-    mem_insns_per_th  = counts.get(InsnType.MEMORY, 0)
+    mem_insns_per_th  = counts.get(InsnType.MEMORY, 0) + counts.get(InsnType.VEC_MEM, 0)
     bytes_per_thread  = mem_insns_per_th * mbytes
 
     est_flops = flops_per_thread * threads

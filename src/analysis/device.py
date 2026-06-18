@@ -263,13 +263,21 @@ def query_rocm_devices() -> list[DevicePeak]:
                 hip.hipDeviceGetAttribute(ctypes.byref(v), attr_id, i)
                 return v.value
 
-            # hipDeviceAttribute_t stable ids
+            # hipDeviceAttribute_t IDs differ across ROCm versions.
+            # Probe for compute capability major by scanning candidate IDs
+            # (ROCm 5.x: 76/77, ROCm 6.x: 87/88) and picking the one that
+            # returns a plausible value (1–12).  Other attribute IDs are stable.
             sm_count       = _attr(17)   # hipDeviceAttributeMultiprocessorCount
             core_clock_khz = _attr(8)    # hipDeviceAttributeClockRate
             mem_clock_khz  = _attr(31)   # hipDeviceAttributeMemoryClockRate
             mem_bus_bits   = _attr(32)   # hipDeviceAttributeMemoryBusWidth
-            gfx_major      = _attr(87)   # hipDeviceAttributeComputeCapabilityMajor
-            gfx_minor      = _attr(88)   # hipDeviceAttributeComputeCapabilityMinor
+            gfx_major = gfx_minor = 0
+            for maj_id, min_id in ((87, 88), (76, 77)):
+                maj = _attr(maj_id)
+                if 1 <= maj <= 12:
+                    gfx_major = maj
+                    gfx_minor = _attr(min_id)
+                    break
 
             name_buf = ctypes.create_string_buffer(256)
             hip.hipDeviceGetName(name_buf, 256, i)
@@ -351,6 +359,9 @@ def query_cpu_device() -> Optional[DevicePeak]:
         # Peak FP32: cores × clock_GHz × SIMD_width × 2 (FMA)
         fp32_tflops = cores * clock_ghz * vec_fp32 * 2 / 1000
         fp64_tflops = fp32_tflops / 2  # FP64 SIMD width is half
+        # FP16 native compute only with AVX-512BF16 or AVX-512FP16; zero otherwise
+        has_fp16 = "avx512_bf16" in cpuinfo or "avx512fp16" in cpuinfo
+        fp16_tflops = fp32_tflops * 2 if has_fp16 else 0.0
 
         # Memory bandwidth: try dmidecode, fall back to conservative estimate
         bw_gbs = 50.0
@@ -380,7 +391,7 @@ def query_cpu_device() -> Optional[DevicePeak]:
             backend="cpu",
             fp32_tflops=fp32_tflops,
             fp64_tflops=fp64_tflops,
-            fp16_tflops=fp32_tflops,
+            fp16_tflops=fp16_tflops,
             bandwidth_gbs=bw_gbs,
             sm_count=cores,
             core_clock_ghz=clock_ghz,

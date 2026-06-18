@@ -1482,18 +1482,19 @@ def _ct_build_raw(spans: list[SpanEvent]) -> list[_RawNode]:
                 explicitly_parented.add(id(s))
 
     # Temporal containment for spans not already parented explicitly.
+    # Explicitly-parented spans are still pushed onto the stack so their
+    # temporally-contained children nest under them correctly.
     stack: list[_RawNode] = []
     roots: list[_RawNode] = []
     for s in sorted_spans:
-        if id(s) in explicitly_parented:
-            continue
         while stack and stack[-1].span.end_ns <= s.start_ns:
             stack.pop()
         node = all_nodes[id(s)]
-        if stack and stack[-1].span.end_ns >= s.end_ns:
-            stack[-1].children.append(node)
-        else:
-            roots.append(node)
+        if id(s) not in explicitly_parented:
+            if stack and stack[-1].span.end_ns >= s.end_ns:
+                stack[-1].children.append(node)
+            else:
+                roots.append(node)
         stack.append(node)
     return roots
 

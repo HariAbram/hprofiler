@@ -87,6 +87,8 @@ def _resolve_batch(tool: str, binary: str,
         for i in range(0, len(lines) - 1, 2):
             if i // 2 >= len(addresses):
                 break
+            if i + 1 >= len(lines):
+                break
             addr = addresses[i // 2]
             loc  = lines[i + 1].strip()
             if loc and loc != "??:0" and "??" not in loc:

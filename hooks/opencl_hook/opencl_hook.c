@@ -174,6 +174,16 @@ typedef cl_int (*RetainEvent_t)(cl_event);
 typedef cl_int (*ReleaseEvent_t)(cl_event);
 typedef cl_int (*GetEventProf_t)(cl_event, cl_profiling_info, size_t, void *, size_t *);
 
+/* File-scope so pthread_once init can populate them safely from any thread. */
+static GetEventProf_t g_real_prof    = NULL;
+static ReleaseEvent_t g_real_release = NULL;
+static pthread_once_t g_ecb_once     = PTHREAD_ONCE_INIT;
+
+static void _ecb_init_fns(void) {
+    g_real_prof    = (GetEventProf_t)dlsym(RTLD_NEXT, "clGetEventProfilingInfo");
+    g_real_release = (ReleaseEvent_t)dlsym(RTLD_NEXT, "clReleaseEvent");
+}
+
 /* OpenCL event completion callback — fired on a driver thread when the
    kernel/transfer completes.  Reads GPU timestamps and emits the span.   */
 static void CL_CALLBACK on_event_complete(cl_event ev,
@@ -181,20 +191,17 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
     event_cb_data_t *d = (event_cb_data_t *)user_data;
     if (status != 0 /* CL_COMPLETE */) { free(d); return; }
 
-    static GetEventProf_t real_prof    = NULL;
-    static ReleaseEvent_t real_release = NULL;
-    if (!real_prof)    real_prof    = (GetEventProf_t)dlsym(RTLD_NEXT, "clGetEventProfilingInfo");
-    if (!real_release) real_release = (ReleaseEvent_t)dlsym(RTLD_NEXT, "clReleaseEvent");
+    pthread_once(&g_ecb_once, _ecb_init_fns);
 
     cl_ulong gpu_start = 0, gpu_end = 0;
-    if (real_prof &&
-        real_prof(ev, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &gpu_start, NULL) == CL_SUCCESS &&
-        real_prof(ev, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &gpu_end,   NULL) == CL_SUCCESS) {
+    if (g_real_prof &&
+        g_real_prof(ev, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &gpu_start, NULL) == CL_SUCCESS &&
+        g_real_prof(ev, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &gpu_end,   NULL) == CL_SUCCESS) {
         uint64_t wall_start = cl_to_wall_ns(gpu_start);
         uint64_t dur_ns     = (gpu_end >= gpu_start) ? (gpu_end - gpu_start) : 0;
         emit_span("opencl", gettid_compat(), wall_start, dur_ns, d->name, d->extra);
     }
-    if (real_release) real_release(ev);
+    if (g_real_release) g_real_release(ev);
     free(d);
 }
 
@@ -263,12 +270,14 @@ cl_command_queue clCreateCommandQueueWithProperties(
     static fn_t real = NULL;
     if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clCreateCommandQueueWithProperties");
 
-    /* Build a modified props array with PROFILING_ENABLE inserted. */
+    /* Build a modified props array with PROFILING_ENABLE inserted.
+     * Reserve 3 slots: the profiling pair + the terminating 0. */
     cl_command_queue_properties new_props[32] = {0};
     int n = 0;
     int already_profiling = 0;
     if (props) {
         for (int i = 0; props[i]; i += 2) {
+            if (n + 3 > 31) break;  /* leave room for insert pair + terminator */
             new_props[n++] = props[i];
             if ((uint64_t)props[i] == 0x1093 /* CL_QUEUE_PROPERTIES */) {
                 new_props[n++] = props[i+1] | CL_QUEUE_PROFILING_ENABLE;
@@ -276,10 +285,9 @@ cl_command_queue clCreateCommandQueueWithProperties(
             } else {
                 new_props[n++] = props[i+1];
             }
-            if (n >= 28) break;
         }
     }
-    if (!already_profiling) {
+    if (!already_profiling && n + 3 <= 32) {
         new_props[n++] = 0x1093; /* CL_QUEUE_PROPERTIES */
         new_props[n++] = CL_QUEUE_PROFILING_ENABLE;
     }
@@ -489,7 +497,9 @@ cl_mem clCreateBuffer(cl_context ctx, cl_mem_flags flags, size_t size,
     typedef cl_mem (*fn_t)(cl_context, cl_mem_flags, size_t, void*, cl_int*);
     static fn_t real = NULL;
     if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clCreateBuffer");
+    uint64_t t0 = now_ns();
     cl_mem ret = real ? real(ctx, flags, size, host_ptr, err) : NULL;
+    uint64_t dur = now_ns() - t0;
     if (ret) {
         pthread_mutex_lock(&g_cl_alloc_mtx);
         if (g_cl_alloc_n < CL_ALLOC_CAP) {
@@ -502,7 +512,7 @@ cl_mem clCreateBuffer(cl_context ctx, cl_mem_flags flags, size_t size,
         pthread_mutex_unlock(&g_cl_alloc_mtx);
         emit_ctr_cl("opencl_memory_bytes", total);
         char extra[64]; snprintf(extra, sizeof(extra), "type=alloc,bytes=%zu", size);
-        emit_span("memory", gettid_compat(), now_ns(), 0, "clCreateBuffer", extra);
+        emit_span("memory", gettid_compat(), t0, dur, "clCreateBuffer", extra);
     }
     return ret;
 }
@@ -522,8 +532,10 @@ cl_int clReleaseMemObject(cl_mem memobj) {
     int64_t total = g_cl_mem_bytes;
     pthread_mutex_unlock(&g_cl_alloc_mtx);
     emit_ctr_cl("opencl_memory_bytes", total);
-    emit_span("memory", gettid_compat(), now_ns(), 0, "clReleaseMemObject", "type=free");
-    return real ? real(memobj) : -1;
+    uint64_t t0_rel = now_ns();
+    cl_int rret = real ? real(memobj) : -1;
+    emit_span("memory", gettid_compat(), t0_rel, now_ns() - t0_rel, "clReleaseMemObject", "type=free");
+    return rret;
 }
 
 /* ── dlopen intercept ────────────────────────────────────────────────────
@@ -587,8 +599,9 @@ void *dlopen(const char *filename, int flags) {
     if (filename && strstr(filename, ".jit.so")) {
         FILE *src = fopen(filename, "rb");
         if (src) {
+            int jit_idx = __atomic_fetch_add(&jit_copy_n, 1, __ATOMIC_RELAXED);
             snprintf(saved_jit_path, sizeof(saved_jit_path),
-                     "/tmp/hprofiler_jit_%d_%d.so", (int)getpid(), jit_copy_n++);
+                     "/tmp/hprofiler_jit_%d_%d.so", (int)getpid(), jit_idx);
             FILE *dst = fopen(saved_jit_path, "wb");
             if (dst) {
                 char buf[65536];
