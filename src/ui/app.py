@@ -2243,7 +2243,7 @@ class ProfilerApp(App):
                 with TabPane("Call Tree  [C]", id="tab-calltree"):
                     yield CallTreeWidget(self.trace)
 
-            if self._collect_disasm:
+            if self._collect_disasm or self.trace.disasm:
                 with TabPane("Disasm  [D]", id="tab-disasm"):
                     yield DisasmWidget(self.trace, id="disasm")
 
