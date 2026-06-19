@@ -444,7 +444,7 @@ def disasm_cuda_cubin(cubin_path: str) -> dict[str, KernelDisasm]:
 
 # ── PTX (CUDA intermediate representation) ───────────────────────────────────
 
-_PTX_ENTRY = re.compile(r'\.(?:entry|func)\s+(\w+)')
+_PTX_ENTRY = re.compile(r'\.(?:entry|func)\s+([^\s(]+)')
 # \s+ instead of \s{2,} — ACPP-generated PTX uses single-tab indentation.
 # Operands are optional (bare "ret;" has no operands).
 _PTX_INSN  = re.compile(r'^\s+([a-z][a-z0-9]*(?:\.[a-z0-9]+)*)(?:\s+(.*?))?\s*;', re.I)
