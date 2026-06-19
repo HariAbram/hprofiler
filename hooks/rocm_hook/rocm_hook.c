@@ -788,6 +788,39 @@ hipError_t hipDeviceReset(void) {
 }
 
 /* ── Native HIP AoT kernel registration ─────────────────────────────────── */
+static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap);
+
+/*
+ * __hipRegisterFatBinary is called once per translation unit during static
+ * initialisation.  The `data` pointer points to the embedded clang offload
+ * bundle (__CLANG_OFFLOAD_BUNDLE__ magic) containing the AMDGCN HSACOs.
+ * Saving it lets the Python disassembler find the device code even for AoT
+ * native HIP binaries where hipModuleLoadData is never called.
+ */
+void **__hipRegisterFatBinary(const void *data) {
+    typedef void **(*fn_t)(const void *);
+    static fn_t real = NULL;
+    if (!real) {
+        void *lib = g_hip_lib ? g_hip_lib :
+                    dlopen("libamdhip64.so", RTLD_LAZY | RTLD_GLOBAL);
+        if (lib) real = (fn_t)dlsym(lib, "__hipRegisterFatBinary");
+    }
+    void **ret = real ? real(data) : NULL;
+
+    char saved_path[512];
+    _save_rocm_bin(data, saved_path, sizeof(saved_path));
+    if (saved_path[0]) {
+        /* Emit a jit_compile span so runner.py finds the saved path and
+         * passes it to collect_disasm via rocm_jit_paths.  The span is also
+         * useful for the glob fallback in case the socket isn't yet open. */
+        char extra[640];
+        snprintf(extra, sizeof(extra), "type=jit_compile,path=%s", saved_path);
+        emit_span("jit", gettid_compat(), now_ns(), 0,
+                  "__hipRegisterFatBinary", extra);
+    }
+    return ret;
+}
+
 /*
  * __hipRegisterFunction is called by the HIP runtime during static
  * initialisation (before main()) to register each __global__ kernel.
