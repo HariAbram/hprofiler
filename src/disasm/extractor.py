@@ -529,7 +529,9 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     For clang offload bundles --triple is added so llvm-objdump extracts the
     embedded AMDGCN code object.
     """
+    import sys as _s
     btype = _rocm_binary_type(binary_path)
+    print(f"[hprofiler] rocm_disasm: {binary_path} btype={btype!r}", file=_s.stderr)
     if not btype:
         return {}
     # Search for an llvm-objdump that has AMDGCN target support.
@@ -553,6 +555,7 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     for _ver in range(20, 13, -1):
         _llvm_objdump_candidates.append(f"llvm-objdump-{_ver}")
     tool = _tool(*_llvm_objdump_candidates)
+    print(f"[hprofiler] rocm_disasm: tool={tool!r} exists={Path(binary_path).exists()}", file=_s.stderr)
     if not tool or not Path(binary_path).exists():
         return {}
     cmd = [tool, "-d", "--no-show-raw-insn"]
@@ -560,6 +563,7 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
         cmd.append("--triple=amdgcn-amd-amdhsa")
     cmd.append(binary_path)
     text = _run(cmd, timeout=60)
+    print(f"[hprofiler] rocm_disasm: text={len(text)} chars, kernels after parse=?", file=_s.stderr)
 
     kernels: dict[str, list[DisasmLine]] = {}
     kd_names: set[str] = set()   # symbols that have a .kd descriptor = real kernel entries
@@ -591,6 +595,7 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     # Only include true kernel entry points (those with a .kd descriptor).
     # Device functions and ACPP runtime helpers do not have .kd counterparts.
     # Fall back to all non-empty symbols if the ELF has no .kd sections (older format).
+    print(f"[hprofiler] rocm_disasm: kernels={list(kernels)[:2]} kd_names={sorted(kd_names)[:2]}", file=_s.stderr)
     if kd_names:
         return {
             name: KernelDisasm(name=name, arch="amdgcn", source=binary_path, lines=lns)
