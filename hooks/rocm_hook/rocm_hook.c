@@ -817,6 +817,9 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
             uint16_t shesz; memcpy(&shesz, p + 58, 2);
             uint16_t shnum; memcpy(&shnum, p + 60, 2);
             size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
+            fprintf(stderr,
+                "[hprofiler/rocm]   ELF64: shoff=%llu shesz=%u shnum=%u initial_end=%zu\n",
+                (unsigned long long)shoff, (unsigned)shesz, (unsigned)shnum, end);
             if (shoff > 0 && shesz >= 64 && shnum > 0 && shnum <= 32768
                     && shoff < 256ULL*1024*1024) {
                 for (uint16_t i = 0; i < shnum; i++) {
@@ -829,6 +832,7 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
                         end = sec_end;
                 }
             }
+            fprintf(stderr, "[hprofiler/rocm]   final_end=%zu\n", end);
             if (end > 64 && end < 256ULL * 1024 * 1024) sz = end;
         }
     } else if (memcmp(p, "__CLANG_OFFLOAD_BUNDLE__", 24) == 0) {
@@ -852,14 +856,23 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
         sz = strnlen((const char *)image, 64 * 1024 * 1024);
         if (sz > 0) sz++;
     }
-    if (sz == 0) return;
+    if (sz == 0) {
+        fprintf(stderr, "[hprofiler/rocm]   sz=0, not saving\n");
+        return;
+    }
 
     int idx = __atomic_fetch_add(&_rocm_bin_counter, 1, __ATOMIC_RELAXED);
     snprintf(out_path, path_cap, "/tmp/hprofiler_rocm_%d_%d.bin",
              (int)getpid(), idx);
     FILE *f = fopen(out_path, "wb");
-    if (f) { fwrite(image, 1, sz, f); fclose(f); }
-    else   { out_path[0] = '\0'; }
+    if (f) {
+        size_t written = fwrite(image, 1, sz, f);
+        fclose(f);
+        fprintf(stderr, "[hprofiler/rocm]   saved %zu bytes -> %s\n", written, out_path);
+    } else {
+        fprintf(stderr, "[hprofiler/rocm]   fopen failed for %s\n", out_path);
+        out_path[0] = '\0';
+    }
 }
 
 hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {

@@ -532,19 +532,39 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     btype = _rocm_binary_type(binary_path)
     if not btype:
         return {}
-    # Prefer the ROCm-bundled llvm-objdump which has AMDGCN target support.
-    tool = _tool(
+    # Search for an llvm-objdump that has AMDGCN target support.
+    # Check common ROCm, AdaptiveCpp, and system LLVM install locations first,
+    # then fall through to whatever is in PATH (including versioned names).
+    _llvm_objdump_candidates = [
         "/opt/rocm/bin/llvm-objdump",
         "/opt/rocm/llvm/bin/llvm-objdump",
-        "llvm-objdump",
-    )
+        "/opt/AdaptiveCpp/bin/llvm-objdump",
+        "/opt/adaptivecpp/bin/llvm-objdump",
+        "/usr/lib/llvm/bin/llvm-objdump",
+    ]
+    # Also search versioned installs (llvm-17, llvm-16, etc.)
+    import glob as _g
+    for _pat in ("/usr/lib/llvm-*/bin/llvm-objdump",
+                 "/opt/rocm-*/bin/llvm-objdump",
+                 "/opt/rocm-*/llvm/bin/llvm-objdump"):
+        _llvm_objdump_candidates.extend(sorted(_g.glob(_pat), reverse=True))
+    _llvm_objdump_candidates += ["llvm-objdump"]
+    # Add versioned names found in PATH
+    for _ver in range(20, 13, -1):
+        _llvm_objdump_candidates.append(f"llvm-objdump-{_ver}")
+    tool = _tool(*_llvm_objdump_candidates)
     if not tool or not Path(binary_path).exists():
+        import sys
+        print(f"[hprofiler] disasm_rocm_binary: tool={tool!r} exists={Path(binary_path).exists()} -> skipping {binary_path}", file=sys.stderr)
         return {}
+    import sys
+    print(f"[hprofiler] disasm_rocm_binary: using {tool} on {binary_path} (type={btype})", file=sys.stderr)
     cmd = [tool, "-d", "--no-show-raw-insn"]
     if btype == "bundle":
         cmd.append("--triple=amdgcn-amd-amdhsa")
     cmd.append(binary_path)
     text = _run(cmd, timeout=60)
+    print(f"[hprofiler] disasm_rocm_binary: got {len(text)} chars of output", file=sys.stderr)
 
     kernels: dict[str, list[DisasmLine]] = {}
     kd_names: set[str] = set()   # symbols that have a .kd descriptor = real kernel entries
