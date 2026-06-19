@@ -797,15 +797,6 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
     out_path[0] = '\0';
     if (!image) return;
     const uint8_t *p = (const uint8_t *)image;
-    /* Diagnostic: always show the first 16 bytes so we know the format */
-    fprintf(stderr,
-        "[hprofiler/rocm] hipModuleLoadData image magic: "
-        "%02x %02x %02x %02x  %02x %02x %02x %02x  "
-        "%02x %02x %02x %02x  %02x %02x %02x %02x  '%c%c%c%c'\n",
-        p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
-        p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
-        (p[0]>31&&p[0]<127)?p[0]:'.', (p[1]>31&&p[1]<127)?p[1]:'.',
-        (p[2]>31&&p[2]<127)?p[2]:'.', (p[3]>31&&p[3]<127)?p[3]:'.');
     size_t sz = 0;
 
     if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
@@ -817,9 +808,6 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
             uint16_t shesz; memcpy(&shesz, p + 58, 2);
             uint16_t shnum; memcpy(&shnum, p + 60, 2);
             size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
-            fprintf(stderr,
-                "[hprofiler/rocm]   ELF64: shoff=%llu shesz=%u shnum=%u initial_end=%zu\n",
-                (unsigned long long)shoff, (unsigned)shesz, (unsigned)shnum, end);
             if (shoff > 0 && shesz >= 64 && shnum > 0 && shnum <= 32768
                     && shoff < 256ULL*1024*1024) {
                 for (uint16_t i = 0; i < shnum; i++) {
@@ -832,7 +820,6 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
                         end = sec_end;
                 }
             }
-            fprintf(stderr, "[hprofiler/rocm]   final_end=%zu\n", end);
             if (end > 64 && end < 256ULL * 1024 * 1024) sz = end;
         }
     } else if (memcmp(p, "__CLANG_OFFLOAD_BUNDLE__", 24) == 0) {
@@ -856,23 +843,14 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
         sz = strnlen((const char *)image, 64 * 1024 * 1024);
         if (sz > 0) sz++;
     }
-    if (sz == 0) {
-        fprintf(stderr, "[hprofiler/rocm]   sz=0, not saving\n");
-        return;
-    }
+    if (sz == 0) return;
 
     int idx = __atomic_fetch_add(&_rocm_bin_counter, 1, __ATOMIC_RELAXED);
     snprintf(out_path, path_cap, "/tmp/hprofiler_rocm_%d_%d.bin",
              (int)getpid(), idx);
     FILE *f = fopen(out_path, "wb");
-    if (f) {
-        size_t written = fwrite(image, 1, sz, f);
-        fclose(f);
-        fprintf(stderr, "[hprofiler/rocm]   saved %zu bytes -> %s\n", written, out_path);
-    } else {
-        fprintf(stderr, "[hprofiler/rocm]   fopen failed for %s\n", out_path);
-        out_path[0] = '\0';
-    }
+    if (f) { fwrite(image, 1, sz, f); fclose(f); }
+    else   { out_path[0] = '\0'; }
 }
 
 hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {
@@ -919,7 +897,6 @@ hipError_t hipModuleGetFunction(hipFunction_t *hfunc, hipModule_t hmod,
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipModuleGetFunction");
     if (!real) return -1;
-    fprintf(stderr, "[hprofiler/rocm] hipModuleGetFunction: name=%s\n", name ? name : "(null)");
     hipError_t ret = real(hfunc, hmod, name);
     if (ret == 0 && hfunc && *hfunc && name) {
         pthread_mutex_lock(&g_kname_mutex);

@@ -554,17 +554,12 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
         _llvm_objdump_candidates.append(f"llvm-objdump-{_ver}")
     tool = _tool(*_llvm_objdump_candidates)
     if not tool or not Path(binary_path).exists():
-        import sys
-        print(f"[hprofiler] disasm_rocm_binary: tool={tool!r} exists={Path(binary_path).exists()} -> skipping {binary_path}", file=sys.stderr)
         return {}
-    import sys
-    print(f"[hprofiler] disasm_rocm_binary: using {tool} on {binary_path} (type={btype})", file=sys.stderr)
     cmd = [tool, "-d", "--no-show-raw-insn"]
     if btype == "bundle":
         cmd.append("--triple=amdgcn-amd-amdhsa")
     cmd.append(binary_path)
     text = _run(cmd, timeout=60)
-    print(f"[hprofiler] disasm_rocm_binary: got {len(text)} chars of output", file=sys.stderr)
 
     kernels: dict[str, list[DisasmLine]] = {}
     kd_names: set[str] = set()   # symbols that have a .kd descriptor = real kernel entries
@@ -596,8 +591,6 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     # Only include true kernel entry points (those with a .kd descriptor).
     # Device functions and ACPP runtime helpers do not have .kd counterparts.
     # Fall back to all non-empty symbols if the ELF has no .kd sections (older format).
-    print(f"[hprofiler] disasm_rocm_binary: found {len(kernels)} symbols, kd_names={sorted(kd_names)[:3]}", file=sys.stderr)
-    print(f"[hprofiler] disasm_rocm_binary: all symbols: {sorted(kernels.keys())[:5]}", file=sys.stderr)
     if kd_names:
         return {
             name: KernelDisasm(name=name, arch="amdgcn", source=binary_path, lines=lns)
@@ -817,25 +810,33 @@ def collect_disasm(
         for p in _rocm_glob.glob(f"/tmp/hprofiler_rocm_{pid_pat}_*.bin"):
             rocm_jit_paths.add(p)
 
-        for rocm_path in sorted(rocm_jit_paths):
+        def _disasm_one_rocm(rocm_path: str) -> dict[str, KernelDisasm]:
             if not Path(rocm_path).exists():
-                continue
+                return {}
             try:
                 with open(rocm_path, "rb") as _rf:
                     _rm = _rf.read(4)
             except OSError:
-                continue
+                return {}
             if _rm[:2] in (b"//", b".v", b"; ") or _rm[:1] in (b".", b";"):
                 text = Path(rocm_path).read_text(errors="replace")
-                jit_kd = _parse_ptx_text(text, rocm_path)
-            else:
-                jit_kd = disasm_rocm_binary(rocm_path)
-            for name, kd in jit_kd.items():
-                result.setdefault(name, kd)
-            try:
-                os.unlink(rocm_path)
-            except OSError:
-                pass
+                return _parse_ptx_text(text, rocm_path)
+            return disasm_rocm_binary(rocm_path)
+
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        valid_rocm_paths = sorted(p for p in rocm_jit_paths if Path(p).exists())
+        with _TPE(max_workers=min(8, len(valid_rocm_paths) or 1)) as _pool:
+            _futures = {_pool.submit(_disasm_one_rocm, p): p for p in valid_rocm_paths}
+            for _fut, _rp in _futures.items():
+                try:
+                    for name, kd in _fut.result().items():
+                        result.setdefault(name, kd)
+                except Exception:
+                    pass
+                try:
+                    os.unlink(_rp)
+                except OSError:
+                    pass
 
     # ── OpenCL / CPU: disassemble ACPP SSCP .jit.so files ───────────────────
     # Also check /tmp/hprofiler_jit_*.so copies saved by the hook.
