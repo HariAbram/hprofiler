@@ -500,8 +500,26 @@ _AMDGCN_LINE = re.compile(
 )
 
 
+def _is_amdgcn_elf(binary_path: str) -> bool:
+    """Return True iff the file is an ELF with e_machine == EM_AMDGPU (224)."""
+    try:
+        with open(binary_path, "rb") as f:
+            hdr = f.read(20)
+        return (len(hdr) >= 20
+                and hdr[:4] == b"\x7fELF"
+                and int.from_bytes(hdr[18:20], "little") == 224)
+    except OSError:
+        return False
+
+
 def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
-    """Disassemble a ROCm/HIP binary with llvm-objdump."""
+    """Disassemble an AMDGCN ELF (HSACO) with llvm-objdump.
+
+    Rejects non-AMDGCN ELFs (e.g. the host x86-64 fat binary) so that
+    calling this on the main executable never returns x86-64 host symbols.
+    """
+    if not _is_amdgcn_elf(binary_path):
+        return {}
     # Prefer the ROCm-bundled llvm-objdump which has AMDGCN target support.
     tool = _tool(
         "/opt/rocm/bin/llvm-objdump",

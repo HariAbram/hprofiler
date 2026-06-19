@@ -26,7 +26,7 @@ import tempfile
 import struct
 import socket as _socket
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from .events import SpanEvent, InstantEvent, CounterEvent, Category, AnyEvent  # noqa: F401
 from .trace import Trace, TraceMetadata
@@ -491,21 +491,44 @@ class Runner:
 
 # ── GPU utilization polling ───────────────────────────────────────────────────
 
+def _find_tool(*names: str) -> Optional[str]:
+    """Find a tool by name in PATH, then in common install directories."""
+    for name in names:
+        v = shutil.which(name)
+        if v:
+            return v
+    # Fall back to well-known install paths (common on HPC clusters where
+    # ROCm/CUDA bin dirs may not be in the system PATH).
+    for name in names:
+        for prefix in ("/opt/rocm/bin", "/usr/local/rocm/bin",
+                       "/usr/local/cuda/bin", "/usr/bin"):
+            p = Path(prefix) / name
+            if p.exists():
+                return str(p)
+    return None
+
+
 def _gpu_poll(trace: Trace, backends: list[str], stop: threading.Event) -> None:
     """Background thread: poll GPU utilisation every second, emit CounterEvents."""
     _nvidia_backends = {"cuda", "opencl", "nccl"}
     _amd_backends    = {"rocm", "opencl"}
-    if any(b in backends for b in _nvidia_backends) and shutil.which("nvidia-smi"):
-        _poll_nvidia_smi(trace, stop)
-    elif any(b in backends for b in _amd_backends) and shutil.which("rocm-smi"):
-        _poll_rocm_smi(trace, stop)
+    if any(b in backends for b in _nvidia_backends):
+        nvidia_smi = _find_tool("nvidia-smi")
+        if nvidia_smi:
+            _poll_nvidia_smi(trace, stop, nvidia_smi)
+            return
+    if any(b in backends for b in _amd_backends):
+        rocm_smi = _find_tool("rocm-smi")
+        if rocm_smi:
+            _poll_rocm_smi(trace, stop, rocm_smi)
 
 
-def _poll_nvidia_smi(trace: Trace, stop: threading.Event) -> None:
+def _poll_nvidia_smi(trace: Trace, stop: threading.Event,
+                     tool: str = "nvidia-smi") -> None:
     while not stop.is_set():
         try:
             r = subprocess.run(
-                ["nvidia-smi",
+                [tool,
                  "--query-gpu=index,utilization.gpu,utilization.memory,memory.used",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=3,
@@ -534,22 +557,27 @@ def _poll_nvidia_smi(trace: Trace, stop: threading.Event) -> None:
         stop.wait(timeout=1.0)
 
 
-def _poll_rocm_smi(trace: Trace, stop: threading.Event) -> None:
+def _poll_rocm_smi(trace: Trace, stop: threading.Event,
+                   tool: str = "rocm-smi") -> None:
     while not stop.is_set():
         try:
             r_use = subprocess.run(
-                ["rocm-smi", "--showuse", "--csv"],
+                [tool, "--showuse", "--csv"],
                 capture_output=True, text=True, timeout=3,
             )
             r_mem = subprocess.run(
-                ["rocm-smi", "--showmeminfo", "vram", "--csv"],
+                [tool, "--showmeminfo", "vram", "--csv"],
                 capture_output=True, text=True, timeout=3,
             )
             ts = time.monotonic_ns()
 
-            # Parse GPU utilization — find "use"/"utiliz" column from header
+            # Parse GPU utilization — find "use"/"utiliz" column from header.
+            # Strip comment lines (#) and banner separator lines (=, -) that
+            # newer rocm-smi versions emit around the CSV data.
             use_lines = [l.strip() for l in r_use.stdout.strip().splitlines()
-                         if l.strip() and not l.startswith("#")]
+                         if l.strip()
+                         and not l.startswith(("#", "=", "-"))
+                         and "," in l]
             if len(use_lines) >= 2:
                 hdr = [h.lower() for h in use_lines[0].split(",")]
                 use_col = next(
@@ -571,7 +599,9 @@ def _poll_rocm_smi(trace: Trace, stop: threading.Event) -> None:
 
             # Parse VRAM — find "used" column from header and detect its unit
             mem_lines = [l.strip() for l in r_mem.stdout.strip().splitlines()
-                         if l.strip() and not l.startswith("#")]
+                         if l.strip()
+                         and not l.startswith(("#", "=", "-"))
+                         and "," in l]
             if len(mem_lines) >= 2:
                 hdr = [h.lower() for h in mem_lines[0].split(",")]
                 used_col = next(
