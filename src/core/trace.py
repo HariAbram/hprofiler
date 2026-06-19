@@ -45,6 +45,10 @@ class Trace:
 
     def add_disasm(self, kd: "KernelDisasm") -> None:  # type: ignore[type-arg]
         self._disasm[kd.name] = kd
+        # Also store under 255-char prefix so spans recorded by older hook
+        # builds (which truncated kname to 255 chars) still match.
+        if len(kd.name) > 255:
+            self._disasm.setdefault(kd.name[:255], kd)
         self._disasm_version += 1
 
     def add_pc_sample(self, func_name: str, pc_offset: int, stall_reason: int, count: int) -> None:

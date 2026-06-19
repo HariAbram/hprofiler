@@ -153,7 +153,7 @@ static void emit_ctr(const char *cat, const char *name,
 
 /* ── Kernel name table (hipModuleGetFunction → name) ──────────────────────── */
 #define KNAME_MAP_CAP 512
-typedef struct { hipFunction_t fn; char name[256]; } KNameEntry;
+typedef struct { hipFunction_t fn; char name[2048]; } KNameEntry;
 static KNameEntry      g_knames[KNAME_MAP_CAP];
 static int             g_kname_n = 0;
 static pthread_mutex_t g_kname_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -316,7 +316,7 @@ typedef struct {
     hipEvent_t   ev_end;
     hipStream_t  stream;
     char         cat[32];
-    char         kname[256];
+    char         kname[2048];
     char         extra[256];
     uint64_t     cpu_start_ns;
     pid_t        tid;
@@ -331,7 +331,7 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
 
     typedef struct {
         hipEvent_t ev_s, ev_e;
-        char cat[32], kname[256], extra[256];
+        char cat[32], kname[2048], extra[256];
         uint64_t t0;
         pid_t tid;
     } Local;
@@ -350,7 +350,7 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
             l->ev_s = pk->ev_start; l->ev_e = pk->ev_end;
             l->t0   = pk->cpu_start_ns; l->tid  = pk->tid;
             strncpy(l->cat,   pk->cat,   31);  l->cat[31]   = '\0';
-            strncpy(l->kname, pk->kname, 255); l->kname[255] = '\0';
+            strncpy(l->kname, pk->kname, 2047); l->kname[2047] = '\0';
             strncpy(l->extra, pk->extra, 255); l->extra[255] = '\0';
         }
     }
@@ -393,7 +393,7 @@ static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
         pk->ev_start = ev_s; pk->ev_end = ev_e;
         pk->stream = stream; pk->cpu_start_ns = t0; pk->tid = tid;
         strncpy(pk->cat,   cat,   31);  pk->cat[31]   = '\0';
-        strncpy(pk->kname, kname, 255); pk->kname[255] = '\0';
+        strncpy(pk->kname, kname, 2047); pk->kname[2047] = '\0';
         strncpy(pk->extra, extra, 255); pk->extra[255] = '\0';
         pthread_mutex_unlock(&g_pk_mutex);
     } else {
@@ -924,8 +924,8 @@ hipError_t hipModuleGetFunction(hipFunction_t *hfunc, hipModule_t hmod,
         pthread_mutex_lock(&g_kname_mutex);
         if (g_kname_n < KNAME_MAP_CAP) {
             g_knames[g_kname_n].fn = *hfunc;
-            strncpy(g_knames[g_kname_n].name, name, 255);
-            g_knames[g_kname_n].name[255] = '\0';
+            strncpy(g_knames[g_kname_n].name, name, 2047);
+            g_knames[g_kname_n].name[2047] = '\0';
             g_kname_n++;
         }
         pthread_mutex_unlock(&g_kname_mutex);

@@ -596,6 +596,8 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     # Only include true kernel entry points (those with a .kd descriptor).
     # Device functions and ACPP runtime helpers do not have .kd counterparts.
     # Fall back to all non-empty symbols if the ELF has no .kd sections (older format).
+    print(f"[hprofiler] disasm_rocm_binary: found {len(kernels)} symbols, kd_names={sorted(kd_names)[:3]}", file=sys.stderr)
+    print(f"[hprofiler] disasm_rocm_binary: all symbols: {sorted(kernels.keys())[:5]}", file=sys.stderr)
     if kd_names:
         return {
             name: KernelDisasm(name=name, arch="amdgcn", source=binary_path, lines=lns)
