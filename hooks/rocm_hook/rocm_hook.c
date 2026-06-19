@@ -797,6 +797,15 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
     out_path[0] = '\0';
     if (!image) return;
     const uint8_t *p = (const uint8_t *)image;
+    /* Diagnostic: always show the first 16 bytes so we know the format */
+    fprintf(stderr,
+        "[hprofiler/rocm] hipModuleLoadData image magic: "
+        "%02x %02x %02x %02x  %02x %02x %02x %02x  "
+        "%02x %02x %02x %02x  %02x %02x %02x %02x  '%c%c%c%c'\n",
+        p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+        p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
+        (p[0]>31&&p[0]<127)?p[0]:'.', (p[1]>31&&p[1]<127)?p[1]:'.',
+        (p[2]>31&&p[2]<127)?p[2]:'.', (p[3]>31&&p[3]<127)?p[3]:'.');
     size_t sz = 0;
 
     if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
