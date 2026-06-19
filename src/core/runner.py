@@ -810,11 +810,11 @@ def _collect_disasm(
         _JIT_NAME = "<jit-kernel>"
         if (any(s.name == _JIT_NAME for s in trace.spans)
                 and _JIT_NAME not in disasm_map):
+            # Alias first available GPU kernel to <jit-kernel> so spans get
+            # disassembly even when the hook couldn't resolve the name (e.g.
+            # native HIP AoT where stubs aren't in .dynsym).
             for kd in disasm_map.values():
-                if kd.arch in ("ptx", "sass", "amdgcn") and (
-                    "hprofiler_cubin_" in kd.source
-                    or "hprofiler_rocm_" in kd.source
-                ):
+                if kd.arch in ("ptx", "sass", "amdgcn"):
                     alias = _copy.copy(kd)
                     alias.name = _JIT_NAME
                     disasm_map[_JIT_NAME] = alias

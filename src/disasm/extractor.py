@@ -860,6 +860,9 @@ def collect_disasm(
     if "rocm" in backends:
         if binary and Path(binary).exists():
             rocm = disasm_rocm_binary(binary)
+            if not rocm:
+                # Main binary is a native HIP AoT binary with embedded fat bundle
+                rocm = _disasm_hip_aot_binary(binary)
             result.update(rocm)
 
         # Collect paths from the jit_spans path= tag (set by hipModuleLoadData hook)
