@@ -810,33 +810,25 @@ def collect_disasm(
         for p in _rocm_glob.glob(f"/tmp/hprofiler_rocm_{pid_pat}_*.bin"):
             rocm_jit_paths.add(p)
 
-        def _disasm_one_rocm(rocm_path: str) -> dict[str, KernelDisasm]:
+        for rocm_path in sorted(rocm_jit_paths):
             if not Path(rocm_path).exists():
-                return {}
+                continue
             try:
                 with open(rocm_path, "rb") as _rf:
                     _rm = _rf.read(4)
             except OSError:
-                return {}
+                continue
             if _rm[:2] in (b"//", b".v", b"; ") or _rm[:1] in (b".", b";"):
                 text = Path(rocm_path).read_text(errors="replace")
-                return _parse_ptx_text(text, rocm_path)
-            return disasm_rocm_binary(rocm_path)
-
-        from concurrent.futures import ThreadPoolExecutor as _TPE
-        valid_rocm_paths = sorted(p for p in rocm_jit_paths if Path(p).exists())
-        with _TPE(max_workers=min(8, len(valid_rocm_paths) or 1)) as _pool:
-            _futures = {_pool.submit(_disasm_one_rocm, p): p for p in valid_rocm_paths}
-            for _fut, _rp in _futures.items():
-                try:
-                    for name, kd in _fut.result().items():
-                        result.setdefault(name, kd)
-                except Exception:
-                    pass
-                try:
-                    os.unlink(_rp)
-                except OSError:
-                    pass
+                jit_kd = _parse_ptx_text(text, rocm_path)
+            else:
+                jit_kd = disasm_rocm_binary(rocm_path)
+            for name, kd in jit_kd.items():
+                result.setdefault(name, kd)
+            try:
+                os.unlink(rocm_path)
+            except OSError:
+                pass
 
     # ── OpenCL / CPU: disassemble ACPP SSCP .jit.so files ───────────────────
     # Also check /tmp/hprofiler_jit_*.so copies saved by the hook.
