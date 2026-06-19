@@ -913,6 +913,67 @@ def summary(trace_file, top):
 
 
 @cli.command()
+@click.argument("trace_file", type=click.Path(exists=True))
+@click.option("--kernel", "-k", default=None, metavar="PATTERN",
+              help="Only dump kernels whose name contains PATTERN (case-insensitive substring).")
+@click.option("--output", "-o", default=None, metavar="FILE",
+              help="Write to FILE instead of stdout.")
+@click.option("--list", "list_only", is_flag=True, default=False,
+              help="List available kernel names and exit.")
+def disasm(trace_file, kernel, output, list_only):
+    """Dump kernel disassembly from a saved trace JSON to a file or stdout.
+
+    The trace must have been recorded with --disasm (or viewed with --disasm)
+    so that assembly data is embedded in the JSON.
+
+    \b
+    Examples:
+      hprofiler disasm trace.json                          # all kernels to stdout
+      hprofiler disasm trace.json --list                   # list kernel names
+      hprofiler disasm trace.json -k kernel1               # filter by name
+      hprofiler disasm trace.json -o kernels.asm           # write to file
+      hprofiler disasm trace.json -k kernel1 -o k1.asm
+    """
+    from src.ui.app import load_trace_from_json
+    trace = load_trace_from_json(trace_file, collect_disasm=False)
+
+    if not trace.disasm:
+        click.echo("[hprofiler] No disassembly in this trace. "
+                   "Re-run with --disasm to collect it.", err=True)
+        raise SystemExit(1)
+
+    names = sorted(trace.disasm)
+    if kernel:
+        names = [n for n in names if kernel.lower() in n.lower()]
+        if not names:
+            click.echo(f"[hprofiler] No kernels matching '{kernel}'.", err=True)
+            raise SystemExit(1)
+
+    if list_only:
+        for n in names:
+            kd = trace.disasm[n]
+            click.echo(f"{n}  [{kd.arch}, {len(kd.lines)} insns]")
+        return
+
+    lines_out = []
+    for name in names:
+        kd = trace.disasm[name]
+        lines_out.append(f"; ── {name}  [{kd.arch}]  {len(kd.lines)} instructions ──")
+        lines_out.append(f"; source: {kd.source}")
+        lines_out.append("")
+        for ln in kd.lines:
+            lines_out.append(ln.raw if ln.raw else f"\t{ln.mnemonic}  {ln.operands}")
+        lines_out.append("")
+
+    text = "\n".join(lines_out)
+    if output:
+        Path(output).write_text(text)
+        click.echo(f"[hprofiler] Disasm written to: {output} ({len(names)} kernel(s))", err=True)
+    else:
+        click.echo(text)
+
+
+@cli.command()
 def backends():
     """List all backends and their availability on this system.
 

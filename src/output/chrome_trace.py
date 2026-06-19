@@ -45,17 +45,47 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
         "args": {"name": meta.command or "profiled-process"},
     })
 
+    # GPU categories whose spans cover async GPU execution time (from CPU launch
+    # to GPU completion).  If emitted on the same tid as CPU spans they will
+    # overlap with hipDeviceSynchronize / hipMalloc / etc. and Perfetto drops
+    # them with SLICE_DROP_OVERLAPPING_COMPLETE_EVENT.
+    # Fix: assign each (category, stream) pair its own virtual tid so Perfetto
+    # renders them on a dedicated GPU row that never conflicts with CPU rows.
+    _GPU_CATS = frozenset({"cuda", "rocm", "opencl"})
+    _GPU_BASE_TID = 2_000_000_000  # far above any realistic OS tid
+    _gpu_tid_map: dict[tuple[str, str], int] = {}
+
+    def _gpu_tid(cat: str, stream: str) -> int:
+        key = (cat, stream)
+        if key not in _gpu_tid_map:
+            _gpu_tid_map[key] = _GPU_BASE_TID + len(_gpu_tid_map)
+        return _gpu_tid_map[key]
+
     for span in trace.spans:
+        cat = span.category.value
+        if cat in _GPU_CATS:
+            stream = span.tags.get("stream", "")
+            tid = _gpu_tid(cat, stream)
+        else:
+            tid = span.tid
         events.append({
             "ph": "X",
             "name": span.name,
-            "cat": span.category.value,
+            "cat": cat,
             "ts": span.start_us,
             "dur": span.duration_us,
             "pid": span.pid or meta.pid,
-            "tid": span.tid,
-            "cname": _category_color(span.category.value),
+            "tid": tid,
+            "cname": _category_color(cat),
             "args": {**span.tags, **({"_stack": span.stack_frames} if span.stack_frames else {})},
+        })
+
+    # Emit thread-name metadata for each virtual GPU track so Perfetto labels them.
+    for (cat, stream), vtid in _gpu_tid_map.items():
+        label = f"GPU/{cat}" + (f"/stream-{stream}" if stream else "")
+        events.append({
+            "ph": "M", "pid": meta.pid, "tid": vtid,
+            "name": "thread_name", "args": {"name": label},
         })
 
     for inst in trace.instants:
