@@ -611,12 +611,18 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
 def _disasm_hip_aot_binary(binary_path: str) -> dict[str, KernelDisasm]:
     """Extract and disassemble AMDGCN kernels from a native HIP AoT binary.
 
-    hipcc embeds the GPU HSACO as a clang offload bundle (__CLANG_OFFLOAD_BUNDLE__)
-    somewhere in the host ELF file.  We scan for the magic bytes directly — no
-    external bundler tool required — extract the bundle to a temp file, and pass
-    it to disasm_rocm_binary which already handles the bundle format.
+    hipcc embeds the GPU HSACO as a clang offload bundle inside the host ELF.
+    ROCm 6+ compresses the HSACO entries (LZ4/zlib) so llvm-objdump on the raw
+    bundle fails.
+
+    Strategy:
+      1. Scan the host ELF for __CLANG_OFFLOAD_BUNDLE__ magic, extract bytes.
+      2. Walk bundle entries: if an AMDGCN entry is an uncompressed HSACO ELF
+         (\x7fELF magic), disassemble it directly.
+      3. Otherwise write the extracted bundle to a temp file and let
+         clang-offload-bundler unbundle it (handles decompression transparently).
     """
-    import struct, tempfile as _tf
+    import struct, tempfile as _tf, glob as _gb
 
     _BUNDLE_MAGIC = b"__CLANG_OFFLOAD_BUNDLE__"
     try:
@@ -632,36 +638,112 @@ def _disasm_hip_aot_binary(binary_path: str) -> dict[str, KernelDisasm]:
     if len(bundle) < 32:
         return {}
 
-    # Parse the bundle header to find the total byte extent.
+    # Parse the bundle header to find the total byte extent and entries.
     num_objs, = struct.unpack_from("<Q", bundle, 24)
+    entries: list[tuple[int, int, str]] = []  # (offset, size, triple)
     max_end = 32
     pos = 32
-    for _ in range(min(num_objs, 1024)):
+    for _ in range(min(int(num_objs), 1024)):
         if pos + 24 > len(bundle):
             break
         offset, bsz, triple_sz = struct.unpack_from("<QQQ", bundle, pos)
-        sec_end = int(offset + bsz)
+        triple_b = bundle[pos + 24: pos + 24 + int(triple_sz)]
+        triple = triple_b.decode("utf-8", errors="replace")
+        entries.append((int(offset), int(bsz), triple))
+        sec_end = int(offset) + int(bsz)
         if 0 < sec_end < 512 * 1024 * 1024 and sec_end > max_end:
             max_end = sec_end
         pos += 24 + int(triple_sz)
 
-    if max_end <= len(_BUNDLE_MAGIC):
+    if max_end <= len(_BUNDLE_MAGIC) or not entries:
         return {}
 
-    bundle = bundle[:max_end]
+    bundle_bytes = bundle[:max_end]
+    result: dict[str, KernelDisasm] = {}
 
-    fd, tmp_path = _tf.mkstemp(suffix=".bundle", prefix="hprofiler_fat_")
+    # --- Pass 1: directly extract uncompressed HSACO ELF entries.
+    for offset, bsz, triple in entries:
+        if "amdgcn" not in triple:
+            continue
+        entry = bundle_bytes[offset: offset + bsz]
+        if len(entry) < 4 or entry[:4] != b"\x7fELF":
+            continue  # compressed or non-ELF; handled in pass 2
+        fd, tmp = _tf.mkstemp(suffix=".hsaco", prefix="hprofiler_fat_")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(entry)
+            for name, kd in disasm_rocm_binary(tmp).items():
+                result.setdefault(name, kd)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        if result:
+            return result
+
+    # --- Pass 2: clang-offload-bundler on the extracted bundle (handles LZ4/zlib).
+    _bundler_candidates = [
+        "/opt/rocm/llvm/bin/clang-offload-bundler",
+        "/opt/rocm/bin/clang-offload-bundler",
+        "/opt/AdaptiveCpp/bin/clang-offload-bundler",
+        "/opt/adaptivecpp/bin/clang-offload-bundler",
+    ]
+    for _pat in ("/opt/rocm-*/llvm/bin/clang-offload-bundler",
+                 "/opt/rocm-*/bin/clang-offload-bundler"):
+        _bundler_candidates.extend(sorted(_gb.glob(_pat), reverse=True))
+    _bundler_candidates.append("clang-offload-bundler")
+    bundler = _tool(*_bundler_candidates)
+    if not bundler:
+        return result
+
+    fd_b, bundle_path = _tf.mkstemp(suffix=".bundle", prefix="hprofiler_fat_")
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(bundle)
-        return disasm_rocm_binary(tmp_path)
+        with os.fdopen(fd_b, "wb") as f:
+            f.write(bundle_bytes)
+
+        r = subprocess.run(
+            [bundler, "--list", "--type=o", f"--input={bundle_path}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return result
+        targets = [t.strip() for t in r.stdout.splitlines()
+                   if t.strip() and "amdgcn" in t]
+
+        for target in targets:
+            fd_o, out_path = _tf.mkstemp(suffix=".hsaco", prefix="hprofiler_fat_")
+            os.close(fd_o)
+            try:
+                subprocess.run(
+                    [bundler, "--unbundle", "--type=o",
+                     f"--input={bundle_path}", f"--output={out_path}",
+                     f"--targets={target}"],
+                    capture_output=True, timeout=30,
+                )
+                if Path(out_path).exists() and Path(out_path).stat().st_size > 0:
+                    for name, kd in disasm_rocm_binary(out_path).items():
+                        result.setdefault(name, kd)
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
+            if result:
+                break
     except Exception:
-        return {}
+        pass
     finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(bundle_path)
         except OSError:
             pass
+
+    return result
 
 
 # ── Address → symbol lookup (for OpenMP codeptr_ra) ──────────────────────────
