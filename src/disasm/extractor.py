@@ -495,7 +495,10 @@ def disasm_cuda_ptx(binary_path: str) -> dict[str, KernelDisasm]:
 
 _AMDGCN_SYM  = re.compile(r'^[0-9a-f]+\s+<([^>]+)>:')
 _AMDGCN_LINE = re.compile(
-    r'^\s*([0-9a-f]+):\s+(?:[0-9a-f]{8}\s+)?([a-z_][a-z0-9_]+)\s*(.*)',
+    r'^\s*([0-9a-f]+):\s+'
+    r'(?:(?:[0-9a-f]{2}\s+){1,8})?'          # optional space-separated raw bytes (e.g. 06 00 00 c0)
+    r'(?:[0-9a-f]{8,16}\s+)?'                 # or optional concatenated raw insn word (e.g. c00000060000)
+    r'([a-z_][a-z0-9_]+)\s*(.*)',             # mnemonic + operands
     re.I,
 )
 
@@ -563,6 +566,9 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
         cmd.append("--triple=amdgcn-amd-amdhsa")
     cmd.append(binary_path)
     text = _run(cmd, timeout=60)
+    # Print the first 20 lines so we can see the actual format
+    for _i, _ln in enumerate(text.splitlines()[:20]):
+        print(f"[hprofiler] rocm_disasm line{_i}: {_ln!r}", file=_s.stderr)
     print(f"[hprofiler] rocm_disasm: text={len(text)} chars, kernels after parse=?", file=_s.stderr)
 
     kernels: dict[str, list[DisasmLine]] = {}
@@ -595,7 +601,7 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     # Only include true kernel entry points (those with a .kd descriptor).
     # Device functions and ACPP runtime helpers do not have .kd counterparts.
     # Fall back to all non-empty symbols if the ELF has no .kd sections (older format).
-    print(f"[hprofiler] rocm_disasm: kernels={list(kernels)[:2]} kd_names={sorted(kd_names)[:2]}", file=_s.stderr)
+    print(f"[hprofiler] rocm_disasm: kernels={[(n, len(l)) for n,l in kernels.items()][:2]} kd_names={sorted(kd_names)[:2]}", file=_s.stderr)
     if kd_names:
         return {
             name: KernelDisasm(name=name, arch="amdgcn", source=binary_path, lines=lns)
