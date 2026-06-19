@@ -798,6 +798,12 @@ def _collect_disasm(
             sm_version = f"sm_{major}{minor}"
             break
 
+    # Debug: show distinct rocm kernel span names so we can compare with ELF symbols
+    import sys as _sys
+    _rocm_names = sorted({s.name for s in trace.spans if s.category.value == "rocm"
+                          and not s.name.startswith("hip")})
+    print(f"[hprofiler] ROCm kernel span names: {_rocm_names[:5]}", file=_sys.stderr)
+
     try:
         disasm_map = collect_disasm(command, backends, jit_spans, omp_syms, profiled_pid, cpu_names,
                                     sm_version=sm_version)

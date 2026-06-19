@@ -919,6 +919,7 @@ hipError_t hipModuleGetFunction(hipFunction_t *hfunc, hipModule_t hmod,
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipModuleGetFunction");
     if (!real) return -1;
+    fprintf(stderr, "[hprofiler/rocm] hipModuleGetFunction: name=%s\n", name ? name : "(null)");
     hipError_t ret = real(hfunc, hmod, name);
     if (ret == 0 && hfunc && *hfunc && name) {
         pthread_mutex_lock(&g_kname_mutex);
