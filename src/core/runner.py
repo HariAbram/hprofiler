@@ -798,16 +798,9 @@ def _collect_disasm(
             sm_version = f"sm_{major}{minor}"
             break
 
-    import sys as _sys, glob as _g2
-    _tmp_files = _g2.glob(f"/tmp/hprofiler_rocm_{profiled_pid}_*.bin")
-    print(f"[hprofiler] disasm: profiled_pid={profiled_pid} rocm_tmp_files={_tmp_files}", file=_sys.stderr)
-    _jit_paths = [s.tags.get("path","") for s in trace.spans if s.tags.get("type")=="jit_compile"]
-    print(f"[hprofiler] disasm: jit_compile paths={_jit_paths}", file=_sys.stderr)
-
     try:
         disasm_map = collect_disasm(command, backends, jit_spans, omp_syms, profiled_pid, cpu_names,
                                     sm_version=sm_version)
-        print(f"[hprofiler] disasm: collect_disasm returned {len(disasm_map)} kernels: {list(disasm_map)[:3]}", file=_sys.stderr)
 
         import copy as _copy
 

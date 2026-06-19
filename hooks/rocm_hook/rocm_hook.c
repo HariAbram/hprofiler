@@ -787,6 +787,51 @@ hipError_t hipDeviceReset(void) {
     return ret;
 }
 
+/* ── Native HIP AoT kernel registration ─────────────────────────────────── */
+/*
+ * __hipRegisterFunction is called by the HIP runtime during static
+ * initialisation (before main()) to register each __global__ kernel.
+ * Intercepting it lets us build the host-stub-pointer → kernel-name table
+ * so that hipLaunchKernel() calls show the real kernel name instead of
+ * "<jit-kernel>".
+ */
+void __hipRegisterFunction(
+        void **modules,
+        const void *hostFunction,
+        char *deviceFunction,
+        const char *deviceName,
+        unsigned int threadLimit,
+        void *tid, void *bid, void *blockDim, void *gridDim, int *wSize)
+{
+    typedef void (*fn_t)(void **, const void *, char *, const char *,
+                         unsigned int, void *, void *, void *, void *, int *);
+    static fn_t real = NULL;
+    if (!real) {
+        void *lib = g_hip_lib ? g_hip_lib :
+                    dlopen("libamdhip64.so", RTLD_LAZY | RTLD_GLOBAL);
+        if (lib) real = (fn_t)dlsym(lib, "__hipRegisterFunction");
+    }
+    if (real) real(modules, hostFunction, deviceFunction, deviceName,
+                   threadLimit, tid, bid, blockDim, gridDim, wSize);
+
+    const char *kname = (deviceName && deviceName[0]) ? deviceName : deviceFunction;
+    if (!hostFunction || !kname || !kname[0]) return;
+    pthread_mutex_lock(&g_kname_mutex);
+    int found = 0;
+    for (int i = 0; i < g_kname_n; i++) {
+        if (g_knames[i].fn == (hipFunction_t)(uintptr_t)hostFunction) {
+            found = 1; break;
+        }
+    }
+    if (!found && g_kname_n < KNAME_MAP_CAP) {
+        g_knames[g_kname_n].fn = (hipFunction_t)(uintptr_t)hostFunction;
+        strncpy(g_knames[g_kname_n].name, kname, 2047);
+        g_knames[g_kname_n].name[2047] = '\0';
+        g_kname_n++;
+    }
+    pthread_mutex_unlock(&g_kname_mutex);
+}
+
 /* ── JIT module load + kernel name table ─────────────────────────────────── */
 
 /* Save the AMDGCN ELF (or PTX text) passed to hipModuleLoad* so the Python
@@ -851,7 +896,6 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
     FILE *f = fopen(out_path, "wb");
     if (f) {
         fwrite(image, 1, sz, f); fclose(f);
-        fprintf(stderr, "[hprofiler/rocm] saved %zu bytes -> %s\n", sz, out_path);
     } else { out_path[0] = '\0'; }
 }
 

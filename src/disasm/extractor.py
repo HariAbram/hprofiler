@@ -529,9 +529,7 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     For clang offload bundles --triple is added so llvm-objdump extracts the
     embedded AMDGCN code object.
     """
-    import sys as _s
     btype = _rocm_binary_type(binary_path)
-    print(f"[hprofiler] rocm_disasm: {binary_path} btype={btype!r}", file=_s.stderr)
     if not btype:
         return {}
     # Search for an llvm-objdump that has AMDGCN target support.
@@ -555,7 +553,6 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     for _ver in range(20, 13, -1):
         _llvm_objdump_candidates.append(f"llvm-objdump-{_ver}")
     tool = _tool(*_llvm_objdump_candidates)
-    print(f"[hprofiler] rocm_disasm: tool={tool!r} exists={Path(binary_path).exists()}", file=_s.stderr)
     if not tool or not Path(binary_path).exists():
         return {}
     cmd = [tool, "-d", "--no-show-raw-insn"]
@@ -563,10 +560,6 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
         cmd.append("--triple=amdgcn-amd-amdhsa")
     cmd.append(binary_path)
     text = _run(cmd, timeout=60)
-    # Print the first 20 lines so we can see the actual format
-    for _i, _ln in enumerate(text.splitlines()[:20]):
-        print(f"[hprofiler] rocm_disasm line{_i}: {_ln!r}", file=_s.stderr)
-    print(f"[hprofiler] rocm_disasm: text={len(text)} chars, kernels after parse=?", file=_s.stderr)
 
     kernels: dict[str, list[DisasmLine]] = {}
     kd_names: set[str] = set()   # symbols that have a .kd descriptor = real kernel entries
@@ -602,7 +595,6 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     # Only include true kernel entry points (those with a .kd descriptor).
     # Device functions and ACPP runtime helpers do not have .kd counterparts.
     # Fall back to all non-empty symbols if the ELF has no .kd sections (older format).
-    print(f"[hprofiler] rocm_disasm: kernels={[(n, len(l)) for n,l in kernels.items()][:2]} kd_names={sorted(kd_names)[:2]}", file=_s.stderr)
     if kd_names:
         return {
             name: KernelDisasm(name=name, arch="amdgcn", source=binary_path, lines=lns)
@@ -614,6 +606,67 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
         for name, lns in kernels.items()
         if lns
     }
+
+
+def _disasm_hip_aot_binary(binary_path: str) -> dict[str, KernelDisasm]:
+    """Extract and disassemble AMDGCN kernels from a native HIP AoT binary.
+
+    hipcc embeds the GPU HSACO as a clang offload bundle inside the host ELF.
+    Uses clang-offload-bundler to unbundle it, then llvm-objdump to disassemble.
+    """
+    _bundler_candidates = [
+        "/opt/rocm/llvm/bin/clang-offload-bundler",
+        "/opt/rocm/bin/clang-offload-bundler",
+        "/opt/AdaptiveCpp/bin/clang-offload-bundler",
+        "/opt/adaptivecpp/bin/clang-offload-bundler",
+    ]
+    import glob as _gb
+    for _pat in ("/opt/rocm-*/llvm/bin/clang-offload-bundler",
+                 "/opt/rocm-*/bin/clang-offload-bundler"):
+        _bundler_candidates.extend(sorted(_gb.glob(_pat), reverse=True))
+    _bundler_candidates.append("clang-offload-bundler")
+    bundler = _tool(*_bundler_candidates)
+    if not bundler:
+        return {}
+
+    try:
+        r = subprocess.run(
+            [bundler, "--list", "--type=o", f"--input={binary_path}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode != 0:
+            return {}
+        targets = [t.strip() for t in r.stdout.splitlines()
+                   if t.strip() and "amdgcn" in t]
+    except Exception:
+        return {}
+
+    if not targets:
+        return {}
+
+    import tempfile as _tf
+    result: dict[str, KernelDisasm] = {}
+    for target in targets:
+        fd, out_path = _tf.mkstemp(suffix=".hsaco", prefix="hprofiler_fat_")
+        os.close(fd)
+        try:
+            subprocess.run(
+                [bundler, "--unbundle", "--type=o",
+                 f"--input={binary_path}", f"--output={out_path}",
+                 f"--targets={target}"],
+                capture_output=True, timeout=30,
+            )
+            if Path(out_path).exists() and Path(out_path).stat().st_size > 0:
+                for name, kd in disasm_rocm_binary(out_path).items():
+                    result.setdefault(name, kd)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+    return result
 
 
 # ── Address → symbol lookup (for OpenMP codeptr_ra) ──────────────────────────
