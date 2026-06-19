@@ -849,8 +849,10 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
     snprintf(out_path, path_cap, "/tmp/hprofiler_rocm_%d_%d.bin",
              (int)getpid(), idx);
     FILE *f = fopen(out_path, "wb");
-    if (f) { fwrite(image, 1, sz, f); fclose(f); }
-    else   { out_path[0] = '\0'; }
+    if (f) {
+        fwrite(image, 1, sz, f); fclose(f);
+        fprintf(stderr, "[hprofiler/rocm] saved %zu bytes -> %s\n", sz, out_path);
+    } else { out_path[0] = '\0'; }
 }
 
 hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {
