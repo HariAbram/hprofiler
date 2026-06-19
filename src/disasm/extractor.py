@@ -478,8 +478,15 @@ def _parse_ptx_text(text: str, source: str) -> dict[str, KernelDisasm]:
     for mangled, lns in kernels.items():
         if not lns:
             continue
-        short = _acpp_kernel_short(mangled)
-        result[short] = KernelDisasm(name=short, arch="ptx", source=source, lines=lns)
+        # Use the full mangled name as the key so it matches span names captured
+        # by the CUDA hook (cuModuleGetFunction / cuLaunchKernel).  Shortened
+        # names like "curvilinear4sg_ci_0" look nicer but break span↔disasm
+        # matching when nvdisasm/cuobjdump aren't available and PTX is the only
+        # disasm source.
+        result[mangled] = KernelDisasm(
+            name=mangled, arch="ptx", source=source,
+            mangled_name=mangled, lines=lns,
+        )
     return result
 
 
@@ -844,11 +851,10 @@ def ptxas_compile_to_sass(ptx_path: str, sm_arch: str) -> dict[str, KernelDisasm
         sass_raw = disasm_cuda_sass(cubin_path)
         result: dict[str, KernelDisasm] = {}
         for mangled, kd in sass_raw.items():
-            short = _acpp_kernel_short(mangled)
-            kd.name          = short
+            kd.name          = mangled
             kd.mangled_name  = mangled
             kd.ptxas_derived = True
-            result[short]    = kd
+            result[mangled]  = kd
         return result
     except Exception:
         return {}
