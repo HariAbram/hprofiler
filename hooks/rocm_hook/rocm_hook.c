@@ -799,13 +799,45 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
     const uint8_t *p = (const uint8_t *)image;
     size_t sz = 0;
 
-    if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F' && p[4] == 2) {
-        /* 64-bit ELF: estimate size from section header table end */
-        uint64_t shoff; memcpy(&shoff, p + 40, 8);
-        uint16_t shesz; memcpy(&shesz, p + 58, 2);
-        uint16_t shnum; memcpy(&shnum, p + 60, 2);
-        size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
-        if (end > 64 && end < 256ULL * 1024 * 1024) sz = end;
+    if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
+        int is64 = (p[4] == 2);
+        if (is64) {
+            /* 64-bit ELF: start with end of section header table, then scan
+             * each section header to include section data that may follow. */
+            uint64_t shoff; memcpy(&shoff, p + 40, 8);
+            uint16_t shesz; memcpy(&shesz, p + 58, 2);
+            uint16_t shnum; memcpy(&shnum, p + 60, 2);
+            size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
+            if (shoff > 0 && shesz >= 64 && shnum > 0 && shnum <= 32768
+                    && shoff < 256ULL*1024*1024) {
+                for (uint16_t i = 0; i < shnum; i++) {
+                    const uint8_t *shdr = p + shoff + (size_t)i * shesz;
+                    uint64_t sec_off, sec_sz;
+                    memcpy(&sec_off, shdr + 24, 8);   /* sh_offset */
+                    memcpy(&sec_sz,  shdr + 32, 8);   /* sh_size   */
+                    size_t sec_end = (size_t)(sec_off + sec_sz);
+                    if (sec_end > end && sec_end < 256ULL*1024*1024)
+                        end = sec_end;
+                }
+            }
+            if (end > 64 && end < 256ULL * 1024 * 1024) sz = end;
+        }
+    } else if (memcmp(p, "__CLANG_OFFLOAD_BUNDLE__", 24) == 0) {
+        /* Clang offload bundle: parse entry headers to find total data extent. */
+        uint64_t num_objs; memcpy(&num_objs, p + 24, 8);
+        size_t max_end = 32;
+        const uint8_t *hdr = p + 32;
+        for (uint64_t i = 0; i < num_objs && i < 1024; i++) {
+            uint64_t offset, bundle_sz, triple_sz;
+            memcpy(&offset,    hdr,      8);
+            memcpy(&bundle_sz, hdr + 8,  8);
+            memcpy(&triple_sz, hdr + 16, 8);
+            size_t sec_end = (size_t)(offset + bundle_sz);
+            if (sec_end > max_end && sec_end < 256ULL*1024*1024)
+                max_end = sec_end;
+            hdr += 24 + (size_t)triple_sz;
+        }
+        if (max_end > 24 && max_end < 256ULL*1024*1024) sz = max_end;
     } else if ((p[0] == '/' && p[1] == '/') || p[0] == '.') {
         /* PTX text */
         sz = strnlen((const char *)image, 64 * 1024 * 1024);

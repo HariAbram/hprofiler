@@ -500,25 +500,37 @@ _AMDGCN_LINE = re.compile(
 )
 
 
-def _is_amdgcn_elf(binary_path: str) -> bool:
-    """Return True iff the file is an ELF with e_machine == EM_AMDGPU (224)."""
+def _rocm_binary_type(binary_path: str) -> str:
+    """Return 'hsaco', 'bundle', or '' for unrecognised / host ELFs.
+
+    'hsaco'  — ELF64 with e_machine == EM_AMDGPU (224)
+    'bundle' — Clang offload bundle (__CLANG_OFFLOAD_BUNDLE__) containing AMDGCN
+    ''       — x86-64, ARM, or any other non-AMDGCN binary
+    """
     try:
         with open(binary_path, "rb") as f:
-            hdr = f.read(20)
-        return (len(hdr) >= 20
-                and hdr[:4] == b"\x7fELF"
-                and int.from_bytes(hdr[18:20], "little") == 224)
+            hdr = f.read(24)
+        if hdr[:24] == b"__CLANG_OFFLOAD_BUNDLE__":
+            return "bundle"
+        if len(hdr) < 4 or hdr[:4] != b"\x7fELF":
+            return ""
+        if len(hdr) >= 20 and int.from_bytes(hdr[18:20], "little") == 224:
+            return "hsaco"
+        return ""   # x86-64 or other non-AMDGCN ELF
     except OSError:
-        return False
+        return ""
 
 
 def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
-    """Disassemble an AMDGCN ELF (HSACO) with llvm-objdump.
+    """Disassemble an AMDGCN HSACO ELF or clang offload bundle with llvm-objdump.
 
-    Rejects non-AMDGCN ELFs (e.g. the host x86-64 fat binary) so that
-    calling this on the main executable never returns x86-64 host symbols.
+    Rejects x86-64 ELFs (the host fat binary) so that calling this on the
+    main executable never returns x86-64 host symbols.
+    For clang offload bundles --triple is added so llvm-objdump extracts the
+    embedded AMDGCN code object.
     """
-    if not _is_amdgcn_elf(binary_path):
+    btype = _rocm_binary_type(binary_path)
+    if not btype:
         return {}
     # Prefer the ROCm-bundled llvm-objdump which has AMDGCN target support.
     tool = _tool(
@@ -528,9 +540,11 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
     )
     if not tool or not Path(binary_path).exists():
         return {}
-    text = _run([
-        tool, "-d", "--no-show-raw-insn", binary_path,
-    ], timeout=60)
+    cmd = [tool, "-d", "--no-show-raw-insn"]
+    if btype == "bundle":
+        cmd.append("--triple=amdgcn-amd-amdhsa")
+    cmd.append(binary_path)
+    text = _run(cmd, timeout=60)
 
     kernels: dict[str, list[DisasmLine]] = {}
     kd_names: set[str] = set()   # symbols that have a .kd descriptor = real kernel entries
