@@ -494,13 +494,10 @@ def disasm_cuda_ptx(binary_path: str) -> dict[str, KernelDisasm]:
 # ── ROCm / AMDGCN ────────────────────────────────────────────────────────────
 
 _AMDGCN_SYM  = re.compile(r'^[0-9a-f]+\s+<([^>]+)>:')
-_AMDGCN_LINE = re.compile(
-    r'^\s*([0-9a-f]+):\s+'
-    r'(?:(?:[0-9a-f]{2}\s+){1,8})?'          # optional space-separated raw bytes (e.g. 06 00 00 c0)
-    r'(?:[0-9a-f]{8,16}\s+)?'                 # or optional concatenated raw insn word (e.g. c00000060000)
-    r'([a-z_][a-z0-9_]+)\s*(.*)',             # mnemonic + operands
-    re.I,
-)
+# ROCm llvm-objdump format: "\t<mnemonic>[ <operands>]  // <HEX_ADDR>: <RAW_BYTES>"
+# The address lives in the trailing C++ comment, not at the start of the line.
+_AMDGCN_LINE = re.compile(r'^\t([a-z_][a-z0-9_]+)\s*(.*)', re.I)
+_AMDGCN_ADDR = re.compile(r'//\s*([0-9a-f]+)\s*:', re.I)
 
 
 def _rocm_binary_type(binary_path: str) -> str:
@@ -588,11 +585,15 @@ def disasm_rocm_binary(binary_path: str) -> dict[str, KernelDisasm]:
         if current:
             m = _AMDGCN_LINE.match(raw)
             if m:
-                addr_s, mnem, ops = m.groups()
+                mnem, rest = m.groups()
+                # Address is in the trailing comment "// XXXXXXXX: ..."
+                addr_m = _AMDGCN_ADDR.search(rest)
+                addr = int(addr_m.group(1), 16) if addr_m else 0
+                # Strip the comment from operands
+                ops = rest.split('//')[0].strip() if '//' in rest else rest.strip()
                 try:
                     kernels[current].append(DisasmLine(
-                        addr=int(addr_s, 16), mnemonic=mnem,
-                        operands=ops.strip(),
+                        addr=addr, mnemonic=mnem, operands=ops,
                         itype=classify("amdgcn", mnem, ops), raw=raw,
                     ))
                 except ValueError:
