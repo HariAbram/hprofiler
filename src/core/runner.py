@@ -883,6 +883,17 @@ def _collect_disasm(
     except Exception:
         pass   # disasm is best-effort; never crash the profiler run
 
+    # Clean up any remaining /tmp/hprofiler_* scratch files for this PID.
+    # The extractor removes files as it processes them, but files left over
+    # from a crashed or interrupted run accumulate otherwise.
+    if profiled_pid:
+        import glob as _gl
+        for _p in _gl.glob(f"/tmp/hprofiler_*_{profiled_pid}_*"):
+            try:
+                Path(_p).unlink()
+            except OSError:
+                pass
+
 
 def _nm_symbols(so_path: str) -> dict[int, str]:
     """Return {addr: name} map from a shared object's symbol table."""

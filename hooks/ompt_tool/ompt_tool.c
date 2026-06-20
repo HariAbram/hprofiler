@@ -575,6 +575,50 @@ static void cb_target(
     }
 }
 
+/* ── ACPP SSCP .jit.so interception ─────────────────────────────────── */
+/* Intercept dlopen for ACPP SSCP .jit.so kernel libraries.
+ * Only active when libhprofiler_ompt.so is also LD_PRELOAD-ed (the OpenMP
+ * backend sets this automatically).  OMP_TOOL_LIBRARIES alone loads the
+ * library as a dlopen plugin, which does NOT put our dlopen() in the global
+ * interposition chain — LD_PRELOAD is needed for that.
+ */
+static int _jit_counter = 0;
+
+void *dlopen(const char *filename, int flags) {
+    typedef void *(*real_dlopen_t)(const char *, int);
+    static real_dlopen_t real = NULL;
+    if (!real) real = (real_dlopen_t)dlsym(RTLD_NEXT, "dlopen");
+    void *h = real ? real(filename, flags) : NULL;
+    if (!h || !filename || !strstr(filename, ".jit.so"))
+        return h;
+    int idx = __sync_fetch_and_add(&_jit_counter, 1);
+    char saved[512];
+    snprintf(saved, sizeof(saved), "/tmp/hprofiler_jit_%d_%d.so",
+             (int)getpid(), idx);
+    FILE *src = fopen(filename, "rb");
+    if (src) {
+        int ok = 0;
+        FILE *dst = fopen(saved, "wb");
+        if (dst) {
+            char buf[65536];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+                fwrite(buf, 1, n, dst);
+            fclose(dst);
+            ok = 1;
+        }
+        fclose(src);
+        if (ok) {
+            const char *base = strrchr(filename, '/');
+            char extra[640];
+            snprintf(extra, sizeof(extra), "type=jit_load,path=%s", saved);
+            emit_span("jit", gettid_compat(), now_ns(), 0,
+                      base ? base + 1 : filename, extra);
+        }
+    }
+    return h;
+}
+
 /* ── OMPT initialize / finalize ──────────────────────────────────────── */
 
 static int tool_initialize(ompt_function_lookup_t lookup,

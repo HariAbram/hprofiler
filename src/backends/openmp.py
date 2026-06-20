@@ -91,3 +91,12 @@ class OpenMPBackend(Backend):
         if not _TOOL_LIB.exists():
             return {}
         return {"OMP_TOOL_LIBRARIES": str(_TOOL_LIB)}
+
+    def preload_libs(self) -> list[str]:
+        # LD_PRELOAD the same library so the dlopen() interposer defined in
+        # ompt_tool.c is active process-wide.  OMP_TOOL_LIBRARIES alone loads
+        # the hook as a dlopen plugin into a private namespace — it does NOT
+        # place our dlopen() in the global interposition chain.
+        if not _TOOL_LIB.exists():
+            return []
+        return [str(_TOOL_LIB)]
