@@ -987,6 +987,8 @@ def collect_disasm(
     import glob as _glob
     pid_pat = str(profiled_pid) if profiled_pid else "*"
     tmp_jit = {Path(p).name: p for p in _glob.glob(f"/tmp/hprofiler_jit_{pid_pat}_*.so")}
+    # Also pick up CPU OCL binaries extracted via clGetProgramInfo.
+    tmp_jit.update({Path(p).name: p for p in _glob.glob(f"/tmp/hprofiler_ocl_{pid_pat}_*.bin")})
 
     for entry in jit_spans:
         so_path    = entry.get("so_path", "")
@@ -1008,18 +1010,18 @@ def collect_disasm(
 
         # Find the full mangled symbol.  Prefer an explicit mangled name;
         # fall back to nm-search on the saved copy.
-        # If short_name looks like a filename (.so suffix), don't pass it
-        # as a symbol search hint — search for any function instead.
+        # If short_name looks like a filename (.so/.bin suffix), don't pass
+        # it as a symbol search hint — search for any function instead.
         sym_to_extract = mangled or None
         if not sym_to_extract:
-            search_hint = "" if short_name.endswith(".so") else short_name
+            search_hint = "" if short_name.endswith((".so", ".bin")) else short_name
             sym_to_extract = _find_jit_symbol(candidate, search_hint)
 
         # Derive a human-readable kernel name from the mangled symbol.
         # This replaces filename basenames with the actual kernel name.
         if sym_to_extract:
             extracted = _acpp_kernel_short(sym_to_extract)
-            if not short_name or short_name.endswith(".so"):
+            if not short_name or short_name.endswith((".so", ".bin")):
                 short_name = extracted
 
         kd = disasm_elf(candidate, symbol=sym_to_extract, arch="x86-64")

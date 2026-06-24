@@ -755,7 +755,8 @@ def _collect_disasm(
         # OpenCL/ACPP SSCP JIT .so files
         if span.category == Category.JIT and span.tags.get("type") == "jit_load":
             so_path = span.tags.get("path", "")
-            if so_path and (".jit.so" in so_path or "hprofiler_jit_" in so_path):
+            if so_path and (".jit.so" in so_path or "hprofiler_jit_" in so_path
+                            or "hprofiler_ocl_" in so_path):
                 jit_spans.append({
                     "name":    span.name,
                     "so_path": so_path,

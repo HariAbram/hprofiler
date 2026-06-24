@@ -179,9 +179,28 @@ static GetEventProf_t g_real_prof    = NULL;
 static ReleaseEvent_t g_real_release = NULL;
 static pthread_once_t g_ecb_once     = PTHREAD_ONCE_INIT;
 
+/* ── OpenCL symbol resolver ───────────────────────────────────────────── */
+/* ACPP loads its backends with dlopen(RTLD_DEEPBIND), which places
+ * libOpenCL.so.1 in a private namespace.  RTLD_NEXT from our hook then
+ * cannot find the real cl* symbols.  This helper falls back to an explicit
+ * handle obtained via RTLD_NOLOAD, which works across namespaces.          */
+static void *find_real_ocl(const char *sym) {
+    void *f = dlsym(RTLD_NEXT, sym);
+    if (f) return f;
+    static void *s_ocl_h = NULL;
+    static int   s_tried = 0;
+    if (!s_tried) {
+        s_tried = 1;
+        s_ocl_h = dlopen("libOpenCL.so.1", RTLD_LAZY | RTLD_NOLOAD);
+        if (!s_ocl_h) s_ocl_h = dlopen("libOpenCL.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (!s_ocl_h) s_ocl_h = dlopen("libOpenCL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+    }
+    return s_ocl_h ? dlsym(s_ocl_h, sym) : NULL;
+}
+
 static void _ecb_init_fns(void) {
-    g_real_prof    = (GetEventProf_t)dlsym(RTLD_NEXT, "clGetEventProfilingInfo");
-    g_real_release = (ReleaseEvent_t)dlsym(RTLD_NEXT, "clReleaseEvent");
+    g_real_prof    = (GetEventProf_t)find_real_ocl("clGetEventProfilingInfo");
+    g_real_release = (ReleaseEvent_t)find_real_ocl("clReleaseEvent");
 }
 
 /* OpenCL event completion callback — fired on a driver thread when the
@@ -212,8 +231,8 @@ static void register_event_callback(cl_event ev,
                                     uint64_t parent_sid) {
     static SetCB_t      real_setcb  = NULL;
     static RetainEvent_t real_retain = NULL;
-    if (!real_setcb)  real_setcb  = (SetCB_t)dlsym(RTLD_NEXT, "clSetEventCallback");
-    if (!real_retain) real_retain = (RetainEvent_t)dlsym(RTLD_NEXT, "clRetainEvent");
+    if (!real_setcb)  real_setcb  = (SetCB_t)find_real_ocl("clSetEventCallback");
+    if (!real_retain) real_retain = (RetainEvent_t)find_real_ocl("clRetainEvent");
     if (!real_setcb || !ev) return;
 
     event_cb_data_t *d = (event_cb_data_t *)malloc(sizeof(*d));
@@ -228,7 +247,7 @@ static void register_event_callback(cl_event ev,
     if (real_retain) real_retain(ev);
     if (real_setcb(ev, 0 /* CL_COMPLETE */, on_event_complete, d) != CL_SUCCESS) {
         static ReleaseEvent_t real_release = NULL;
-        if (!real_release) real_release = (ReleaseEvent_t)dlsym(RTLD_NEXT, "clReleaseEvent");
+        if (!real_release) real_release = (ReleaseEvent_t)find_real_ocl("clReleaseEvent");
         if (real_retain && real_release) real_release(ev);
         free(d);
     }
@@ -239,7 +258,7 @@ static const char *get_kernel_name(cl_kernel kernel) {
     typedef cl_int (*GetKernelInfo_t)(cl_kernel, cl_uint, size_t, void*, size_t*);
     static GetKernelInfo_t real = NULL;
     static __thread char kname[256];
-    if (!real) real = (GetKernelInfo_t)dlsym(RTLD_NEXT, "clGetKernelInfo");
+    if (!real) real = (GetKernelInfo_t)find_real_ocl("clGetKernelInfo");
     if (!real || !kernel) return "<unknown>";
 #define CL_KERNEL_FUNCTION_NAME 0x1190
     real(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kname), kname, NULL);
@@ -255,7 +274,8 @@ cl_command_queue clCreateCommandQueue(
     typedef cl_command_queue (*fn_t)(cl_context, cl_device_id,
                                      cl_command_queue_properties, cl_int*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clCreateCommandQueue");
+    if (!real) real = (fn_t)find_real_ocl("clCreateCommandQueue");
+    if (!real) { if (err) *err = -6; return NULL; }
     /* Force profiling on. */
     return real(ctx, dev, props | CL_QUEUE_PROFILING_ENABLE, err);
 }
@@ -268,7 +288,8 @@ cl_command_queue clCreateCommandQueueWithProperties(
     typedef cl_command_queue (*fn_t)(cl_context, cl_device_id,
                                      const cl_command_queue_properties*, cl_int*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clCreateCommandQueueWithProperties");
+    if (!real) real = (fn_t)find_real_ocl("clCreateCommandQueueWithProperties");
+    if (!real) { if (err) *err = -6; return NULL; }
 
     /* Build a modified props array with PROFILING_ENABLE inserted.
      * Reserve 3 slots: the profiling pair + the terminating 0. */
@@ -307,7 +328,7 @@ cl_int clEnqueueNDRangeKernel(
                             const size_t*, const size_t*, const size_t*,
                             cl_uint, const cl_event*, cl_event*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clEnqueueNDRangeKernel");
+    if (!real) real = (fn_t)find_real_ocl("clEnqueueNDRangeKernel");
 
     const char *kname = get_kernel_name(kernel);
     if (g_dbg) { fprintf(g_dbg, "[opencl-hook] clEnqueueNDRangeKernel kernel=%s\n", kname); fflush(g_dbg); }
@@ -337,7 +358,7 @@ cl_int clEnqueueNDRangeKernel(
         if (our_event) {
             typedef cl_int (*ReleaseEvent_t)(cl_event);
             static ReleaseEvent_t real_release = NULL;
-            if (!real_release) real_release = (ReleaseEvent_t)dlsym(RTLD_NEXT, "clReleaseEvent");
+            if (!real_release) real_release = (ReleaseEvent_t)find_real_ocl("clReleaseEvent");
             if (real_release) real_release(*event);
         }
     }
@@ -354,7 +375,7 @@ cl_int clEnqueueSVMMemcpy(
     typedef cl_int (*fn_t)(cl_command_queue, cl_bool, void*, const void*,
                             size_t, cl_uint, const cl_event*, cl_event*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clEnqueueSVMMemcpy");
+    if (!real) real = (fn_t)find_real_ocl("clEnqueueSVMMemcpy");
     char extra[64]; snprintf(extra, sizeof(extra), "type=svm_memcpy,bytes=%zu", size);
     cl_event iev = NULL;
     if (!ev) ev = &iev;
@@ -375,7 +396,7 @@ cl_int clEnqueueReadBuffer(
     typedef cl_int (*fn_t)(cl_command_queue, cl_mem, cl_bool, size_t, size_t,
                             void*, cl_uint, const cl_event*, cl_event*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clEnqueueReadBuffer");
+    if (!real) real = (fn_t)find_real_ocl("clEnqueueReadBuffer");
 
     cl_event iev = NULL;
     if (!ev) ev = &iev;
@@ -395,7 +416,7 @@ cl_int clEnqueueWriteBuffer(
     typedef cl_int (*fn_t)(cl_command_queue, cl_mem, cl_bool, size_t, size_t,
                             const void*, cl_uint, const cl_event*, cl_event*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clEnqueueWriteBuffer");
+    if (!real) real = (fn_t)find_real_ocl("clEnqueueWriteBuffer");
 
     cl_event iev = NULL;
     if (!ev) ev = &iev;
@@ -410,6 +431,122 @@ cl_int clEnqueueWriteBuffer(
 
 /* ── clBuildProgram: tracks JIT compilation time (ACPP SSCP, etc.) ─── */
 
+/* Extract the compiled ELF binary from a successfully-built OpenCL program.
+ * CPU OpenCL backends (POCL, Intel CPU OCL) return an ELF that objdump can
+ * disassemble; GPU backends return GPU ISA — we skip those (no ELF magic).
+ * Saves to /tmp/hprofiler_ocl_<pid>_<n>.bin and emits a jit_load span so
+ * the runner's disasm extractor picks it up automatically. */
+
+/* Intel CPU OCL wraps the compiled x86 ELF in a proprietary outer ELF with
+ * e_type=0xff04 and e_version=0.  The real relocatable is in ".ocl.obj".
+ * Returns 1 and sets *out / *outsz if successfully unwrapped. */
+static int _unwrap_intel_ocl(const unsigned char *buf, size_t sz,
+                              const unsigned char **out, size_t *outsz)
+{
+    if (sz < 0x40) return 0;
+    uint16_t e_type;
+    memcpy(&e_type, buf + 0x10, 2);
+    if (e_type != 0xff04u) return 0; /* not Intel OCL wrapper */
+
+    uint64_t e_shoff;
+    uint16_t e_shentsize, e_shnum, e_shstrndx;
+    memcpy(&e_shoff,     buf + 0x28, 8);
+    memcpy(&e_shentsize, buf + 0x3a, 2);
+    memcpy(&e_shnum,     buf + 0x3c, 2);
+    memcpy(&e_shstrndx,  buf + 0x3e, 2);
+
+    if (e_shnum == 0 || e_shentsize < 64) return 0;
+    if (e_shoff + (uint64_t)e_shnum * e_shentsize > sz) return 0;
+    if (e_shstrndx >= e_shnum) return 0;
+
+    /* String table section */
+    const unsigned char *shstr_sh = buf + e_shoff + (uint64_t)e_shstrndx * e_shentsize;
+    uint64_t strtab_off, strtab_sz;
+    memcpy(&strtab_off, shstr_sh + 0x18, 8);
+    memcpy(&strtab_sz,  shstr_sh + 0x20, 8);
+    if (strtab_off + strtab_sz > sz) return 0;
+    const char *strtab = (const char *)(buf + strtab_off);
+
+    for (uint16_t i = 0; i < e_shnum; i++) {
+        const unsigned char *sh = buf + e_shoff + (uint64_t)i * e_shentsize;
+        uint32_t sh_name;
+        memcpy(&sh_name, sh, 4);
+        if (sh_name >= (uint32_t)strtab_sz) continue;
+        if (strcmp(strtab + sh_name, ".ocl.obj") != 0) continue;
+        uint64_t sh_offset, sh_size;
+        memcpy(&sh_offset, sh + 0x18, 8);
+        memcpy(&sh_size,   sh + 0x20, 8);
+        if (sh_size == 0 || sh_offset + sh_size > sz) return 0;
+        *out   = buf + sh_offset;
+        *outsz = (size_t)sh_size;
+        return 1;
+    }
+    return 0;
+}
+
+static void _extract_ocl_binary(cl_program program) {
+    typedef cl_int (*GetPI_t)(cl_program, cl_uint, size_t, void*, size_t*);
+    static GetPI_t gpi = NULL;
+    if (!gpi) gpi = (GetPI_t)find_real_ocl("clGetProgramInfo");
+    if (!gpi) return;
+
+#define _OCL_PROG_NUM_DEVICES   0x1162u
+#define _OCL_PROG_BINARY_SIZES  0x1165u
+#define _OCL_PROG_BINARIES      0x1166u
+
+    cl_uint ndev = 0;
+    cl_int r1 = gpi(program, _OCL_PROG_NUM_DEVICES, sizeof(ndev), &ndev, NULL);
+    if (r1 || ndev == 0) return;
+
+    size_t *bsizes = (size_t *)calloc(ndev, sizeof(size_t));
+    if (!bsizes) return;
+    cl_int r2 = gpi(program, _OCL_PROG_BINARY_SIZES, ndev * sizeof(size_t), bsizes, NULL);
+    if (r2) { free(bsizes); return; }
+
+    unsigned char **bins = (unsigned char **)calloc(ndev, sizeof(unsigned char *));
+    if (!bins) { free(bsizes); return; }
+    for (cl_uint i = 0; i < ndev; i++) {
+        if (bsizes[i] > 0) bins[i] = (unsigned char *)malloc(bsizes[i]);
+    }
+
+    cl_int r3 = gpi(program, _OCL_PROG_BINARIES, ndev * sizeof(unsigned char *), bins, NULL);
+    if (r3 == CL_SUCCESS) {
+        static int ocl_bin_n = 0;
+        for (cl_uint i = 0; i < ndev; i++) {
+            if (!bins[i] || bsizes[i] < 4) continue;
+            if (!(bins[i][0] == 0x7f && bins[i][1] == 'E' &&
+                  bins[i][2] == 'L'  && bins[i][3] == 'F'))
+                continue;
+            /* Peel Intel CPU OCL outer wrapper (e_type=0xff04) to get the
+             * standard x86-64 ELF relocatable stored in .ocl.obj. */
+            const unsigned char *obj_data = bins[i];
+            size_t obj_sz = bsizes[i];
+            const unsigned char *inner = NULL;
+            size_t inner_sz = 0;
+            if (_unwrap_intel_ocl(bins[i], bsizes[i], &inner, &inner_sz)) {
+                obj_data = inner;
+                obj_sz   = inner_sz;
+            }
+            int idx = __atomic_fetch_add(&ocl_bin_n, 1, __ATOMIC_RELAXED);
+            char saved[512];
+            snprintf(saved, sizeof(saved), "/tmp/hprofiler_ocl_%d_%d.bin",
+                     (int)getpid(), idx);
+            FILE *fp = fopen(saved, "wb");
+            if (fp) {
+                fwrite(obj_data, 1, obj_sz, fp);
+                fclose(fp);
+                char extra[640];
+                snprintf(extra, sizeof(extra), "type=jit_load,path=%s", saved);
+                emit_span("jit", gettid_compat(), now_ns(), 0, "ocl_kernel.bin", extra);
+            }
+        }
+    }
+
+    for (cl_uint i = 0; i < ndev; i++) free(bins[i]);
+    free(bins);
+    free(bsizes);
+}
+
 cl_int clBuildProgram(
     cl_program program, cl_uint num_devices, const cl_device_id *device_list,
     const char *options, void (*pfn_notify)(cl_program, void*), void *user_data)
@@ -417,12 +554,13 @@ cl_int clBuildProgram(
     typedef cl_int (*fn_t)(cl_program, cl_uint, const cl_device_id*,
                             const char*, void(*)(cl_program,void*), void*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clBuildProgram");
+    if (!real) real = (fn_t)find_real_ocl("clBuildProgram");
 
     uint64_t t0 = now_ns();
     cl_int ret = real(program, num_devices, device_list, options, pfn_notify, user_data);
     emit_span("jit", gettid_compat(), t0, now_ns()-t0,
               "clBuildProgram", ret == CL_SUCCESS ? "status=ok" : "status=err");
+    if (ret == CL_SUCCESS) _extract_ocl_binary(program);
     return ret;
 }
 
@@ -436,7 +574,7 @@ cl_int clCompileProgram(
                             const char*, cl_uint, const cl_program*,
                             const char**, void(*)(cl_program,void*), void*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clCompileProgram");
+    if (!real) real = (fn_t)find_real_ocl("clCompileProgram");
 
     uint64_t t0 = now_ns();
     cl_int ret = real(program, num_devices, device_list, options,
@@ -452,7 +590,7 @@ cl_int clCompileProgram(
 cl_int clFinish(cl_command_queue queue) {
     typedef cl_int (*fn_t)(cl_command_queue);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clFinish");
+    if (!real) real = (fn_t)find_real_ocl("clFinish");
     uint64_t t0 = now_ns();
     cl_int ret = real ? real(queue) : -1;
     emit_span("sync", gettid_compat(), t0, now_ns()-t0, "clFinish", "type=sync");
@@ -462,7 +600,7 @@ cl_int clFinish(cl_command_queue queue) {
 cl_int clWaitForEvents(cl_uint num_events, const cl_event *event_list) {
     typedef cl_int (*fn_t)(cl_uint, const cl_event*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clWaitForEvents");
+    if (!real) real = (fn_t)find_real_ocl("clWaitForEvents");
     char extra[64]; snprintf(extra, sizeof(extra), "type=sync,count=%u", num_events);
     uint64_t t0 = now_ns();
     cl_int ret = real ? real(num_events, event_list) : -1;
@@ -496,7 +634,7 @@ cl_mem clCreateBuffer(cl_context ctx, cl_mem_flags flags, size_t size,
                        void *host_ptr, cl_int *err) {
     typedef cl_mem (*fn_t)(cl_context, cl_mem_flags, size_t, void*, cl_int*);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clCreateBuffer");
+    if (!real) real = (fn_t)find_real_ocl("clCreateBuffer");
     uint64_t t0 = now_ns();
     cl_mem ret = real ? real(ctx, flags, size, host_ptr, err) : NULL;
     uint64_t dur = now_ns() - t0;
@@ -520,7 +658,7 @@ cl_mem clCreateBuffer(cl_context ctx, cl_mem_flags flags, size_t size,
 cl_int clReleaseMemObject(cl_mem memobj) {
     typedef cl_int (*fn_t)(cl_mem);
     static fn_t real = NULL;
-    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "clReleaseMemObject");
+    if (!real) real = (fn_t)find_real_ocl("clReleaseMemObject");
     pthread_mutex_lock(&g_cl_alloc_mtx);
     for (int i = 0; i < g_cl_alloc_n; i++) {
         if (g_cl_allocs[i].handle == memobj) {
