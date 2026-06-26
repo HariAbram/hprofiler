@@ -143,14 +143,16 @@ static int ev_ok(void) {
     return f_evCreate && f_evRecord && f_evElapsed && f_evDestroy && f_evSync;
 }
 
-/* Record a GPU-accurate span: create events before and after the call. */
+/* Record a GPU-accurate span: create events before and after the call.
+ * _t0 is captured BEFORE f_evRecord so the CPU timestamp is never later
+ * than the GPU start event (timestamp ordering fix). */
 #define GPU_SPAN_BEGIN(stream)                          \
+    uint64_t _t0 = now_ns();                            \
     cudaEvent_t _ev_s = NULL, _ev_e = NULL;             \
     int _gpu_ok = ev_ok() &&                            \
         f_evCreate(&_ev_s) == 0 &&                      \
         f_evCreate(&_ev_e) == 0 &&                      \
-        f_evRecord(_ev_s, (stream)) == 0;               \
-    uint64_t _t0 = now_ns();
+        f_evRecord(_ev_s, (stream)) == 0;
 
 #define GPU_SPAN_END(cat, name, extra, stream)                          \
     if (_gpu_ok) {                                                       \

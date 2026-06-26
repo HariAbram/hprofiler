@@ -388,10 +388,11 @@ static void pk_commit(cudaEvent_t ev_s, cudaEvent_t ev_e,
                       cudaStream_t stream,
                       const char *cat, const char *kname, const char *extra,
                       uint64_t t0, pid_t tid) {
+    /* Record the end event BEFORE taking the mutex so we never call a
+     * CUDA API function while holding g_pk_mutex (deadlock risk fix). */
+    f_evRecord(ev_e, stream);
     pthread_mutex_lock(&g_pk_mutex);
     if (g_pk_n < MAX_PENDING) {
-        /* Record the end event only after we know the slot is available. */
-        f_evRecord(ev_e, stream);
         PendingKernel *pk = &g_pk[g_pk_n++];
         pk->ev_start = ev_s; pk->ev_end = ev_e;
         pk->stream = stream; pk->cpu_start_ns = t0; pk->tid = tid;
@@ -757,8 +758,11 @@ static void _save_cubin(const void *image) {
         size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
         if (end > 64 && end < 512ULL*1024*1024) sz = end;
     } else if ((p[0]=='/' && p[1]=='/') || p[0]=='.') {
+        /* PTX text: include null terminator only if string ends within the
+         * limit; if strnlen returns the limit the string may be unterminated
+         * and adding 1 would read past the mapped region (off-by-one fix). */
         sz = strnlen((const char *)image, 64*1024*1024);
-        if (sz > 0) sz++;
+        if (sz > 0 && sz < 64*1024*1024) sz++;
     }
     FILE *f = fopen(path, "wb");
     if (f) { fwrite(image, 1, sz, f); fclose(f); }

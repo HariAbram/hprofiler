@@ -165,7 +165,8 @@ Pass `--disasm` to collect post-run per-kernel disassembly (runs in background, 
 | CUDA JIT (ACPP) | Built-in PTX parser |
 | ROCm | `llvm-objdump` (`apt install llvm`) |
 | CPU / OpenMP | `capstone` (`pip install capstone`) or `objdump` |
-| OpenCL JIT | `objdump` on the `.jit.so` emitted by ACPP SSCP |
+| OpenCL JIT (ACPP SSCP generic) | `objdump` on the `.jit.so` emitted by ACPP SSCP |
+| OpenCL CPU (Intel CPU OCL) | `objdump` on x86-64 ELF extracted via `clGetProgramInfo` |
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for the full CLI reference, backend details, wire protocol, and how to extend the profiler.
 

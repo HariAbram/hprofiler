@@ -917,9 +917,10 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
         }
         if (max_end > 24 && max_end < 256ULL*1024*1024) sz = max_end;
     } else if ((p[0] == '/' && p[1] == '/') || p[0] == '.') {
-        /* PTX text */
+        /* PTX text: include null terminator only if the string ends within
+         * the limit (off-by-one fix: sz++ past mapped region at exact 64MB). */
         sz = strnlen((const char *)image, 64 * 1024 * 1024);
-        if (sz > 0) sz++;
+        if (sz > 0 && sz < 64 * 1024 * 1024) sz++;
     }
     if (sz == 0) return;
 

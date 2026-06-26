@@ -471,7 +471,10 @@ Injects `libhprofiler_cuda.so` via `LD_PRELOAD` to wrap CUDA API calls.
 | `nvtxRangePushA/W/Ex` + `nvtxRangePop` | `nvtx` | `type=nvtx_range` |
 
 **GPU-accurate kernel timing:** The hook creates `cudaEvent_t` pairs around
-each kernel launch. At each sync point the pending events are flushed and
+each kernel launch. The end-of-kernel event is recorded (`cuEventRecord`)
+*before* acquiring the pending-kernel mutex so that no CUDA API call is ever
+made while holding a lock — avoiding potential deadlock with CUDA's internal
+serialisation. At each sync point the pending events are flushed and
 `cudaEventElapsedTime` gives the true GPU execution time.
 
 **NVTX range interception:** Fully replaced — no `libnvToolsExt.so` required.
@@ -526,10 +529,46 @@ hprofiler run --backend cuda --disasm --gpu-pc-sampling -- ./my_cuda_program
 
 Injects `libhprofiler_opencl.so` via `LD_PRELOAD`. Forces
 `CL_QUEUE_PROFILING_ENABLE` on every queue, captures GPU-side kernel and
-buffer-transfer timestamps, and emits `jit` spans for `clBuildProgram`.
+buffer-transfer timestamps via event callbacks, and emits `jit` spans for
+`clBuildProgram`.
+
+**Wrapped functions:**
+
+| Function | Category | What is captured |
+|----------|----------|-----------------|
+| `clCreateCommandQueue` / `clCreateCommandQueueWithProperties` | — | Forces `CL_QUEUE_PROFILING_ENABLE` on every queue |
+| `clEnqueueNDRangeKernel` / `clEnqueueTask` | `opencl` | GPU-side kernel duration from `CL_PROFILING_COMMAND_START/END` |
+| `clEnqueueReadBuffer` / `clEnqueueWriteBuffer` / `clEnqueueCopyBuffer` | `opencl` | Buffer transfer timing |
+| `clBuildProgram` | `jit` | JIT compile time; extracts compiled binary for disassembly |
+| `clFinish` / `clWaitForEvents` | `sync` | Host-side synchronisation barriers |
+
+**JIT binary extraction for disassembly:** After every successful `clBuildProgram`
+call the hook calls `clGetProgramInfo(CL_PROGRAM_BINARIES)` to retrieve the
+compiled binary. The binary is saved to `/tmp/hprofiler_ocl_<pid>_<n>.bin` and
+a `jit_load` span is emitted so the disassembly extractor picks it up.
+
+- **ACPP SSCP / POCL:** the binary is a standard ELF relocatable — `objdump`
+  reads it directly.
+- **Intel CPU OCL (`libintelocl.so`):** the driver wraps the compiled x86-64 ELF
+  inside a proprietary outer ELF (`e_type = 0xff04`). The hook's
+  `_unwrap_intel_ocl()` function detects this format, locates the `.ocl.obj`
+  section (a standard `elf64-x86-64` relocatable), and saves only that inner
+  object — making it readable by `nm` and `objdump` for the Disasm tab.
+
+**RTLD_DEEPBIND compatibility:** ACPP loads its OCL backend
+(`librt-backend-ocl.so`) in a private `RTLD_DEEPBIND` namespace, which causes
+`dlsym(RTLD_NEXT, "cl...")` to return NULL inside the hook. The hook's
+`find_real_ocl()` helper falls back to `dlopen("libOpenCL.so.1", RTLD_NOLOAD)`
+(which works across namespaces) to resolve real OpenCL symbols even when the
+library is not visible via `RTLD_NEXT`. The fallback handle is opened exactly
+once via `pthread_once` — safe when multiple driver threads call into the hook
+concurrently at startup.
 
 ```bash
 hprofiler run --backend opencl -- ./my_ocl_program
+
+# ACPP SYCL targeting Intel CPU OCL with disassembly
+ACPP_VISIBILITY_MASK=ocl hprofiler run --backend opencl,cpu --disasm -- ./app
 ```
 
 ---
@@ -551,6 +590,8 @@ Tools Interface (OMPT).
 | `ompt_callback_target begin/end` | `openmp` | GPU offload spans |
 
 **Note on task callbacks:** `task_create` and `task_schedule` use enum values 5 and 6 per the OpenMP 5.0 specification. `task_create` is called from user-code context so call-tree capture works for it. `task_schedule` is called from the runtime worker thread, so its call stack does not include `main` even with `--call-tree`.
+
+**Thread-safe startup:** All OpenMP worker threads start simultaneously at thread-pool creation. The `cb_thread_begin` callback is invoked concurrently on every worker. The hook serialises socket initialisation inside this callback with `g_sock_mutex` so exactly one thread performs `connect()` regardless of pool size.
 
 **Critical requirement:** The profiled program must link against **LLVM's
 `libomp`**, not GCC's `libgomp`. GCC's `libgomp` on Ubuntu 24.04 does not
@@ -617,6 +658,10 @@ Up to 512 streams are tracked; beyond that, spans are tagged `stream=-1`.
 
 **Group operations:** `ncclGroupStart` / `ncclGroupEnd` nest correctly — only
 the outermost pair emits a `ncclGroup` span covering the full group duration.
+
+**GPU timing accuracy:** The CPU timestamp for each NCCL collective is captured
+*before* `cuEventRecord` is called on the start event. This ensures the wall-clock
+anchor never falls after the GPU start, keeping CPU and GPU timelines consistent.
 
 **Requirements:** CUDA Runtime (`libcuda.so`) must be loaded in the same
 process for GPU-accurate timing. NCCL itself need not be present at build time.
@@ -1079,7 +1124,22 @@ hprofiler run --backend opencl,cpu -- ./acpp_sscp_program
 ```
 
 OpenCL queues get profiling forced on. `clBuildProgram` time appears as `jit`
-spans. For SSCP CPU execution, add `--backend cpu` for actual compute timing.
+spans. After each successful build the hook extracts the compiled binary via
+`clGetProgramInfo(CL_PROGRAM_BINARIES)` and saves it to
+`/tmp/hprofiler_ocl_<pid>_<n>.bin` for post-run disassembly.
+
+**ACPP SSCP generic target:** ACPP compiles each SYCL lambda to a separate
+`clBuildProgram` call. Five kernels produce five `.bin` files, each containing
+one ACPP kernel symbol (`_Z18__acpp_sscp_kernel...`). The disasm extractor
+uses `nm` to find the symbol and `objdump` to disassemble it, then
+`_acpp_kernel_short()` produces a readable short name (e.g.
+`curvilinear4sg_ci::$_0`).
+
+**Intel CPU OCL (`libintelocl.so`):** The Intel driver returns a proprietary
+outer ELF wrapper (`e_type = 0xff04`) from `clGetProgramInfo`. The hook
+automatically unwraps it — locating the `.ocl.obj` section which is a standard
+`elf64-x86-64` relocatable — and saves only the inner object. Standard tools
+(`nm`, `objdump`) can then read it normally.
 
 **OpenCL CPU runtime — instruction-level profiling:**
 
@@ -1096,6 +1156,7 @@ ACPP_VISIBILITY_MASK=ocl \
 
 This combination gives you:
 - **OpenCL event timing** (GPU-accurate kernel duration from `clGetEventProfilingInfo`)
+- **Per-kernel disassembly** (x86-64 assembly extracted from `clGetProgramInfo`)
 - **CPU sampling** (which CPU functions are hot during kernel execution)
 - **Instruction heat** (per-instruction sample % for the JIT-compiled kernel body)
 
@@ -1114,7 +1175,8 @@ passed. Collection runs in a background thread — the TUI is not blocked.
 | CUDA JIT (ACPP) | PTX from `cuModuleLoadData` | Built-in PTX parser | `ptx` |
 | ROCm AoT | ELF sections | `llvm-objdump` | `amdgcn` |
 | ROCm JIT (ACPP) | AMDGCN ELF from `hipModuleLoadData` | `llvm-objdump` | `amdgcn` |
-| OpenCL JIT | `.jit.so` emitted by ACPP SSCP | `objdump` | `x86-64` / `aarch64` |
+| OpenCL JIT (ACPP SSCP generic) | `.jit.so` emitted by ACPP SSCP | `objdump` | `x86-64` / `aarch64` |
+| OpenCL CPU (Intel CPU OCL) | x86-64 ELF from `clGetProgramInfo`, inner `.ocl.obj` section unwrapped from Intel's proprietary outer ELF | `nm` + `objdump` | `x86-64` |
 | OpenMP / CPU | ELF symbol at `codeptr_ra` | `capstone` (fast) or `objdump` | `x86-64` / `aarch64` / `rv64` |
 
 > **Requirement for source-line annotation:** compile your binary with `-g` (full debug) or at minimum `-lineinfo` (`nvcc -lineinfo`) to embed DWARF line tables. Without debug info, source file:line annotations are silently skipped — disassembly still works, but no `// file.cpp:42` comments appear in the Disasm tab.
@@ -1201,9 +1263,12 @@ record` pass. It outputs per-instruction sample percentages, which are stored
 in `DisasmLine.sample_pct` and displayed in the Heat column of the Disasm tab.
 
 For SYCL programs using the OpenCL CPU runtime (`ACPP_VISIBILITY_MASK=ocl`),
-kernels compile to JIT x86-64 code and are profiled by `perf` like any native
-CPU function. Use `--backend opencl,cpu --disasm` to get both OpenCL event
-timing and instruction-level heat:
+kernels compile to JIT x86-64 code executed via the Intel CPU OCL driver. The
+hook extracts the compiled x86-64 ELF from `clGetProgramInfo(CL_PROGRAM_BINARIES)`
+after each `clBuildProgram` — automatically unwrapping Intel's proprietary outer
+ELF wrapper — so disassembly is available with no extra tooling. Adding
+`--backend cpu` also profiles the kernels with `perf record`, providing
+instruction-level heat annotation:
 
 ```bash
 ACPP_VISIBILITY_MASK=ocl hprofiler run --backend opencl,cpu --disasm -- ./app
@@ -1320,6 +1385,9 @@ advisor runs for every kernel in the Disasm tab when the kernel is selected.
 - **CUDA AoT:** install `cuobjdump` from the CUDA toolkit.
 - **CPU/OpenMP fast path:** install `capstone >= 5.0` (`pip install capstone`).
 - **ROCm disasm:** install `llvm-objdump` (`apt install llvm`).
+- **OpenCL Intel CPU disasm:** no extra tools needed — `objdump` (GNU binutils)
+  is sufficient. The hook extracts a standard ELF relocatable from the driver
+  automatically. Use `--backend opencl --disasm` (add `cpu` for instruction heat).
 - **Instruction-mix percentages** always count the complete function, including
   instructions not visible due to the 500-line display cap.
 - **CUDA heat map:** add `--gpu-pc-sampling` to a `--disasm` run for AoT-compiled (NVCC fatbinary) kernels. Has no effect on JIT/PTX kernels — a warning is printed in that case.
@@ -1443,7 +1511,7 @@ flowchart TB
 
         TRACE --> J & S & T
 
-        D["Disasm Collector  —  background thread\n──────────────────────────────────────\nCUDA    →  cuobjdump  SASS / PTX\nROCm    →  llvm-objdump  AMDGCN\nOpenCL  →  objdump  .jit.so\nCPU/OMP →  capstone  x86-64 / AArch64 / rv64\nACPP    →  PTX symbol demangling"]
+        D["Disasm Collector  —  background thread\n──────────────────────────────────────\nCUDA         →  cuobjdump  SASS / PTX\nROCm         →  llvm-objdump  AMDGCN\nOpenCL SSCP  →  objdump  .jit.so\nOpenCL Intel →  objdump  .ocl.obj (unwrapped from clGetProgramInfo)\nCPU/OMP      →  capstone  x86-64 / AArch64 / rv64\nACPP         →  PTX symbol demangling"]
 
         RF["profiler roofline\n──────────────\nncu   (CUDA)\nrocprof   (ROCm)\nperf stat   (CPU/OMP)\n→ HTML chart"]
 
@@ -1476,11 +1544,15 @@ flowchart TB
 4. The Python receiver matches `stk:` records to their preceding `span:` by `(pid, tid, start_ns)` and attaches the call stack to the `SpanEvent`.
 5. After the process exits, the `Trace` is serialized to Chrome Trace JSON.
 5. When `--disasm` is passed, a background thread starts `_collect_disasm`:
-   - CUDA: parses PTX/cubin blobs from `/tmp/hprofiler_cubin_*.bin`
-   - ROCm: parses AMDGCN blobs from `/tmp/hprofiler_rocm_*.bin`
-   - OpenCL JIT: disassembles ACPP `.jit.so` files
+   - CUDA: parses PTX/cubin blobs from `/tmp/hprofiler_cubin_<pid>_*.bin`
+   - ROCm: parses AMDGCN blobs from `/tmp/hprofiler_rocm_<pid>_*.bin`
+   - OpenCL SSCP: disassembles ACPP `.jit.so` files
+   - OpenCL Intel CPU: disassembles `/tmp/hprofiler_ocl_<pid>_*.bin` — standard
+     x86-64 ELF relocatables extracted and unwrapped from the Intel OCL driver
    - OpenMP/CPU: resolves `sym=` / `lib=,offset=` tags to ELF symbols; auto-detects
      x86-64, AArch64, or RISC-V from `e_machine`; uses capstone (fast) or objdump
+   - All `/tmp/hprofiler_*_<pid>_*` scratch files are deleted after processing;
+     any left over from a crashed run are cleaned up at the end of the next run
 6. After disassembly, `_collect_disasm` runs annotation passes:
    - CPU/OpenCL-CPU kernels: `annotate_with_perf(kd, perf_data)` — runs `perf annotate`
      and sets `DisasmLine.sample_pct` from the `perf.data` recording (then deletes it).
@@ -1517,22 +1589,32 @@ All timestamps are **absolute nanoseconds** from `CLOCK_MONOTONIC`.
 
 ### `src/core/trace.py` — Trace container
 
-`Trace` provides: `spans`, `instants`, `counters` views; `aggregated_stats()`
-(grouped by name+category, sorted by total time); `lanes()` (per-stream lanes
-for CUDA/ROCm, per-thread for others); `disasm` dict populated post-run.
+`Trace` is **fully thread-safe**. A `threading.Lock` (`_lock`) guards all
+mutable state. The socket receive thread writes via `add()`, `add_disasm()`,
+and `add_pc_sample()`; the TUI thread reads via the properties and analysis
+helpers; the disassembly background thread writes via `add_disasm()`. All
+three can operate concurrently without races.
+
+- `spans`, `instants`, `counters`, `all_events` — return **list copies** taken
+  under the lock, safe to iterate after the call returns.
+- `disasm` — returns a **dict copy** taken under the lock.
+- `aggregated_stats()`, `top_spans()`, `spans_by_category()`, `lanes()` — each
+  calls `self.spans` (which takes a snapshot) then computes without holding the
+  lock, keeping the lock held only for the brief copy.
 
 `TraceMetadata` stores command, args, backends, hostname, and `cwd` (working
 directory at run time — used to resolve relative binary paths when reloading).
 
 Additional fields used by instruction-level annotation:
 
-- `_disasm_version: int` — incremented on every `add_disasm()` call. The TUI
-  Disasm poller compares this value each tick; a change means either a new
-  kernel was added *or* existing `DisasmLine` fields (heat, stall) were updated
-  by annotation, and the view is refreshed accordingly.
+- `_disasm_version: int` — incremented on every `add_disasm()` call (under the
+  lock). The TUI Disasm poller compares this value each tick; a change means
+  either a new kernel was added *or* existing `DisasmLine` fields (heat, stall)
+  were updated by annotation, and the view is refreshed accordingly.
 - `_pc_samples: dict[str, list[tuple[int, int, int]]]` — per-function list of
   `(pc_offset, stall_reason, count)` tuples accumulated from `pcsa:` socket
-  records. Consumed by `annotate_with_cupti` after disassembly is complete.
+  records. Protected by `_lock`; consumed by `annotate_with_cupti` after
+  disassembly is complete.
 - `add_pc_sample(func_name, pc_offset, stall_reason, count)` — appends a CUPTI
   PC sample record; called from the socket receive loop when a `pcsa:` line
   arrives.
@@ -1554,6 +1636,16 @@ Instead, `_collect_disasm` receives the path as `perf_data` and calls
 `finally` block. This preserves the recording for post-run annotation without
 keeping it on disk longer than necessary.
 
+**MPI scalability:** The `client_threads` list that tracks one thread per
+accepted rank-connection is pruned automatically when it exceeds 50 entries,
+keeping memory bounded for large MPI jobs (hundreds of ranks × hundreds of
+profiling runs).
+
+**perf script parser:** The `_parse_perf_script` function resets `cur_ts` to
+zero immediately after flushing a stack sample, preventing duplicate CPU spans
+if two consecutive sample headers appear without a blank-line separator between
+them (a rare but valid output from some `perf script` versions).
+
 ### `src/disasm/extractor.py` — Disassembly engine
 
 | Function | Purpose |
@@ -1569,6 +1661,15 @@ keeping it on disk longer than necessary.
 | `_acpp_kernel_short(mangled)` | Demangle ACPP kernel name |
 | `annotate_with_perf(kd, perf_data)` | Run `perf annotate` against `perf.data`; set `DisasmLine.sample_pct` on matching addresses |
 | `annotate_with_cupti(kd, samples)` | Match `(pc_offset, stall_reason, count)` tuples to `DisasmLine.addr`; set `sample_pct`, `stall_cycles`, `stall_reason` |
+
+**Intel CPU OCL binary handling:** The JIT span collector globs
+`/tmp/hprofiler_ocl_<pid>_*.bin` alongside the ACPP `.jit.so` files. These
+`.bin` files are standard `elf64-x86-64` relocatables (the Intel OCL wrapper
+has already been stripped by the hook's `_unwrap_intel_ocl()`). They are
+treated identically to `.jit.so` files: `nm` finds the kernel symbol,
+`objdump` (or capstone) disassembles the `.ltext` section, and
+`_acpp_kernel_short()` produces a readable display name. The file is deleted
+from `/tmp` after processing.
 
 `_disasm_elf_capstone` reads only the target function's bytes (ELF section
 header walk, no subprocess). Typical time: ~40ms regardless of binary size.
@@ -1707,7 +1808,7 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | `openmp` | `lib=<path>,offset=0x<n>` | Library + static offset (fallback) |
 | `openmp` | `type=work,count=N` | Work-sharing iteration count |
 | `nvtx` | `type=nvtx_range` | NVTX push/pop range |
-| `jit` | `type=jit_load,path=<so>` | ACPP SSCP `.jit.so` loaded |
+| `jit` | `type=jit_load,path=<file>` | ACPP SSCP `.jit.so` or Intel CPU OCL `.bin` extracted from `clGetProgramInfo` |
 | `nccl` | `type=allreduce\|broadcast\|...` | Collective type |
 | `nccl` | `bytes=N,stream=ID` | Transfer size and CUDA stream |
 | `nccl` | `type=group` | `ncclGroupStart/End` boundary |
@@ -1748,10 +1849,14 @@ build a root→leaf call path.
 | Built with libunwind | `unw_step` loop | `libunwind-dev` at build time |
 | Fallback | glibc `backtrace()` | Binary built with `-fno-omit-frame-pointer` |
 
-C++ names are demangled via `__cxa_demangle`. Hook and runtime frames are
-filtered out via a prefix skip-list (`libhprofiler_`, `libcuda`, `libmpi`,
-`libgomp`, `libomp`, etc.). Characters `|` and `;` within names are replaced
-with `,` to preserve the field/frame separator semantics.
+C++ names are demangled via `__cxa_demangle`. The function pointer is resolved
+once in `cs_init()` (the hook constructor) via `dlsym(RTLD_DEFAULT,
+"__cxa_demangle")` — never lazily inside `emit_callstack()` while the socket
+mutex is held, which would risk deadlock with an allocator that also holds an
+internal lock. Hook and runtime frames are filtered out via a prefix skip-list
+(`libhprofiler_`, `libcuda`, `libmpi`, `libgomp`, `libomp`, etc.). Characters
+`|` and `;` within names are replaced with `,` to preserve the field/frame
+separator semantics.
 
 **Set by** `--call-tree` flag → `HPROFILER_CALLSTACK=1` in the child environment.
 
@@ -1947,6 +2052,9 @@ The TUI remains responsive at 250k spans at all zoom levels.
 | **OpenCL semantic depth** | OpenCL only shows host-API events (kernel name, memcpy size). Intra-kernel constructs (barriers, local memory, work-group size) are not visible. OpenMP shows construct-level detail via OMPT. | Expected: OpenCL has no host-visible construct callback API. |
 | **NVTX v3** | NVTX v3 (header-only, inline-expanded API) is not intercepted by LD_PRELOAD. Only NVTX v2 (library-dispatched) calls are captured. | Compile with `NVTX_DISABLE` or use `nvtxRangePushA` (v2 path). |
 | **snprintf truncation** | Span records longer than 2048 bytes (e.g., extremely long kernel names + many tags) are silently dropped. | Unlikely in practice; kernel names from `nm`/CUDA are typically < 256 chars. |
+| **Static CUDA runtime** | Binaries linked with `libcudart_static.a` (nvcc default) show 0 events because LD_PRELOAD cannot intercept compile-time-resolved `cudaXxx` symbols. `--gpu-pc-sampling` has the same requirement. | Rebuild with `-cudart shared` (no runtime-performance impact). |
+| **Device bandwidth estimates** | The roofline `device.py` memory-bandwidth formula under-reports peak bandwidth by ~2× for HBM-based cards (A100, H100, MI300). | Treat bandwidth peaks in the System tab as conservative estimates; check vendor datasheets for exact numbers. |
+| **ROCm PC sampling** | `--gpu-pc-sampling` is silently ignored for ROCm runs. Instruction-level heat annotation requires `librocprofiler-sdk.so` integration (not yet implemented). | Use CUDA backend for instruction-level GPU heat. |
 
 ---
 
@@ -2266,6 +2374,17 @@ Results from the new run would be loaded into a secondary `Trace` and made avail
 
 All profiling data sent to the LLM includes:
 
+- Kernel/function names from the profiled binary
+- Timing and counter data
+- Hostname, command-line arguments, and backends used
+
+**Ollama is fully local** — no data leaves your machine. For cloud providers
+(Anthropic, OpenAI, any openai-compat endpoint), review the provider's data
+handling policy before profiling sensitive workloads.
+
+To avoid sending sensitive argument values, use `--no-summary` and review what
+`context_to_str()` would include for your trace before enabling cloud analysis.
+
 ---
 
 ## 16. Call-Path Analysis, CCT, and GPU Starvation
@@ -2474,16 +2593,10 @@ hprofiler run --backend cuda,cpu -- ./sim --steps 100
 #   → If launch_gap_pct > 30%, investigate what the CPU does between launches
 
 # Step 3: enable call trees to attribute GPU time to source locations
-HPROFILER_CALLSTACK=1 hprofiler run --backend cuda --call-tree -- ./sim --steps 10
+hprofiler run --backend cuda --call-tree -- ./sim --steps 10
 #   → The CCT section in the summary shows which functions are launching hot kernels
+#   → (--call-tree sets HPROFILER_CALLSTACK=1 automatically)
 
 # Step 4: check the Call Tree tab in the TUI for full call-path detail
 #   → Drill down to find the exact file:line responsible for each bottleneck
 ```
-- Kernel/function names from the profiled binary
-- Timing and counter data
-- Hostname, command-line arguments, and backends used
-
-**Ollama is fully local** — no data leaves your machine. For cloud providers (Anthropic, OpenAI, any openai-compat endpoint), review the provider's data handling policy before profiling sensitive workloads.
-
-To avoid sending sensitive argument values, use `--no-summary` and review what `context_to_str()` would include for your trace before enabling cloud analysis.

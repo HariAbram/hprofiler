@@ -43,9 +43,16 @@
 /* Defined here (static) — one instance per compilation unit. */
 static int g_callstack = 0;
 
+typedef char *(*_cs_dem_fn_t)(const char *, char *, size_t *, int *);
+static _cs_dem_fn_t s_dem = NULL;
+
 static void cs_init(void)
 {
     g_callstack = !!getenv("HPROFILER_CALLSTACK");
+    /* Resolve __cxa_demangle eagerly so emit_callstack never calls dlsym
+     * while holding g_sock_mutex (dlsym can call malloc which may acquire
+     * an internal lock, risking deadlock with allocator hooks). */
+    s_dem = (_cs_dem_fn_t)dlsym(RTLD_DEFAULT, "__cxa_demangle");
 }
 
 /* Libraries whose frames should be stripped from the captured stack. */
@@ -91,11 +98,7 @@ static void emit_callstack(uint64_t start_ns)
 {
     if (!g_callstack) return;
 
-    /* Locate __cxa_demangle once via dlsym — available if the target links C++. */
-    typedef char *(*dem_fn_t)(const char *, char *, size_t *, int *);
-    static dem_fn_t s_dem = (dem_fn_t)(uintptr_t)1; /* sentinel = not yet looked up */
-    if (s_dem == (dem_fn_t)(uintptr_t)1)
-        s_dem = (dem_fn_t)dlsym(RTLD_DEFAULT, "__cxa_demangle");
+    /* s_dem is pre-resolved in cs_init() — never call dlsym under the mutex. */
 
     char buf[8192];
     int pos = snprintf(buf, sizeof(buf), "stk:%d:%d:%llu:",

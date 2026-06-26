@@ -284,6 +284,9 @@ class Runner:
                     t = threading.Thread(target=handle_client, args=(client,), daemon=True)
                     t.start()
                     client_threads.append(t)
+                    # Prune finished threads to prevent unbounded growth for large MPI jobs
+                    if len(client_threads) > 50:
+                        client_threads[:] = [th for th in client_threads if th.is_alive()]
                 except sock_mod.timeout:
                     continue
                 except Exception:
@@ -1039,6 +1042,7 @@ def _parse_perf_script(perf_data: str, trace: Trace) -> None:
                 _flush()
                 cur_stack = []
                 cur_top_sym = ""
+                cur_ts = 0  # reset so back-to-back headers don't double-flush
             try:
                 cur_pid = int(m.group(2))
                 cur_tid = int(m.group(3)) if m.group(3) else cur_pid

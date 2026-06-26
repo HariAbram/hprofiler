@@ -315,7 +315,11 @@ static uint64_t              g_parallel_id_seq = 1;
 /* ── Callbacks ───────────────────────────────────────────────────────── */
 
 static void cb_thread_begin(ompt_thread_t type, ompt_data_t *thread_data) {
+    /* All OpenMP worker threads start concurrently; must hold the socket mutex
+     * so that g_sock is initialised by exactly one thread (race fix). */
+    pthread_mutex_lock(&g_sock_mutex);
     ensure_connected();
+    pthread_mutex_unlock(&g_sock_mutex);
     (void)type; (void)thread_data;
 }
 
@@ -602,10 +606,12 @@ void *dlopen(const char *filename, int flags) {
         if (dst) {
             char buf[65536];
             size_t n;
-            while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
-                fwrite(buf, 1, n, dst);
-            fclose(dst);
             ok = 1;
+            while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+                if (fwrite(buf, 1, n, dst) != n) { ok = 0; break; }
+            }
+            fclose(dst);
+            if (!ok) remove(saved);
         }
         fclose(src);
         if (ok) {

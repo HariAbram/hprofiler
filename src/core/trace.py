@@ -5,6 +5,7 @@ Provides analysis helpers (totals, top-N, flame-graph data).
 
 from __future__ import annotations
 import heapq
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -28,6 +29,7 @@ class Trace:
 
     def __init__(self, metadata: TraceMetadata | None = None) -> None:
         self.metadata = metadata or TraceMetadata()
+        self._lock = threading.Lock()
         self._events:   list[AnyEvent]     = []
         self._spans:    list[SpanEvent]    = []
         self._instants: list[InstantEvent] = []
@@ -44,21 +46,24 @@ class Trace:
         self._devices: list["DevicePeak"] = []  # type: ignore[type-arg]
 
     def add_disasm(self, kd: "KernelDisasm") -> None:  # type: ignore[type-arg]
-        self._disasm[kd.name] = kd
-        # Also store under 255-char prefix so spans recorded by older hook
-        # builds (which truncated kname to 255 chars) still match.
-        if len(kd.name) > 255:
-            self._disasm.setdefault(kd.name[:255], kd)
-        self._disasm_version += 1
+        with self._lock:
+            self._disasm[kd.name] = kd
+            # Also store under 255-char prefix so spans recorded by older hook
+            # builds (which truncated kname to 255 chars) still match.
+            if len(kd.name) > 255:
+                self._disasm.setdefault(kd.name[:255], kd)
+            self._disasm_version += 1
 
     def add_pc_sample(self, func_name: str, pc_offset: int, stall_reason: int, count: int) -> None:
-        if func_name not in self._pc_samples:
-            self._pc_samples[func_name] = []
-        self._pc_samples[func_name].append((pc_offset, stall_reason, count))
+        with self._lock:
+            if func_name not in self._pc_samples:
+                self._pc_samples[func_name] = []
+            self._pc_samples[func_name].append((pc_offset, stall_reason, count))
 
     @property
     def disasm(self) -> dict[str, "KernelDisasm"]:  # type: ignore[type-arg]
-        return dict(self._disasm)
+        with self._lock:
+            return dict(self._disasm)
 
     def set_devices(self, devices: list["DevicePeak"]) -> None:  # type: ignore[type-arg]
         self._devices = list(devices)
@@ -68,17 +73,18 @@ class Trace:
         return list(self._devices)
 
     def add(self, event: AnyEvent) -> None:
-        self._events.append(event)
-        if isinstance(event, SpanEvent):
-            self._spans.append(event)
-            if event.stack_frames:
-                self._has_stacks = True
-            if event.category == Category.CPU:
-                self._has_cpu = True
-        elif isinstance(event, InstantEvent):
-            self._instants.append(event)
-        elif isinstance(event, CounterEvent):
-            self._counters.append(event)
+        with self._lock:
+            self._events.append(event)
+            if isinstance(event, SpanEvent):
+                self._spans.append(event)
+                if event.stack_frames:
+                    self._has_stacks = True
+                if event.category == Category.CPU:
+                    self._has_cpu = True
+            elif isinstance(event, InstantEvent):
+                self._instants.append(event)
+            elif isinstance(event, CounterEvent):
+                self._counters.append(event)
 
     def add_many(self, events: list[AnyEvent]) -> None:
         for event in events:
@@ -86,19 +92,23 @@ class Trace:
 
     @property
     def spans(self) -> list[SpanEvent]:
-        return self._spans
+        with self._lock:
+            return list(self._spans)
 
     @property
     def instants(self) -> list[InstantEvent]:
-        return self._instants
+        with self._lock:
+            return list(self._instants)
 
     @property
     def counters(self) -> list[CounterEvent]:
-        return self._counters
+        with self._lock:
+            return list(self._counters)
 
     @property
     def all_events(self) -> list[AnyEvent]:
-        return list(self._events)
+        with self._lock:
+            return list(self._events)
 
     @property
     def duration_ns(self) -> int:
@@ -109,12 +119,12 @@ class Trace:
 
     def spans_by_category(self) -> dict[Category, list[SpanEvent]]:
         result: dict[Category, list[SpanEvent]] = defaultdict(list)
-        for s in self._spans:
+        for s in self.spans:
             result[s.category].append(s)
         return dict(result)
 
     def top_spans(self, n: int = 20) -> list[SpanEvent]:
-        return heapq.nlargest(n, self._spans, key=lambda s: s.duration_ns)
+        return heapq.nlargest(n, self.spans, key=lambda s: s.duration_ns)
 
     def aggregated_stats(self) -> list[dict]:
         """Group spans by name, return sorted by total time desc."""
@@ -122,7 +132,7 @@ class Trace:
             "name": "", "category": "", "count": 0,
             "total_ns": 0, "min_ns": float("inf"), "max_ns": 0
         })
-        for s in self._spans:
+        for s in self.spans:
             key = f"{s.category.value}::{s.name}"
             r = totals[key]
             r["name"] = s.name
@@ -157,7 +167,7 @@ class Trace:
         All other spans keep the existing (category/thread-TID) grouping.
         """
         lanes: dict[str, list[SpanEvent]] = defaultdict(list)
-        for s in self._spans:
+        for s in self.spans:
             if s.category.value in ("cuda", "rocm") and "stream" in s.tags:
                 key = f"{s.category.value}/stream-{s.tags['stream']}"
             elif s.tid:

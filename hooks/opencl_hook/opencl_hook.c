@@ -174,33 +174,42 @@ typedef cl_int (*RetainEvent_t)(cl_event);
 typedef cl_int (*ReleaseEvent_t)(cl_event);
 typedef cl_int (*GetEventProf_t)(cl_event, cl_profiling_info, size_t, void *, size_t *);
 
-/* File-scope so pthread_once init can populate them safely from any thread. */
+/* File-scope so pthread_once init can populate them safely from any thread.
+ * All four pointers are written once (inside g_ecb_once) and read-only after. */
 static GetEventProf_t g_real_prof    = NULL;
 static ReleaseEvent_t g_real_release = NULL;
+static SetCB_t        g_real_setcb   = NULL;
+static RetainEvent_t  g_real_retain  = NULL;
 static pthread_once_t g_ecb_once     = PTHREAD_ONCE_INIT;
 
 /* ── OpenCL symbol resolver ───────────────────────────────────────────── */
 /* ACPP loads its backends with dlopen(RTLD_DEEPBIND), which places
  * libOpenCL.so.1 in a private namespace.  RTLD_NEXT from our hook then
  * cannot find the real cl* symbols.  This helper falls back to an explicit
- * handle obtained via RTLD_NOLOAD, which works across namespaces.          */
+ * handle obtained via RTLD_NOLOAD, which works across namespaces.
+ *
+ * pthread_once guarantees s_ocl_h is initialised exactly once even when
+ * multiple threads call find_real_ocl concurrently (bug fix: the old
+ * s_tried/s_ocl_h plain-static approach was a data race).               */
+static void *s_ocl_h = NULL;
+static pthread_once_t s_ocl_once = PTHREAD_ONCE_INIT;
+static void _init_ocl_handle(void) {
+    s_ocl_h = dlopen("libOpenCL.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (!s_ocl_h) s_ocl_h = dlopen("libOpenCL.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!s_ocl_h) s_ocl_h = dlopen("libOpenCL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+}
 static void *find_real_ocl(const char *sym) {
     void *f = dlsym(RTLD_NEXT, sym);
     if (f) return f;
-    static void *s_ocl_h = NULL;
-    static int   s_tried = 0;
-    if (!s_tried) {
-        s_tried = 1;
-        s_ocl_h = dlopen("libOpenCL.so.1", RTLD_LAZY | RTLD_NOLOAD);
-        if (!s_ocl_h) s_ocl_h = dlopen("libOpenCL.so", RTLD_LAZY | RTLD_NOLOAD);
-        if (!s_ocl_h) s_ocl_h = dlopen("libOpenCL.so.1", RTLD_LAZY | RTLD_GLOBAL);
-    }
+    pthread_once(&s_ocl_once, _init_ocl_handle);
     return s_ocl_h ? dlsym(s_ocl_h, sym) : NULL;
 }
 
 static void _ecb_init_fns(void) {
     g_real_prof    = (GetEventProf_t)find_real_ocl("clGetEventProfilingInfo");
     g_real_release = (ReleaseEvent_t)find_real_ocl("clReleaseEvent");
+    g_real_setcb   = (SetCB_t)find_real_ocl("clSetEventCallback");
+    g_real_retain  = (RetainEvent_t)find_real_ocl("clRetainEvent");
 }
 
 /* OpenCL event completion callback — fired on a driver thread when the
@@ -229,11 +238,9 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
 static void register_event_callback(cl_event ev,
                                     const char *name, const char *extra,
                                     uint64_t parent_sid) {
-    static SetCB_t      real_setcb  = NULL;
-    static RetainEvent_t real_retain = NULL;
-    if (!real_setcb)  real_setcb  = (SetCB_t)find_real_ocl("clSetEventCallback");
-    if (!real_retain) real_retain = (RetainEvent_t)find_real_ocl("clRetainEvent");
-    if (!real_setcb || !ev) return;
+    /* g_real_setcb / g_real_retain are initialised once via g_ecb_once. */
+    pthread_once(&g_ecb_once, _ecb_init_fns);
+    if (!g_real_setcb || !ev) return;
 
     event_cb_data_t *d = (event_cb_data_t *)malloc(sizeof(*d));
     if (!d) return;
@@ -244,11 +251,9 @@ static void register_event_callback(cl_event ev,
     else
         snprintf(d->extra, sizeof(d->extra), "%s", extra ? extra : "");
 
-    if (real_retain) real_retain(ev);
-    if (real_setcb(ev, 0 /* CL_COMPLETE */, on_event_complete, d) != CL_SUCCESS) {
-        static ReleaseEvent_t real_release = NULL;
-        if (!real_release) real_release = (ReleaseEvent_t)find_real_ocl("clReleaseEvent");
-        if (real_retain && real_release) real_release(ev);
+    if (g_real_retain) g_real_retain(ev);
+    if (g_real_setcb(ev, 0 /* CL_COMPLETE */, on_event_complete, d) != CL_SUCCESS) {
+        if (g_real_retain && g_real_release) g_real_release(ev);
         free(d);
     }
 }
@@ -376,6 +381,7 @@ cl_int clEnqueueSVMMemcpy(
                             size_t, cl_uint, const cl_event*, cl_event*);
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clEnqueueSVMMemcpy");
+    if (!real) return -1; /* CL_INVALID_OPERATION */
     char extra[64]; snprintf(extra, sizeof(extra), "type=svm_memcpy,bytes=%zu", size);
     cl_event iev = NULL;
     if (!ev) ev = &iev;
@@ -397,6 +403,7 @@ cl_int clEnqueueReadBuffer(
                             void*, cl_uint, const cl_event*, cl_event*);
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clEnqueueReadBuffer");
+    if (!real) return -1; /* CL_INVALID_OPERATION */
 
     cl_event iev = NULL;
     if (!ev) ev = &iev;
@@ -417,6 +424,7 @@ cl_int clEnqueueWriteBuffer(
                             const void*, cl_uint, const cl_event*, cl_event*);
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clEnqueueWriteBuffer");
+    if (!real) return -1; /* CL_INVALID_OPERATION */
 
     cl_event iev = NULL;
     if (!ev) ev = &iev;
@@ -744,9 +752,12 @@ void *dlopen(const char *filename, int flags) {
             if (dst) {
                 char buf[65536];
                 size_t n;
-                while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
-                    fwrite(buf, 1, n, dst);
+                int copy_ok = 1;
+                while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+                    if (fwrite(buf, 1, n, dst) != n) { copy_ok = 0; break; }
+                }
                 fclose(dst);
+                if (!copy_ok) { remove(saved_jit_path); saved_jit_path[0] = 0; }
             } else {
                 saved_jit_path[0] = 0;
             }
