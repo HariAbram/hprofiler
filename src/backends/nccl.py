@@ -21,23 +21,50 @@ Requirements:
 """
 
 from __future__ import annotations
+import glob
+import os
+import subprocess
 from pathlib import Path
 from .base import Backend
 
 _HOOK_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_nccl.so"
-_NCCL_CANDIDATES = [
-    Path("/usr/lib/x86_64-linux-gnu/libnccl.so.2"),
-    Path("/usr/local/lib/libnccl.so.2"),
-    Path("/usr/local/cuda/lib64/libnccl.so.2"),
-    Path("/opt/nccl/lib/libnccl.so.2"),
-]
 
 
 def _nccl_available() -> bool:
-    import shutil
-    if shutil.which("nccl-version"):
-        return True
-    return any(p.exists() for p in _NCCL_CANDIDATES)
+    """True if libnccl is available on this system.
+
+    Checks in priority order (mirrors cuda.py/opencl.py):
+    1. ldconfig cache  — authoritative on most Linux distros
+    2. Env-var paths   — $NCCL_ROOT / $NCCL_HOME / $CUDA_PATH (common on clusters)
+    3. Glob patterns   — covers non-ldconfig setups (containers, sysroot installs)
+       including x86_64, aarch64 (Jetson / Grace), and PowerPC system paths
+    """
+    try:
+        out = subprocess.run(
+            ["ldconfig", "-p"], capture_output=True, text=True, timeout=5
+        ).stdout
+        if "libnccl.so" in out:
+            return True
+    except Exception:
+        pass
+
+    candidates = [
+        "/usr/lib/x86_64-linux-gnu/libnccl.so*",
+        "/usr/lib/aarch64-linux-gnu/libnccl.so*",
+        "/usr/lib/powerpc64le-linux-gnu/libnccl.so*",
+        "/usr/lib64/libnccl.so*",
+        "/usr/local/lib/libnccl.so*",
+        "/usr/local/cuda/lib64/libnccl.so*",
+        "/opt/nccl/lib/libnccl.so*",
+    ]
+    for env_var in ("NCCL_ROOT", "NCCL_HOME", "CUDA_PATH", "CUDA_HOME"):
+        root = os.environ.get(env_var, "")
+        if root:
+            candidates += [
+                f"{root}/lib64/libnccl.so*",
+                f"{root}/lib/libnccl.so*",
+            ]
+    return any(glob.glob(p) for p in candidates)
 
 
 class NCCLBackend(Backend):

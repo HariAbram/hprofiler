@@ -38,6 +38,23 @@ HOOKS_DIR = Path(__file__).parent.parent.parent / "build" / "lib"
 # inst:<category>:<pid>:<tid>:<ts_ns>:<name>
 # ctr:<category>:<pid>:<ts_ns>:<name>:<value>:<unit>
 
+# Tags are always "key=val[,key=val...]" with no colons in them, so once a
+# candidate tail (everything after the *last* colon) matches this, it's the
+# tags segment and everything before it is the name — even if the name
+# itself contains colons (e.g. demangled C++ "Namespace::kernel", or an
+# NVTX label with a ':' in it). If it doesn't match, there's no tags segment
+# and the whole remainder is the name.
+_TAGS_RE = re.compile(r"^[^,=]+=[^,]*(,[^,=]+=[^,]*)*$")
+
+
+def _split_name_tags(rest: str) -> tuple[str, str]:
+    if ":" not in rest:
+        return rest, ""
+    name, maybe_tags = rest.rsplit(":", 1)
+    if _TAGS_RE.match(maybe_tags):
+        return name, maybe_tags
+    return rest, ""
+
 
 def _parse_record(line: str) -> AnyEvent | None:
     try:
@@ -45,11 +62,10 @@ def _parse_record(line: str) -> AnyEvent | None:
         kind = parts[0]
         if kind == "span" and len(parts) >= 7:
             _, cat, pid, tid, start_ns, dur_ns, rest = parts[0], parts[1], int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5]), parts[6]
-            name_tags = rest.split(":", 1)
-            name = name_tags[0]
+            name, tags_str = _split_name_tags(rest)
             tags: dict = {}
-            if len(name_tags) > 1:
-                for kv in name_tags[1].split(","):
+            if tags_str:
+                for kv in tags_str.split(","):
                     if "=" in kv:
                         k, v = kv.split("=", 1)
                         tags[k] = v
@@ -195,9 +211,10 @@ class Runner:
                         print(
                             f"[hprofiler][warn] '{self.command[0]}' appears to be linked with "
                             f"the STATIC CUDA runtime (libcudart_static.a).\n"
-                            f"  Direct symbol interception via LD_PRELOAD is not possible, "
-                            f"but hprofiler will attempt to capture events via "
-                            f"cuGetProcAddress/dlsym intercept.",
+                            f"  Direct symbol interception via LD_PRELOAD is not possible, so "
+                            f"CUDA Runtime/Driver API calls will NOT be captured for this run "
+                            f"(0 cuda events expected). Rebuild with the shared runtime "
+                            f"(nvcc -cudart shared) to enable CUDA profiling.",
                             file=_sys.stderr,
                         )
             except Exception:

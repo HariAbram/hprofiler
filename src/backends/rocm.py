@@ -12,11 +12,25 @@ kernel wrapper symbols emitted by ACPP's SSCP compilation.
 
 from __future__ import annotations
 import os
+import re
 import subprocess
 from pathlib import Path
 from .base import Backend
 
 _HOOK_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_rocm.so"
+
+
+def _version_sort_key(path: str) -> tuple[int, ...]:
+    """Numeric sort key from a trailing version, e.g. '/opt/rocm-10.0' -> (10, 0).
+
+    Plain string sort would rank '9.0' above '10.0' (lexicographic '9' > '1'),
+    picking the wrong "newest" install when both are present.
+    """
+    m = re.search(r"(\d+(?:\.\d+)*)$", path.rstrip("/"))
+    if not m:
+        return (0,)
+    return tuple(int(x) for x in m.group(1).split("."))
+
 
 def _find_rocm_root() -> Path:
     """Locate ROCm installation — checks env override, then common cluster paths."""
@@ -30,7 +44,7 @@ def _find_rocm_root() -> Path:
     # Also find versioned dirs like /opt/rocm-5.7.0
     import glob
     for pattern in ["/opt/rocm-*", "/usr/local/rocm-*"]:
-        hits = sorted(glob.glob(pattern), reverse=True)  # newest first
+        hits = sorted(glob.glob(pattern), key=_version_sort_key, reverse=True)  # newest first
         candidates.extend(hits)
     for p in candidates:
         if Path(p).is_dir():

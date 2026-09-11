@@ -445,6 +445,15 @@ cl_int clEnqueueWriteBuffer(
  * Saves to /tmp/hprofiler_ocl_<pid>_<n>.bin and emits a jit_load span so
  * the runner's disasm extractor picks it up automatically. */
 
+/* Overflow-safe "[off, off+len) fits within [0, sz)" check -- off/len come
+ * from the (untrusted-ish, locally-generated but not necessarily
+ * well-formed) ELF being parsed, so off+len must not be computed directly
+ * (it can wrap on a corrupt/adversarial header). */
+static int _range_ok(uint64_t off, uint64_t len, uint64_t sz)
+{
+    return len <= sz && off <= sz - len;
+}
+
 /* Intel CPU OCL wraps the compiled x86 ELF in a proprietary outer ELF with
  * e_type=0xff04 and e_version=0.  The real relocatable is in ".ocl.obj".
  * Returns 1 and sets *out / *outsz if successfully unwrapped. */
@@ -464,7 +473,7 @@ static int _unwrap_intel_ocl(const unsigned char *buf, size_t sz,
     memcpy(&e_shstrndx,  buf + 0x3e, 2);
 
     if (e_shnum == 0 || e_shentsize < 64) return 0;
-    if (e_shoff + (uint64_t)e_shnum * e_shentsize > sz) return 0;
+    if (!_range_ok(e_shoff, (uint64_t)e_shnum * e_shentsize, sz)) return 0;
     if (e_shstrndx >= e_shnum) return 0;
 
     /* String table section */
@@ -472,7 +481,7 @@ static int _unwrap_intel_ocl(const unsigned char *buf, size_t sz,
     uint64_t strtab_off, strtab_sz;
     memcpy(&strtab_off, shstr_sh + 0x18, 8);
     memcpy(&strtab_sz,  shstr_sh + 0x20, 8);
-    if (strtab_off + strtab_sz > sz) return 0;
+    if (!_range_ok(strtab_off, strtab_sz, sz)) return 0;
     const char *strtab = (const char *)(buf + strtab_off);
 
     for (uint16_t i = 0; i < e_shnum; i++) {
@@ -480,11 +489,15 @@ static int _unwrap_intel_ocl(const unsigned char *buf, size_t sz,
         uint32_t sh_name;
         memcpy(&sh_name, sh, 4);
         if (sh_name >= (uint32_t)strtab_sz) continue;
+        /* strtab[sh_name .. strtab_sz) must contain a NUL before strcmp may
+         * read it -- a malformed/truncated string table could otherwise
+         * make strcmp read past the mapped binary buffer. */
+        if (!memchr(strtab + sh_name, '\0', strtab_sz - sh_name)) continue;
         if (strcmp(strtab + sh_name, ".ocl.obj") != 0) continue;
         uint64_t sh_offset, sh_size;
         memcpy(&sh_offset, sh + 0x18, 8);
         memcpy(&sh_size,   sh + 0x20, 8);
-        if (sh_size == 0 || sh_offset + sh_size > sz) return 0;
+        if (sh_size == 0 || !_range_ok(sh_offset, sh_size, sz)) return 0;
         *out   = buf + sh_offset;
         *outsz = (size_t)sh_size;
         return 1;
