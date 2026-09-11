@@ -19,6 +19,7 @@ with a clang-based toolchain.
 
 from __future__ import annotations
 import glob
+import os
 from pathlib import Path
 from .base import Backend
 
@@ -45,7 +46,23 @@ def _libomp_paths() -> list[str]:
         # Generic /opt LLVM installs
         "/opt/llvm*/lib/libomp.so*",
         "/opt/llvm*/lib64/libomp.so*",
+        # ROCm's bundled LLVM (e.g. Cray/HPC clusters like Dardel, where the
+        # system C compiler is the Cray `cc` wrapper and clang/libomp come
+        # from the ROCm install instead of a system package):
+        # /opt/rocm-6.3.3/llvm/lib/libomp.so (top-level `llvm` is usually a
+        # symlink to lib/llvm, but check both forms in case it isn't).
+        "/opt/rocm*/llvm/lib/libomp.so*",
+        "/opt/rocm*/lib/llvm/lib/libomp.so*",
     ]
+    for env_var in ("ROCM_PATH", "ROCM_HOME", "LLVM_HOME", "LLVM_ROOT", "LLVM_PATH"):
+        root = os.environ.get(env_var, "")
+        if root:
+            patterns += [
+                f"{root}/llvm/lib/libomp.so*",
+                f"{root}/lib/llvm/lib/libomp.so*",
+                f"{root}/lib/libomp.so*",
+                f"{root}/lib64/libomp.so*",
+            ]
     found = []
     for p in patterns:
         found.extend(glob.glob(p))
@@ -54,20 +71,27 @@ def _libomp_paths() -> list[str]:
 
 def _install_hint() -> str:
     """Return the right package-manager hint for the current distro."""
-    import os
     os_release = ""
     try:
         os_release = open("/etc/os-release").read().lower()
     except OSError:
         pass
+    # HPC/Cray login nodes rarely have root for a package-manager install —
+    # if a ROCm module is loaded (e.g. Dardel/LUMI-style clusters) its
+    # bundled LLVM already ships libomp.so, just not on the default search
+    # path unless $ROCM_PATH is exported.
+    hpc_hint = (
+        " — or, on an HPC/Cray cluster, `module load rocm` (or similar) and "
+        "`export ROCM_PATH=/opt/rocm-X.Y.Z` to use its bundled libomp"
+    )
     if any(x in os_release for x in ("rhel", "rocky", "centos", "fedora", "almalinux")):
-        return "dnf install llvm-toolset  (or: yum install llvm)"
+        return "dnf install llvm-toolset  (or: yum install llvm)" + hpc_hint
     if "arch" in os_release:
-        return "pacman -S openmp"
+        return "pacman -S openmp" + hpc_hint
     if "suse" in os_release or "opensuse" in os_release:
-        return "zypper install libomp-devel"
+        return "zypper install libomp-devel" + hpc_hint
     # Default: Debian/Ubuntu
-    return "apt install libomp-dev  (then compile binary with clang++)"
+    return "apt install libomp-dev  (then compile binary with clang++)" + hpc_hint
 
 
 class OpenMPBackend(Backend):
