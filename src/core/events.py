@@ -35,7 +35,7 @@ class SpanEvent:
     """A duration event: kernel launch, function call, memory transfer, etc."""
     name: str
     category: Category
-    start_ns: int           # wall-clock ns since trace start
+    start_ns: int           # absolute CLOCK_MONOTONIC ns (NOT relative to trace start -- see src/output/otlp.py's "Time alignment" note)
     duration_ns: int
     pid: int = 0
     tid: int = 0

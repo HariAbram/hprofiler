@@ -64,22 +64,32 @@ def _resolve_batch(tool: str, binary: str,
     lines = proc.stdout.splitlines()
 
     if is_llvm:
-        # llvm-symbolizer: per-address block of "funcname\nfile:line\n\n"
+        # llvm-symbolizer: per-address block of "funcname\nfile:line\n" PAIRS,
+        # terminated by a blank line. --inlining defaults to true, so ONE
+        # input address commonly produces MULTIPLE pairs (the full inline
+        # call chain), not just one -- a version of this loop that consumed
+        # only the first pair and then assumed the very next line was the
+        # blank separator would, for any inlined address, instead read the
+        # leftover inlined-frame lines as if they belonged to the NEXT
+        # address, misaligning every subsequent address in the batch (wrong
+        # file:line annotations from then on). Consume every pair up to the
+        # real blank separator, keeping only the first (innermost, i.e. the
+        # line that actually executed) location per address.
         idx = 0
         for addr in addresses:
-            # skip function name line
-            if idx < len(lines):
-                idx += 1
-            if idx < len(lines):
+            first_loc: str | None = None
+            while idx < len(lines) and lines[idx].strip():
+                idx += 1  # function name line
+                if idx >= len(lines):
+                    break
                 loc = lines[idx].strip()
                 idx += 1
-            else:
-                continue
-            # skip blank separator
+                if first_loc is None:
+                    first_loc = loc
             while idx < len(lines) and not lines[idx].strip():
-                idx += 1
-            if loc and loc != "??:0":
-                parts = loc.rsplit(":", 1)
+                idx += 1  # blank separator (and any stray extra blanks)
+            if first_loc and first_loc != "??:0":
+                parts = first_loc.rsplit(":", 1)
                 if len(parts) == 2:
                     result[addr] = (parts[0], parts[1])
     else:

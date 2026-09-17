@@ -1109,6 +1109,23 @@ class TimelineWidget(Widget):
             np.add.at(diff, ix1m,     -1.0)
             activity += np.cumsum(diff[:width])
 
+        # KNOWN LIMITATION: this accumulates per-pixel coverage as a SUM of
+        # each span's overlap fraction (scatter-add above), then clips to
+        # [0,1] -- not a true interval union. When two+ spans overlap the
+        # SAME sub-pixel time window on the same lane (e.g. OMPT's nested
+        # parallel-region + work/barrier spans on one thread, which share
+        # one `openmp/thread-TID` lane per Trace.lanes()) their fractions
+        # sum first and are clipped after, so a genuinely-partially-covered
+        # pixel can read as more covered than it truly is (only a sum that
+        # reaches >=1.0 gets corrected by the clip; a sum that overlaps but
+        # stays <1.0 does not). A fully correct fix needs real per-pixel
+        # interval-union math, which is a materially bigger rewrite of this
+        # vectorized routine (documented as a deliberately hand-tuned,
+        # performance-critical path -- ~8ms at 250k spans) than the size of
+        # this bug warrants; not attempted here to avoid risking a
+        # correctness or performance regression in exchange for a display
+        # metric that is only skewed under same-lane overlap, never crashes
+        # or produces a wildly wrong value (bounded to [0,1] either way).
         np.clip(activity, 0.0, 1.0, out=activity)
         util_pct = float(activity.sum()) / width * 100.0
 
@@ -1573,6 +1590,18 @@ def _ct_aggregate(raw_nodes: list[_RawNode]) -> list[_CTNode]:
         for n in nodes:
             all_children.extend(n.children)
         children = _ct_aggregate(all_children)
+        # self_ns = this node's cumulative duration minus its children's --
+        # correct when children are strictly nested within their parent's
+        # own interval (the normal call-stack case), but when a node's
+        # invocations spawn CONCURRENT children (e.g. nested OpenMP
+        # parallel regions/tasks that genuinely overlap in wall time), the
+        # children's summed duration can exceed the parent's, and max(0, …)
+        # silently floors self_ns to 0 rather than the small positive value
+        # truer interval-aware accounting would show. Kept as a safe,
+        # non-crashing floor rather than negative/nonsensical self time;
+        # a fully correct fix would need to redefine "self time" under
+        # concurrent (not just sequential) children, a bigger design
+        # decision than this pass's bug fixes.
         self_ns = max(0, total_ns - sum(c.total_ns for c in children))
         result.append(_CTNode(
             name=name, category=cat,

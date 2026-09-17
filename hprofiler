@@ -974,6 +974,153 @@ def disasm(trace_file, kernel, output, list_only):
 
 
 @cli.command()
+@click.argument("trace_file", type=click.Path(exists=True))
+@click.option("--baseline", default=None, type=click.Path(exists=True), metavar="TRACE",
+              help="A trace from the same program at a lower rank/thread count, "
+                   "used to compute Computational Scaling.")
+@click.option("--interconnect-bw", default=None, type=float, metavar="GB/S",
+              help="Peak interconnect bandwidth (GB/s) to compare achieved NCCL bus "
+                   "bandwidth against.")
+@click.option("--critical-path/--no-critical-path", "use_cp", default=True, show_default=True,
+              help="Also run critical-path analysis to compute Serialization Efficiency.")
+def efficiency(trace_file, baseline, interconnect_bw, use_cp):
+    """Print a POP-style parallel efficiency breakdown for a saved trace.
+
+    Decomposes efficiency the way the POP (Performance Optimisation and
+    Productivity) Centre of Excellence standard metrics do -- Load Balance,
+    Communication Efficiency, Parallel Efficiency -- computed directly from
+    the trace with no offline network simulator, plus GPU and NCCL
+    efficiency layers specific to hprofiler. Serialization Efficiency
+    additionally requires critical-path analysis (run automatically unless
+    --no-critical-path); Computational Scaling requires --baseline. See
+    DOCUMENTATION.md for the exact formulas and their approximations.
+
+    \b
+    Examples:
+      hprofiler efficiency trace.json
+      hprofiler efficiency trace.json --baseline trace_1rank.json
+      hprofiler efficiency trace.json --interconnect-bw 300
+    """
+    from src.ui.app import load_trace_from_json
+    from src.analysis import pop_efficiency as pe
+
+    trace = load_trace_from_json(trace_file, collect_disasm=True)
+    baseline_trace = load_trace_from_json(baseline, collect_disasm=False) if baseline else None
+
+    cp_report = None
+    if use_cp:
+        from src.analysis import criticalpath
+        try:
+            cp_report = criticalpath.analyze(trace)
+        except Exception as e:
+            click.echo(f"[hprofiler][warn] critical-path analysis failed: {e}", err=True)
+
+    report = pe.analyze(trace, baseline=baseline_trace,
+                         nccl_peak_bw_gbs=interconnect_bw, critical_path=cp_report)
+
+    def pct(x):
+        return f"{100*x:5.1f}%" if x is not None else "   n/a"
+
+    click.echo(f"\n{'='*64}")
+    click.echo(f"  POP-style Efficiency Breakdown: {trace_file}")
+    click.echo(f"{'='*64}")
+    click.echo(f"  Ranks/processes observed : {len(report.per_rank_useful_ns)}")
+    click.echo(f"\n  Global Efficiency           : {pct(report.global_efficiency)}")
+    click.echo(f"    Parallel Efficiency       : {pct(report.parallel_efficiency)}")
+    click.echo(f"      Load Balance            : {pct(report.load_balance)}")
+    click.echo(f"      Communication Efficiency : {pct(report.comm_efficiency)}")
+    click.echo(f"        Serialization Efficiency: {pct(report.serialization_efficiency)}")
+    click.echo(f"        Transfer Efficiency (proxy): {pct(report.transfer_efficiency)}")
+    for cat, eff in sorted(report.transfer_efficiency_by_category.items()):
+        click.echo(f"          {cat:<10}          : {pct(eff)}")
+    click.echo(f"    Computational Scaling     : {pct(report.computational_scaling)}")
+    if report.gpu_efficiency is not None:
+        click.echo(f"\n  GPU Efficiency (roofline)  : {pct(report.gpu_efficiency)}")
+    if report.nccl_bus_bw_gbs is not None:
+        click.echo(f"\n  NCCL achieved bus BW       : {report.nccl_bus_bw_gbs:.1f} GB/s")
+        if report.nccl_efficiency is not None:
+            click.echo(f"  NCCL Efficiency            : {pct(report.nccl_efficiency)}")
+    if report.notes:
+        click.echo(f"\n  Notes:")
+        for n in report.notes:
+            click.echo(f"    - {n}")
+    click.echo(f"{'='*64}\n")
+
+
+@cli.command("critical-path")
+@click.argument("trace_file", type=click.Path(exists=True))
+@click.option("--top", "-n", default=15, show_default=True,
+              help="Number of top categories to show in each breakdown.")
+@click.option("--export", default=None, type=click.Path(), metavar="FILE",
+              help="Write the trace back out as Chrome Trace JSON with critical-path "
+                   "spans tagged on_critical_path=1, for highlighting in Perfetto.")
+def critical_path_cmd(trace_file, top, export):
+    """Compute and print the N-way cross-runtime critical path for a saved trace.
+
+    Builds a dependency graph over every captured span (CUDA/ROCm/OpenCL/
+    OpenMP/MPI/NCCL) using each backend's known synchronization semantics --
+    stream ordering, device syncs, MPI/NCCL send/recv and collective pairing,
+    OpenMP barriers -- not arbitrary data-flow, walks it backward from the
+    last-ending event to find the real observed critical path, and
+    attributes idle time on that path to whichever span was being waited on.
+    Single-node only (see DOCUMENTATION.md).
+
+    \b
+    Examples:
+      hprofiler critical-path trace.json
+      hprofiler critical-path trace.json --export trace.critpath.json
+    """
+    from src.ui.app import load_trace_from_json
+    from src.analysis import criticalpath as cpmod
+
+    trace = load_trace_from_json(trace_file, collect_disasm=False)
+    report = cpmod.analyze(trace)
+
+    def fmt_ns(ns):
+        if ns >= 1_000_000_000:
+            return f"{ns/1e9:.3f}s"
+        if ns >= 1_000_000:
+            return f"{ns/1e6:.2f}ms"
+        if ns >= 1_000:
+            return f"{ns/1e3:.1f}us"
+        return f"{ns}ns"
+
+    click.echo(f"\n{'='*64}")
+    click.echo(f"  Critical Path Analysis: {trace_file}")
+    click.echo(f"{'='*64}")
+    click.echo(f"  Path length (spans) : {len(report.path_span_indices)}")
+    click.echo(f"  Wall time           : {fmt_ns(report.wall_ns)}")
+    click.echo(f"  Time accounted for  : {fmt_ns(report.total_path_ns)}")
+
+    click.echo(f"\n  Time ON the critical path, by category (productive work):")
+    for cat, ns in sorted(report.time_on_path_by_category.items(), key=lambda kv: -kv[1])[:top]:
+        click.echo(f"    {cat:<12} {fmt_ns(ns):>12}")
+
+    if report.wait_caused_by_category:
+        click.echo(f"\n  Idle time on the critical path, blamed by category (what it was waiting on):")
+        for cat, ns in report.top_blame(top):
+            click.echo(f"    {cat:<12} {fmt_ns(ns):>12}")
+    else:
+        click.echo(f"\n  No idle gaps on the critical path -- fully back-to-back.")
+
+    if report.notes:
+        click.echo(f"\n  Notes:")
+        for n in report.notes:
+            click.echo(f"    - {n}")
+
+    if export:
+        from src.output import chrome_trace
+        on_path = {id(report.spans[i]) for i in report.path_span_indices}
+        for s in trace.spans:
+            if id(s) in on_path:
+                s.tags["on_critical_path"] = "1"
+        chrome_trace.write(trace, export, pretty=True)
+        click.echo(f"\n  Annotated trace written to: {export}")
+
+    click.echo(f"{'='*64}\n")
+
+
+@cli.command()
 def backends():
     """List all backends and their availability on this system.
 

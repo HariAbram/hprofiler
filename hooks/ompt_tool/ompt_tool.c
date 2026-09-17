@@ -304,11 +304,14 @@ static __thread int          tls_sync_depth      = 0;
 static __thread uint64_t     tls_target_start[MAX_DEPTH];
 static __thread int          tls_target_depth    = 0;
 
-/* Task scheduling stacks */
+/* Open tasks on this thread, keyed by task ID -- NOT a LIFO stack. Untied
+ * tasks and task-yield points can hand a thread a task that isn't its most
+ * recently created descendant, breaking strict nesting order; looking a
+ * completing task up by its own ID (rather than assuming it's whatever is
+ * on top of a stack) handles that correctly regardless of ordering. */
 #define MAX_TASK_DEPTH 32
-static __thread uint64_t     tls_task_start[MAX_TASK_DEPTH];
-static __thread uint64_t     tls_task_id[MAX_TASK_DEPTH];
-static __thread int          tls_task_depth = 0;
+typedef struct { uint64_t id; uint64_t start_ns; int in_use; } TaskSlot;
+static __thread TaskSlot     tls_tasks[MAX_TASK_DEPTH];
 static uint64_t              g_task_id_seq     = 1;
 static uint64_t              g_parallel_id_seq = 1;
 
@@ -532,23 +535,36 @@ static void cb_task_schedule(
     ompt_data_t *next_task_data)
 {
     uint64_t now = now_ns();
-    /* Complete / suspend prior task */
-    if (prior_task_data && tls_task_depth > 0 &&
-        prior_task_data->value == tls_task_id[tls_task_depth - 1]) {
-        tls_task_depth--;
-        char extra[64];
-        snprintf(extra, sizeof(extra), "type=task,id=%llu,status=%d",
-                 (unsigned long long)prior_task_data->value, prior_task_status);
-        emit_span("openmp", gettid_compat(),
-                  tls_task_start[tls_task_depth],
-                  now - tls_task_start[tls_task_depth],
-                  "omp_task", extra);
+    /* Complete / suspend prior task -- find it by ID among open slots,
+     * not by assuming it's the most-recently-pushed one. */
+    if (prior_task_data) {
+        for (int i = 0; i < MAX_TASK_DEPTH; i++) {
+            if (tls_tasks[i].in_use && tls_tasks[i].id == prior_task_data->value) {
+                char extra[64];
+                snprintf(extra, sizeof(extra), "type=task,id=%llu,status=%d",
+                         (unsigned long long)prior_task_data->value, prior_task_status);
+                emit_span("openmp", gettid_compat(),
+                          tls_tasks[i].start_ns, now - tls_tasks[i].start_ns,
+                          "omp_task", extra);
+                tls_tasks[i].in_use = 0;
+                break;
+            }
+        }
     }
-    /* Start next task */
-    if (next_task_data && tls_task_depth < MAX_TASK_DEPTH) {
-        tls_task_start[tls_task_depth] = now;
-        tls_task_id[tls_task_depth]    = next_task_data->value;
-        tls_task_depth++;
+    /* Start next task -- claim any free slot (order doesn't matter, we
+     * look tasks up by ID, not position). If all MAX_TASK_DEPTH slots are
+     * in use (unusually deep concurrent task nesting on one thread), this
+     * task's span simply isn't tracked -- no corruption of another task's
+     * data, unlike overwriting a fixed stack-position slot would risk. */
+    if (next_task_data) {
+        for (int i = 0; i < MAX_TASK_DEPTH; i++) {
+            if (!tls_tasks[i].in_use) {
+                tls_tasks[i].id = next_task_data->value;
+                tls_tasks[i].start_ns = now;
+                tls_tasks[i].in_use = 1;
+                break;
+            }
+        }
     }
 }
 
@@ -639,7 +655,23 @@ static int tool_initialize(ompt_function_lookup_t lookup,
         (ompt_set_callback_t)lookup("ompt_set_callback");
     if (!set_callback) return 0;
 
-#define REG(event, cb) set_callback(event, (ompt_interface_fn_t)(cb))
+    /* set_callback()'s return value was previously discarded: if the
+     * runtime doesn't support a given callback (e.g. ompt_callback_target
+     * on some libgomp builds), that whole span category would silently
+     * report zero events forever -- indistinguishable from "the profiled
+     * code just doesn't use that feature". Collect and report unsupported
+     * ones instead. ompt_set_error(0)/ompt_set_never(1) mean the callback
+     * will never actually fire despite the call "succeeding". */
+    char unsupported[256] = "";
+#define REG(event, cb) do { \
+        ompt_set_result_t _r = set_callback(event, (ompt_interface_fn_t)(cb)); \
+        if (_r == ompt_set_error || _r == ompt_set_never) { \
+            size_t _len = strlen(unsupported); \
+            if (_len + strlen(#event) + 3 < sizeof(unsupported)) \
+                snprintf(unsupported + _len, sizeof(unsupported) - _len, \
+                         "%s%s", _len ? "," : "", #event); \
+        } \
+    } while (0)
     REG(ompt_callback_thread_begin,   cb_thread_begin);
     REG(ompt_callback_thread_end,     cb_thread_end);
     REG(ompt_callback_parallel_begin, cb_parallel_begin);
@@ -650,6 +682,13 @@ static int tool_initialize(ompt_function_lookup_t lookup,
     REG(ompt_callback_sync_region,    cb_sync_region);
     REG(ompt_callback_target,         cb_target);
 #undef REG
+
+    if (unsupported[0]) {
+        fprintf(stderr,
+                "[hprofiler][ompt] this OpenMP runtime does not support: %s "
+                "-- those event categories will report zero events, not an error\n",
+                unsupported);
+    }
 
     return 1;
 }

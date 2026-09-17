@@ -20,7 +20,12 @@ class InsnType(str, Enum):
     MEMORY  = "memory"   # scalar load / store / atomic
     CONTROL = "control"  # branch / call / return / exit
     SYNC    = "sync"     # barriers, fences, synchronisation
-    COMPUTE = "compute"  # FMA / multiply-accumulate — heavy-compute ALU
+    COMPUTE = "compute"  # FMA / multiply-accumulate — heavy-compute ALU (real FP only)
+    INT_COMPUTE = "int_compute"  # integer multiply/MAD (IMAD/IMUL/XMAD, v_*_u32/i32, …) —
+                                  # the standard idiom for address/index arithmetic, NOT
+                                  # floating-point work; must never be charged FLOPs
+    TENSOR  = "tensor"   # matrix/tensor-core ops (HMMA/BMMA/IMMA, MFMA, …) — one
+                          # instruction does a whole tile matmul, not a scalar op
     OTHER   = "other"
 
 
@@ -35,6 +40,8 @@ ITYPE_COLOR: dict[InsnType, str] = {
     InsnType.CONTROL: "magenta",
     InsnType.SYNC:    "red",
     InsnType.COMPUTE: "bright_blue",
+    InsnType.INT_COMPUTE: "blue",
+    InsnType.TENSOR:  "purple",
     InsnType.OTHER:   "grey62",
 }
 
@@ -124,16 +131,32 @@ def classify_x86(mnemonic: str, operands: str = "") -> InsnType:
 
 _SASS_MEM  = re.compile(r'^(LDG|STG|LDS|STS|LDL|STL|LD|ST|RED|ATOM|LDC|LDGSTS)\b')
 _SASS_CTL  = re.compile(r'^(BRA|CAL|RET|EXIT|BRX|JCAL|SYNC|SSY|BREAK|PRET|LONGJMP)\b')
-_SASS_FMA  = re.compile(r'^(FFMA|DFMA|HFMA|FMUL|FADD|FDIV|DMUL|DADD|IMAD|IMUL|XMAD|HMMA|BMMA)\b')
+# Real floating-point ALU ops only -- FLOPs means Floating-point Operations,
+# so only these are charged in the roofline FLOPs estimate.
+_SASS_FP_FMA = re.compile(r'^(FFMA|DFMA|HFMA|FMUL|FADD|FDIV|DMUL|DADD)\b')
+# Integer multiply/multiply-add: the dominant SASS idiom for 64-bit
+# global-memory address computation on Volta+, present in nearly every
+# kernel. These were previously lumped in with the FP ops above, silently
+# inflating est_flops (and therefore achieved_tflops / arithmetic_intensity
+# / the compute-vs-memory-bound verdict) for purely memory-bound kernels
+# with normal address arithmetic.
+_SASS_INT_MAD = re.compile(r'^(IMAD|IMUL|XMAD)\b')
+# Tensor-core matrix-multiply-accumulate: ONE instruction computes a whole
+# MxNxK tile (e.g. 16x8x16), not a single scalar op -- charging it the same
+# 2.0 FLOPs as a scalar FFMA (the previous behavior, via the same bucket as
+# the FP ops above) undercounted real tensor-core throughput by ~100x+.
+_SASS_TENSOR = re.compile(r'^(HMMA|BMMA|IMMA|DMMA)\b')
 _SASS_SYNC = re.compile(r'^(BAR|MEMBAR|CCTL|DEPBAR|SETLMEMBASE)\b')
 
 
 def classify_sass(mnemonic: str, operands: str = "") -> InsnType:
     m = mnemonic.strip().upper()
-    if _SASS_MEM.match(m):   return InsnType.MEMORY
-    if _SASS_SYNC.match(m):  return InsnType.SYNC
-    if _SASS_CTL.match(m):   return InsnType.CONTROL
-    if _SASS_FMA.match(m):   return InsnType.COMPUTE
+    if _SASS_MEM.match(m):    return InsnType.MEMORY
+    if _SASS_SYNC.match(m):   return InsnType.SYNC
+    if _SASS_CTL.match(m):    return InsnType.CONTROL
+    if _SASS_TENSOR.match(m): return InsnType.TENSOR
+    if _SASS_FP_FMA.match(m): return InsnType.COMPUTE
+    if _SASS_INT_MAD.match(m):return InsnType.INT_COMPUTE
     return InsnType.SCALAR
 
 
@@ -142,11 +165,23 @@ def classify_sass(mnemonic: str, operands: str = "") -> InsnType:
 def classify_amdgcn(mnemonic: str, operands: str = "") -> InsnType:
     m = mnemonic.strip().lower()
     if m.startswith("v_"):
+        # MFMA (matrix-fma, AMD's tensor-core instruction) must be checked
+        # before the generic "_f32"/"_f16" substring checks below --
+        # e.g. "v_mfma_f32_32x32x8f16" contains "_f32" and would otherwise
+        # be charged as a single scalar-rate FP op instead of a whole tile
+        # matmul (one MFMA instruction computes a full MxNxK tile).
+        if m.startswith("v_mfma"):
+            return InsnType.TENSOR
         if "_f32" in m or "_f16" in m or "_bf16" in m or "_f8" in m:
             return InsnType.VEC_SP
         if "_f64" in m:
             return InsnType.VEC_DP
-        return InsnType.VECTOR   # integer lane ops (v_add_u32, v_lshl, …)
+        if "_u32" in m or "_i32" in m or "_u16" in m or "_i16" in m:
+            # Integer lane ops (v_add_u32, v_mad_i32, v_lshl, …) -- the
+            # standard idiom for address/index arithmetic on AMDGCN, same
+            # reasoning as SASS IMAD/IMUL: must not be charged as FLOPs.
+            return InsnType.INT_COMPUTE
+        return InsnType.VECTOR   # other/unknown integer or bit-manipulation lane ops
     if m.startswith("s_"):
         if "branch" in m or "cbranch" in m or m == "s_endpgm":
             return InsnType.CONTROL
@@ -160,11 +195,19 @@ def classify_amdgcn(mnemonic: str, operands: str = "") -> InsnType:
 
 # ── PTX (CUDA IR text) ────────────────────────────────────────────────────────
 
-_PTX_VEC  = re.compile(r'\.(v2|v4)\b')
-_PTX_MEM  = re.compile(r'^(ld|st|atom|red|prefetch|prefetchu|suld|sust)\b', re.I)
-_PTX_CTL  = re.compile(r'^(bra|call|ret|exit|brx|setp|selp)\b', re.I)
-_PTX_SYNC = re.compile(r'^(bar|membar|fence|atom)\b', re.I)
-_PTX_FMA  = re.compile(r'^(fma|mad|mul|add|div)\b', re.I)
+_PTX_VEC    = re.compile(r'\.(v2|v4)\b')
+_PTX_MEM    = re.compile(r'^(ld|st|atom|red|prefetch|prefetchu|suld|sust)\b', re.I)
+_PTX_CTL    = re.compile(r'^(bra|call|ret|exit|brx|setp|selp)\b', re.I)
+_PTX_SYNC   = re.compile(r'^(bar|membar|fence|atom)\b', re.I)
+_PTX_TENSOR = re.compile(r'^(mma|wmma)\b', re.I)  # tensor-core PTX ops (wmma.mma, mma.sync, …)
+_PTX_FMA    = re.compile(r'^(fma|mad|mul|add|div)\b', re.I)
+# PTX encodes the operand type as a dotted suffix on the SAME mnemonic
+# (mad.lo.s32 vs fma.rn.f32) rather than a different prefix like SASS, so
+# fma/mad/mul/add/div must be split by that suffix -- mad.lo.s32/s64 (very
+# common for PTX array-indexing arithmetic, the PTX equivalent of SASS
+# IMAD) was previously charged the same FLOPs as a real fma.rn.f32.
+_PTX_FP_TYPE  = re.compile(r'\.(f16|f32|f64|bf16)\b')
+_PTX_INT_TYPE = re.compile(r'\.(s8|s16|s32|s64|u8|u16|u32|u64|b8|b16|b32|b64)\b')
 
 
 def classify_ptx(mnemonic: str, operands: str = "") -> InsnType:
@@ -173,7 +216,11 @@ def classify_ptx(mnemonic: str, operands: str = "") -> InsnType:
     if _PTX_SYNC.match(m):    return InsnType.SYNC
     if _PTX_CTL.match(m):     return InsnType.CONTROL
     if _PTX_MEM.match(m):     return InsnType.MEMORY
-    if _PTX_FMA.match(m):     return InsnType.COMPUTE
+    if _PTX_TENSOR.match(m):  return InsnType.TENSOR
+    if _PTX_FMA.match(m):
+        if _PTX_INT_TYPE.search(m) and not _PTX_FP_TYPE.search(m):
+            return InsnType.INT_COMPUTE
+        return InsnType.COMPUTE
     return InsnType.SCALAR
 
 

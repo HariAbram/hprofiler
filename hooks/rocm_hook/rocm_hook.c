@@ -130,6 +130,33 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                 cat, g_pid, (int)tid,
                 (unsigned long long)start_ns, (unsigned long long)dur_ns,
                 name);
+        /* snprintf returns >= sizeof(buf) when truncated. Rather than
+         * silently dropping the whole span, retry with a shortened name so
+         * the event -- correct timing, full tags -- still reaches the
+         * trace (heavily-templated C++ kernel names can alone exceed this
+         * buffer). */
+        if (n >= (int)sizeof(buf)) {
+            char short_name[200];
+            size_t name_len = strlen(name);
+            if (name_len > sizeof(short_name) - 4) {
+                memcpy(short_name, name, sizeof(short_name) - 4);
+                memcpy(short_name + sizeof(short_name) - 4, "...", 4);
+            } else {
+                memcpy(short_name, name, name_len + 1);
+            }
+            if (extra && *extra)
+                n = snprintf(buf, sizeof(buf),
+                    "span:%s:%d:%d:%llu:%llu:%s:%s\n",
+                    cat, g_pid, (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
+                    short_name, extra);
+            else
+                n = snprintf(buf, sizeof(buf),
+                    "span:%s:%d:%d:%llu:%llu:%s\n",
+                    cat, g_pid, (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
+                    short_name);
+        }
         if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
         emit_callstack(start_ns);
     }
@@ -259,30 +286,19 @@ static void pin_track_rem(void *ptr) {
 }
 
 /* ── Stream ID assignment ────────────────────────────────────────────────── */
-#define STREAM_MAP_CAP 256
-static void           *g_stream_ptrs[STREAM_MAP_CAP];
-static int             g_stream_ids[STREAM_MAP_CAP];
-static int             g_stream_count = 0;
-static pthread_mutex_t g_stream_mutex = PTHREAD_MUTEX_INITIALIZER;
-
+/* Deterministic small-integer ID derived from the pointer VALUE (MurmurHash3
+ * finalizer/fmix64), not from order-of-first-observation -- same technique
+ * and rationale as cuda_hook.c's get_stream_id() (kept identical there and
+ * here for consistency even though no AMD-side NCCL-equivalent hook exists
+ * yet to cross-reference). Also removes the previous STREAM_MAP_CAP
+ * overflow behavior (silently collapsing to stream=-1 past 256 streams). */
 static int get_stream_id(const void *stream) {
     if (!stream) return 0;
-    pthread_mutex_lock(&g_stream_mutex);
-    for (int i = 0; i < g_stream_count; i++) {
-        if (g_stream_ptrs[i] == stream) {
-            int id = g_stream_ids[i];
-            pthread_mutex_unlock(&g_stream_mutex);
-            return id;
-        }
-    }
-    int id = (g_stream_count < STREAM_MAP_CAP) ? (g_stream_count + 1) : -1;
-    if (g_stream_count < STREAM_MAP_CAP) {
-        g_stream_ptrs[g_stream_count] = (void*)stream;
-        g_stream_ids[g_stream_count]  = id;
-        g_stream_count++;
-    }
-    pthread_mutex_unlock(&g_stream_mutex);
-    return id;
+    uint64_t v = (uint64_t)(uintptr_t)stream;
+    v ^= v >> 33; v *= 0xff51afd7ed558ccdULL;
+    v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL;
+    v ^= v >> 33;
+    return (int)(v % 999983) + 1;
 }
 
 /* ── GPU-accurate timing via hipEvent pairs ──────────────────────────────── */
@@ -364,9 +380,23 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
                   f_evElapsed(&ms, l->ev_s, l->ev_e) == 0 && ms >= 0.0f);
         f_evDestroy(l->ev_s);
         f_evDestroy(l->ev_e);
-        if (ok)
+        if (ok) {
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
                       l->kname, l->extra);
+        } else {
+            /* hipEventSynchronize/hipEventElapsedTime failed -- a kernel
+             * that ran to completion on the GPU must not simply vanish
+             * from the trace. Fall back to wall-clock time from launch to
+             * this flush (an upper-bound approximation, since it may
+             * include time for other kernels queued after this one), marked
+             * distinctly from GPU-accurate timing. */
+            char marked[300];
+            if (l->extra[0])
+                snprintf(marked, sizeof(marked), "%s,timing=cpu_flush", l->extra);
+            else
+                snprintf(marked, sizeof(marked), "timing=cpu_flush");
+            emit_span(l->cat, l->tid, l->t0, now_ns() - l->t0, l->kname, marked);
+        }
     }
 }
 
@@ -380,6 +410,20 @@ static int pk_try_begin(hipStream_t stream, hipEvent_t *ev_s, hipEvent_t *ev_e) 
         *ev_s = *ev_e = NULL; return 0;
     }
     return 1;
+}
+
+/* Appends "timing=cpu" (or ",timing=cpu" if extra already has tags) to mark
+ * a span that fell back to CPU-side (launch-call) timing instead of
+ * GPU-accurate hipEvent timing -- without this a launch-overhead-only
+ * measurement is indistinguishable from a real GPU kernel duration in the
+ * emitted span. */
+static void mark_cpu_fallback(char *extra, size_t cap) {
+    size_t len = strlen(extra);
+    if (len == 0) {
+        snprintf(extra, cap, "timing=cpu");
+    } else if (len + 12 < cap) {
+        snprintf(extra + len, cap - len, ",timing=cpu");
+    }
 }
 
 static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
@@ -399,7 +443,14 @@ static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
     } else {
         pthread_mutex_unlock(&g_pk_mutex);
         f_evDestroy(ev_s); f_evDestroy(ev_e);
-        emit_span(cat, tid, t0, now_ns() - t0, kname, extra);
+        /* Pending-kernel queue full -- fall back to CPU-side timing,
+         * clearly marked so it isn't mistaken for a GPU-accurate one. */
+        char marked[300];
+        if (extra && *extra)
+            snprintf(marked, sizeof(marked), "%s,timing=cpu", extra);
+        else
+            snprintf(marked, sizeof(marked), "timing=cpu");
+        emit_span(cat, tid, t0, now_ns() - t0, kname, marked);
     }
 }
 
@@ -426,8 +477,12 @@ hipError_t hipLaunchKernel(const void *fn, dim3 grid, dim3 block,
     int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
     uint64_t t0 = now_ns();
     hipError_t ret = real(fn, grid, block, args, sharedMem, stream);
-    if (gpu_ok) pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
-    else        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
+    if (gpu_ok) {
+        pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
+    } else {
+        mark_cpu_fallback(extra, sizeof(extra));
+        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
+    }
 
     in_hook = 0;
     return ret;
@@ -457,8 +512,12 @@ hipError_t hipLaunchKernelGGL(hipFunction_t fn,
     int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
     uint64_t t0 = now_ns();
     hipError_t ret = real(fn, grid, block, sharedMem, stream, kernelParams);
-    if (gpu_ok) pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
-    else        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
+    if (gpu_ok) {
+        pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
+    } else {
+        mark_cpu_fallback(extra, sizeof(extra));
+        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
+    }
 
     in_hook = 0;
     return ret;
@@ -493,8 +552,12 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f,
     uint64_t t0 = now_ns();
     hipError_t ret = real(f, gx,gy,gz, bx,by,bz, sharedMem, stream,
                           kernelParams, extra_params);
-    if (gpu_ok) pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
-    else        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
+    if (gpu_ok) {
+        pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
+    } else {
+        mark_cpu_fallback(extra, sizeof(extra));
+        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
+    }
 
     in_hook = 0;
     return ret;
@@ -539,8 +602,12 @@ hipError_t hipMemcpyAsync(void *dst, const void *src, size_t size,
     int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
     uint64_t t0 = now_ns();
     hipError_t ret = real(dst, src, size, kind, stream);
-    if (gpu_ok) pk_commit(ev_s, ev_e, stream, "memory", "hipMemcpyAsync", extra, t0, tid);
-    else        emit_span("memory", tid, t0, now_ns()-t0, "hipMemcpyAsync", extra);
+    if (gpu_ok) {
+        pk_commit(ev_s, ev_e, stream, "memory", "hipMemcpyAsync", extra, t0, tid);
+    } else {
+        mark_cpu_fallback(extra, sizeof(extra));
+        emit_span("memory", tid, t0, now_ns()-t0, "hipMemcpyAsync", extra);
+    }
 
     in_hook = 0;
     return ret;
@@ -991,6 +1058,28 @@ hipError_t hipModuleGetFunction(hipFunction_t *hfunc, hipModule_t hmod,
     return ret;
 }
 
+hipError_t hipModuleUnload(hipModule_t hmod) {
+    typedef hipError_t (*fn_t)(hipModule_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipModuleUnload");
+    if (!real) return -1;
+    hipError_t ret = real(hmod);
+    /* g_knames doesn't track which module each hipFunction_t came from, so
+     * we can't selectively invalidate just this module's entries -- and
+     * the driver is free to reuse a freed hipFunction_t address for an
+     * unrelated kernel in a later-loaded module (relevant for JIT-heavy
+     * use, e.g. ACPP/hipSYCL targeting ROCm), which would otherwise make
+     * resolve_name() return the OLD kernel's name forever. Clearing the
+     * whole table is conservative but correct; still-loaded modules are
+     * cheaply repopulated by their next hipModuleGetFunction call. */
+    if (ret == 0) {
+        pthread_mutex_lock(&g_kname_mutex);
+        g_kname_n = 0;
+        pthread_mutex_unlock(&g_kname_mutex);
+    }
+    return ret;
+}
+
 /* ── HIP Graph launch ────────────────────────────────────────────────────── */
 typedef void *hipGraphExec_t;
 
@@ -1011,8 +1100,12 @@ hipError_t hipGraphLaunch(hipGraphExec_t graphExec, hipStream_t stream) {
     int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
     uint64_t t0 = now_ns();
     hipError_t ret = real(graphExec, stream);
-    if (gpu_ok) pk_commit(ev_s, ev_e, stream, "rocm", "hipGraphLaunch", extra, t0, tid);
-    else        emit_span("rocm", tid, t0, now_ns()-t0, "hipGraphLaunch", extra);
+    if (gpu_ok) {
+        pk_commit(ev_s, ev_e, stream, "rocm", "hipGraphLaunch", extra, t0, tid);
+    } else {
+        mark_cpu_fallback(extra, sizeof(extra));
+        emit_span("rocm", tid, t0, now_ns()-t0, "hipGraphLaunch", extra);
+    }
 
     in_hook = 0;
     return ret;

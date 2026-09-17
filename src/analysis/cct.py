@@ -220,7 +220,17 @@ def gpu_starvation(trace: "Trace") -> dict:
     """
     from ..core.events import Category
 
-    wall_ns = trace.duration_ns or 1
+    # NOTE: deliberately not trace.duration_ns -- meaningless for a trace
+    # reconstructed by load_trace_from_json (TraceMetadata.start_time_ns
+    # defaults to the *load* time, not the original run's start). Derive
+    # wall time from the spans themselves instead, same fix already applied
+    # in src/output/summary.py, src/analysis/criticalpath.py and
+    # src/analysis/pop_efficiency.py.
+    timed = [s for s in trace.spans if s.duration_ns > 0]
+    if timed:
+        wall_ns = max(1, max(s.start_ns + s.duration_ns for s in timed) - min(s.start_ns for s in timed))
+    else:
+        wall_ns = 1
 
     _GPU_CATS = {Category.GPU_CUDA, Category.GPU_ROCM, Category.GPU_OPENCL}
     _SYNC_NAMES = {
@@ -231,6 +241,7 @@ def gpu_starvation(trace: "Trace") -> dict:
     }
 
     kernel_intervals: list[tuple[int, int]] = []
+    sync_intervals:   list[tuple[int, int]] = []
     sync_ns = 0
     sync_count = 0
 
@@ -239,13 +250,22 @@ def gpu_starvation(trace: "Trace") -> dict:
             if span.tags.get("type") == "kernel" or span.tags.get("side") in ("gpu", None):
                 kernel_intervals.append((span.start_ns, span.start_ns + span.duration_ns))
         if span.name in _SYNC_NAMES and span.duration_ns > 0:
+            sync_intervals.append((span.start_ns, span.start_ns + span.duration_ns))
             sync_ns += span.duration_ns
             sync_count += 1
 
     # Merge overlapping kernel intervals to get true GPU active time
     gpu_active_ns = _merge_intervals(kernel_intervals)
 
-    launch_gap_ns = max(0, wall_ns - gpu_active_ns - sync_ns)
+    # launch_gap_ns must be computed from the UNION of kernel-active and
+    # sync-wait intervals, not gpu_active_ns + sync_ns added separately: a
+    # sync call's interval routinely overlaps the tail of the kernel(s) it
+    # waits on (e.g. cudaStreamSynchronize starts while the kernel is still
+    # running), so naively adding both double-counts that overlap -- which
+    # silently floored launch_gap_ns to 0 (via the max(0, ...) clamp) even
+    # when a real gap existed, hiding it instead of reporting it.
+    busy_ns = _merge_intervals(kernel_intervals + sync_intervals)
+    launch_gap_ns = max(0, wall_ns - busy_ns)
 
     return {
         "wall_ns":        wall_ns,

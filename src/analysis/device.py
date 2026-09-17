@@ -91,6 +91,24 @@ def _cuda_fp64_ratio(major: int, minor: int) -> float:
     )
 
 
+# FP16 throughput as a multiple of FP32 peak, by compute capability.
+# Pascal (cc 6.x) consumer/mobile parts (GTX 10-series, Jetson TX2) have
+# crippled packed-FP16 (__half2) throughput -- roughly on par with FP32, NOT
+# the 2x every later architecture (Volta+) and Pascal's own datacenter part
+# (P100, cc 6.0) achieve via real 2-per-clock packed FP16 execution.
+# Applying a uniform 2x to Pascal consumer parts overstated their FP16
+# roofline ceiling by ~2x.
+_CUDA_FP16_RATIO: dict[tuple[int, int], float] = {
+    (6, 0): 2.0,   # Pascal P100 (datacenter) -- real 2x packed FP16
+    (6, 1): 1.0,   # Pascal consumer (GTX 10-series) -- crippled FP16
+    (6, 2): 1.0,   # Pascal mobile/Jetson (TX2) -- crippled FP16
+}
+
+
+def _cuda_fp16_ratio(major: int, minor: int) -> float:
+    return _CUDA_FP16_RATIO.get((major, minor), 2.0)  # Volta+ (7.0+): full 2x packed FP16
+
+
 @dataclass
 class DevicePeak:
     """Theoretical peak capabilities of a single compute device."""
@@ -154,6 +172,12 @@ class DevicePeak:
         )
 
 
+# Dedup sets so a failed device-attribute query warns once per attribute id
+# per process, not once per device or per call.
+_cuda_attr_warned: set[int] = set()
+_rocm_attr_warned: set[int] = set()
+
+
 def query_cuda_devices() -> list[DevicePeak]:
     """Query CUDA devices via the driver API using ctypes."""
     try:
@@ -185,7 +209,23 @@ def query_cuda_devices() -> list[DevicePeak]:
 
             def _attr(attr_id: int) -> int:
                 v = ctypes.c_int(0)
-                cuda.cuDeviceGetAttribute(ctypes.byref(v), attr_id, dev)
+                rc = cuda.cuDeviceGetAttribute(ctypes.byref(v), attr_id, dev)
+                if rc != 0:
+                    # Previously silently ignored: a failed query left
+                    # v.value at its ctypes default (0), indistinguishable
+                    # from a device that genuinely reports 0 for that
+                    # attribute -- e.g. a 0 mem_bus_bits/mem_clock_khz
+                    # zeroes bandwidth_gbs, which zeroes ridge_point,
+                    # forcing every kernel to classify as compute-bound;
+                    # a 0 sm_count/core_clock_khz zeroes fp32_tflops,
+                    # making flops_pct always report exactly 0.0% instead
+                    # of surfacing that the device query itself failed.
+                    if attr_id not in _cuda_attr_warned:
+                        _cuda_attr_warned.add(attr_id)
+                        import sys
+                        print(f"[hprofiler][warn] cuDeviceGetAttribute({attr_id}) failed "
+                              f"(CUresult={rc}) -- device peak specs derived from it may be "
+                              f"wrong (reporting 0)", file=sys.stderr)
                 return v.value
 
             # Stable CU_DEVICE_ATTRIBUTE_* ids
@@ -204,7 +244,7 @@ def query_cuda_devices() -> list[DevicePeak]:
             # Peak FP32: SMs × cores/SM × 2 (FMA = mul+add) × clock
             fp32_tflops   = sm_count * cores_sm * 2 * core_clock_ghz / 1000
             fp64_tflops   = fp32_tflops * _cuda_fp64_ratio(major, minor)
-            fp16_tflops   = fp32_tflops * 2
+            fp16_tflops   = fp32_tflops * _cuda_fp16_ratio(major, minor)
 
             # Tensor cores: rough estimate from known GPU families
             tensor_tflops = 0.0
@@ -317,9 +357,20 @@ def query_rocm_devices() -> list[DevicePeak]:
 
         devices: list[DevicePeak] = []
         for i in range(count.value):
-            def _attr(attr_id: int, _i: int = i) -> int:
+            def _attr(attr_id: int, _i: int = i, warn: bool = True) -> int:
                 v = ctypes.c_int(0)
-                hip.hipDeviceGetAttribute(ctypes.byref(v), attr_id, _i)
+                rc = hip.hipDeviceGetAttribute(ctypes.byref(v), attr_id, _i)
+                if rc != 0 and warn and attr_id not in _rocm_attr_warned:
+                    # See query_cuda_devices' _attr for why silently
+                    # ignoring this return code is dangerous: a failed
+                    # query is indistinguishable from a device that
+                    # genuinely reports 0, silently zeroing
+                    # bandwidth_gbs/fp32_tflops downstream.
+                    _rocm_attr_warned.add(attr_id)
+                    import sys
+                    print(f"[hprofiler][warn] hipDeviceGetAttribute({attr_id}) failed "
+                          f"(hipError={rc}) -- device peak specs derived from it may be "
+                          f"wrong (reporting 0)", file=sys.stderr)
                 return v.value
 
             # Use CUDA-compatible attribute IDs — HIP maintains the same numbering:
@@ -333,10 +384,13 @@ def query_rocm_devices() -> list[DevicePeak]:
 
             gfx_major = gfx_minor = 0
             for maj_id, min_id in ((87, 88), (75, 76)):
-                maj = _attr(maj_id)
+                # warn=False: querying the "wrong" (unsupported on this
+                # ROCm version) id pair is expected, normal probing, not a
+                # failure worth warning about.
+                maj = _attr(maj_id, warn=False)
                 if 1 <= maj <= 12:
                     gfx_major = maj
-                    gfx_minor = _attr(min_id)
+                    gfx_minor = _attr(min_id, warn=False)
                     break
 
             name_buf = ctypes.create_string_buffer(256)

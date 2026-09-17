@@ -119,8 +119,9 @@ static pthread_mutex_t g_req_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t req_register(MPI_Request req, const char *type,
                               int peer, int tag, size_t bytes) {
     pthread_mutex_lock(&g_req_mutex);
-    uint64_t id = g_req_seq++;
+    uint64_t id = 0;
     if (g_req_n < REQ_TABLE_CAP) {
+        id = g_req_seq++;
         ReqRec *r   = &g_req_table[g_req_n++];
         r->req      = req;
         r->id       = id;
@@ -129,6 +130,13 @@ static uint64_t req_register(MPI_Request req, const char *type,
         r->bytes    = bytes;
         strncpy(r->type, type, 15); r->type[15] = '\0';
     }
+    /* else: table full (REQ_TABLE_CAP simultaneously outstanding async
+     * requests on this rank -- very deep pipelining). Return 0 rather than
+     * a fresh-looking sequence id: every call site already treats a 0
+     * return as "don't tag sid=", which correctly omits an id that would
+     * otherwise dangle forever (req_lookup() could never find a matching
+     * table entry for it, so the later MPI_Wait's psid= cross-link would
+     * silently never resolve). */
     pthread_mutex_unlock(&g_req_mutex);
     return id;
 }

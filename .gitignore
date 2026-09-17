@@ -7,4 +7,5 @@ dist/
 *.perf.data
 *.hprofiler.json
 MEMORY.md
+*.claude
 memory/

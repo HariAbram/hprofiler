@@ -239,8 +239,21 @@ def _make_traces(device: "DevicePeak",
         # (e.g. FLOPs not measurable on hybrid-core CPUs) still appear on the chart.
         xs, ys, ms = zip(*[(max(p[0], _AXIS_MIN_X), max(p[1], _AXIS_MIN_Y), p[2]) for p in pts])
         hover = []
-        for m in ms:
+        for y_plotted, m in zip(ys, ms):
             flops_unmeasured = m.est_flops == 0.0
+            # For memory-bound kernels, the plotted Y is clamped to the
+            # memory-bandwidth-implied ceiling (line above: min(achieved_tflops,
+            # ai*bw)) so the point visually sits ON the memory roofline rather
+            # than floating above it -- but the tooltip used to always show
+            # the raw, unclamped m.achieved_tflops, which could read higher
+            # than where the dot is actually drawn with no explanation (e.g.
+            # if est_flops was itself overestimated). Flag it explicitly
+            # whenever the two differ non-trivially.
+            clamp_note = ("<br><i>⚠ plotted at the memory-BW ceiling "
+                           f"({y_plotted:.4f} TFLOPs/s); computed-from-instructions "
+                           f"estimate was {m.achieved_tflops:.4f} TFLOPs/s</i>"
+                           if m.achieved_tflops > 0 and y_plotted < m.achieved_tflops * 0.99
+                           else "")
             bw_note = ("<br><i>⚠ BW counter includes L2 write-backs — may exceed peak</i>"
                        if m.bw_pct >= 90 else "")
             fp_note = ("<br><b>⚠ FLOPs not measured</b> — point placed at chart left edge.<br>"
@@ -292,7 +305,7 @@ def _make_traces(device: "DevicePeak",
                    f"<b>FP32 ceiling: {ceil_t:.4f} TFLOPs/s ({hr:.1f}× headroom)</b><br>"
                    f"<b>Bound: {m.bound}</b>  ridge: {m.ridge:.1f} F/B") +
                 (f"<br>{occ_line}" if occ_line else "") +
-                f"{fp_note}<br><i>Source: {m.data_source}</i>"
+                f"{fp_note}{clamp_note}<br><i>Source: {m.data_source}</i>"
             )
         # Split into measured (show normally) and unmeasured-FLOPs (gray x-mark)
         measured   = [(x, y, m, h) for x, y, m, h in zip(xs, ys, ms, hover)

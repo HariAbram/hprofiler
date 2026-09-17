@@ -63,27 +63,46 @@ static pid_t           g_pid         = 0;
  * CL device timestamps are in the OpenCL device time domain (an opaque
  * monotonic counter reset independently from CLOCK_MONOTONIC).  To make
  * kernel spans appear at the correct wall-clock position in the trace we
- * capture a (wall_ns, cl_ns) pair at the first observed event and use the
- * offset to translate all subsequent CL timestamps.
+ * capture a (wall_ns, cl_ns) pair once and use the offset to translate all
+ * subsequent CL timestamps.
  *
- * The offset may be off by the latency between the kernel completing and
- * the callback firing (typically < 1 ms), but it is far better than the
- * unbounded error of raw CL timestamps.
+ * That calibration pair MUST be taken from CL_PROFILING_COMMAND_END, not
+ * COMMAND_START: this function is only ever called from the CL_COMPLETE
+ * callback (on_event_complete), which fires essentially AT the moment the
+ * command finishes -- so now_ns() there is a tight match for gpu_end, but
+ * could be off from gpu_start by the entire duration of whichever kernel
+ * calibrates first (an earlier version paired now_ns() with gpu_start,
+ * silently biasing the wall-clock POSITION -- not duration, which stays
+ * correct -- of every subsequent span in the trace by that amount; often
+ * hundreds of ms if the first kernel was a slow JIT/warm-up one).
+ *
+ * Known remaining approximation: this offset is a single global value even
+ * if the process uses multiple OpenCL devices with independent clock
+ * domains (e.g. two GPUs, or a GPU + the CPU device) -- a per-device offset
+ * map would be needed to calibrate each independently; not implemented, so
+ * multi-device runs may still see a modest per-device position error.
  */
 static int64_t         g_cl_offset_ns   = INT64_MIN;
 static pthread_mutex_t g_cl_offset_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t now_ns(void);   /* forward declaration — defined below */
 
-static uint64_t cl_to_wall_ns(cl_ulong cl_ns) {
+/* Establishes the offset (once) from a CL_PROFILING_COMMAND_END timestamp,
+ * paired with a wall-clock reading taken essentially at the same moment
+ * (inside the CL_COMPLETE callback). Must be called before cl_to_wall_ns()
+ * is used to convert that event's START timestamp, so the offset is always
+ * anchored to an END, never a START. */
+static void cl_calibrate_if_needed(cl_ulong gpu_end_ns) {
     pthread_mutex_lock(&g_cl_offset_mutex);
     if (g_cl_offset_ns == INT64_MIN) {
-        /* First calibration: record wall time at the moment we first observe
-         * a CL timestamp.  The offset is negative when the CL counter started
-         * earlier than CLOCK_MONOTONIC (common on discrete GPUs). */
-        g_cl_offset_ns = (int64_t)now_ns() - (int64_t)cl_ns;
+        g_cl_offset_ns = (int64_t)now_ns() - (int64_t)gpu_end_ns;
     }
-    int64_t offset = g_cl_offset_ns;
+    pthread_mutex_unlock(&g_cl_offset_mutex);
+}
+
+static uint64_t cl_to_wall_ns(cl_ulong cl_ns) {
+    pthread_mutex_lock(&g_cl_offset_mutex);
+    int64_t offset = (g_cl_offset_ns == INT64_MIN) ? 0 : g_cl_offset_ns;
     pthread_mutex_unlock(&g_cl_offset_mutex);
     int64_t wall = (int64_t)cl_ns + offset;
     return wall > 0 ? (uint64_t)wall : 0;
@@ -153,6 +172,32 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                 cat, g_pid, tid,
                 (unsigned long long)start_ns, (unsigned long long)dur_ns,
                 name);
+        /* snprintf returns >= sizeof(buf) when truncated. Rather than
+         * silently dropping the whole span, retry with a shortened name so
+         * the event -- correct timing, full tags -- still reaches the
+         * trace. */
+        if (n >= (int)sizeof(buf)) {
+            char short_name[200];
+            size_t name_len = strlen(name);
+            if (name_len > sizeof(short_name) - 4) {
+                memcpy(short_name, name, sizeof(short_name) - 4);
+                memcpy(short_name + sizeof(short_name) - 4, "...", 4);
+            } else {
+                memcpy(short_name, name, name_len + 1);
+            }
+            if (extra && *extra)
+                n = snprintf(buf, sizeof(buf),
+                    "span:%s:%d:%d:%llu:%llu:%s:%s\n",
+                    cat, g_pid, tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
+                    short_name, extra);
+            else
+                n = snprintf(buf, sizeof(buf),
+                    "span:%s:%d:%d:%llu:%llu:%s\n",
+                    cat, g_pid, tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
+                    short_name);
+        }
         if (n > 0 && n < (int)sizeof(buf))
             send_all(buf, n);
         emit_callstack(start_ns);
@@ -225,6 +270,7 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
     if (g_real_prof &&
         g_real_prof(ev, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &gpu_start, NULL) == CL_SUCCESS &&
         g_real_prof(ev, CL_PROFILING_COMMAND_END,   sizeof(cl_ulong), &gpu_end,   NULL) == CL_SUCCESS) {
+        cl_calibrate_if_needed(gpu_end);
         uint64_t wall_start = cl_to_wall_ns(gpu_start);
         uint64_t dur_ns     = (gpu_end >= gpu_start) ? (gpu_end - gpu_start) : 0;
         emit_span("opencl", gettid_compat(), wall_start, dur_ns, d->name, d->extra);

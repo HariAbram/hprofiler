@@ -19,10 +19,22 @@ Mapping:
   Category      → InstrumentationScope name  (e.g. "hprofiler.cuda")
 
 Time alignment:
-  hprofiler timestamps are monotonic-ns relative to trace start.
-  At export time the difference (time.time_ns() - time.monotonic_ns()) converts
-  them to Unix epoch nanoseconds; the error is ≤ clock drift since the run, i.e.
-  sub-millisecond for immediately post-run exports.
+  hprofiler span/counter timestamps are RAW, ABSOLUTE CLOCK_MONOTONIC
+  nanoseconds (whatever clock_gettime(CLOCK_MONOTONIC) read in the hook at
+  the moment of the call) -- NOT relative to trace start. CLOCK_MONOTONIC is
+  a single, system-wide clock shared by every process on the same machine
+  (typically nanoseconds since boot), so at export time the difference
+  (time.time_ns() - time.monotonic_ns()), computed in THIS process, converts
+  any such absolute-monotonic timestamp to Unix epoch nanoseconds directly --
+  correct even when exporting from a different process than the one that
+  captured the trace (e.g. `hprofiler view saved.json --otlp-endpoint ...`
+  run later), as long as it's the same machine and it hasn't rebooted since.
+  Do NOT additionally add trace.metadata.start_time_ns -- that's also an
+  absolute CLOCK_MONOTONIC reading, not an offset, and adding both was a
+  real (now-fixed) bug: every exported timestamp was off by trace start's
+  own CLOCK_MONOTONIC reading (i.e. system uptime at trace start), which on
+  a persistent HPC login/compute node is hours to months, not the intended
+  sub-millisecond clock-drift error.
 """
 
 from __future__ import annotations
@@ -129,9 +141,12 @@ def build_traces_payload(trace: "Trace") -> dict:
     from ..core.events import SpanEvent, InstantEvent
 
     meta  = trace.metadata
-    # Epoch offset: converts monotonic ns → Unix ns.  Computed once per export.
+    # Epoch offset: converts an absolute CLOCK_MONOTONIC ns reading (what
+    # every ev.start_ns/timestamp_ns already is) to Unix epoch ns. Computed
+    # once per export. Do NOT also add meta.start_time_ns -- see module
+    # docstring "Time alignment" for why that double-counts trace start's
+    # own monotonic reading.
     epoch_offset     = time.time_ns() - time.monotonic_ns()
-    trace_epoch_ns   = meta.start_time_ns + epoch_offset
 
     run_key  = f"{meta.command}:{meta.start_time_ns}:{meta.hostname}"
     tid      = _trace_id(run_key)
@@ -147,7 +162,7 @@ def build_traces_payload(trace: "Trace") -> dict:
     for ev in trace.all_events:
         if isinstance(ev, SpanEvent):
             cat      = ev.category.value
-            start_ns = trace_epoch_ns + ev.start_ns
+            start_ns = epoch_offset + ev.start_ns
             end_ns   = start_ns + max(ev.duration_ns, 0)
             name     = ev.name or f"[{cat}]"
             attrs    = [_attr_str("hprofiler.category", cat)]
@@ -163,7 +178,7 @@ def build_traces_payload(trace: "Trace") -> dict:
 
         elif isinstance(ev, InstantEvent):
             cat      = ev.category.value
-            start_ns = trace_epoch_ns + ev.timestamp_ns
+            start_ns = epoch_offset + ev.timestamp_ns
             end_ns   = start_ns
             name     = ev.name or f"[{cat}:instant]"
             attrs    = [_attr_str("hprofiler.category", cat)]
@@ -223,13 +238,13 @@ def build_metrics_payload(trace: "Trace") -> dict:
         return {"resourceMetrics": []}
 
     meta           = trace.metadata
+    # See build_traces_payload's comment: do NOT add meta.start_time_ns here.
     epoch_offset   = time.time_ns() - time.monotonic_ns()
-    trace_epoch_ns = meta.start_time_ns + epoch_offset
 
     # Group data points by counter name
     by_name: dict[str, list[dict]] = {}
     for ctr in trace.counters:
-        ts = trace_epoch_ns + ctr.timestamp_ns
+        ts = epoch_offset + ctr.timestamp_ns
         dp: dict = {
             "timeUnixNano": str(ts),
             "asDouble":     float(ctr.value),

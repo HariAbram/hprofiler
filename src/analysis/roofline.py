@@ -37,6 +37,7 @@ _FLOPS: dict[str, dict[InsnType, float]] = {
         InsnType.VEC_MEM:   0.0,  # pure load / store
         InsnType.VECTOR:   16.0,  # integer SIMD — same bucket as VEC_SP as fallback
         InsnType.COMPUTE:   2.0,  # scalar FMA / imul
+        InsnType.INT_COMPUTE: 0.0,  # not currently emitted by classify_x86; explicit for clarity
         InsnType.SCALAR:    0.5,  # ~half of scalars are FP ops
         InsnType.MEMORY:    0.0,
         InsnType.CONTROL:   0.0,
@@ -44,8 +45,20 @@ _FLOPS: dict[str, dict[InsnType, float]] = {
         InsnType.OTHER:     0.0,
     },
     "sass": {
-        InsnType.COMPUTE:   2.0,  # FFMA (FP32 FMA) = mul + add
-        InsnType.VECTOR:    2.0,  # HMMA / HFMA conservative
+        InsnType.COMPUTE:   2.0,  # FFMA (FP32 FMA) = mul + add -- real FP ops only, see classify_sass
+        InsnType.INT_COMPUTE: 0.0,  # IMAD/IMUL/XMAD address arithmetic -- NOT FLOPs
+        # Tensor-core MMA: one instruction computes a whole MxNxK tile, not
+        # a scalar op. Using a representative FP16-accumulate 16x8x16 shape
+        # (4096 FLOPs / 32-thread warp = 128 FLOPs "per thread", consistent
+        # with how this model multiplies flops-per-instruction by total
+        # thread count for every other instruction type too) -- real shapes
+        # vary (16x8x8, 16x8x32, TF32 m16n8k4, …), so treat this as a
+        # representative average, same "approximate estimate" caveat as the
+        # rest of this disasm-based model. The previous value (2.0, the
+        # same bucket as a scalar FFMA) undercounted real tensor-core
+        # throughput by ~100x+.
+        InsnType.TENSOR:  128.0,
+        InsnType.VECTOR:    2.0,  # generic SASS vector fallback (rarely emitted)
         InsnType.VEC_SP:    2.0,
         InsnType.VEC_DP:    2.0,
         InsnType.VEC_MEM:   0.0,
@@ -59,7 +72,16 @@ _FLOPS: dict[str, dict[InsnType, float]] = {
         InsnType.VEC_SP:    4.0,  # v_fma_f32 (SIMD4 lane × 2 ops)
         InsnType.VEC_DP:    2.0,  # v_fma_f64 (SIMD2 lane × 2 ops)
         InsnType.VEC_MEM:   0.0,
-        InsnType.VECTOR:    4.0,  # integer lane ops — same bucket as VEC_SP
+        InsnType.VECTOR:    4.0,  # other/unknown integer or bit-manipulation lane ops
+        InsnType.INT_COMPUTE: 0.0,  # v_*_u32/i32 address arithmetic -- NOT FLOPs
+        # MFMA (matrix-fma): one instruction computes a whole tile. Using a
+        # representative v_mfma_f32_32x32x8f16 shape: 2*32*32*8 = 16384
+        # FLOPs / 64-lane wavefront = 256 FLOPs "per thread" (same
+        # per-instruction × total-thread-count model as every other type
+        # here; real shapes vary). The previous value (4.0, the same
+        # bucket as a plain FP32 SIMD op) undercounted real MFMA throughput
+        # by ~100x+, the AMDGCN analog of the SASS HMMA issue above.
+        InsnType.TENSOR:  256.0,
         InsnType.COMPUTE:   2.0,  # v_mac_f32 / v_mul_f32 pair
         InsnType.SCALAR:    1.0,  # s_mul_i32 etc.
         InsnType.MEMORY:    0.0,
@@ -317,6 +339,21 @@ def compute_kernel_metrics(
     """
     Estimate FLOPs, bandwidth and utilization for a single kernel span.
     Returns None when there is insufficient data (zero duration, no instructions).
+
+    IMPORTANT known limitation: this counts each STATIC disassembly line
+    exactly once (see the loop below), i.e. it assumes every instruction in
+    the kernel body executes exactly once per thread. For any kernel
+    containing a loop (stencils, iterative solvers, anything with a
+    trip-count > 1) this UNDER-estimates true per-thread FLOPs/bytes
+    roughly in proportion to the loop's trip count -- a kernel that
+    actually does 100 loop iterations of real FP work will report ~100x
+    less est_flops than it truly executes. There is currently no dynamic
+    execution-count data (e.g. per-PC-offset sample density from
+    --gpu-pc-sampling) fed into this estimate to correct for it. This
+    applies only to the disassembly-estimate path (data_source="disasm");
+    the hardware-counter path (metrics_from_counters, data_source
+    containing "hardware_counters"/"hw_counters(...)") measures real
+    executed FLOPs and is unaffected.
     """
     if span.duration_ns <= 0 or not kd.lines:
         return None
@@ -325,7 +362,8 @@ def compute_kernel_metrics(
     ftbl    = _flops_table(kd.arch)
     mbytes  = _mem_bytes(kd.arch)
 
-    # Aggregate instruction counts by type
+    # Aggregate STATIC instruction counts by type -- see the loop-trip-count
+    # caveat in this function's docstring.
     counts: dict[InsnType, int] = {}
     for ln in kd.lines:
         counts[ln.itype] = counts.get(ln.itype, 0) + 1

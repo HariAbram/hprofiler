@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import resource
+from collections import deque
 import shutil
 import socket
 import subprocess
@@ -113,6 +114,45 @@ def _parse_record(line: str) -> AnyEvent | None:
             )
     except Exception:
         pass
+    return None
+
+
+# Maps (pid, tid) -> a small ring of recent SpanEvents from that thread, used
+# to attach a stk: record to the span: record it annotates.
+#
+# stk: records are sent immediately after their span: record on the same
+# connection, but each LD_PRELOAD hook (cuda/rocm/opencl/ompt/nccl/mpi) opens
+# its own socket connection with its own handler thread, so two different
+# hooks emitting from the same OS tid in close succession can interleave
+# across connections. A single last-write-wins slot could then have already
+# been overwritten by the other hook's span by the time this stk: record
+# arrives, even though the correct span is still very recent. Keep a short
+# ring instead of one slot and match by start_ns anywhere in it.
+RECENT_SPANS_PER_THREAD = 8
+
+
+def _remember_recent_span(
+    recent: dict[tuple[int, int], "deque[SpanEvent]"], ev: SpanEvent,
+    maxlen: int = RECENT_SPANS_PER_THREAD,
+) -> None:
+    key = (ev.pid, ev.tid)
+    ring = recent.get(key)
+    if ring is None:
+        ring = deque(maxlen=maxlen)
+        recent[key] = ring
+    ring.append(ev)
+
+
+def _find_recent_span(
+    recent: dict[tuple[int, int], "deque[SpanEvent]"],
+    pid: int, tid: int, start_ns: int,
+) -> SpanEvent | None:
+    ring = recent.get((pid, tid))
+    if ring is None:
+        return None
+    for candidate in reversed(ring):
+        if candidate.start_ns == start_ns:
+            return candidate
     return None
 
 
@@ -238,10 +278,7 @@ class Runner:
 
         events_lock = threading.Lock()
         client_threads: list[threading.Thread] = []
-        # Maps (pid, tid) → most recent SpanEvent from that thread.
-        # stk: records are always sent immediately after their span: record
-        # from the same thread, so this single-slot cache is sufficient.
-        _last_span: dict[tuple[int, int], SpanEvent] = {}
+        _recent_spans: dict[tuple[int, int], deque[SpanEvent]] = {}
 
         def handle_client(client: sock_mod.socket) -> None:
             buf = ""
@@ -261,8 +298,8 @@ class Runner:
                                     # Frames may be plain "sym" or "sym|/lib.so|0xoffset"
                                     frames = [f for f in parts[4].split(";") if f]
                                     with events_lock:
-                                        span = _last_span.get((pid, tid))
-                                        if span is not None and span.start_ns == start_ns:
+                                        span = _find_recent_span(_recent_spans, pid, tid, start_ns)
+                                        if span is not None:
                                             span.stack_frames = frames
                                             trace._has_stacks = True
                             except Exception:
@@ -285,7 +322,7 @@ class Runner:
                             if ev is not None:
                                 with events_lock:
                                     if isinstance(ev, SpanEvent):
-                                        _last_span[(ev.pid, ev.tid)] = ev
+                                        _remember_recent_span(_recent_spans, ev)
                                     trace.add(ev)
                                 if self.on_event:
                                     self.on_event(ev)

@@ -27,6 +27,8 @@ intercepted without requiring libnvToolsExt.
 14. [Extending the Profiler](#14-extending-the-profiler)
 15. [AI Performance Analysis](#15-ai-performance-analysis)
 16. [Call-Path Analysis, CCT, and GPU Starvation](#16-call-path-analysis-cct-and-gpu-starvation)
+17. [POP-Style Efficiency Analysis](#17-pop-style-efficiency-analysis)
+18. [Critical Path and Cross-Runtime Blame Attribution](#18-critical-path-and-cross-runtime-blame-attribution)
 
 ---
 
@@ -92,9 +94,9 @@ python3 hprofiler run --no-ui -- ./my_program
 | OpenMP backend | `libomp` (LLVM) — not GCC's `libgomp` (see §4) |
 | CUDA backend | CUDA Runtime installed (`libcuda.so`) |
 | OpenCL backend | Any ICD loader (`libOpenCL.so`) |
-| ROCm backend | ROCm installed at `/opt/rocm` |
+| ROCm backend | `libamdhip64.so` findable via ldconfig, `$ROCM_PATH`/`$ROCM_HOME`, or a system/`/opt/rocm*` lib dir (not required to be exactly `/opt/rocm`) |
 | NCCL backend | CUDA Runtime + `libnccl.so` at runtime |
-| MPI backend | Any MPI implementation (`mpicc` at build time) |
+| MPI backend | Any MPI implementation with `mpicc`, **or** a Cray Programming Environment (`$CRAY_MPICH_DIR` + the `cc` compiler wrapper) — no `mpicc` needed there |
 | Call-path unwinding (optional) | `libunwind-dev` (apt) / `libunwind-devel` (dnf) — for accurate C++ stack capture without frame pointers |
 | Disasm (CUDA AoT) | `cuobjdump` (CUDA toolkit) |
 | Disasm (CPU/ELF) | `capstone>=5.0` (fast path) or `objdump` / `llvm-objdump` |
@@ -267,6 +269,15 @@ hprofiler roofline --backend rocm -- ./my_hip_app
 hprofiler roofline my_program.hprofiler.json
 ```
 
+This mode counts each *static* disassembly line once per thread — it has no
+information about dynamic execution counts. For any kernel containing a
+loop (stencils, iterative solvers, anything with a trip count > 1), this
+**under-estimates** true FLOPs/bytes roughly in proportion to the loop's
+trip count (100 real loop iterations of FP work → roughly 100x less
+`est_flops` than actually executed). Prefer Mode 1 (hardware counters) for
+looping kernels; Mode 2 is most reliable for straight-line (unrolled,
+non-looping) kernel bodies.
+
 **Required tools per backend:**
 
 | Backend | Tool | Install |
@@ -312,6 +323,49 @@ hprofiler summary [OPTIONS] TRACE_FILE
 
 ```bash
 hprofiler summary --top 10 my_program.hprofiler.json
+```
+
+---
+
+### `hprofiler efficiency`
+
+Print a POP-style parallel efficiency breakdown for a saved trace. See §17
+for the full formula tree and what's exact vs. approximate.
+
+```
+hprofiler efficiency [OPTIONS] TRACE_FILE
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--baseline TRACE` | none | A trace of the same program at a lower rank/thread count, for Computational Scaling |
+| `--interconnect-bw GB/S` | none | Peak interconnect bandwidth, to turn achieved NCCL bus bandwidth into an efficiency % |
+| `--critical-path` / `--no-critical-path` | `--critical-path` | Also run critical-path analysis to compute Serialization Efficiency |
+
+```bash
+hprofiler efficiency trace.json
+hprofiler efficiency trace.json --baseline trace_1rank.json --interconnect-bw 300
+```
+
+---
+
+### `hprofiler critical-path`
+
+Compute and print the N-way cross-runtime critical path for a saved trace.
+See §18 for the dependency model, its scope, and the single-node limitation.
+
+```
+hprofiler critical-path [OPTIONS] TRACE_FILE
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--top`, `-n` | `15` | Number of top categories to show in each breakdown |
+| `--export FILE` | none | Write the trace back out as Chrome Trace JSON with critical-path spans tagged `on_critical_path=1`, for highlighting in Perfetto |
+
+```bash
+hprofiler critical-path trace.json
+hprofiler critical-path trace.json --export trace.critpath.json
 ```
 
 ---
@@ -611,6 +665,23 @@ ldd ./my_program | grep -E "gomp|omp"
 hprofiler run --backend openmp -- ./my_omp_program
 ```
 
+**Finding `libomp` on HPC/Cray clusters:** besides the usual distro package
+paths, the backend also checks `/opt/rocm*/llvm/lib/` and
+`/opt/rocm*/lib/llvm/lib/` (ROCm ships its own Clang+libomp), and honors
+`$ROCM_PATH`/`$ROCM_HOME`/`$LLVM_HOME`/`$LLVM_ROOT`/`$LLVM_PATH` if set. On a
+Cray system where the default `cc` wrapper doesn't provide an OMPT-capable
+`libomp` (e.g. Dardel), load the ROCm module and export the path:
+
+```bash
+module load rocm  # or equivalent on your system
+export ROCM_PATH=/opt/rocm-6.3.3   # adjust to the loaded version
+hprofiler backends   # openmp should now show available
+```
+
+Note this only fixes *detection* — the profiled binary still has to actually
+be linked against that same OMPT-capable `libomp` (not the Cray PE's default
+OpenMP runtime) for events to be captured.
+
 ---
 
 ### `rocm` — ROCm / HIP
@@ -619,7 +690,16 @@ Injects `libhprofiler_rocm.so` via `LD_PRELOAD`. Uses `hipEvent_t` pairs for
 GPU-accurate kernel timing, tracks device memory with counter events, groups
 spans by stream ID, and saves JIT binaries for disassembly.
 
-**Requirements:** ROCm installed at `/opt/rocm` with `libamdhip64.so`.
+**Requirements:** `libamdhip64.so` findable at runtime. Checked, in order: the
+system ldconfig cache; `$ROCM_PATH`/`$ROCM_HOME` (if set) plus their `lib`/
+`lib64` subdirs; `/opt/rocm`, `/usr/local/rocm`, and any `/opt/rocm-*` /
+`/usr/local/rocm-*` versioned install (newest version picked first, by
+numeric — not lexicographic — sort); and common system lib dirs
+(`/usr/lib/x86_64-linux-gnu`, `/usr/lib64`, `/usr/lib`, `/usr/lib/aarch64-linux-gnu`).
+A full ROCm SDK at `/opt/rocm` is *not* required — a standalone
+`libamdhip64` runtime package (e.g. Debian/Ubuntu's `libamdhip64-5`) is
+enough for the hook to load; ROCm's own `hipcc`/headers are only needed to
+compile the HIP program being profiled.
 
 ```bash
 hprofiler run --backend rocm -- ./my_hip_program
@@ -715,6 +795,19 @@ mpirun -np 4 env LD_PRELOAD=build/lib/libhprofiler_mpi.so \
 # Combined with hprofiler run (MPI backend auto-injects the library)
 hprofiler run --backend mpi -- mpirun -np 4 ./my_mpi_app
 ```
+
+**Cray Programming Environment:** on Cray systems (e.g. Dardel) there is
+often no `mpicc` — the `cc` compiler wrapper supplies MPI headers/libs
+automatically. `hooks/mpi_hook/CMakeLists.txt` detects this via
+`$CRAY_MPICH_DIR` and confirms the current `CMAKE_C_COMPILER` can already
+compile+link a trivial MPI program with no extra `-I`/`-L` (via
+`check_c_source_compiles`) before trusting it; if so, no manual include/link
+flags are added — the wrapper injects its own, and adding your own can
+conflict. Falls back to the conventional `mpi.h` search (now also honoring
+`$MPI_HOME`/`$MPI_ROOT` hints) on non-Cray systems or if that probe fails.
+On a Cray login node `cc` is normally already the default C compiler CMake
+picks up, so `python3 hprofiler build` should detect it with no extra flags;
+if it doesn't, force it with `CC=cc python3 hprofiler build`.
 
 **Note:** The MPI hook uses wall-clock host timing only. It does not intercept
 MPI-3 RMA epochs or non-blocking collective progress; `MPI_Wait` / `MPI_Waitall`
@@ -1816,6 +1909,17 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | `mpi` | `type=send\|recv\|allreduce\|...` | MPI call type |
 | `mpi` | `bytes=N,rank=R,peer=P,tag=T` | Message size, own rank, remote rank |
 
+**Names containing `:`:** hook-side names (e.g. demangled C++ kernel names
+like `Namespace::kernel`, or NVTX labels) are not escaped before being
+written into the record, so the `<name>[:<key=val,...>]` boundary can be
+ambiguous. The Python receiver resolves this by taking the text after the
+*last* `:` and checking whether it matches the `key=val[,key=val...]` tag
+grammar; if it doesn't, the whole remainder — colons included — is treated
+as the name. This correctly handles a name with colons plus real trailing
+tags (`Layer::forward:sid=5,psid=3` → name `Layer::forward`, tags `sid=5`,
+`psid=3`), but a tagless name that itself ends in something that happens to
+look like `key=val` would still be misread as carrying a (bogus) tag.
+
 ### Call-stack record *(emitted only when `HPROFILER_CALLSTACK=1`)*
 
 Immediately follows the `span:` record it annotates, while the socket mutex is
@@ -2055,6 +2159,8 @@ The TUI remains responsive at 250k spans at all zoom levels.
 | **Static CUDA runtime** | Binaries linked with `libcudart_static.a` (nvcc default) show 0 events because LD_PRELOAD cannot intercept compile-time-resolved `cudaXxx` symbols. `--gpu-pc-sampling` has the same requirement. | Rebuild with `-cudart shared` (no runtime-performance impact). |
 | **Device bandwidth estimates** | The roofline `device.py` memory-bandwidth formula under-reports peak bandwidth by ~2× for HBM-based cards (A100, H100, MI300). | Treat bandwidth peaks in the System tab as conservative estimates; check vendor datasheets for exact numbers. |
 | **ROCm PC sampling** | `--gpu-pc-sampling` is silently ignored for ROCm runs. Instruction-level heat annotation requires `librocprofiler-sdk.so` integration (not yet implemented). | Use CUDA backend for instruction-level GPU heat. |
+| **Critical-path analysis is single-node only** | `hprofiler critical-path` (§18) can't build cross-node dependency edges — the collector's `AF_UNIX` socket is only reachable within one node/filesystem, so multi-node MPI jobs are inherently out of scope, not just a clock-sync issue. | Profile one node's ranks at a time, or use it for single-node multi-GPU/multi-rank runs. |
+| **POP efficiency's Serialization/Transfer split is approximate** | `hprofiler efficiency` (§17) fits latency/bandwidth from the trace's own messages instead of a Dimemas network replay. | Treat Transfer Efficiency as a proxy; check `EfficiencyReport.notes` for when it was too under-determined to compute at all. |
 
 ---
 
@@ -2600,3 +2706,154 @@ hprofiler run --backend cuda --call-tree -- ./sim --steps 10
 # Step 4: check the Call Tree tab in the TUI for full call-path detail
 #   → Drill down to find the exact file:line responsible for each bottleneck
 ```
+
+---
+
+## 17. POP-Style Efficiency Analysis
+
+```bash
+hprofiler efficiency trace.json
+hprofiler efficiency trace.json --baseline trace_1rank.json
+hprofiler efficiency trace.json --interconnect-bw 300
+```
+
+`hprofiler efficiency` decomposes a trace's parallel efficiency the way the
+[POP (Performance Optimisation and Productivity) Centre of Excellence
+standard metrics](https://pop-coe.eu/) do, computed directly from a single
+hprofiler trace with **no offline network simulator** (POP's usual
+methodology replays the trace over a simulated zero-contention network via
+Dimemas to separate unavoidable serialization from avoidable network
+slowdown — this module approximates that instead, see below), plus two
+layers beyond stock POP (which only covers MPI+OpenMP): GPU and NCCL
+efficiency.
+
+### Formula tree
+
+```
+Global Efficiency      = Parallel Efficiency × Computational Scaling
+Parallel Efficiency    = Load Balance × Communication Efficiency
+Communication Efficiency = Serialization Efficiency × Transfer Efficiency
+```
+
+| Factor | Formula | Exact or approximate? |
+|---|---|---|
+| Load Balance | avg(useful time per rank) / max(useful time per rank) | **Exact** — "useful time" is the merged (overlap-deduplicated) wall-clock interval covered by `cpu`/`cuda`/`rocm`/`opencl`/`openmp` category spans on that rank/process |
+| Communication Efficiency | max(useful time per rank) / wall time | **Exact** |
+| Transfer Efficiency | ideal message time (self-fitted α+bytes/β model) / actual message time | **Approximate** — see below |
+| Serialization Efficiency | (communication time that is actually on the critical path) / (total communication time) | **Approximate**, and only computed when critical-path analysis (§18) is available — `--no-critical-path` disables it |
+| Computational Scaling | mean IPC(this trace) / mean IPC(`--baseline` trace), capped at 1.0 | **Approximate proxy** — POP's stricter definition also scales instruction count, not just IPC; requires a `--baseline` trace at a lower rank/thread count (inherent to the metric itself, not a limitation of this implementation — POP's own methodology needs a reference case too) |
+| GPU Efficiency | duration-weighted mean of the existing disassembly-based roofline `flops_pct` | Requires the trace to have been recorded/viewed with `--disasm` |
+| NCCL Efficiency | achieved bus bandwidth (standard ring-allreduce formula, same metric `nccl-tests` reports) / `--interconnect-bw` | Achieved bus bandwidth is exact; the efficiency **percentage** requires `--interconnect-bw` (no reliable auto-detection of NVLink/PCIe/Slingshot peak across all platforms) |
+
+### The self-calibrated Transfer Efficiency proxy
+
+Instead of a Dimemas replay, `fit_alpha_beta()` fits `duration_ns ≈ α +
+bytes/β` (a standard latency+bandwidth / "Hockney" model) directly from the
+trace's own population of `(bytes, duration)` pairs already captured on
+every MPI/NCCL span — no separate micro-benchmark run needed. Transfer
+Efficiency is then `Σ(ideal time) / Σ(actual time)` over those same
+messages. This needs at least 4 messages with varying sizes to regress
+meaningfully; with too little size variance it's omitted (reported in
+`notes`, never silently guessed).
+
+### `--baseline` and `--interconnect-bw`
+
+- `--baseline TRACE`: a trace of the *same program* run at a lower
+  rank/thread count, used only for Computational Scaling. Requires an `ipc`
+  counter in both traces (the `likwid` or `cpu` backend).
+- `--interconnect-bw GB/S`: peak interconnect bandwidth, used only to turn
+  the always-computed achieved NCCL bus bandwidth into an efficiency
+  percentage.
+
+Every field the report couldn't compute is `None`/`n/a`, never a silently
+wrong guess — check `EfficiencyReport.notes` (also printed by the CLI) for
+exactly why.
+
+---
+
+## 18. Critical Path and Cross-Runtime Blame Attribution
+
+```bash
+hprofiler critical-path trace.json
+hprofiler critical-path trace.json --export trace.critpath.json   # tags spans for Perfetto
+```
+
+`hprofiler critical-path` builds a dependency graph over **every** captured
+span — CUDA, ROCm, OpenCL, OpenMP, MPI, NCCL together in one graph, since
+every hook in a run already reports to the same collector — walks it
+backward from the last-ending event to find the real observed critical
+path, and attributes idle time on that path to whichever span was being
+waited on. This generalizes two established but narrower techniques:
+CASITA's critical-path analysis (MPI+CUDA only) and HPCToolkit's
+blame-shifting (CPU+GPU pairs only) to an arbitrary N-way combination of
+hprofiler's backends.
+
+### Scope: structural synchronization, not data-flow
+
+An edge in the graph means *"the destination provably cannot proceed until
+the source reaches the marked point"* — never *"the destination reads data
+the source wrote"*. Edges come only from each programming model's known
+synchronization semantics:
+
+| Edge kind | Meaning | Source |
+|---|---|---|
+| Program order | Sequential spans on the same OS thread | Timestamps only |
+| Stream order | Sequential CUDA/ROCm spans on the same `stream=N` | `stream=` tag |
+| Device sync | `cudaDeviceSynchronize`/`hipDeviceSynchronize` depends on every GPU span since the last device sync on that process | Category/name matching |
+| Point-to-point | The Nth `MPI_Send` pairs with the Nth matching `MPI_Recv` (`rank`/`peer`/`tag`), in each side's own chronological order — **not** "whichever send had already started" (MPI guarantees FIFO delivery per ordered pair+tag, so this holds regardless of which span starts first; a recv is commonly posted well before its matching send, to overlap communication setup with compute). Gated by the send's **start**, evaluated against the recv's **end** — the recv can't complete before the send has at least begun, not before it's fully finished. `Isend`/`Irecv` → `Wait`/`Waitall` additionally via the existing `sid=`/`psid=` span correlation (§12/§16.1) | `rank=`/`peer=`/`tag=` tags, `span_id`/`parent_span_id` |
+| Collective / barrier rendezvous | Every participant depends on the single **last-arriving** participant (by `start_ns`) — not a full mutual clique between all participants, which would let the walk keep chaining through arrival edges after the last arriver is already found. Gated the same way as point-to-point: by the last arriver's **start**, against the waiting participant's **end** | Overlapping-interval clustering per `(type)` for MPI/NCCL, per `(pid, barrier name)` for OpenMP |
+
+This does **not** attempt arbitrary data-flow analysis (e.g. "this kernel
+depends on that MPI recv because it reads the buffer it filled") — only
+these structural cases. The same scoping choice CASITA and Score-P make.
+
+### Single-node only
+
+hprofiler's collector listens on an `AF_UNIX` socket (§12), reachable only
+from processes on the same node/filesystem — so a trace is inherently
+single-node today regardless of clock synchronization; there's no
+multi-node case to guard against yet. A future network-transport collector
+would additionally need a clock-offset correction step (the same class of
+problem Score-P/Vampir solve for multi-node traces) before cross-node edges
+would be safe to add.
+
+### Collective/barrier pairing assumes SPMD ordering
+
+Ranks are assumed to call the Nth collective of a given type in the same
+relative order, and one round finishes before the next starts on most ranks
+— true for typical GROMACS-style loop structure, not guaranteed in general.
+
+### Reading the output
+
+```
+Time ON the critical path, by category (productive work):
+    cuda               812.4ms
+    mpi                 45.2ms
+
+Idle time on the critical path, blamed by category (what it was waiting on):
+    mpi                203.7ms
+    openmp              12.1ms
+```
+
+The first table is "what the critical path is actually doing" (where the
+unavoidable time goes); the second is "what it's idle *waiting on*" — the
+category of whichever span gated the next step. A large `mpi` entry in the
+blame table means MPI communication is the thing most worth optimizing
+*on the critical path specifically* (as opposed to MPI's total time in the
+`hprofiler summary` breakdown, which includes MPI activity off the critical
+path too).
+
+If `Time accounted for` in the header exceeds `Wall time`, `notes` will say
+so explicitly: this happens when the path passes through multiple
+rendezvous (`arrival`-gated) edges whose spans genuinely overlap in
+wall-clock time across different threads/ranks — each still contributes its
+own full duration to the category breakdown rather than being merged into
+one interval, a known consequence of modeling dependencies at span
+granularity rather than splitting every span into separate start/end
+events.
+
+### `--export`: highlighting the critical path in Perfetto
+
+`--export FILE` writes the trace back out as Chrome Trace JSON with every
+critical-path span tagged `on_critical_path=1`, which you can filter/color
+on in [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`.

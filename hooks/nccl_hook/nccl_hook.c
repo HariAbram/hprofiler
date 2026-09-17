@@ -45,23 +45,29 @@ typedef int   ncclRedOp_t;
 
 #define ncclSuccess 0
 
-/* Common NCCL datatype sizes (index matches ncclDataType_t enum order). */
+/* Common NCCL datatype sizes (index matches ncclDataType_t enum order).
+ * NCCL >= 2.20 added ncclFp8E4M3=10 / ncclFp8E5M2=11 (1 byte each, used by
+ * FP8 training collectives) -- without these two entries every FP8
+ * collective's bytes= tag (and anything computed from it, e.g. bus
+ * bandwidth) was silently 4x too large via the generic fallback below. */
 static const size_t _nccl_dtype_sizes[] = {
-    1,  /* ncclInt8   / ncclChar  */
-    1,  /* ncclUint8              */
-    4,  /* ncclInt32  / ncclInt   */
-    4,  /* ncclUint32             */
-    8,  /* ncclInt64              */
-    8,  /* ncclUint64             */
-    2,  /* ncclFloat16 / ncclHalf */
-    4,  /* ncclFloat32 / ncclFloat*/
-    8,  /* ncclFloat64 /ncclDouble*/
-    2,  /* ncclBfloat16           */
+    1,  /* ncclInt8    / ncclChar   */
+    1,  /* ncclUint8               */
+    4,  /* ncclInt32   / ncclInt    */
+    4,  /* ncclUint32              */
+    8,  /* ncclInt64               */
+    8,  /* ncclUint64              */
+    2,  /* ncclFloat16 / ncclHalf   */
+    4,  /* ncclFloat32 / ncclFloat  */
+    8,  /* ncclFloat64 / ncclDouble */
+    2,  /* ncclBfloat16            */
+    1,  /* ncclFp8E4M3 (NCCL >= 2.20) */
+    1,  /* ncclFp8E5M2 (NCCL >= 2.20) */
 };
 static size_t nccl_dtype_sz(ncclDataType_t dt) {
     if (dt >= 0 && (size_t)dt < sizeof(_nccl_dtype_sizes)/sizeof(_nccl_dtype_sizes[0]))
         return _nccl_dtype_sizes[dt];
-    return 4;  /* fallback */
+    return 4;  /* fallback for datatypes newer than this table */
 }
 
 /* ── Globals (shared with cuda_hook via socket) ──────────────────────── */
@@ -232,22 +238,23 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
     return ret;
 }
 
-/* ── NCCL stream ID (simple index) ───────────────────────────────────── */
-#define SMAP_CAP 512
-static void *_sptrs[SMAP_CAP]; static int _sids[SMAP_CAP], _sn = 0;
-static pthread_mutex_t _smtx = PTHREAD_MUTEX_INITIALIZER;
+/* ── NCCL stream ID (deterministic hash of the pointer, NOT an
+ * order-of-first-observation counter) ──────────────────────────────────
+ * Must match cuda_hook.c's get_stream_id() exactly: it's a separate .so
+ * with no shared state, but the same cudaStream_t handle is the same
+ * pointer value in both when cuda+nccl are active together (the common
+ * case) -- an order-dependent counter would otherwise assign the SAME
+ * stream a DIFFERENT stream=N in "cuda"-category vs "nccl"-category spans,
+ * silently breaking cross-hook per-stream correlation. Also removes the
+ * previous SMAP_CAP overflow behavior (silently collapsing to stream=-1
+ * past 512 streams). */
 static int stream_id(cudaStream_t s) {
     if (!s) return 0;
-    pthread_mutex_lock(&_smtx);
-    for (int i = 0; i < _sn; i++) {
-        if (_sptrs[i] == s) { int id = _sids[i]; pthread_mutex_unlock(&_smtx); return id; }
-    }
-    if (_sn >= SMAP_CAP) { pthread_mutex_unlock(&_smtx); return -1; }
-    int id = ++_sn;
-    _sptrs[_sn - 1] = s;
-    _sids[_sn - 1]  = id;
-    pthread_mutex_unlock(&_smtx);
-    return id;
+    uint64_t v = (uint64_t)(uintptr_t)s;
+    v ^= v >> 33; v *= 0xff51afd7ed558ccdULL;
+    v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL;
+    v ^= v >> 33;
+    return (int)(v % 999983) + 1;
 }
 
 /* ── NCCL collectives ────────────────────────────────────────────────── */

@@ -7,7 +7,7 @@ Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, Open
 - Python 3.10+, CMake 3.16+, GCC/Clang
 - `pip install click textual rich capstone`
 - TUI flamegraph/roofline viewers: `pip install plotly "kaleido==0.2.1"` (0.2.1 specifically — later versions require Chrome and break on clusters)
-- Backend-specific: CUDA toolkit, ROCm at `/opt/rocm`, LLVM `libomp`, `mpicc`, or `perf`
+- Backend-specific: CUDA toolkit, a `libamdhip64` (ROCm/HIP) runtime, LLVM `libomp`, an MPI implementation (`mpicc`, or a Cray Programming Environment `cc` wrapper), or `perf` — see [DOCUMENTATION.md](DOCUMENTATION.md#requirements) for exact search paths
 
 ## Build
 
@@ -167,6 +167,23 @@ Pass `--disasm` to collect post-run per-kernel disassembly (runs in background, 
 | CPU / OpenMP | `capstone` (`pip install capstone`) or `objdump` |
 | OpenCL JIT (ACPP SSCP generic) | `objdump` on the `.jit.so` emitted by ACPP SSCP |
 | OpenCL CPU (Intel CPU OCL) | `objdump` on x86-64 ELF extracted via `clGetProgramInfo` |
+
+## Multi-Runtime Efficiency and Critical-Path Analysis
+
+For programs combining several backends at once (e.g. MPI+OpenMP+CUDA):
+
+```bash
+# POP-style parallel efficiency breakdown (Load Balance, Communication
+# Efficiency, GPU/NCCL efficiency, ...) computed from a single trace
+python3 hprofiler efficiency trace.json
+
+# N-way cross-runtime critical path + blame attribution across every
+# backend active in the trace (generalizes CASITA/HPCToolkit-style
+# critical-path analysis beyond MPI+CUDA-only or CPU+GPU-only)
+python3 hprofiler critical-path trace.json
+```
+
+See [DOCUMENTATION.md](DOCUMENTATION.md) §17–18 for the exact formulas, what's approximate vs. exact, and the single-node scope of critical-path analysis.
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for the full CLI reference, backend details, wire protocol, and how to extend the profiler.
 
