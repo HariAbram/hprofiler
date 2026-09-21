@@ -1,6 +1,6 @@
 # hprofiler — Heterogeneous Profiler
 
-Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI simultaneously, with a terminal UI and native TUI viewers for flame graphs and roofline charts. CPU sampling is provided via Linux `perf`.
+Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI simultaneously — with a terminal UI, native TUI viewers for flame graphs and roofline charts, and cross-layer causal attribution: one dependency graph over every backend active in a run, with a confidence-graded, formally-computed critical path instead of a single-runtime or heuristic one (see [Cross-Layer Causal Attribution](#cross-layer-causal-attribution) below). CPU sampling is provided via Linux `perf`.
 
 ## Requirements
 
@@ -168,9 +168,19 @@ Pass `--disasm` to collect post-run per-kernel disassembly (runs in background, 
 | OpenCL JIT (ACPP SSCP generic) | `objdump` on the `.jit.so` emitted by ACPP SSCP |
 | OpenCL CPU (Intel CPU OCL) | `objdump` on x86-64 ELF extracted via `clGetProgramInfo` |
 
-## Multi-Runtime Efficiency and Critical-Path Analysis
+## Cross-Layer Causal Attribution
 
-For programs combining several backends at once (e.g. MPI+OpenMP+CUDA):
+hprofiler's core contribution: for programs combining several backends at
+once (e.g. MPI+OpenMP+CUDA), it builds one dependency graph over every
+captured span — CUDA, ROCm, OpenCL, OpenMP, MPI, NCCL together, not a
+separate per-runtime trace to merge — using each programming model's real
+synchronization semantics (resolved MPI wildcard matching, real
+communicator identity, stream/device-sync ordering, OpenMP barriers), and
+finds the true critical path via a formal DAG longest-path computation,
+not a heuristic walk. Every edge in that graph is tagged with how directly
+the underlying data proves it (`certain`/`high`/`medium` — see
+[DOCUMENTATION.md](DOCUMENTATION.md) §18), so the result never presents a
+call-order guess with the same confidence as a hardware-enforced ordering.
 
 ```bash
 # POP-style parallel efficiency breakdown (Load Balance, Communication
@@ -179,11 +189,21 @@ python3 hprofiler efficiency trace.json
 
 # N-way cross-runtime critical path + blame attribution across every
 # backend active in the trace (generalizes CASITA/HPCToolkit-style
-# critical-path analysis beyond MPI+CUDA-only or CPU+GPU-only)
+# critical-path analysis beyond MPI+CUDA-only or CPU+GPU-only), with a
+# per-hop confidence breakdown
 python3 hprofiler critical-path trace.json
+
+# Multi-node: profile each node separately, then merge onto one timeline
+# before running critical-path/efficiency across node boundaries
+python3 hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
+python3 hprofiler critical-path merged.json
 ```
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) §17–18 for the exact formulas, what's approximate vs. exact, and the single-node scope of critical-path analysis.
+See [DOCUMENTATION.md](DOCUMENTATION.md) §17–20 for the exact formulas,
+edge-confidence model, formal critical-path algorithm, multi-node clock
+synchronization, and what's approximate vs. exact vs. still
+hardware-unverified on this development machine (documented honestly, not
+glossed over — see §13's Known Limitations table).
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for the full CLI reference, backend details, wire protocol, and how to extend the profiler.
 

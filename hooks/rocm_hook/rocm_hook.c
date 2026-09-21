@@ -327,6 +327,56 @@ static int ev_api_ok(void) {
     return f_evCreate && f_evRecord && f_evElapsed && f_evDestroy && f_evSync;
 }
 
+/* ── Exec-start calibration: real GPU-timeline kernel-execution start ────────
+ * (xs= tag), distinct from start_ns/t0 (the CPU-side launch-CALL time) ─────
+ * Mirrors cuda_hook.c's identical mechanism -- see its comment for the full
+ * rationale (hipEvent_t has the same FIFO-completion semantics as
+ * cudaEvent_t, and hipEventElapsedTime works across streams the same way).
+ * xs= is additive and never changes what start_ns/duration_ns mean.
+ *
+ * NOT independently verified against real kernel execution on this
+ * development machine (no AMD GPU present -- see DOCUMENTATION.md's Known
+ * Limitations); compile-checked only. */
+static hipEvent_t      g_calib_event  = NULL;
+static uint64_t        g_calib_cpu_ns = 0;
+static int             g_calib_state  = 0;   /* 0=not tried, 1=ok, -1=failed */
+static pthread_mutex_t g_calib_mutex  = PTHREAD_MUTEX_INITIALIZER;
+
+static int exec_start_calibrate_if_needed(void) {
+    pthread_mutex_lock(&g_calib_mutex);
+    if (g_calib_state != 0) {
+        int ok = (g_calib_state == 1);
+        pthread_mutex_unlock(&g_calib_mutex);
+        return ok;
+    }
+    int ok = 0;
+    if (ev_api_ok() && f_evCreate(&g_calib_event) == 0) {
+        if (f_evRecord(g_calib_event, NULL) == 0 && f_evSync(g_calib_event) == 0) {
+            g_calib_cpu_ns = now_ns();
+            ok = 1;
+        } else {
+            f_evDestroy(g_calib_event);
+            g_calib_event = NULL;
+        }
+    }
+    g_calib_state = ok ? 1 : -1;
+    pthread_mutex_unlock(&g_calib_mutex);
+    return ok;
+}
+
+/* Returns 1 and fills *exec_start_ns from ev_s if computable; 0 if
+ * calibration or the elapsed-time query failed. ev_s must have already
+ * completed on the GPU (true for any ev_s whose paired ev_e has already
+ * been successfully synced, since events on one stream complete in FIFO
+ * order). */
+static int compute_exec_start_ns(hipEvent_t ev_s, uint64_t *exec_start_ns) {
+    if (!exec_start_calibrate_if_needed()) return 0;
+    float ms = 0.0f;
+    if (f_evElapsed(&ms, g_calib_event, ev_s) != 0 || ms < 0.0f) return 0;
+    *exec_start_ns = g_calib_cpu_ns + (uint64_t)(ms * 1e6f);
+    return 1;
+}
+
 typedef struct {
     hipEvent_t   ev_start;
     hipEvent_t   ev_end;
@@ -378,11 +428,27 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
         float ms = 0.0f;
         int ok = (f_evSync(l->ev_e) == 0 &&
                   f_evElapsed(&ms, l->ev_s, l->ev_e) == 0 && ms >= 0.0f);
+        /* Must compute BEFORE destroying ev_s below -- see cuda_hook.c's
+         * matching comment for why this is safe here. */
+        uint64_t xs_ns = 0;
+        int has_xs = ok && compute_exec_start_ns(l->ev_s, &xs_ns);
         f_evDestroy(l->ev_s);
         f_evDestroy(l->ev_e);
         if (ok) {
+            char final_extra[300];
+            if (has_xs) {
+                if (l->extra[0])
+                    snprintf(final_extra, sizeof(final_extra), "%s,xs=%llu",
+                             l->extra, (unsigned long long)xs_ns);
+                else
+                    snprintf(final_extra, sizeof(final_extra), "xs=%llu",
+                             (unsigned long long)xs_ns);
+            } else {
+                strncpy(final_extra, l->extra, sizeof(final_extra) - 1);
+                final_extra[sizeof(final_extra) - 1] = '\0';
+            }
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
-                      l->kname, l->extra);
+                      l->kname, final_extra);
         } else {
             /* hipEventSynchronize/hipEventElapsedTime failed -- a kernel
              * that ran to completion on the GPU must not simply vanish

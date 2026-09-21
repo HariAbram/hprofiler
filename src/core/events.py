@@ -27,6 +27,7 @@ class Category(str, Enum):
     SYNC = "sync"
     JIT = "jit"
     NVTX = "nvtx"
+    SCHED = "sched"  # OS-level scheduler events (hooks/os_tracer) -- off-CPU/wakeup/migrate
     OTHER = "other"
 
 

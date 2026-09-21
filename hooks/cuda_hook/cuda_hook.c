@@ -334,6 +334,82 @@ static int ev_api_ok(void) {
     return f_evCreate && f_evRecord && f_evElapsed && f_evDestroy && f_evSync;
 }
 
+/* ── Exec-start calibration: real GPU-timeline kernel-execution start ────────
+ * (xs= tag), distinct from start_ns/t0 (the CPU-side launch-CALL time) ─────
+ *
+ * A cudaEvent_t recorded into a stream completes exactly when the GPU's
+ * execution reaches that point in the stream's FIFO queue -- so ev_s
+ * (already recorded immediately before each kernel launch, purely to get
+ * GPU-accurate DURATION via cudaEventElapsedTime(ev_s,ev_e)) also marks the
+ * true GPU-timeline instant that kernel actually began executing. This can
+ * differ significantly from its CPU launch-CALL time under queue backlog:
+ * several kernels launched back-to-back on a busy stream all get CPU launch
+ * timestamps within microseconds of each other, but only the first can
+ * start executing immediately -- the rest wait on the GPU for however long
+ * their predecessors take, yet start_ns (t0) reports them all as if they
+ * began at launch-call time. Without this, a critical-path/timeline view
+ * built from start_ns can show queued kernels overlapping in time when they
+ * actually ran strictly sequentially on the GPU.
+ *
+ * One-time calibration (mirrors opencl_hook.c's cl_calibrate_if_needed):
+ * record a calibration event, synchronize on it immediately (forcing the
+ * GPU to have reached "now"), and pair it with a CPU wall-clock reading
+ * taken essentially at that same instant. Later, for any kernel's ev_s,
+ * cudaEventElapsedTime(g_calib_event, ev_s) gives the GPU-side elapsed time
+ * since calibration -- works across streams, since CUDA events mark points
+ * on one single per-device timeline, not a per-stream one. xs= is additive
+ * and never changes what start_ns/duration_ns mean -- fully backward
+ * compatible with anything already reading spans without knowing about it.
+ *
+ * Known remaining approximation, same class as OpenCL's: a single global
+ * calibration (no periodic re-anchor for long-run clock drift, no
+ * per-device map for multi-GPU processes) -- see DOCUMENTATION.md.
+ *
+ * NOT independently verified against real kernel execution on this
+ * development machine (broken NVIDIA driver -- see DOCUMENTATION.md's
+ * Known Limitations); compile-checked only. The logic mirrors the already
+ * hardware-verified opencl_hook.c calibration technique, but treat xs= as
+ * unverified until confirmed on a working CUDA GPU. */
+static cudaEvent_t     g_calib_event  = NULL;
+static uint64_t        g_calib_cpu_ns = 0;
+static int             g_calib_state  = 0;   /* 0=not tried, 1=ok, -1=failed */
+static pthread_mutex_t g_calib_mutex  = PTHREAD_MUTEX_INITIALIZER;
+
+static int exec_start_calibrate_if_needed(void) {
+    pthread_mutex_lock(&g_calib_mutex);
+    if (g_calib_state != 0) {
+        int ok = (g_calib_state == 1);
+        pthread_mutex_unlock(&g_calib_mutex);
+        return ok;
+    }
+    int ok = 0;
+    if (ev_api_ok() && f_evCreate(&g_calib_event) == 0) {
+        if (f_evRecord(g_calib_event, NULL) == 0 && f_evSync(g_calib_event) == 0) {
+            g_calib_cpu_ns = now_ns();
+            ok = 1;
+        } else {
+            f_evDestroy(g_calib_event);
+            g_calib_event = NULL;
+        }
+    }
+    g_calib_state = ok ? 1 : -1;
+    pthread_mutex_unlock(&g_calib_mutex);
+    return ok;
+}
+
+/* Returns 1 and fills *exec_start_ns from ev_s if computable; 0 if
+ * calibration or the elapsed-time query failed (caller omits xs=
+ * entirely rather than guess). ev_s must have already completed on the
+ * GPU (true for any ev_s whose paired ev_e has already been successfully
+ * synced, since events on one stream complete in FIFO order). */
+static int compute_exec_start_ns(cudaEvent_t ev_s, uint64_t *exec_start_ns) {
+    if (!exec_start_calibrate_if_needed()) return 0;
+    float ms = 0.0f;
+    if (f_evElapsed(&ms, g_calib_event, ev_s) != 0 || ms < 0.0f) return 0;
+    *exec_start_ns = g_calib_cpu_ns + (uint64_t)(ms * 1e6f);
+    return 1;
+}
+
 typedef struct {
     cudaEvent_t  ev_start;
     cudaEvent_t  ev_end;
@@ -385,11 +461,30 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
         float ms = 0.0f;
         int ok = (f_evSync(l->ev_e) == 0 &&
                   f_evElapsed(&ms, l->ev_s, l->ev_e) == 0 && ms >= 0.0f);
+        /* Must compute BEFORE destroying ev_s below. Safe to query here:
+         * ev_e has already been confirmed complete (f_evSync above), and
+         * events on one stream complete in FIFO order, so ev_s -- recorded
+         * immediately before this same kernel's launch -- has necessarily
+         * already completed too. */
+        uint64_t xs_ns = 0;
+        int has_xs = ok && compute_exec_start_ns(l->ev_s, &xs_ns);
         f_evDestroy(l->ev_s);
         f_evDestroy(l->ev_e);
         if (ok) {
+            char final_extra[300];
+            if (has_xs) {
+                if (l->extra[0])
+                    snprintf(final_extra, sizeof(final_extra), "%s,xs=%llu",
+                             l->extra, (unsigned long long)xs_ns);
+                else
+                    snprintf(final_extra, sizeof(final_extra), "xs=%llu",
+                             (unsigned long long)xs_ns);
+            } else {
+                strncpy(final_extra, l->extra, sizeof(final_extra) - 1);
+                final_extra[sizeof(final_extra) - 1] = '\0';
+            }
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
-                      l->kname, l->extra);
+                      l->kname, final_extra);
         } else {
             /* cudaEventSynchronize/cudaEventElapsedTime failed (e.g. event
              * queried from a different context/device than it was created

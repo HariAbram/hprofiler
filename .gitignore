@@ -9,3 +9,10 @@ dist/
 MEMORY.md
 *.claude
 memory/
+tests/native/ringbuffer_stress
+tests/native/ringbuffer_stress_tsan
+hooks/os_tracer/vmlinux.h
+hooks/os_tracer/*.bpf.o
+hooks/os_tracer/*.skel.h
+hooks/os_tracer/*.o
+hooks/os_tracer/os_tracer

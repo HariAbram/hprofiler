@@ -93,13 +93,28 @@ def _parse_record(line: str) -> AnyEvent | None:
                 start_ns=int(start_ns), duration_ns=dur_ns, pid=int(pid), tid=int(tid),
             )
         if kind == "inst" and len(parts) >= 6:
-            _, cat, pid, tid, ts_ns, name = parts[:6]
+            cat, pid, tid, ts_ns = parts[1], int(parts[2]), int(parts[3]), int(parts[4])
+            # inst has one fewer leading numeric field than span (no dur_ns), so
+            # "name[:tags]" starts one position earlier (parts[5], not parts[6]).
+            # The top-level split(":", 6) was sized for span's shape, so for inst
+            # it may have already split *inside* a colon-containing name or tags
+            # blob before we get here -- rejoin everything from parts[5] onward
+            # so _split_name_tags sees the same undivided tail span: gets.
+            rest = ":".join(parts[5:])
+            name, tags_str = _split_name_tags(rest)
+            tags: dict = {}
+            if tags_str:
+                for kv in tags_str.split(","):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        tags[k] = v
             return InstantEvent(
                 name=name,
                 category=Category(cat) if cat in Category._value2member_map_ else Category.OTHER,
-                timestamp_ns=int(ts_ns),
-                pid=int(pid),
-                tid=int(tid),
+                timestamp_ns=ts_ns,
+                pid=pid,
+                tid=tid,
+                tags=tags,
             )
         if kind == "ctr" and len(parts) >= 6:
             _, cat, pid, ts_ns, name, value = parts[:6]

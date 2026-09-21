@@ -7,6 +7,48 @@ kernels (ACPP/AdaptiveCpp, nvcc, etc.) with per-kernel disassembly. GPU-accurate
 kernel timing is captured via CUDA/HIP event pairs. NVTX annotations are
 intercepted without requiring libnvToolsExt.
 
+Its core contribution is **cross-layer causal attribution**: one dependency
+graph built directly over every backend active in a single run — not a
+separate per-runtime trace merged after the fact — with each edge tagged by
+how directly the data proves it (§18), a formally-computed (not heuristic)
+critical path, and a collection/observability design aimed at low
+perturbation and full-stack visibility (§13, §19). See "Implementation
+Status" immediately below for what's verified end-to-end vs. what remains
+unverified on this development machine's specific hardware, and why.
+
+---
+
+## Implementation Status: Cross-Layer Causal Attribution
+
+The sections below were built across seven pieces of work, each addressing
+a specific, named gap (resolved MPI matching and communicator identity;
+confidence-graded, formally-computed critical paths; real GPU
+execution-start timing; a lock-free collection path; OS-level scheduler
+visibility; multi-node clock alignment; and quantitative accuracy
+validation instead of crash-only testing). Verification depth differs
+per piece **because this specific development machine's hardware/
+privileges differ per piece** — a broken NVIDIA driver, no AMD GPU, no
+real multi-rank MPI (confirmed a PMI/KVS rank-discovery failure in this
+machine's MPICH/UCX/PMIx setup, unrelated to hprofiler), and no root/
+CAP_BPF — not because some pieces were designed or tested less carefully
+than others. Each row states exactly what was and wasn't possible to
+confirm here, so nothing is implicitly overstated.
+
+| # | Piece | Status | Verified how | Docs |
+|---|---|---|---|---|
+| 1 | MPI protocol semantics (resolved wildcard matching, `Waitany`/`Waitsome`/`Test*`/`Cancel`, communicator identity) | ✅ **Verified end-to-end** | Real hook built + `LD_PRELOAD`ed into a fixture; actual wire-protocol bytes captured over a real `AF_UNIX` socket and parsed with the production parser (`tests/integration/test_mpi_protocol.py`, 8 tests) | §4 `mpi`, §12 |
+| 2 | Typed causal DAG: edge confidence tiers + formal DAG longest-path DP (replaces the old greedy walk) | ✅ **Verified end-to-end** | 27 hand-computed unit tests (`tests/test_criticalpath.py`), including a constructed case proving the DP finds a materially better (650ns vs. 60ns) answer than the old algorithm on the same graph | §18 |
+| 3 | GPU lifecycle split: real exec-start via reference-event calibration (`xs=` tag) | ⚠️ **Compile-verified only** | Clean `gcc -Wall -Wextra` compile of `cuda_hook.c`/`rocm_hook.c`, clean rebuild via the real CMake path, integrated into the DP (unit-tested against synthetic `xs=` tags) — **never run against a real GPU** (this machine's NVIDIA driver is broken, no AMD GPU present) | §4 `cuda`, §18, §13 |
+| 4 | Collection-path redesign: lock-free per-thread ring buffer (removes mutex+socket from the hot path) | ✅ **Primitive verified in isolation**; ⚠️ **not wired into any hook** | Concurrent correctness stress test, exact drop-counter accounting, FIFO-under-wraparound, ThreadSanitizer-clean, and real measured overhead (1.5–58x faster than today's mutex+`send()` pattern, depending on thread count) — deliberately not integrated into any hook's actual `emit_span()` this pass (see §13 for why) | §13 |
+| 5 | eBPF OS-level scheduler tracer (off-CPU/wakeup/migrate visibility) | ⚠️ **Compiled, linked, and run to the exact expected privilege wall — never loaded into a kernel** | `bpftool gen skeleton` independently confirms the compiled object's structure (fully offline check); running it reaches libbpf's internal probe-load self-test and fails with `EPERM`, precisely the error `kernel.unprivileged_bpf_disabled=2` should produce, handled gracefully — the kernel BPF verifier itself has never run against it | §19 |
+| 6 | Multi-node design: clock-offset estimation (Cristian's algorithm) + trace merging | ✅ **Python side (merge, validation, offset arithmetic) verified end-to-end**; ⚠️ **C-side round-trip capture compile-verified only** | 14 unit tests including an asymmetric-latency case proving the error bound brackets the real error, plus a real CLI run merging two actual traces (confirmed correct pid remapping) — the C-side round-trip exchange itself has never executed a real 2+-rank exchange (same MPI multi-rank limitation as #1's cross-process piece) | §20 |
+| 7 | Validation suite: aggregate precision/recall + determinism checks (vs. crash-only testing) | ✅ **Verified** | 100%/100% precision/recall across 22 hand-constructed ground-truth edges spanning all three confidence tiers; 35 determinism trials (7 scenarios × 5 random reorderings) with byte-identical results | §18, `tests/validation/` |
+
+Every ⚠️ item is re-stated with full detail, including the exact command
+and error that was reached, in its own section and in §13's Known
+Limitations table — this summary exists so that detail doesn't have to be
+hunted for, not to replace it.
+
 ---
 
 ## Table of Contents
@@ -29,6 +71,8 @@ intercepted without requiring libnvToolsExt.
 16. [Call-Path Analysis, CCT, and GPU Starvation](#16-call-path-analysis-cct-and-gpu-starvation)
 17. [POP-Style Efficiency Analysis](#17-pop-style-efficiency-analysis)
 18. [Critical Path and Cross-Runtime Blame Attribution](#18-critical-path-and-cross-runtime-blame-attribution)
+19. [OS-Level Observability (eBPF Scheduler Tracer)](#19-os-level-observability-ebpf-scheduler-tracer)
+20. [Multi-Node Trace Merging and Clock Synchronization](#20-multi-node-trace-merging-and-clock-synchronization)
 
 ---
 
@@ -370,6 +414,28 @@ hprofiler critical-path trace.json --export trace.critpath.json
 
 ---
 
+### `hprofiler merge-nodes`
+
+Merge multiple per-node traces from a multi-node run onto one timeline. See
+§20 for the clock-offset model and what's verified vs. not.
+
+```
+hprofiler merge-nodes [OPTIONS] TRACE_FILES...
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o`, `--output` | *(required)* | Where to write the merged trace (Chrome Trace JSON) |
+| `--offset-ns NS` | none | Explicit per-node clock offset in ns, repeatable, same order as `TRACE_FILES` — overrides embedded `HPROFILER_CLOCK_SYNC` counters for that node |
+
+```bash
+hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
+hprofiler merge-nodes node0.json node1.json -o merged.json --offset-ns 0 --offset-ns 15000
+hprofiler critical-path merged.json   # analyze across node boundaries
+```
+
+---
+
 ### `hprofiler backends`
 
 List all backends and whether they are available on the current machine.
@@ -531,6 +597,38 @@ made while holding a lock — avoiding potential deadlock with CUDA's internal
 serialisation. At each sync point the pending events are flushed and
 `cudaEventElapsedTime` gives the true GPU execution time.
 
+**Exec-start calibration (`xs=` tag) — GPU lifecycle split:** `start_ns` on
+a kernel span is the CPU-side *launch-call* time, not when the GPU actually
+began executing it — under stream queue backlog (several kernels launched
+back-to-back on a busy stream), only the first can start immediately; the
+rest wait on the GPU for however long their predecessors take, but
+`start_ns` alone reports every one of them as if it began at launch-call
+time. Every kernel/memcpy span additionally carries `xs=<ns>`: the real
+GPU-timeline execution-start wall-clock time, from a one-time reference-
+event calibration (record a calibration `cudaEvent_t`, synchronize on it
+immediately, pair it with a CPU wall-clock reading taken at that same
+instant — mirrors `opencl_hook.c`'s `cl_calibrate_if_needed`; a `cudaEvent_t`
+recorded into a stream completes exactly when the GPU's execution reaches
+that point in the stream's FIFO queue, and this holds across streams since
+CUDA events mark points on one single per-device timeline). Purely
+additive — never changes what `start_ns`/`duration_ns` mean, so anything
+reading spans without knowing about `xs=` is unaffected.
+`src/analysis/criticalpath.py`'s dependency-graph DP (§18) prefers `xs=`
+over `start_ns` when computing causal gate/gap times for GPU spans, so idle-
+time attribution around a queued kernel is accurate even though the
+Timeline/roofline/CCT views still show `start_ns` (deliberately — "when I
+issued this kernel" is itself useful information for a programmer
+optimizing their code's launch pattern, a different question than "what
+was on the critical path").
+
+**Verification status:** compile-checked only (`gcc -Wall -Wextra` clean,
+and via the real `./hprofiler build` CMake path) — **not independently
+verified against real kernel execution**, since this development machine
+has no working CUDA GPU (broken NVIDIA driver, see §13 Known Limitations).
+The logic mirrors `opencl_hook.c`'s calibration technique, which *is*
+hardware-verified, but treat `xs=` as unverified on real hardware until
+confirmed on a working CUDA/ROCm GPU.
+
 **NVTX range interception:** Fully replaced — no `libnvToolsExt.so` required.
 NVTX v3 (header-only inline API) is not intercepted.
 
@@ -688,7 +786,12 @@ OpenMP runtime) for events to be captured.
 
 Injects `libhprofiler_rocm.so` via `LD_PRELOAD`. Uses `hipEvent_t` pairs for
 GPU-accurate kernel timing, tracks device memory with counter events, groups
-spans by stream ID, and saves JIT binaries for disassembly.
+spans by stream ID, and saves JIT binaries for disassembly. Kernel/memcpy
+spans also carry the same `xs=<ns>` exec-start calibration tag as the `cuda`
+backend (`hipEvent_t`/`hipEventElapsedTime` have the same FIFO-completion
+semantics `cudaEvent_t` does) — see the `cuda` section above for the full
+rationale; also compile-checked only here, no AMD GPU on this development
+machine to verify against.
 
 **Requirements:** `libamdhip64.so` findable at runtime. Checked, in order: the
 system ldconfig cache; `$ROCM_PATH`/`$ROCM_HOME` (if set) plus their `lib`/
@@ -764,14 +867,17 @@ Link the library alongside the program.
 
 | Category | Functions |
 |----------|----------|
-| Point-to-point | `MPI_Send`, `MPI_Recv`, `MPI_Isend`, `MPI_Irecv`, `MPI_Ssend`, `MPI_Bsend`, `MPI_Wait`, `MPI_Waitall` |
-| Collectives | `MPI_Bcast`, `MPI_Reduce`, `MPI_Allreduce`, `MPI_Alltoall`, `MPI_Allgather`, `MPI_Scatter`, `MPI_Gather`, `MPI_Barrier`, `MPI_Scan` |
+| Point-to-point | `MPI_Send`, `MPI_Recv`, `MPI_Isend`, `MPI_Irecv`, `MPI_Ssend`, `MPI_Bsend`, `MPI_Wait`, `MPI_Waitall`, `MPI_Waitany`, `MPI_Waitsome`, `MPI_Test`, `MPI_Testany`, `MPI_Testsome`, `MPI_Testall`, `MPI_Cancel` |
+| Non-blocking collectives | `MPI_Ibcast`, `MPI_Iallreduce`, `MPI_Ireduce`, `MPI_Iallgather`, `MPI_Ialltoall`, `MPI_Iscatter`, `MPI_Igather` |
+| Persistent requests | `MPI_Send_init`, `MPI_Recv_init`, `MPI_Start`, `MPI_Startall` |
+| Collectives | `MPI_Bcast`, `MPI_Reduce`, `MPI_Allreduce`, `MPI_Alltoall`, `MPI_Allgather`, `MPI_Scatter`, `MPI_Gather`, `MPI_Barrier`, `MPI_Scan`, `MPI_Exscan` |
 | One-sided | `MPI_Put`, `MPI_Get`, `MPI_Accumulate` |
 | Lifecycle | `MPI_Init`, `MPI_Init_thread`, `MPI_Finalize` |
+| Communicators | `MPI_Comm_dup`, `MPI_Comm_split`, `MPI_Comm_create` (hooked only to assign `commid=`, see below) |
 
 Every span is in category `mpi` and carries `type=<call>`, `bytes=N`
-(count × datatype size), `rank=<own rank>`, and where applicable `peer=<rank>`
-and `tag=N`.
+(count × datatype size), `rank=<own rank>`, and where applicable `peer=<rank>`,
+`tag=N`, and `commid=<N>`.
 
 **Timing:** All timings are **wall-clock** from `CLOCK_MONOTONIC` on the host
 calling thread. For blocking collectives (`MPI_Allreduce`, `MPI_Barrier`, etc.)
@@ -780,6 +886,76 @@ rank.
 
 **Datatype sizes:** Common built-in MPI types are resolved by a static table.
 Unknown derived datatypes fall back to `PMPI_Type_size`.
+
+**Wildcard receive resolution (`MPI_ANY_SOURCE`/`MPI_ANY_TAG`):** a receive
+posted with a wildcard doesn't know its real peer/tag until the call
+completes. Every completion path (`MPI_Recv`, `MPI_Wait`, `MPI_Waitall`,
+`MPI_Waitany`, `MPI_Waitsome`, `MPI_Test`, `MPI_Testany`) resolves this from
+the real `MPI_Status` the underlying call returns — including when the
+*application* passed `MPI_STATUS_IGNORE`/`MPI_STATUSES_IGNORE`: the hook
+transparently substitutes its own status buffer in that case (the caller
+never observes either buffer, so this changes nothing about program
+behavior) purely so the real match is always resolvable. A wildcard
+`MPI_Irecv`'s own span carries `wildcard=1` and the input (sentinel)
+`peer=`/`tag=` rather than a value it cannot know yet; the resolution
+appears on whichever call later observes completion:
+
+| Call | Resolved-match tags |
+|------|---------------------|
+| `MPI_Recv` | `peer=`/`tag=` in the span itself are the *resolved* values, plus `wildcard=1` |
+| `MPI_Wait` | `rpeer=`/`rtag=` (only present if the awaited request was a wildcard recv) |
+| `MPI_Waitall` | `rmatches=<req_id>/<peer>/<tag>;...` — one entry per wildcard request that completed |
+| `MPI_Waitany` | `completed_index=`, plus `rpeer=`/`rtag=` if that one request was a wildcard |
+| `MPI_Waitsome` | `rmatches=` list, same format as `MPI_Waitall` |
+| `MPI_Test` / `MPI_Testany` | `flag=0` (checked, not ready — itself a real causal signal, not silence) or `flag=1` with `rpeer=`/`rtag=` |
+
+`rmatches=` entries use `/` (not `:`) between `req_id`, `peer`, and `tag` —
+tag *values* must never contain a colon, since the wire parser
+(`_split_name_tags` in `src/core/runner.py`) locates the tags segment by
+scanning for the record's *last* colon; a colon inside a value would be
+misidentified as that boundary and corrupt the parsed name and every tag on
+the line. (This was caught by `tests/integration/test_mpi_protocol.py`
+during development — see that file's history for the concrete failure.)
+
+**`MPI_Cancel`** emits an instant event (`type=cancel,rank=,psid=<req_id>`),
+giving the cancelled request's lifecycle an explicit terminal state distinct
+from a normal completion.
+
+**Communicator identity (`commid=`):** collective and point-to-point spans
+carry `commid=<N>`: `0` for `MPI_COMM_WORLD` (a global constant, needs no
+agreement), or a rank-agreed integer for any communicator created via
+`MPI_Comm_dup`/`MPI_Comm_split`/`MPI_Comm_create`. The id is assigned by the
+new communicator's own rank 0 and broadcast to every member immediately
+after creation — safe because communicator creation is itself already
+collective, so every member reaches the bootstrap `MPI_Bcast` together. The
+id packs `(bootstrapping process's MPI_COMM_WORLD rank << 32) | local
+sequence number)`, so two *different* communicators bootstrapped by two
+different world ranks (e.g. two disjoint halves of an `MPI_Comm_split`)
+cannot collide on the same id even though each starts counting from 1
+independently — a real bug caught during development before it reached any
+test (see `comm_id_register()` in `mpi_hook.c`). `commid=-1` means
+"unregistered": `MPI_COMM_SELF` or a communicator created via an API this
+hook doesn't intercept (`MPI_Comm_create_group`, `MPI_Cart_create`,
+`MPI_Intercomm_create`, …) — matching for those falls back to the
+call-order-only heuristic that was the only option before this mechanism
+existed.
+
+**Verification status:** all of the above is verified end-to-end on this
+development machine via `tests/integration/test_mpi_protocol.py`, which
+builds the real hook, `LD_PRELOAD`s it into a fixture exercising every path
+above, and asserts on the *actual* wire-protocol bytes captured over a real
+`AF_UNIX` socket (not a simulated/mocked wire format). One limitation: this
+machine's MPICH/Hydra cannot form a real multi-rank `MPI_COMM_WORLD` —
+every rank under `mpirun -np N` (N>1) independently observes
+`MPI_Comm_size() == 1`, reproduced even with the pre-existing, unmodified
+`mpi_mini.c` fixture and confirmed via `UCX_LOG_LEVEL=info` to be a PMI/KVS
+rank-discovery failure in this machine's MPICH/UCX/PMIx setup, unrelated to
+hprofiler. The test therefore uses a self-communicating single-process
+fixture (`tests/fixtures/mpi_proto_self.c`) — real `PMPI_*` completion
+semantics end-to-end, but it cannot exercise genuine *cross-process*
+`commid=` agreement (only self-consistency across calls on one process);
+`tests/fixtures/mpi_proto.c` is the real 4-rank design, compile-verified
+here and intended to be run on a working cluster (e.g. Dardel).
 
 **Build and use:**
 
@@ -813,10 +989,17 @@ if it doesn't, force it with `CC=cc python3 hprofiler build`.
 MPI-3 RMA epochs or non-blocking collective progress; `MPI_Wait` / `MPI_Waitall`
 spans cover the wait time but not the underlying network transfer time.
 
-`MPI_Wait` and `MPI_Waitall` emit a `psid=` tag containing the span ID(s) of
-the originating `Isend`/`Irecv` so the Timeline can draw cross-link arrows
-between post and wait spans. `MPI_Finalize` flushes the socket send buffer
-before closing so no queued events are lost at program exit.
+`MPI_Wait`, `MPI_Waitall`, `MPI_Waitany`, `MPI_Waitsome`, `MPI_Test`, and
+`MPI_Testany` all emit a `psid=`/`completed_index=` tag containing the span
+ID(s) of the originating `Isend`/`Irecv`/non-blocking-collective/persistent
+request so the Timeline can draw cross-link arrows between post and
+completion spans. `MPI_Finalize` flushes the socket send buffer before
+closing so no queued events are lost at program exit.
+
+**Multi-node clock synchronization:** set `HPROFILER_CLOCK_SYNC=1` (off by
+default) to have each rank estimate its clock offset relative to rank 0
+during `MPI_Init`, for aligning multiple nodes' traces via `hprofiler
+merge-nodes` — see §20 for the full protocol and verification status.
 
 ---
 
@@ -1895,6 +2078,7 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 |---------|-----|---------|
 | `cuda`, `rocm` | `type=kernel,grid=NxNxN,block=NxNxN` | Launch configuration |
 | `cuda`, `rocm` | `stream=N` | Sequential stream ID (0 = default) |
+| `cuda`, `rocm` | `xs=<ns>` | Calibrated real GPU-timeline execution-start time, vs. `start_ns` (CPU launch-call time) — see §4 `cuda`'s "Exec-start calibration" |
 | `memory` | `type=memcpy,bytes=N` | Transfer size |
 | `memory` | `type=alloc,bytes=N` | Device allocation |
 | `openmp` | `sym=<mangled>` | Symbol resolved via `dladdr()` |
@@ -1907,7 +2091,11 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | `nccl` | `type=group` | `ncclGroupStart/End` boundary |
 | `nccl` | `peer=N` | Target rank for `ncclSend`/`ncclRecv` |
 | `mpi` | `type=send\|recv\|allreduce\|...` | MPI call type |
-| `mpi` | `bytes=N,rank=R,peer=P,tag=T` | Message size, own rank, remote rank |
+| `mpi` | `bytes=N,rank=R,peer=P,tag=T,commid=C` | Message size, own rank, remote rank, communicator identity |
+| `mpi` | `wildcard=1` | `MPI_Irecv` posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG`; real peer/tag not yet known (see §4 `mpi`) |
+| `mpi` | `rpeer=P,rtag=T` | Resolved wildcard match, on the completing `Wait`/`Waitany`/`Test`/`Testany` span |
+| `mpi` | `rmatches=<req_id>/<peer>/<tag>;...` | Resolved wildcard matches for `MPI_Waitall`/`MPI_Waitsome` (multiple requests at once) |
+| `mpi` | `completed_index=N` | Which array slot completed, on `MPI_Waitany`/`MPI_Testany` |
 
 **Names containing `:`:** hook-side names (e.g. demangled C++ kernel names
 like `Namespace::kernel`, or NVTX labels) are not escaped before being
@@ -1919,6 +2107,18 @@ as the name. This correctly handles a name with colons plus real trailing
 tags (`Layer::forward:sid=5,psid=3` → name `Layer::forward`, tags `sid=5`,
 `psid=3`), but a tagless name that itself ends in something that happens to
 look like `key=val` would still be misread as carrying a (bogus) tag.
+
+**Tag values must never contain `:`:** since the boundary check above scans
+for the record's *last* colon, a colon embedded in a tag *value* (not just a
+name) is indistinguishable from that boundary and will corrupt both the
+parsed name and every tag on the line. `mpi_hook.c`'s `rmatches=` list hit
+this exactly: it packs a `(req_id, peer, tag)` triple per wildcard match and
+originally used `:` between them (`rmatches=2:0:12`), which silently mangled
+the whole record whenever it was the last tag on the line. Fixed by using
+`/` instead (`rmatches=2/0/12`) — any new tag that needs an internal
+sub-delimiter should do the same; `,` and `;` are also unsafe (`,` separates
+tags, `;` is already used to separate multiple `rmatches=`/`psid=` entries
+from each other).
 
 ### Call-stack record *(emitted only when `HPROFILER_CALLSTACK=1`)*
 
@@ -1973,8 +2173,17 @@ ctr:<cat>:<pid>:<ts_ns>:<name>:<value>[:<unit>]
 ### Instant record
 
 ```
-inst:<cat>:<pid>:<tid>:<ts_ns>:<name>
+inst:<cat>:<pid>:<tid>:<ts_ns>:<name>[:<key=val,...>]
 ```
+
+The optional trailing tags segment follows the same `<name>[:<tags>]`
+boundary rule as `span:` records (see "Names containing `:`" above);
+`_parse_record`'s `inst:` branch used to discard this segment unconditionally
+even when a hook sent one — no call site relied on it until `mpi_hook.c`'s
+`MPI_Test`/`MPI_Testany`/`MPI_Testsome`/`MPI_Testall`/`MPI_Cancel` started
+tagging instant events with `flag=`/`psid=`/`rpeer=`/`rtag=`, which
+surfaced it. `InstantEvent.tags` (`src/core/events.py`) is populated from
+this segment the same way `SpanEvent.tags` is.
 
 ### PC sample record *(emitted only when `HPROFILER_GPU_PCSAMPLING=1`)*
 
@@ -2061,7 +2270,72 @@ For most programs this is invisible. It becomes measurable when:
   iterations. OMPT callbacks have the same overhead per callback.
 - **Contended mutex** — multiple threads launching kernels simultaneously will
   serialize on the socket write mutex. In practice, CUDA streams are usually
-  driven from one host thread, so contention is rare.
+  driven from one host thread, so contention is rare for CUDA/ROCm
+  specifically — but this is **not** rare for OpenMP (every worker thread
+  calls into the hook independently) or MPI+OpenMP hybrid codes, and the
+  contention cost is worse than linear in thread count — see below.
+
+### Reducing collection-path overhead: a lock-free ring buffer
+
+This — a per-process mutex serializing every intercepted call's `send()`
+across however many threads the profiled program runs — is the specific
+collection-path design a reviewer critique named as unsuitable for
+low-overhead tracing (works fine single-threaded, degrades badly under
+real multi-threaded contention). `hooks/common/ringbuffer.h` implements an
+alternative: a lock-free, per-thread single-producer/single-consumer ring
+buffer (each OS thread gets its own buffer, written to without any lock or
+syscall — just a bump of an atomic tail index and a `memcpy` into a
+pre-allocated slot) plus a bump-allocating arena and a mutex-protected
+name-interning table (interning only touches its lock once per *distinct*
+name, not once per event, so it doesn't reintroduce the per-event
+contention this exists to remove).
+
+**Real measured numbers**, from `tests/native/ringbuffer_stress.c`'s
+benchmark (mutex+`write(2)` to a drained pipe, matching today's real
+per-hook `g_sock_mutex` pattern, vs. `rb_push()` into a lock-free
+per-thread ring buffer — run with `bash tests/native/run_native_tests.sh`,
+numbers below from this development machine, 12 cores):
+
+| Threads | Mutex+`write(2)` (today) | `rb_push` (ring buffer) | Ratio |
+|---|---|---|---|
+| 1 | ~320–740 ns/call | ~160–230 ns/call | 1.5–2.2x |
+| 4 | ~3.0–6.3 µs/call | ~150–170 ns/call | ~20–21x |
+| 8 | ~6.8–14.3 µs/call | ~110–130 ns/call | ~52–58x |
+
+The mutex pattern's cost grows roughly linearly with contending thread
+count (each thread serializes behind every other one); the ring buffer's
+stays roughly flat, since each thread only ever touches its own memory.
+This directly quantifies why a heavily multi-threaded OpenMP or hybrid
+MPI+OpenMP program sees collection overhead scale far worse than a
+single-stream CUDA program does under the current design.
+
+**Correctness verification:** `tests/native/ringbuffer_stress.c` stress-
+tests concurrent producer/consumer correctness (8 independent
+producer/consumer pairs × 200,000 events each, verifying every event
+arrives exactly once, in order, uncorrupted), drop-counter exactness under
+intentional overflow, FIFO order across repeated wrap-around past physical
+capacity, the arena allocator, and the interning table — all passing, and
+additionally clean under ThreadSanitizer (`bash tests/native/
+run_native_tests.sh`'s best-effort TSan pass; this machine needed
+`setarch $(uname -m) -R` to work around a TSan/mmap-layout incompatibility
+unrelated to hprofiler) with zero data races detected across repeated runs.
+
+**Status: designed and verified in isolation, not yet wired into any
+hook.** This header does not open a socket, spawn a drain thread, or
+replace any hook's actual `emit_span()` — deliberately. Wiring it in needs
+a background drain thread with its own lifecycle (correct behavior across
+the profiled process's normal exit, matching the existing `MPI_Finalize`-
+style final-flush pattern so no buffered tail of the trace is silently
+lost) that is real additional work with its own failure modes — a stuck or
+crashed drain thread silently losing events is a *worse* failure than
+today's synchronous-but-simple path, and that integration hasn't been
+stress-tested under this machine's actual GPU/multi-node workloads (no
+working GPU here, no working multi-rank MPI — see §13's limitations and
+[[project-paper4-benchmark-suite]]). Replacing a collection path that
+currently works, is well-tested, and has a 28-check crash-safety matrix
+behind it, with one whose lifecycle edge cases couldn't be fully verified
+here, was judged too large a risk for this pass relative to shipping the
+primitive itself, fully verified, as the next concrete step.
 
 ### `--call-tree` overhead
 
@@ -2159,8 +2433,12 @@ The TUI remains responsive at 250k spans at all zoom levels.
 | **Static CUDA runtime** | Binaries linked with `libcudart_static.a` (nvcc default) show 0 events because LD_PRELOAD cannot intercept compile-time-resolved `cudaXxx` symbols. `--gpu-pc-sampling` has the same requirement. | Rebuild with `-cudart shared` (no runtime-performance impact). |
 | **Device bandwidth estimates** | The roofline `device.py` memory-bandwidth formula under-reports peak bandwidth by ~2× for HBM-based cards (A100, H100, MI300). | Treat bandwidth peaks in the System tab as conservative estimates; check vendor datasheets for exact numbers. |
 | **ROCm PC sampling** | `--gpu-pc-sampling` is silently ignored for ROCm runs. Instruction-level heat annotation requires `librocprofiler-sdk.so` integration (not yet implemented). | Use CUDA backend for instruction-level GPU heat. |
-| **Critical-path analysis is single-node only** | `hprofiler critical-path` (§18) can't build cross-node dependency edges — the collector's `AF_UNIX` socket is only reachable within one node/filesystem, so multi-node MPI jobs are inherently out of scope, not just a clock-sync issue. | Profile one node's ranks at a time, or use it for single-node multi-GPU/multi-rank runs. |
+| **Multi-node critical-path needs a merge step first, and its clock-offset mechanism is unverified** | A single trace is still inherently single-node (the collector's `AF_UNIX` socket is only reachable within one node/filesystem) — `hprofiler merge-nodes` (§20) combines several nodes' traces first, using clock offsets from `mpi_hook.c`'s opt-in `HPROFILER_CLOCK_SYNC` round-trip exchange. The Python-side offset arithmetic and merge logic are fully unit-tested; the C-side round-trip *capture* has never executed against a real multi-node job (this machine can't form a real multi-rank `MPI_COMM_WORLD` at all, see below). | Run `merge-nodes` before `critical-path` for a multi-node trace; treat the resulting cross-node edges as unverified until `HPROFILER_CLOCK_SYNC` has been confirmed on a real cluster — `validate_causality()` (also run automatically by the `merge-nodes` CLI command) flags any resulting send-after-receive violation rather than silently trusting the offset. |
 | **POP efficiency's Serialization/Transfer split is approximate** | `hprofiler efficiency` (§17) fits latency/bandwidth from the trace's own messages instead of a Dimemas network replay. | Treat Transfer Efficiency as a proxy; check `EfficiencyReport.notes` for when it was too under-determined to compute at all. |
+| **Cross-process `commid=` agreement untested on this dev machine** | `MPI_Comm_dup`/`split`/`create`'s bootstrap `Bcast` (§4 `mpi`) is only meaningfully exercised at 2+ real ranks; this development machine's MPICH/Hydra cannot form a multi-rank `MPI_COMM_WORLD` at all (every rank under `mpirun -np N`, N>1, independently sees size 1 — a PMI/KVS rank-discovery failure in this machine's MPICH/UCX/PMIx setup, reproducible with the pre-existing unmodified `mpi_mini.c` fixture, unrelated to hprofiler). | Verified here only via a self-communicating fixture (real completion semantics, no real second rank) plus compile-checked multi-rank code (`tests/fixtures/mpi_proto.c`); needs a real multi-rank run (e.g. on Dardel) to confirm cross-process agreement. |
+| **`xs=` exec-start calibration unverified on real GPU hardware** | `cuda_hook.c`/`rocm_hook.c`'s reference-event calibration (§4 `cuda`) has no working GPU to run against on this development machine (broken NVIDIA driver, no AMD GPU) — only compile-checked (`gcc -Wall -Wextra` clean, and via `./hprofiler build`), and `src/analysis/criticalpath.py`'s consumption of it (`_effective_start_ns`/`_edge_gap_and_gate`) is only unit-tested against hand-constructed synthetic spans with a fake `xs=` tag, never a real captured trace. | Treat `xs=`-derived gap/idle-time numbers as unverified until confirmed on a working CUDA/ROCm GPU; the underlying technique mirrors `opencl_hook.c`'s calibration, which *is* hardware-verified. |
+| **Lock-free ring buffer (`hooks/common/ringbuffer.h`) not wired into any hook** | Built and verified in isolation (stress-tested, ThreadSanitizer-clean, benchmarked — see §13 "Reducing collection-path overhead"), but no hook's `emit_span()` actually uses it yet; today's real collection path is still the mutex+`send()` pattern for every hook. | The measured 1.5–58x overhead reduction is real for the primitive itself, not yet realized end-to-end in a profiling run; treat it as available infrastructure for a future integration pass, not a shipped speedup. |
+| **eBPF OS tracer (`hooks/os_tracer/`) never loaded into a kernel** | `kernel.unprivileged_bpf_disabled=2` on this development machine blocks BPF loading for non-root — see §19. Compiled, linked, and run up to `EPERM` at the exact expected privilege wall; the kernel BPF verifier (a distinct pass beyond compilation) has never actually run against it. | Needs root/`CAP_BPF` on a machine where that's authorized to confirm the tracepoint handlers pass kernel verification and emit semantically correct events under real scheduler activity. |
 
 ---
 
@@ -2780,13 +3058,13 @@ hprofiler critical-path trace.json --export trace.critpath.json   # tags spans f
 
 `hprofiler critical-path` builds a dependency graph over **every** captured
 span — CUDA, ROCm, OpenCL, OpenMP, MPI, NCCL together in one graph, since
-every hook in a run already reports to the same collector — walks it
-backward from the last-ending event to find the real observed critical
-path, and attributes idle time on that path to whichever span was being
-waited on. This generalizes two established but narrower techniques:
-CASITA's critical-path analysis (MPI+CUDA only) and HPCToolkit's
-blame-shifting (CPU+GPU pairs only) to an arbitrary N-way combination of
-hprofiler's backends.
+every hook in a run already reports to the same collector — finds the real
+observed critical path via a formal DAG longest-path computation (see
+"Formal critical path" below), and attributes idle time on that path to
+whichever span was being waited on. This generalizes two established but
+narrower techniques: CASITA's critical-path analysis (MPI+CUDA only) and
+HPCToolkit's blame-shifting (CPU+GPU pairs only) to an arbitrary N-way
+combination of hprofiler's backends.
 
 ### Scope: structural synchronization, not data-flow
 
@@ -2800,12 +3078,109 @@ synchronization semantics:
 | Program order | Sequential spans on the same OS thread | Timestamps only |
 | Stream order | Sequential CUDA/ROCm spans on the same `stream=N` | `stream=` tag |
 | Device sync | `cudaDeviceSynchronize`/`hipDeviceSynchronize` depends on every GPU span since the last device sync on that process | Category/name matching |
-| Point-to-point | The Nth `MPI_Send` pairs with the Nth matching `MPI_Recv` (`rank`/`peer`/`tag`), in each side's own chronological order — **not** "whichever send had already started" (MPI guarantees FIFO delivery per ordered pair+tag, so this holds regardless of which span starts first; a recv is commonly posted well before its matching send, to overlap communication setup with compute). Gated by the send's **start**, evaluated against the recv's **end** — the recv can't complete before the send has at least begun, not before it's fully finished. `Isend`/`Irecv` → `Wait`/`Waitall` additionally via the existing `sid=`/`psid=` span correlation (§12/§16.1) | `rank=`/`peer=`/`tag=` tags, `span_id`/`parent_span_id` |
-| Collective / barrier rendezvous | Every participant depends on the single **last-arriving** participant (by `start_ns`) — not a full mutual clique between all participants, which would let the walk keep chaining through arrival edges after the last arriver is already found. Gated the same way as point-to-point: by the last arriver's **start**, against the waiting participant's **end** | Overlapping-interval clustering per `(type)` for MPI/NCCL, per `(pid, barrier name)` for OpenMP |
+| Point-to-point | The Nth send-side event pairs with the Nth matching receive-side event for a given `(rank, peer, tag)` key, in each side's own post/arrival order — **not** "whichever send had already started" (MPI guarantees FIFO delivery per ordered pair+tag, so this holds regardless of which span starts first; a recv is commonly posted well before its matching send, to overlap communication setup with compute). Covers both blocking `MPI_Send`/`MPI_Recv` and non-blocking `MPI_Isend`/`MPI_Irecv` — for the latter, the edge lands on whichever call actually observes completion (`MPI_Wait`/`Waitall`/`Waitany`/`Waitsome`), not the `Irecv` itself, which returns almost instantly and isn't what blocks. A receive posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG` is matched using the *resolved* real peer/tag mpi_hook.c reports (§4 `mpi`), not a sentinel. Gated by the send's **start**, evaluated against the completing event's **end**. `Isend`/`Irecv` → their own `Wait`/`Waitall`/`Waitany`/`Waitsome` additionally get a same-rank `explicit_span_id` edge via `sid=`/`psid=` (§12/§16.1), including through a `;`-separated multi-request `psid=` on `Waitall`/`Waitsome` | `rank=`/`peer=`/`tag=`/`wildcard=`/`rpeer=`/`rtag=` tags, `span_id`/`parent_span_id` |
+| Collective / barrier rendezvous | Every participant depends on the single **last-arriving** participant (by `start_ns`) — not a full mutual clique between all participants, which would let the walk keep chaining through arrival edges after the last arriver is already found. Gated the same way as point-to-point: by the last arriver's **start**, against the waiting participant's **end**. MPI collectives cluster per `(type, commid)` when a real communicator id is available (§4 `mpi`), not just per `(type)` — closes a real false-positive case where two *unrelated* communicators doing the same collective type at overlapping wall-clock times used to be merged into one bogus rendezvous group | Overlapping-interval clustering per `(type, commid)` for MPI (falls back to `(type)` only when `commid` is unavailable), per `(type)` for NCCL (no communicator-identity mechanism yet), per `(pid, barrier name)` for OpenMP |
 
 This does **not** attempt arbitrary data-flow analysis (e.g. "this kernel
 depends on that MPI recv because it reads the buffer it filled") — only
 these structural cases. The same scoping choice CASITA and Score-P make.
+
+One stated gap: `MPI_Test`/`MPI_Testany`/`MPI_Testsome`/`MPI_Testall`/
+`MPI_Cancel` are emitted as instant events, not spans (they're meant to be
+non-blocking polls, not durations — §4 `mpi`), and this graph is built only
+over spans. A non-blocking receive completed *exclusively* via a `Test*`
+poll loop (never `Wait`/`Waitall`/`Waitany`/`Waitsome`) gets no cross-rank
+edge in this version — a documented scope boundary, not a silent miss.
+
+### Edge confidence: how directly each dependency is proven
+
+Every edge also records how strong the evidence behind it is, not just that
+it exists — the response to feedback that the matching was "a heuristic"
+with no way to tell a hardware-enforced ordering from a best-effort guess:
+
+| Tier | Meaning |
+|---|---|
+| `certain` | Enforced by the runtime/hardware itself (same-thread program order; CUDA/HIP stream & event semantics), or an explicit id the hook itself assigned and later referenced (`sid=`/`psid=`) |
+| `high` | MPI point-to-point matched using *resolved* `MPI_ANY_SOURCE`/`ANY_TAG` status data, or collective/barrier rendezvous scoped by a real communicator id (`commid=`) |
+| `medium` | The same kind of matching without that extra evidence: exact (non-wildcard) tag matching by call order only, or rendezvous clustering with no `commid=` available |
+
+`hprofiler critical-path`'s terminal output shows a "Path evidence
+strength" breakdown (ns and % of the reported path at each tier); `--export`
+tags each on-path span `path_confidence=<tier>` in addition to
+`on_critical_path=1`, so it's visible per-span in Perfetto too. If over 30%
+of the path's time rests on `medium`-or-below evidence, a note says so
+explicitly rather than leaving a single number silently mixing strong and
+weak evidence.
+
+### Formal critical path: DAG longest-path DP, not a greedy walk
+
+Earlier versions found the critical path with a backward greedy walk:
+starting at the last-ending span, repeatedly picking whichever valid
+predecessor had the single *tightest* gate time and recursing. That local
+choice is not guaranteed to reach the same answer as the path that actually
+accounts for the most wall-clock time when two predecessors compete — a
+predecessor with a tighter gate but a short chain behind it can lose to one
+with a looser gate but a much longer chain, and greedy has no way to see
+that behind the immediate choice.
+
+`compute_critical_path` now solves this as a proper dynamic program over
+the dependency DAG: `accounted[v] = max` over every causally-valid `(u, v)`
+edge of `accounted[u] + gap + duration(v)`, computed in topological order,
+with the reported path reconstructed by tracing the arg-max choices back
+from whichever node achieves the global maximum. This is the textbook
+"longest path in a DAG" algorithm — solvable exactly in O(V+E) time
+(longest path in a *general* graph is NP-hard; the DAG's acyclic structure,
+guaranteed here because every edge builder only ever points from an
+earlier-enabling event to a later-gated one, is what makes it tractable).
+`tests/test_criticalpath.py`'s `TestFormalDPBeatsGreedy` is a hand-verified
+worked example where the two algorithms diverge: the DP finds a path
+accounting for 650ns where greedy would have stopped at 60ns, on the exact
+same graph. The DAG-ness is verified via topological sort rather than
+assumed — if a cycle is ever detected (would indicate a bug in an edge
+builder, since none is expected to produce one), it falls back to the
+original greedy walk, which stays correct in the presence of a cycle by
+construction (its `visited` set prevents infinite loops), with the caller
+free to notice the discrepancy rather than the tool silently hanging.
+
+### GPU exec-start calibration feeds the DP directly
+
+The DP's gate/gap computation (`_edge_gap_and_gate`) uses each span's
+*effective* start/end rather than raw `start_ns`/`duration_ns` directly —
+for a GPU kernel/memcpy span carrying `xs=` (§4 `cuda`'s exec-start
+calibration), that's the real GPU-timeline execution-start time instead of
+the CPU-side launch-call time. This matters specifically for idle-time
+attribution: under stream queue backlog, a kernel's CPU launch call can
+happen microseconds after the one before it while the GPU itself doesn't
+reach it until much later, and computing a gap from the misleadingly-early
+`start_ns` would understate (or entirely miss) how long a downstream span
+actually waited on it. `xs=` does **not** change which edges exist or what
+order spans are chained in (a stream's FIFO submission order and FIFO
+execution order are the same order, so plain `start_ns` sorting stays
+correct for that); it only changes the *numeric* causal reasoning the DP
+does once those edges already exist. Falls back to `start_ns` for any span
+without an `xs=` tag — everything non-GPU, and any GPU span calibration
+wasn't available for — so this is purely additive.
+
+### Accuracy validation
+
+`tests/validation/test_causal_accuracy.py` is the direct answer to
+"current tests mostly verify 'does not crash', not measurement
+correctness": rather than one hand-picked scenario per assertion, it runs
+a battery of synthetic scenarios with known ground-truth edge sets (exact
+and wildcard-resolved MPI matching, `commid=`-scoped vs. unscoped
+rendezvous — including a two-communicator case specifically checking a
+false cross-communicator edge is *not* produced — async `Isend`/`Irecv`+
+`Wait` pairing, program order, device sync, OpenMP barriers) through the
+real dependency-graph builder and reports aggregate **precision and
+recall, broken down per confidence tier**. Current result: 100%/100%
+across 22 ground-truth edges spanning all three tiers — a regression that
+starts producing spurious edges or missing real ones shows up as a drop
+here even if every narrower unit test elsewhere still happens to pass on
+its own fixed scenario. A companion determinism check re-runs every
+scenario with its spans inserted in several different orders and confirms
+byte-identical edge sets *and* critical paths — catching any latent
+dependence on dict/set iteration order a single fixed-order test couldn't
+surface.
 
 ### Single-node only
 
@@ -2830,18 +3205,29 @@ Time ON the critical path, by category (productive work):
     cuda               812.4ms
     mpi                 45.2ms
 
+Path evidence strength (how directly each hop is proven, not guessed):
+    certain            790.1ms  ( 92.2%)
+    high                45.2ms  (  5.3%)
+    medium              21.8ms  (  2.5%)
+
 Idle time on the critical path, blamed by category (what it was waiting on):
     mpi                203.7ms
     openmp              12.1ms
 ```
 
 The first table is "what the critical path is actually doing" (where the
-unavoidable time goes); the second is "what it's idle *waiting on*" — the
+unavoidable time goes); the third is "what it's idle *waiting on*" — the
 category of whichever span gated the next step. A large `mpi` entry in the
 blame table means MPI communication is the thing most worth optimizing
 *on the critical path specifically* (as opposed to MPI's total time in the
 `hprofiler summary` breakdown, which includes MPI activity off the critical
-path too).
+path too). The middle "Path evidence strength" table is new: it's
+`CriticalPathReport.confidence_breakdown_ns()` (see "Edge confidence"
+above) — high `certain`/`high` percentages mean the reported path rests on
+hardware/runtime-enforced ordering or resolved MPI status/communicator
+data; a large `medium` share means more of it depends on call-order
+matching without that stronger evidence, worth keeping in mind before
+treating the exact reported chain as precise.
 
 If `Time accounted for` in the header exceeds `Wall time`, `notes` will say
 so explicitly: this happens when the path passes through multiple
@@ -2855,5 +3241,217 @@ events.
 ### `--export`: highlighting the critical path in Perfetto
 
 `--export FILE` writes the trace back out as Chrome Trace JSON with every
-critical-path span tagged `on_critical_path=1`, which you can filter/color
-on in [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`.
+critical-path span tagged `on_critical_path=1` and (for every span but the
+first — see "Edge confidence" above) `path_confidence=<tier>`, which you
+can filter/color on in [Perfetto](https://ui.perfetto.dev) or
+`chrome://tracing`.
+
+---
+
+## 19. OS-Level Observability (eBPF Scheduler Tracer)
+
+`hooks/os_tracer/` answers a question none of the LD_PRELOAD/OMPT/PMPI
+hooks can: when a thread's span shows an idle gap, was that gap actually
+caused by the dependency the causal-path graph (§18) thinks it was waiting
+on, or was the OS scheduler simply not running that thread on a CPU during
+that window — preempted by another process, waiting for a free core,
+migrated across NUMA nodes? That's invisible below the userspace boundary
+every other hook operates at.
+
+### What it captures
+
+An eBPF CO-RE (Compile Once – Run Everywhere) program,
+`sched_trace.bpf.c`, attached to three kernel scheduler tracepoints:
+
+| Tracepoint | Emitted as | Meaning |
+|---|---|---|
+| `sched_switch` | `span:sched:0:<tid>:<start>:<dur>:off_cpu:comm=<name>` | One event per off-CPU period: how long a thread was switched out before it ran again — directly comparable to any instrumented span's idle gap |
+| `sched_wakeup` | `inst:sched:0:<tid>:<ts>:wakeup:comm=<name>,target_cpu=N` | A sleeping thread became runnable (pairing this with the next matching `off_cpu` span's end gives run-queue/scheduling latency — not decomposed in-kernel in this version, a documented follow-on) |
+| `sched_migrate_task` | `inst:sched:0:<tid>:<ts>:migrate:comm=<name>,orig_cpu=N,dest_cpu=N` | A thread moved to a different CPU (often cross-NUMA) — a common, otherwise-invisible cause of an unexplained slowdown |
+
+Events use the same wire protocol (§12) every other hook does, over
+`HPROFILER_SOCKET`, with a new `sched` category (`src/core/events.py`).
+The `pid` field is always `0` (process-grouping not resolved from the raw
+tracepoint's `prev_pid`/`next_pid`/`pid` fields, which are kernel-level
+thread ids only) — an explicit "not resolved" sentinel, not a guess;
+`tid` is the real, directly-available kernel thread id. Thread names
+(`comm`) are sanitized before being embedded as a tag value (`:`, `,`, `=`
+replaced with `_`) — the same class of wire-protocol corruption risk
+found and fixed in `mpi_hook.c`'s `rmatches=` earlier in this redesign
+(§12's "Tag values must never contain `:`"), since a thread can set an
+arbitrary `comm` via `prctl(PR_SET_NAME)`.
+
+### Why a separate process, not an LD_PRELOAD hook
+
+Every other hook is injected into the profiled program itself via
+`LD_PRELOAD`/`OMP_TOOL_LIBRARIES`/PMPI linking. Loading an eBPF program
+needs `CAP_BPF` (in practice, usually root) — a property of how the
+*loading process* was launched, which an LD_PRELOAD shim injected into an
+arbitrary unprivileged profiled program cannot obtain for itself. Run
+`os_tracer` as a separate, explicitly-privileged process alongside the
+profiled program instead:
+
+```bash
+cd hooks/os_tracer && make          # builds sched_trace.bpf.o, the
+                                     # bpftool-generated skeleton, and
+                                     # os_tracer itself -- see Makefile
+sudo HPROFILER_SOCKET=/tmp/hprofiler.sock ./os_tracer &
+hprofiler run --backend mpi -- mpirun -np 4 ./my_app
+kill %1
+```
+
+### Build requirements
+
+`clang` (BPF backend), `bpftool`, and libbpf headers + library. The
+Makefile prefers `pkg-config libbpf` (i.e. a proper `libbpf-dev` install:
+`sudo apt install clang llvm libbpf-dev linux-tools-common
+linux-tools-$(uname -r)`); `vmlinux.h` (the CO-RE struct-layout header) is
+generated fresh from the running kernel's own BTF on every build
+(`bpftool btf dump file /sys/kernel/btf/vmlinux format c`) — not checked
+into source control, since it's kernel-version-specific and ~150k lines.
+
+### Verification status: compiled, linked, and run up to the exact expected privilege wall — never loaded into a kernel
+
+This development machine has `libbpf.so.1` (the runtime) but not
+`libbpf-dev` (headers + the unversioned `.so` symlink `-lbpf` needs), and
+`kernel.unprivileged_bpf_disabled=2` blocks BPF loading for non-root
+regardless. Given that, verification here went as far as it possibly
+could without root:
+
+1. **The BPF program compiles cleanly** (`clang -target bpf`, zero
+   warnings under default flags) against this machine's own
+   BTF-generated `vmlinux.h`, using struct field names (`prev_pid`,
+   `next_pid`, `target_cpu`, `orig_cpu`, `dest_cpu`, …) read directly out
+   of that generated header, not from memory/guesswork.
+2. **`bpftool gen skeleton`** — an entirely offline, no-kernel-interaction
+   operation that parses the compiled object's own ELF/BTF metadata —
+   correctly identified both maps (`offcpu_start`, `events`) and all
+   three programs, an independent structural check beyond "clang didn't
+   error."
+3. **The userspace loader compiles and links cleanly** (`gcc -Wall
+   -Wextra`, zero warnings) against libbpf headers borrowed from the
+   `linux-headers` package's own internal copy (unmodified, same
+   upstream LGPL-2.1/BSD-2-Clause libbpf source used to build the
+   kernel's `resolve_btfids` tool) and linked directly against the
+   system's versioned `libbpf.so.1`/`libelf.so.1`/`libz.so.1` (working
+   around the missing unversioned `-dev` symlinks) — see the Makefile's
+   comment for the exact commands, and install `libbpf-dev` properly on
+   any other machine instead of relying on this workaround.
+4. **Running it reaches the real kernel boundary and fails exactly as
+   expected, gracefully**: `sched_trace_bpf__open_and_load()` reaches
+   libbpf's internal `bpf_object__probe_loading()` self-test (a trivial
+   always-succeeds program libbpf loads first to confirm basic BPF
+   availability) and gets `EPERM` — precisely the error
+   `unprivileged_bpf_disabled=2` should produce, not some unrelated
+   failure. The program detects this, prints a clear, actionable message,
+   and exits cleanly — no crash, no hang.
+
+**What remains genuinely unverified:** the kernel's BPF *verifier* — a
+distinct, additional pass beyond compilation that statically proves
+memory-safety and termination properties C compilation doesn't check —
+has never actually run against this program, since that only happens
+during a load attempt that got past the privilege check. Whether the
+three tracepoint handlers and the ring buffer/LRU-hash map usage pass
+verification, and whether the emitted events are semantically correct
+once real scheduler activity flows through them, are unconfirmed until
+run as root (or with `CAP_BPF`) on a machine where that's authorized —
+this is the honest limit of what's checkable here, one step further than
+compile-only (phases 3/4 of this redesign), but still short of a live run.
+
+---
+
+## 20. Multi-Node Trace Merging and Clock Synchronization
+
+hprofiler's collector is a local `AF_UNIX` socket (§12), so a single trace
+is inherently single-node regardless of clock synchronization — a
+multi-node job produces one independent trace file per node (profile each
+node separately, e.g. via your job launcher's per-node wrapper). This
+section covers aligning and combining those per-node traces.
+
+### Clock offset estimation: `HPROFILER_CLOCK_SYNC`
+
+Set `HPROFILER_CLOCK_SYNC=1` when launching a multi-node MPI job to have
+`mpi_hook.c` estimate each rank's clock offset relative to rank 0's clock,
+once, during `MPI_Init`/`MPI_Init_thread`. **Off by default** — this adds
+a real, blocking round-trip exchange to a function every MPI program
+calls, so it must never run unless explicitly requested.
+
+**Protocol** (Cristian's algorithm — the same round-trip technique NTP
+itself is built on): rank R sends a zero-byte ping to rank 0 at its own
+local time `T1`; rank 0 records its own local times `T2` (ping received)
+and `T3` (about to reply) and returns both to R; R records `T4` (reply
+received). Assuming symmetric network latency (a real approximation, not
+an exact guarantee):
+
+```
+round_trip  = T4 - T1
+offset      = (T2+T3)/2 - (T1 + round_trip/2)   # rank 0's clock minus R's, same instant
+error_bound = round_trip / 2                     # standard bound under the symmetry assumption
+```
+
+Rank 0 loops over every other rank sequentially (O(size) round trips —
+simple to reason about correctly; this runs once per job, not once per
+profiled call). Each non-root rank emits three counters into its own
+trace: `clock_offset_vs_rank0_ns`, `clock_offset_error_bound_ns`,
+`clock_sync_round_trip_ns` (category `mpi`).
+
+**Verification status:** the offset/error-bound *arithmetic* is
+independently, fully unit-tested (`tests/test_multinode.py`) against
+hand-derived synthetic `(T1,T2,T3,T4)` scenarios — including one with
+asymmetric forward/return latency, confirming the error bound correctly
+brackets the actual estimation error rather than the point estimate being
+silently treated as exact. The C-side round-trip *capture itself*
+(`clock_sync_if_requested` in `mpi_hook.c`) is compiled and its
+zero-effect-when-disabled and size-under-2 no-op paths are exercised, but
+the real 2-or-more-rank exchange has never executed on this development
+machine, which cannot form a real multi-rank `MPI_COMM_WORLD` at all (see
+§13's Known Limitations / [[project-paper4-benchmark-suite]] memory) — the
+same limitation already affecting cross-process `commid=` agreement (§4
+`mpi`).
+
+### Merging: `hprofiler merge-nodes`
+
+```bash
+hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
+hprofiler critical-path merged.json   # now analyzes across node boundaries
+```
+
+The first file is the reference node (offset 0). Each other node's offset
+comes from its embedded `HPROFILER_CLOCK_SYNC` counters, or `--offset-ns`
+if given explicitly. `src/analysis/multinode.py`'s `merge_traces()`:
+
+- Shifts every span/instant/counter timestamp by that node's offset.
+- Remaps `pid` into a per-node-unique namespace (`node_index *
+  10_000_000`) — pid 1234 on node A and pid 1234 on node B are unrelated
+  processes; without this, every `(pid, tid)`-keyed piece of existing
+  analysis code (program-order edges, stream-order edges, …) could
+  conflate two different nodes' threads that happen to share numbers.
+  `tid` is deliberately left unchanged: everywhere in this codebase that
+  groups by thread already groups by `(pid, tid)` together, so a
+  per-node-unique `pid` alone keeps those tuples unique post-merge.
+- Leaves MPI `rank=`/`peer=`/`commid=` tags completely untouched —
+  `MPI_COMM_WORLD` ranks and (from Phase 1 of this redesign)
+  communicator identities are already globally unique across an entire
+  job regardless of which physical node a rank runs on, so
+  `criticalpath.py`'s existing cross-rank P2P/collective matching (built
+  on those tags, not `pid`/`tid`) works transparently across a merge with
+  no further change needed — a direct benefit of that earlier work.
+- Adds a `node=<index>` tag to every merged event, and warns (rather than
+  silently proceeding) about any non-reference node merged at an
+  uncorrected 0 offset because no `HPROFILER_CLOCK_SYNC` data or
+  `--offset-ns` was available for it.
+
+Selective aggregation (merging only a subset of nodes/ranks) needs no
+separate API: just pass fewer `TRACE_FILES`.
+
+### Post-merge validation
+
+A matched MPI send can never causally complete after its receive already
+finished. `merge_nodes_cmd` automatically runs
+`multinode.validate_causality()` (reusing `criticalpath.py`'s own p2p
+matching, so it checks exactly the pairing the critical-path engine
+itself will use) and reports any violation as a warning — a violation
+means either a wrong clock-offset estimate for one of the merged nodes or
+a genuine anomaly, surfaced explicitly rather than silently accepted into
+a critical-path report that would then misattribute blame across a false
+ordering.

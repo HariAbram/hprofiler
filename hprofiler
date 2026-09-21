@@ -1053,17 +1053,25 @@ def efficiency(trace_file, baseline, interconnect_bw, use_cp):
               help="Number of top categories to show in each breakdown.")
 @click.option("--export", default=None, type=click.Path(), metavar="FILE",
               help="Write the trace back out as Chrome Trace JSON with critical-path "
-                   "spans tagged on_critical_path=1, for highlighting in Perfetto.")
+                   "spans tagged on_critical_path=1 and path_confidence=<tier>, "
+                   "for highlighting in Perfetto.")
 def critical_path_cmd(trace_file, top, export):
     """Compute and print the N-way cross-runtime critical path for a saved trace.
 
     Builds a dependency graph over every captured span (CUDA/ROCm/OpenCL/
     OpenMP/MPI/NCCL) using each backend's known synchronization semantics --
-    stream ordering, device syncs, MPI/NCCL send/recv and collective pairing,
-    OpenMP barriers -- not arbitrary data-flow, walks it backward from the
-    last-ending event to find the real observed critical path, and
-    attributes idle time on that path to whichever span was being waited on.
-    Single-node only (see DOCUMENTATION.md).
+    stream ordering, device syncs, MPI/NCCL send/recv and collective pairing
+    (using resolved MPI_ANY_SOURCE/ANY_TAG status data and real communicator
+    identity when available, not just call-order heuristics), OpenMP
+    barriers -- not arbitrary data-flow, then finds the real observed
+    critical path via a formal DAG longest-path computation (provably the
+    globally-best explanatory chain, not a locally-greedy approximation of
+    one), and attributes idle time on that path to whichever span was being
+    waited on. Every hop is also tagged with how directly it's proven --
+    certain (hardware/runtime-enforced or an explicit id the hook itself
+    assigned) down to medium (call-order matching with no stronger
+    evidence available) -- shown in the "Path evidence strength" section
+    below. Single-node only (see DOCUMENTATION.md).
 
     \b
     Examples:
@@ -1096,6 +1104,17 @@ def critical_path_cmd(trace_file, top, export):
     for cat, ns in sorted(report.time_on_path_by_category.items(), key=lambda kv: -kv[1])[:top]:
         click.echo(f"    {cat:<12} {fmt_ns(ns):>12}")
 
+    breakdown = report.confidence_breakdown_ns()
+    if breakdown:
+        conf_total = sum(breakdown.values())
+        click.echo(f"\n  Path evidence strength (how directly each hop is proven, not guessed):")
+        for tier in ("certain", "high", "medium", "low"):
+            ns = breakdown.get(tier)
+            if ns is None:
+                continue
+            pct = 100.0 * ns / conf_total if conf_total else 0.0
+            click.echo(f"    {tier:<12} {fmt_ns(ns):>12}  ({pct:5.1f}%)")
+
     if report.wait_caused_by_category:
         click.echo(f"\n  Idle time on the critical path, blamed by category (what it was waiting on):")
         for cat, ns in report.top_blame(top):
@@ -1111,13 +1130,99 @@ def critical_path_cmd(trace_file, top, export):
     if export:
         from src.output import chrome_trace
         on_path = {id(report.spans[i]) for i in report.path_span_indices}
+        # path_edge_confidence[i-1] is the confidence of the edge explaining
+        # path[i]'s inclusion (path[0], the root of the backward walk, has
+        # none -- see CriticalPathReport.confidence_breakdown_ns).
+        conf_by_id = {
+            id(report.spans[report.path_span_indices[i]]): report.path_edge_confidence[i - 1]
+            for i in range(1, len(report.path_span_indices))
+        }
         for s in trace.spans:
             if id(s) in on_path:
                 s.tags["on_critical_path"] = "1"
+                if id(s) in conf_by_id:
+                    s.tags["path_confidence"] = conf_by_id[id(s)]
         chrome_trace.write(trace, export, pretty=True)
         click.echo(f"\n  Annotated trace written to: {export}")
 
     click.echo(f"{'='*64}\n")
+
+
+@cli.command("merge-nodes")
+@click.argument("trace_files", type=click.Path(exists=True), nargs=-1, required=True)
+@click.option("-o", "--output", required=True, type=click.Path(),
+              help="Where to write the merged trace (Chrome Trace JSON).")
+@click.option("--offset-ns", multiple=True, type=int, metavar="NS",
+              help="Explicit clock offset for a node, in ns, same order as TRACE_FILES "
+                   "(overrides any HPROFILER_CLOCK_SYNC counters in that trace). "
+                   "Omit for a node to use its embedded counters (or 0 for node 0, "
+                   "the assumed reference).")
+def merge_nodes_cmd(trace_files, output, offset_ns):
+    """Merge multiple per-node traces from a multi-node run onto one timeline.
+
+    hprofiler's collector is a local socket, so a multi-node job produces
+    one independent trace file per node (profile each node separately,
+    e.g. via your job launcher's per-node wrapper, then merge here). The
+    first TRACE_FILES argument is treated as the reference node (offset
+    0); every other node's clock offset relative to it comes from
+    HPROFILER_CLOCK_SYNC counters embedded in that trace (see the `mpi`
+    backend's clock-sync section in DOCUMENTATION.md -- off by default,
+    set HPROFILER_CLOCK_SYNC=1 when running each node to capture them) or
+    from --offset-ns if given explicitly.
+
+    pid is remapped into a per-node-unique namespace so same-numbered
+    pids from different physical nodes are never conflated; MPI rank=/
+    peer= tags are left untouched (already globally unique across the
+    whole job). After merging, checks that no matched MPI send/receive
+    pair violates causality -- a violation usually means a wrong clock
+    offset, printed as a warning rather than silently trusted.
+
+    \b
+    Examples:
+      hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
+      hprofiler merge-nodes node0.json node1.json -o merged.json --offset-ns 0 --offset-ns 15000
+    """
+    from src.ui.app import load_trace_from_json
+    from src.analysis import multinode as mn
+    from src.output import chrome_trace
+
+    nodes = []
+    for i, path in enumerate(trace_files):
+        trace = load_trace_from_json(path, collect_disasm=False)
+        if i < len(offset_ns):
+            offset = offset_ns[i]
+            error_bound = 0
+        elif i == 0:
+            offset, error_bound = 0, 0
+        else:
+            est = mn.offset_from_counters(trace)
+            if est is None:
+                click.echo(f"  Warning: {path} has no HPROFILER_CLOCK_SYNC counters and "
+                           f"no --offset-ns given -- merging at an uncorrected 0 offset.")
+                offset, error_bound = 0, 0
+            else:
+                offset, error_bound = est.offset_ns, est.error_bound_ns
+                click.echo(f"  {path}: offset={offset}ns (±{error_bound}ns from "
+                           f"embedded HPROFILER_CLOCK_SYNC measurement)")
+        nodes.append(mn.NodeTrace(trace=trace, offset_ns=offset, error_bound_ns=error_bound,
+                                  label=str(path)))
+
+    merged, warnings = mn.merge_traces(nodes)
+    for w in warnings:
+        click.echo(f"  Warning: {w}")
+
+    problems = mn.validate_causality(merged)
+    if problems:
+        click.echo(f"\n  Warning: {len(problems)} causality violation(s) found after merging "
+                   f"(likely a wrong clock offset for one of these nodes):")
+        for p in problems[:10]:
+            click.echo(f"    - {p}")
+        if len(problems) > 10:
+            click.echo(f"    ... and {len(problems) - 10} more")
+
+    chrome_trace.write(merged, output, pretty=True)
+    click.echo(f"\n  Merged {len(trace_files)} node(s), {len(merged.spans)} spans "
+              f"-> {output}")
 
 
 @cli.command()
