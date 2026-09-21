@@ -512,9 +512,12 @@ class Runner:
             _likwid_backend.post_process(trace)
 
         # ── OpenMP zero-event sanity check ────────────────────────────────────
-        # GCC libgomp does not implement OMPT 5.0 — the hook loads but callbacks
-        # never fire.  Warn early so the user isn't left wondering why all OpenMP
-        # rows are empty in the timeline.
+        # Two independent capture paths are injected together (see
+        # src/backends/openmp.py's module docstring): OMPT (needs LLVM
+        # libomp) and direct GOMP_* interception (needs GNU libgomp, no
+        # OMPT dependency). If BOTH produced zero events, something else is
+        # wrong — warn with troubleshooting steps for both paths rather
+        # than assuming which one should have worked.
         if "openmp" in self.backends:
             import sys as _sys2
             omp_spans = [s for s in trace.spans if s.category.value == "openmp"]
@@ -522,11 +525,20 @@ class Runner:
                 print(
                     "[hprofiler][warn] openmp backend active but 0 OpenMP events "
                     "were captured.\n"
-                    "  Most likely cause: binary compiled with GCC libgomp instead of "
-                    "clang/LLVM libomp.\n"
-                    "  OMPT 5.0 callbacks only fire with LLVM libomp — recompile with "
-                    "clang++ and link -lomp (not -lgomp).\n"
-                    "  To verify: ldd <binary> | grep -E 'omp|gomp'",
+                    "  Check which OpenMP runtime the binary actually links:\n"
+                    "    ldd <binary> | grep -E 'omp|gomp'\n"
+                    "  libomp.so  -> OMPT path: confirm $OMP_TOOL_LIBRARIES pointed at "
+                    "a real libhprofiler_ompt.so (run 'hprofiler build' if missing).\n"
+                    "  libgomp.so -> GOMP_* interception path: confirm "
+                    "build/lib/libhprofiler_gomp.so exists and was actually LD_PRELOADed "
+                    "(check $LD_PRELOAD in the run's environment) — this path only covers "
+                    "GOMP_parallel/loop(non-static)/barrier/critical/single, not every "
+                    "construct (see DOCUMENTATION.md's openmp backend section), so a "
+                    "program using ONLY unintercepted constructs (e.g. tasks, sections, "
+                    "target offload) can legitimately still show 0 events.\n"
+                    "  neither   -> statically-linked OpenMP runtime, or a runtime other "
+                    "than libomp/libgomp — LD_PRELOAD interception cannot intercept "
+                    "compile-time-resolved symbols.",
                     file=_sys2.stderr,
                 )
 

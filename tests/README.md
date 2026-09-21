@@ -41,6 +41,20 @@ Four layers:
     symmetric exact case), trace merging (pid remapping avoids cross-node
     collisions, MPI rank=/peer= tags deliberately left unremapped), and
     post-merge causality validation.
+  - `test_braille_canvas.py` -- `src/ui/braille_canvas.py`: the Braille
+    sub-cell line-drawing primitive behind the Timeline's cross-rank
+    communication connectors, checked against hand-computed Braille dot
+    bit-patterns (not just "a line got drawn somewhere").
+  - `test_timeline_connectors.py` -- `TimelineWidget`'s connector overlay
+    (`src/ui/app.py`): this project's first UI-level test, using Textual's
+    headless `App.run_test()` harness rather than only exercising the
+    analysis/hook layers directly. Verifies connector computation
+    (cross-lane vs. same-lane skip, MPI/NCCL-only filtering, confidence
+    tiers), that rendering actually produces Braille overlay characters
+    when expected and *none* when there's nothing to connect (a
+    regression guard against the feature silently corrupting the
+    pre-existing Timeline appearance), crash-safety under extreme
+    zoom/pan, and a 64-rank scale check.
 
 - **Native (C-level) stress tests** (`tests/native/`): infrastructure with
   no GPU/MPI dependency, verified with much stronger tools than the Python
@@ -93,6 +107,21 @@ Four layers:
 
     ```bash
     python3 -m unittest tests.integration.test_mpi_protocol -v
+    ```
+
+  - `test_gomp_hook.py` -- same measurement-correctness standard, for
+    `hooks/gomp_hook/gomp_hook.c` (direct `GOMP_*` interception for
+    binaries linked against GNU's libgomp, which has no OMPT support in
+    typical builds -- see `src/backends/openmp.py`'s module docstring).
+    Compiles `tests/fixtures/gomp_mini.c` with real `gcc` (confirmed via
+    `ldd` to link `libgomp`, not `libomp`), `LD_PRELOAD`s the hook, and
+    asserts on per-thread/per-construct correctness: exactly one
+    `omp_parallel_region` span per thread (not just one for the whole
+    region), correct barrier/critical-section/single counts, and that the
+    interception doesn't change the program's own computed result.
+
+    ```bash
+    python3 -m unittest tests.integration.test_gomp_hook -v
     ```
 
 - **Validation suite** (`tests/validation/`): the direct response to "these

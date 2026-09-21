@@ -45,6 +45,7 @@ from textual.widgets import (
 
 from ..core.trace import Trace
 from ..core.events import SpanEvent, Category
+from .braille_canvas import BrailleCanvas
 
 # ── Color palette ─────────────────────────────────────────────────────────────
 
@@ -65,6 +66,17 @@ _CAT_RICH: dict[str, str] = {
 
 def _cat_color(cat: str) -> str:
     return _CAT_RICH.get(cat, "grey70")
+
+# Connector-line style per criticalpath.py edge confidence tier (see its
+# module docstring's "Edge confidence" section) -- lets a communication
+# line's own color signal how directly it's proven, the same distinction
+# `hprofiler critical-path`'s "Path evidence strength" breakdown surfaces
+# in the CLI, now visible directly in the live Timeline.
+_CONNECTOR_STYLE: dict[str, str] = {
+    "certain": "bold bright_white",
+    "high":    "bold bright_cyan",
+    "medium":  "grey58",
+}
 
 # Per-function color palette — 8 primary hues spaced 45° apart, interleaved
 # so adjacent palette indices are ~180° apart in hue (maximum contrast).
@@ -1008,6 +1020,49 @@ class TimelineWidget(Widget):
                 self._cidx_arr[lane]   = np.empty(0, dtype=np.int32)
                 self._max_dur[lane]    = 0
 
+        # ── Cross-rank communication connectors (MPI/NCCL) ────────────────
+        # Reuses criticalpath.py's dependency-graph edges directly (resolved
+        # wildcard matching, commid=-scoped rendezvous, confidence tiers --
+        # see its module docstring) rather than re-deriving send/recv or
+        # collective-participant matching here. Computed once at
+        # construction, same as every other precomputed structure above --
+        # TimelineWidget is built once per loaded/completed trace (see
+        # ProfilerApp.compose), not live-refreshed as new events stream in.
+        # (pred_lane, pred_mid_ns, succ_lane, succ_mid_ns, confidence)
+        self._connectors: list[tuple[str, float, str, float, str]] = []
+        try:
+            from ..analysis import criticalpath as _cp
+            cp_spans, cp_preds = _cp.build_dependency_graph(trace)
+            span_lane: dict[int, str] = {
+                id(s): lane for lane, spans_list in self._lanes.items() for s in spans_list
+            }
+            for succ_idx, edges in cp_preds.items():
+                succ = cp_spans[succ_idx]
+                if succ.category.value not in ("mpi", "nccl"):
+                    continue
+                succ_lane = span_lane.get(id(succ))
+                if succ_lane is None:
+                    continue
+                succ_mid = (succ.start_ns + succ.end_ns) / 2.0
+                for pred_idx, kind, confidence in edges:
+                    if kind not in ("p2p", "arrival"):
+                        continue
+                    pred = cp_spans[pred_idx]
+                    pred_lane = span_lane.get(id(pred))
+                    # Same-lane edges need no cross-lane connector -- the
+                    # spans are already visually adjacent in one row.
+                    if pred_lane is None or pred_lane == succ_lane:
+                        continue
+                    pred_mid = (pred.start_ns + pred.end_ns) / 2.0
+                    self._connectors.append((pred_lane, pred_mid, succ_lane, succ_mid, confidence))
+        except Exception:
+            # Connector lines are a display enhancement layered on an
+            # otherwise-independent, already-working Timeline -- a failure
+            # here (e.g. an unusual trace shape criticalpath.py doesn't
+            # handle) must not take down the whole tab. Falls back to no
+            # connectors, same as before this feature existed.
+            self._connectors = []
+
     def _lane_label(self, lane_name: str) -> str:
         parts = lane_name.split("/", 1)
         cat   = parts[0]
@@ -1043,9 +1098,12 @@ class TimelineWidget(Widget):
         return f"{label:<{self._LABEL_W}}"
 
     def _density_row(self, lane_name: str, width: int,
-                     _unused: str) -> tuple[Text, float]:
+                     _unused: str) -> tuple[list[str], list[str], float]:
         """
-        Return (rendered Text row, visible-window utilisation %).
+        Return (per-column chars, per-column styles, visible-window
+        utilisation %) -- raw, not yet RLE-encoded into a Text; pass to
+        _row_from_columns (optionally after overlaying connector-line
+        characters onto specific columns) to get the final Text row.
 
         Fully vectorised — no Python loop over spans:
           1. Spatial index  : np.searchsorted clips to only the visible spans O(log n)
@@ -1070,7 +1128,7 @@ class TimelineWidget(Widget):
         hi = int(np.searchsorted(starts, vis_end,             side="right"))
 
         if lo >= hi:
-            return Text("·" * width, style="color(237)"), 0.0
+            return ["·"] * width, ["color(237)"] * width, 0.0
 
         s_ns = self._starts_arr[lane_name][lo:hi].astype(np.float64)
         e_ns = self._ends_arr[lane_name][lo:hi].astype(np.float64)
@@ -1086,7 +1144,7 @@ class TimelineWidget(Widget):
         vis = cx1 > cx0 + 1e-6            # drop zero-width spans
         cx0 = cx0[vis]; cx1 = cx1[vis]; c_np = c_np[vis]
         if len(cx0) == 0:
-            return Text("·" * width, style="color(237)"), 0.0
+            return ["·"] * width, ["color(237)"] * width, 0.0
 
         ix0 = cx0.astype(np.int32)
         ix1 = np.minimum(cx1.astype(np.int32), width - 1)
@@ -1149,28 +1207,53 @@ class TimelineWidget(Widget):
         covered  = (sp >= 0) & (ix1[sp_safe] >= pix)
         dom_idx  = np.where(covered, c_np[sp_safe].astype(np.int32), -1)
 
-        # ── Build Rich Text row (run-length encoded by color) ─────────────
-        row  = Text()
+        # ── Per-column char/style arrays ───────────────────────────────────
+        # Returned raw (not yet RLE-encoded into a Text) so a caller can
+        # overlay connector-line characters (see _ConnectorOverlay /
+        # TimelineWidget.render) onto specific columns before the final
+        # Text is built via _row_from_columns -- splicing arbitrary
+        # characters into an already-built Rich Text is awkward with its
+        # API, but overwriting entries in a plain list is trivial. width is
+        # terminal columns (rarely more than a few hundred), so this
+        # per-column Python loop is negligible next to the numpy work above
+        # over however many thousand spans are actually in view.
         IDLE = 0.05
-        act  = activity          # local alias for speed
-        i    = 0
-        while i < width:
-            if act[i] <= IDLE:
-                j = i + 1
-                while j < width and act[j] <= IDLE:
-                    j += 1
-                row.append("·" * (j - i), style="color(237)")
-                i = j
-            else:
+        chars:  list[str] = ["·"] * width
+        styles: list[str] = ["color(237)"] * width
+        for i in range(width):
+            if activity[i] > IDLE:
                 ci = int(dom_idx[i])
-                c  = _SPAN_PALETTE[ci] if ci >= 0 else "white"
-                j  = i + 1
-                while j < width and act[j] > IDLE and int(dom_idx[j]) == ci:
-                    j += 1
-                row.append("█" * (j - i), style=c)
-                i = j
+                chars[i]  = "█"
+                styles[i] = _SPAN_PALETTE[ci] if ci >= 0 else "white"
 
-        return row, util_pct
+        return chars, styles, util_pct
+
+    @staticmethod
+    def _row_from_columns(chars: list[str], styles: list[str]) -> Text:
+        """RLE-encodes parallel per-column char/style lists into a Rich
+        Text, grouping consecutive same-style columns into one run --
+        shared by lane data rows and (now overlay-able) spacer rows."""
+        row = Text()
+        width = len(chars)
+        i = 0
+        while i < width:
+            j = i + 1
+            while j < width and styles[j] == styles[i]:
+                j += 1
+            row.append("".join(chars[i:j]), style=styles[i])
+            i = j
+        return row
+
+    @staticmethod
+    def _apply_overlay(chars: list[str], styles: list[str],
+                       canvas: BrailleCanvas, canvas_row: int, width: int) -> None:
+        """Overwrites entries in chars/styles wherever the Braille canvas
+        has a connector-line dot in this row, leaving every other column
+        (the vast majority — connectors are sparse) completely untouched."""
+        for col in range(width):
+            cell = canvas.cell(col, canvas_row)
+            if cell is not None:
+                chars[col], styles[col] = cell
 
     def on_mouse_move(self, event: MouseMove) -> None:
         """Update hover info when the mouse moves over the timeline."""
@@ -1276,25 +1359,71 @@ class TimelineWidget(Widget):
         max_sy = max(0, total_lanes - visible_rows)
         lo = min(self.view_y, max_sy)
         hi = min(total_lanes, lo + visible_rows)
+        visible_lanes = self._lane_names[lo:hi]
+        lanes_drawn   = len(visible_lanes)
 
-        lanes_drawn = 0
-        for lane_name in self._lane_names[lo:hi]:
+        # ── Cross-rank communication connectors ───────────────────────────
+        # A Braille sub-cell canvas (src/ui/braille_canvas.py) covering
+        # exactly the visible lanes' 2 rows each x the content width.
+        # Endpoints outside the visible time window are clipped to the
+        # nearest edge (matching how _density_row already clips spans
+        # themselves) rather than hidden — a connector with one end
+        # scrolled off-screen still shows as a line running to that edge,
+        # which is more informative than vanishing entirely; a connector
+        # with BOTH ends off the same side is skipped since nothing about
+        # it would be visible anyway.
+        canvas: BrailleCanvas | None = None
+        if self._connectors and lanes_drawn:
+            lane_row: dict[str, int] = {name: i for i, name in enumerate(visible_lanes)}
+            canvas = BrailleCanvas(cols=width, rows=lanes_drawn * 2)
+            scale = width * self.zoom / self._trace_dur
+            for pred_lane, pred_ns, succ_lane, succ_ns, confidence in self._connectors:
+                pred_row = lane_row.get(pred_lane)
+                succ_row = lane_row.get(succ_lane)
+                if pred_row is None or succ_row is None:
+                    continue
+                pred_col = (pred_ns - self._view_start) * scale - self.view_x
+                succ_col = (succ_ns - self._view_start) * scale - self.view_x
+                if (pred_col < 0 and succ_col < 0) or (pred_col > width and succ_col > width):
+                    continue
+                pred_col = max(0.0, min(float(width), pred_col))
+                succ_col = max(0.0, min(float(width), succ_col))
+                style = _CONNECTOR_STYLE.get(confidence, "grey58")
+                # Target the middle dot-row of each lane's DATA row
+                # specifically (row*2 = that lane's starting character row;
+                # *4 = dot rows per character row; +2 = vertical center of
+                # the 4-dot-tall data row, not the spacer row after it).
+                dot_y0 = pred_row * 2 * 4 + 2
+                dot_y1 = succ_row * 2 * 4 + 2
+                canvas.line(int(pred_col * 2), dot_y0, int(succ_col * 2), dot_y1, style=style)
+
+        for row_idx, lane_name in enumerate(visible_lanes):
             cat   = lane_name.split("/")[0]
             color = _cat_color(cat)
 
             # Data row
             out.append(f"{self._lane_label(lane_name)} ", style=f"bold {color}")
-            density_row, util_pct = self._density_row(lane_name, width, color)
-            out.append(density_row)
+            chars, styles, util_pct = self._density_row(lane_name, width, color)
+            if canvas is not None:
+                self._apply_overlay(chars, styles, canvas, row_idx * 2, width)
+            out.append(self._row_from_columns(chars, styles))
             util_col = ("bright_green" if util_pct >= 50
                         else "yellow"  if util_pct >= 20
                         else "red")
             out.append(f" {util_pct:4.0f}%", style=f"dim {util_col}")
             out.append("\n")
 
-            # Blank spacer row — gives visual breathing room between lanes
+            # Blank spacer row — gives visual breathing room between lanes,
+            # and (when a connector's routed path passes through it) now
+            # also carries the connector line's continuation between two
+            # non-adjacent lanes.
+            if canvas is not None:
+                spacer_chars: list[str]  = [" "] * width
+                spacer_styles: list[str] = [""] * width
+                self._apply_overlay(spacer_chars, spacer_styles, canvas, row_idx * 2 + 1, width)
+                out.append(" " * self._COL_W)
+                out.append(self._row_from_columns(spacer_chars, spacer_styles))
             out.append("\n")
-            lanes_drawn += 1
 
         # ── Pad to push footer to the bottom of the widget ───────────────
         used = 2 + lanes_drawn * 2        # ruler rows + lane rows

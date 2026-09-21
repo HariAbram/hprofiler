@@ -725,12 +725,21 @@ ACPP_VISIBILITY_MASK=ocl hprofiler run --backend opencl,cpu --disasm -- ./app
 
 ---
 
-### `openmp` — OpenMP (OMPT)
+### `openmp` — OpenMP (OMPT + direct GOMP_* interception)
 
-Loads `libhprofiler_ompt.so` via `OMP_TOOL_LIBRARIES`. Uses the OpenMP 5.0
-Tools Interface (OMPT).
+Two independent capture paths, **both always injected together** whenever
+this backend is active — which OpenMP runtime the profiled binary actually
+links against isn't known in advance, so rather than guess, both are
+covered and whichever is irrelevant for a given binary is a harmless
+no-op (it intercepts symbol names that binary never calls).
 
-**Registered callbacks:**
+**Path 1 — OMPT** (`libhprofiler_ompt.so`, loaded via `OMP_TOOL_LIBRARIES`
+and also `LD_PRELOAD`ed so its `dlopen()` interposer is in the global
+interposition chain, not just a private-namespace plugin): uses the
+OpenMP 5.0 Tools Interface. **Requires LLVM's `libomp`** — GCC's `libgomp`
+does not implement OMPT in typical distro/vendor builds (confirmed
+empirically: `nm -D libgomp.so.1 | grep ompt` finds no OMPT symbols
+exported at all on Ubuntu 24.04/GCC 13). Registered callbacks:
 
 | Callback | Category | What it captures |
 |----------|---------|-----------------|
@@ -745,30 +754,16 @@ Tools Interface (OMPT).
 
 **Thread-safe startup:** All OpenMP worker threads start simultaneously at thread-pool creation. The `cb_thread_begin` callback is invoked concurrently on every worker. The hook serialises socket initialisation inside this callback with `g_sock_mutex` so exactly one thread performs `connect()` regardless of pool size.
 
-**Critical requirement:** The profiled program must link against **LLVM's
-`libomp`**, not GCC's `libgomp`. GCC's `libgomp` on Ubuntu 24.04 does not
-implement the OMPT interface.
-
 ```bash
 # Compile with clang to get libomp
 clang -O2 -fopenmp -o my_program my_program.c
-
-# Verify
-ldd ./my_program | grep -E "gomp|omp"
-# Good:  libomp.so.5 => /lib/x86_64-linux-gnu/libomp.so.5
-# Bad:   libgomp.so.1 => /lib/x86_64-linux-gnu/libgomp.so.1
-```
-
-```bash
-hprofiler run --backend openmp -- ./my_omp_program
+ldd ./my_program | grep -E "gomp|omp"   # Good: libomp.so.5   Bad: libgomp.so.1
 ```
 
 **Finding `libomp` on HPC/Cray clusters:** besides the usual distro package
 paths, the backend also checks `/opt/rocm*/llvm/lib/` and
 `/opt/rocm*/lib/llvm/lib/` (ROCm ships its own Clang+libomp), and honors
-`$ROCM_PATH`/`$ROCM_HOME`/`$LLVM_HOME`/`$LLVM_ROOT`/`$LLVM_PATH` if set. On a
-Cray system where the default `cc` wrapper doesn't provide an OMPT-capable
-`libomp` (e.g. Dardel), load the ROCm module and export the path:
+`$ROCM_PATH`/`$ROCM_HOME`/`$LLVM_HOME`/`$LLVM_ROOT`/`$LLVM_PATH` if set:
 
 ```bash
 module load rocm  # or equivalent on your system
@@ -776,9 +771,81 @@ export ROCM_PATH=/opt/rocm-6.3.3   # adjust to the loaded version
 hprofiler backends   # openmp should now show available
 ```
 
-Note this only fixes *detection* — the profiled binary still has to actually
-be linked against that same OMPT-capable `libomp` (not the Cray PE's default
-OpenMP runtime) for events to be captured.
+That fixes *detection* of an OMPT-capable `libomp` somewhere on the
+system — it does **not** mean the profiled binary is linked against it.
+GROMACS/Fortran/plain-C codes built by a typical HPC module-system
+toolchain (`cpeGNU`, plain `gcc`/`gfortran`, …) are overwhelmingly linked
+against GNU's `libgomp` instead, regardless of what `libomp` `hprofiler
+backends` found — for those, Path 2 below is what actually captures
+events; OMPT will produce 0.
+
+**Path 2 — direct `GOMP_*` interception** (`libhprofiler_gomp.so`,
+`hooks/gomp_hook/gomp_hook.c`, `LD_PRELOAD`ed unconditionally): for
+binaries linked against **GNU's `libgomp`**. Rather than depend on
+libgomp's OMPT support — unreliable, and per the above, often entirely
+absent — this intercepts libgomp's own public ABI directly, the same
+LD_PRELOAD function-interposition mechanism every other hook in this
+codebase already uses, applied to the `GOMP_*` symbol family GCC-generated
+code calls directly for every `#pragma omp` construct instead of a vendor
+tools callback API. No detection/availability check beyond the hook itself
+being built — it has no dependency on `libomp` or on libgomp having any
+particular capability.
+
+```bash
+gcc -O2 -fopenmp -o my_program my_program.c
+ldd ./my_program | grep -E "gomp|omp"   # libgomp.so.1 -> this path
+hprofiler run --backend openmp -- ./my_program   # same command either way
+```
+
+**Intercepted constructs** (span category `openmp` unless noted):
+
+| Construct | Span(s) | Notes |
+|---|---|---|
+| `GOMP_parallel` | `omp_parallel_region` — one per participating thread | Per-thread visibility via a trampoline function substituted for the region body, not just the initiating thread's outer-call duration — matches OMPT's per-thread granularity (`ompt_callback_implicit_task`) despite not using OMPT at all |
+| `GOMP_loop_{dynamic,guided,runtime}_start`/`GOMP_loop_nonmonotonic_{dynamic,guided}_start`/`GOMP_loop_maybe_nonmonotonic_runtime_start`, closed by `GOMP_loop_end`/`_end_nowait` | `omp_work_loop`/`omp_work_loop_nowait` | Both the plain and "nonmonotonic"/"maybe_nonmonotonic" variants are intercepted since which one a given compiler/flags combination emits isn't assumed — verified empirically (see limitation below) that GCC 13 emits the nonmonotonic ones by default |
+| `GOMP_barrier` | `omp_barrier` (category `sync`) | Both explicit `#pragma omp barrier` and a work-sharing construct's own implicit end-of-region barrier (compiler-inserted call to the same function) |
+| `GOMP_critical_start`/`_end`, `GOMP_critical_name_start`/`_end` | `omp_critical_wait` (category `sync`, the acquisition-wait duration) + `omp_critical_hold` (the time actually spent inside the section) as two separate spans | Named (`critical(name)`) sections tagged `named=1` |
+| `GOMP_single_start` | `omp_single` instant event | Emitted only on the one thread selected to execute the region (`GOMP_single_start`'s own return value) |
+
+**Known limitation — unchunked (and, per GCC 13's actual lowering,
+chunked) `schedule(static)` loops are not directly observable as a
+distinct span.** Verified empirically by inspecting a real compiled test
+binary's imported symbols (`nm -D -u`, at both `-O0` and `-O2`): GCC
+computes a static loop's per-thread iteration range via **inline
+arithmetic**, calling no `GOMP_loop_*` function at all — there is nothing
+to intercept for the loop's start. Its trailing implicit barrier (unless
+`nowait`) still goes through `GOMP_barrier`, so it's not entirely
+invisible, but no `omp_work_loop` span is emitted for it — a real,
+documented limitation of ABI-level interception (as opposed to OMPT,
+which gets a callback for this case too via `ompt_callback_work`), not a
+bug. `schedule(dynamic)`/`schedule(guided)`/`schedule(runtime)` — which
+inherently require runtime dispatch, unlike static — are unaffected and
+fully captured.
+
+**Also not covered in this version:** `GOMP_task`/`GOMP_taskwait` (the
+task ABI has changed more across GCC versions than the constructs above;
+getting a calling-convention wrong risks crashing the profiled program,
+and this was not verified against a specific enough range of GCC
+versions to risk it), `sections`, `doacross`, `target` offload, and the
+legacy split `GOMP_parallel_start`/`_end` ABI (superseded by combined
+`GOMP_parallel` since GCC 4.9).
+
+**Verification status:** unlike most of this project's other recent
+hardware-dependent work, this was fully verifiable on this development
+machine (real `gcc`/`libgomp` present) — built, compiled against a real
+GCC-linked-to-libgomp test fixture, and run end-to-end through the actual
+`hprofiler run` CLI (`tests/integration/test_gomp_hook.py`,
+`tests/integration/run_matrix.sh`'s `gomp` section). Caught and fixed two
+real bugs during that verification: (1) the symbol-name assumption above
+(plain vs. nonmonotonic loop variants) was wrong until checked against a
+real compiled binary; (2) an event-loss-at-process-exit race (missing a
+destructor to flush/drain the socket before the process tears down,
+unlike `mpi_hook.c`'s `MPI_Finalize`-based flush or ompt_tool.c's OMPT
+`finalize` callback) — caused a barrier-span count to be flaky (7 vs. the
+correct 8) until fixed; stable across repeated runs afterward. **Not yet
+confirmed on the real HPC cluster (Dardel) whose GROMACS/libgomp mismatch
+motivated building this** — the GCC version and exact code paths GROMACS
+exercises there haven't been checked against what was verified here.
 
 ---
 
@@ -1104,6 +1171,35 @@ is visible.
 | `+` / `=` | Zoom in (2×) |
 | `-` | Zoom out |
 | `r` | Reset zoom, scroll, and pan |
+
+**Cross-rank communication connectors:** MPI/NCCL spans get connector
+lines drawn between matched send/receive pairs and collective-rendezvous
+participants, directly in the live Timeline — a Paraver/Extrae-style view
+of the actual communication pattern, not just isolated per-rank bars.
+Reuses `criticalpath.py`'s already-resolved dependency-graph edges
+(resolved wildcard matching, `commid=`-scoped rendezvous, confidence
+tiers — see §18) rather than re-deriving matching logic in the UI, so the
+same edges `hprofiler critical-path` reports are what gets drawn here.
+Line color signals confidence, the same tiers §18's "Path evidence
+strength" uses: bright white = `certain`, bright cyan = `high`, grey =
+`medium`. Only cross-lane edges are drawn (same-lane ones are already
+visually adjacent in one row); an edge with one endpoint scrolled off the
+visible time window still draws a line running to that edge rather than
+disappearing, but an edge with *both* endpoints off the same side is
+skipped since nothing about it would be visible anyway.
+
+Rendered via `src/ui/braille_canvas.py`: Unicode Braille Patterns
+(U+2800–U+28FF) pack 2×4 dots per character cell, giving roughly 8× the
+effective resolution of plain characters for line art — the same
+technique terminal-plotting libraries like `drawille`/`plotext` use to
+get "canvas-like" output from pure text. Deliberately **not** built on a
+terminal graphics protocol (Sixel, the Kitty graphics protocol, iTerm2
+inline images): those need the terminal emulator *and* any `tmux`/`screen`
+multiplexer in between to explicitly support the specific protocol, and
+degrade to garbled escape-code text — not a graceful fallback — when they
+don't. Braille rendering is plain Unicode text, so it works identically
+over any SSH session into any terminal, including a bare HPC cluster
+login-node terminal, which was the deciding factor for this project.
 
 ### Hotspots Tab
 
@@ -2439,6 +2535,7 @@ The TUI remains responsive at 250k spans at all zoom levels.
 | **`xs=` exec-start calibration unverified on real GPU hardware** | `cuda_hook.c`/`rocm_hook.c`'s reference-event calibration (§4 `cuda`) has no working GPU to run against on this development machine (broken NVIDIA driver, no AMD GPU) — only compile-checked (`gcc -Wall -Wextra` clean, and via `./hprofiler build`), and `src/analysis/criticalpath.py`'s consumption of it (`_effective_start_ns`/`_edge_gap_and_gate`) is only unit-tested against hand-constructed synthetic spans with a fake `xs=` tag, never a real captured trace. | Treat `xs=`-derived gap/idle-time numbers as unverified until confirmed on a working CUDA/ROCm GPU; the underlying technique mirrors `opencl_hook.c`'s calibration, which *is* hardware-verified. |
 | **Lock-free ring buffer (`hooks/common/ringbuffer.h`) not wired into any hook** | Built and verified in isolation (stress-tested, ThreadSanitizer-clean, benchmarked — see §13 "Reducing collection-path overhead"), but no hook's `emit_span()` actually uses it yet; today's real collection path is still the mutex+`send()` pattern for every hook. | The measured 1.5–58x overhead reduction is real for the primitive itself, not yet realized end-to-end in a profiling run; treat it as available infrastructure for a future integration pass, not a shipped speedup. |
 | **eBPF OS tracer (`hooks/os_tracer/`) never loaded into a kernel** | `kernel.unprivileged_bpf_disabled=2` on this development machine blocks BPF loading for non-root — see §19. Compiled, linked, and run up to `EPERM` at the exact expected privilege wall; the kernel BPF verifier (a distinct pass beyond compilation) has never actually run against it. | Needs root/`CAP_BPF` on a machine where that's authorized to confirm the tracepoint handlers pass kernel verification and emit semantically correct events under real scheduler activity. |
+| **`gomp_hook.c` (direct `GOMP_*` interception) not yet confirmed on the real cluster that motivated it** | Built in response to a real user run on the Dardel HPC cluster (`ldd gmx_mpi` showed `libgomp.so.1`, confirming OMPT alone would never capture events there) and fully verified end-to-end on this development machine (real `gcc`+`libgomp`, unlike most of this project's other recent hardware-dependent work) — see §4 `openmp`. | Dardel's specific GCC version (`cpeGNU` toolchain) and the exact GROMACS code paths exercised there haven't been checked against what was verified here; ask for the actual Dardel trace/output before treating this as confirmed working there. |
 
 ---
 

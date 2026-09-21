@@ -76,6 +76,45 @@ for backend in "${AVAILABLE[@]}"; do
 done
 
 log ""
+log "=== gomp (GNU libgomp direct interception, separate from the clang/libomp"
+log "    OMPT path already covered by the 'openmp' entry above) ==="
+if gcc -O2 -fopenmp -fno-omit-frame-pointer -rdynamic -o "$FIX/gomp_mini" "$FIX/gomp_mini.c" \
+    > "$OUT/build_gomp.log" 2>&1; then
+    ok "build gomp fixture"
+    if ldd "$FIX/gomp_mini" | grep -q libgomp; then
+        ok "gomp fixture actually links libgomp (not libomp)"
+    else
+        bad "gomp fixture did not link libgomp as expected"
+    fi
+    trace="$OUT/gomp.json"
+    # Real backend name is still "openmp" -- both capture paths (OMPT +
+    # direct GOMP_* interception) are injected together, see
+    # src/backends/openmp.py's module docstring for why.
+    run_or_fail "hprofiler run --backend openmp (gomp fixture)" \
+        python3 hprofiler run --backend openmp --no-ui -o "$trace" -- "$FIX/gomp_mini"
+    if [ -f "$trace" ]; then
+        run_or_fail "hprofiler summary (gomp)"       python3 hprofiler summary "$trace"
+        run_or_fail "hprofiler efficiency (gomp)"     python3 hprofiler efficiency "$trace"
+        run_or_fail "hprofiler critical-path (gomp)"  python3 hprofiler critical-path "$trace"
+        n_openmp_spans=$(python3 -c "
+import json
+d = json.load(open('$trace'))
+events = d.get('traceEvents', d) if isinstance(d, dict) else d
+print(sum(1 for e in events if isinstance(e, dict) and e.get('cat') in ('openmp', 'sync')))
+" 2>/dev/null || echo 0)
+        if [ "${n_openmp_spans:-0}" -gt 0 ] 2>/dev/null; then
+            ok "gomp fixture produced $n_openmp_spans openmp/sync events (not just 'didn't crash')"
+        else
+            bad "gomp fixture produced 0 openmp/sync events -- interception did not fire"
+        fi
+    else
+        bad "gomp fixture produced no trace file"
+    fi
+else
+    log "  SKIP build gomp fixture (gcc -fopenmp unavailable, see $OUT/build_gomp.log)"
+fi
+
+log ""
 if [ "$FAIL" -eq 0 ]; then
     log "=== ALL OK (logs in $OUT) ==="
 else

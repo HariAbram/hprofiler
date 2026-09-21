@@ -1,20 +1,34 @@
 """
-OpenMP backend: OMPT (OpenMP Tools Interface, OpenMP 5.0+).
+OpenMP backend: two independent capture mechanisms, injected together so
+whichever OpenMP runtime the profiled binary actually links against gets
+covered without needing to know in advance which one that is.
 
-The tool library (hooks/ompt_tool/ompt_tool.c) registers callbacks for:
-  - ompt_callback_parallel_begin/end   (parallel regions)
-  - ompt_callback_task_create/schedule (task events)
-  - ompt_callback_thread_begin/end     (thread lifecycle)
-  - ompt_callback_work                 (loop/sections distribution)
-  - ompt_callback_sync_region          (barriers, taskwait, etc.)
+1. OMPT (hooks/ompt_tool/ompt_tool.c), loaded via OMP_TOOL_LIBRARIES.
+   Registers callbacks for parallel regions, tasks, thread lifecycle,
+   work distribution, and sync regions (barriers, taskwait, ...).
+   Requires LLVM libomp (clang's OpenMP runtime) -- GCC libgomp does not
+   implement the OMPT 5.0 ABI in typical distro/vendor builds (confirmed
+   empirically on this project's own dev machine: `nm -D libgomp.so.1 |
+   grep ompt` finds no OMPT symbols exported at all). The profiled binary
+   must be linked against libomp.so (not libgomp.so) for this path to
+   produce any events.
 
-Loaded via OMP_TOOL_LIBRARIES.
+2. Direct GOMP_* interception (hooks/gomp_hook/gomp_hook.c), LD_PRELOADed
+   unconditionally. For binaries linked against GNU's libgomp instead --
+   the common case for anything built with plain gcc/gfortran, including
+   most HPC-cluster module-system toolchains (e.g. GROMACS on Dardel's
+   cpeGNU environment). Works by intercepting libgomp's own public ABI
+   directly (the same LD_PRELOAD interposition every other hook in this
+   codebase uses), not a vendor tools callback API -- so it has no
+   dependency on OMPT support existing at all.
 
-IMPORTANT: requires LLVM libomp (clang's OpenMP runtime). GCC libgomp does
-NOT implement the OMPT 5.0 ABI on Ubuntu 24.04 and will silently produce 0
-events. The profiled binary must be compiled with clang++ and linked against
-libomp.so (not libgomp.so). For ACPP/hipSYCL, use ACPP_VISIBILITY_MASK=omp
-with a clang-based toolchain.
+Both are always injected together when this backend is active: each only
+has any effect on a binary that actually imports the specific symbols it
+intercepts, so on any given run at most one of the two produces events
+(matching whichever runtime the binary is really linked against) and the
+other is a harmless no-op -- there is no reliable way to know in advance
+which one a given binary uses without inspecting it, so this backend
+doesn't try to guess and instead covers both.
 """
 
 from __future__ import annotations
@@ -24,6 +38,7 @@ from pathlib import Path
 from .base import Backend
 
 _TOOL_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_ompt.so"
+_GOMP_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_gomp.so"
 
 
 def _libomp_paths() -> list[str]:
@@ -96,19 +111,26 @@ def _install_hint() -> str:
 
 class OpenMPBackend(Backend):
     name = "openmp"
-    description = "OpenMP parallel region / task tracing via OMPT (requires clang libomp, not GCC libgomp)"
+    description = "OpenMP parallel region / task tracing — OMPT (clang libomp) + direct GOMP_* interception (GCC libgomp)"
 
     def is_available(self) -> bool:
-        return _TOOL_LIB.exists() and self.libomp_available()
+        # gomp_hook.c has no libomp/detection dependency at all (a plain
+        # LD_PRELOAD symbol interposer against libgomp's own stable ABI) —
+        # available whenever it's built, regardless of whether libomp is
+        # findable on this system. OMPT remains additionally available
+        # when its own hook is built, independent of the gomp path.
+        return _TOOL_LIB.exists() or _GOMP_LIB.exists()
 
     def libomp_available(self) -> bool:
         return bool(_libomp_paths())
 
     def availability_note(self) -> str:
-        if not _TOOL_LIB.exists():
-            return "hook not built — run: hprofiler build"
-        if not self.libomp_available():
-            return f"libomp not found — install: {_install_hint()}"
+        if not _TOOL_LIB.exists() and not _GOMP_LIB.exists():
+            return "hooks not built — run: hprofiler build"
+        if _TOOL_LIB.exists() and not self.libomp_available():
+            return (f"OMPT path (for clang/libomp binaries) needs libomp, not found "
+                    f"— install: {_install_hint()} — GCC/libgomp binaries are still "
+                    f"covered via direct GOMP_* interception either way")
         return ""
 
     def env_vars(self) -> dict[str, str]:
@@ -117,10 +139,17 @@ class OpenMPBackend(Backend):
         return {"OMP_TOOL_LIBRARIES": str(_TOOL_LIB)}
 
     def preload_libs(self) -> list[str]:
-        # LD_PRELOAD the same library so the dlopen() interposer defined in
-        # ompt_tool.c is active process-wide.  OMP_TOOL_LIBRARIES alone loads
-        # the hook as a dlopen plugin into a private namespace — it does NOT
-        # place our dlopen() in the global interposition chain.
-        if not _TOOL_LIB.exists():
-            return []
-        return [str(_TOOL_LIB)]
+        # LD_PRELOAD both hooks unconditionally (whichever are built) — see
+        # module docstring for why injecting both, rather than trying to
+        # detect which OpenMP runtime the target actually uses, is the
+        # robust choice. For OMPT: LD_PRELOAD (in addition to
+        # OMP_TOOL_LIBRARIES above) is what puts the dlopen() interposer
+        # defined in ompt_tool.c into the global interposition chain —
+        # OMP_TOOL_LIBRARIES alone loads it as a dlopen plugin into a
+        # private namespace, which does not achieve that.
+        libs = []
+        if _TOOL_LIB.exists():
+            libs.append(str(_TOOL_LIB))
+        if _GOMP_LIB.exists():
+            libs.append(str(_GOMP_LIB))
+        return libs
