@@ -14,9 +14,23 @@ dependencies = [
     "numpy>=1.23",
 ]
 
+[project.optional-dependencies]
+# Qt/QML popup GUI (`hprofiler run --gui`, `hprofiler gui <trace.json>`).
+# Optional and lazily imported (src/gui/launch.py) so the TUI keeps
+# working with zero Qt installed -- most profiling targets (cluster
+# compute nodes, minimal containers) have no GUI libraries at all, and
+# PySide6 alone is a large (~250MB) download.
+gui = ["PySide6>=6.5"]
+
 [project.scripts]
 hprofiler = "hprofiler:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+# QML files ship as package data, not Python modules -- collected here so
+# `pip install`/`hprofiler build` puts them alongside src/gui/*.py rather
+# than needing a separate MANIFEST.in entry.
+"src.gui" = ["qml/*.qml", "qml/**/*.qml"]

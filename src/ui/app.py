@@ -32,7 +32,6 @@ Keyboard shortcuts:
 from __future__ import annotations
 import json
 import math
-import re
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -58,6 +57,19 @@ from textual.widgets import (
 
 from ..core.trace import Trace
 from ..core.events import SpanEvent, Category
+from ..analysis.dashboard import (
+    fmt_ns as _fmt_ns,
+    fmt_bytes as _fmt_bytes,
+    fmt_tf as _fmt_tf,
+    fmt_kernel_name as _fmt_kernel_name,
+    merged_ns as _merged_ns,
+    trace_wall_ns as _trace_wall_ns,
+    bottleneck_analysis as _bottleneck_analysis,
+    diagnose as _diagnose,
+    top_findings as _top_findings,
+    find_source_context,
+    _GPU_CATS,
+)
 from .braille_canvas import BrailleCanvas
 
 # ── Color palette ─────────────────────────────────────────────────────────────
@@ -117,27 +129,9 @@ def _span_color(name: str) -> str:
     """Stable per-function color derived from the function name."""
     return _SPAN_PALETTE[(hash(name) & 0x7FFFFFFF) % len(_SPAN_PALETTE)]
 
-def _fmt_ns(ns: float) -> str:
-    if ns >= 1_000_000_000:
-        return f"{ns / 1e9:.3f}s"
-    if ns >= 1_000_000:
-        return f"{ns / 1e6:.2f}ms"
-    if ns >= 1_000:
-        return f"{ns / 1e3:.1f}µs"
-    return f"{ns:.0f}ns"
-
 def _bar(frac: float, width: int, filled: str = "█", empty: str = "░") -> str:
     n = max(0, min(width, int(frac * width)))
     return filled * n + empty * (width - n)
-
-_JIT_HASH_RE = re.compile(r'^(\d+)\.(\d+)\.jit\.so$')
-
-def _fmt_kernel_name(name: str) -> str:
-    """Shorten ACPP SSCP hash-named JIT kernels to a readable form."""
-    m = _JIT_HASH_RE.match(name)
-    if m:
-        return f"[jit:{m.group(1)[-6:]}…{m.group(2)[-4:]}]"
-    return name
 
 def _grad_bar(frac: float, width: int) -> str:
     """Gradient block bar using sub-character resolution (▏▎▍▌▋▊▉█)."""
@@ -174,24 +168,6 @@ def _sparkline(values: list[float], width: int = 12) -> str:
         result += spark_chars[idx]
     return result.ljust(width)
 
-def _fmt_bytes(b: float) -> str:
-    if b >= 1024**3:
-        return f"{b/1024**3:.2f} GB"
-    if b >= 1024**2:
-        return f"{b/1024**2:.1f} MB"
-    if b >= 1024:
-        return f"{b/1024:.0f} KB"
-    return f"{b:.0f} B"
-
-def _fmt_tf(tf: float) -> str:
-    """Format TFLOPs value compactly."""
-    if tf >= 1000:
-        return f"{tf/1000:.1f} PF"
-    if tf >= 1:
-        return f"{tf:.1f} TF"
-    if tf >= 0.001:
-        return f"{tf*1000:.0f} GF"
-    return f"{tf:.2g} TF"
 
 
 # ── Help overlay ──────────────────────────────────────────────────────────────
@@ -271,31 +247,6 @@ class HelpScreen(ModalScreen):
 
     def action_dismiss(self) -> None:
         self.dismiss()
-
-
-def _merged_ns(spans: list) -> int:
-    """Merged-interval sum of span durations — prevents >100% from concurrent streams."""
-    ivs = sorted((s.start_ns, s.start_ns + s.duration_ns)
-                 for s in spans if s.duration_ns > 0)
-    merged = cur_lo = cur_hi = 0
-    for lo, hi in ivs:
-        if lo > cur_hi:
-            merged += cur_hi - cur_lo
-            cur_lo, cur_hi = lo, hi
-        else:
-            cur_hi = max(cur_hi, hi)
-    merged += cur_hi - cur_lo
-    return merged
-
-
-def _trace_wall_ns(trace: Any) -> int:
-    """Derive wall time from span timestamps (works for live runs and JSON-loaded traces)."""
-    timed = [s for s in trace.spans if s.duration_ns > 0]
-    if not timed:
-        return trace.duration_ns or 1
-    span_end   = max(s.start_ns + s.duration_ns for s in timed)
-    span_start = min(s.start_ns for s in timed)
-    return max(span_end - span_start, 1)
 
 
 # ── System tab ────────────────────────────────────────────────────────────────
@@ -584,149 +535,14 @@ class ProfileWidget(Static):
 
 # ── Dashboard analysis helpers ──────────────────────────────────────────────
 #
-# Everything here PRESENTS analysis that already lives elsewhere in the
-# codebase (analysis/cct.gpu_starvation, analysis/pop_efficiency.load_balance,
-# Trace.aggregated_stats) rather than computing new metrics -- so the
-# Dashboard tab and `hprofiler summary`/`efficiency` never disagree.
-
-_GPU_CATS = ("cuda", "rocm", "opencl")
-
-
-def _bottleneck_analysis(trace: Trace, ctrs: dict[str, float]) -> list[str]:
-    """
-    Short "icon + one-liner" diagnostic tips. Each tip is prefixed with a
-    2-char icon; callers split via `icon, body = tip[:2], tip[2:].strip()`.
-    Shared by the Dashboard's "Top findings" panel and the Profile tab's
-    "Insight" section (this used to be a call to a same-named function in
-    output/summary.py that was never actually defined there -- a dead
-    import silently swallowed by `except Exception: pass`, so neither
-    section ever rendered anything; fixed by giving both a real,
-    local implementation).
-    """
-    tips: list[str] = []
-    meta = trace.metadata
-
-    # Icons are plain box-drawing/geometric-shape glyphs (matching
-    # _top_findings' "!"/"▲"/"◆" vocabulary), deliberately not emoji --
-    # emoji glyph coverage over a bare SSH session to an HPC cluster is
-    # unreliable (missing glyphs silently fall back to whatever the local
-    # font substitutes, e.g. a stray unrelated letter) and many render as
-    # double-width, which would also throw off the fixed `tip[:2]` icon
-    # slice every caller here relies on.
-    if any(b in _GPU_CATS for b in (meta.backends_used or [])):
-        try:
-            from ..analysis.cct import gpu_starvation
-            sv = gpu_starvation(trace)
-            if sv["launch_gap_pct"] > 30:
-                tips.append(
-                    f"! Low GPU occupancy — idle {sv['launch_gap_pct']:.0f}% of wall "
-                    f"time between kernel launches; check CPU-side work in between")
-            if sv["sync_stall_pct"] > 20:
-                tips.append(
-                    f"▲ High GPU sync stall ({sv['sync_stall_pct']:.0f}%) — "
-                    f"consider async launches or batching kernel submissions")
-        except Exception:
-            pass
-
-    ipc = ctrs.get("ipc", 0.0)
-    if 0 < ipc < 1.0:
-        tips.append(f"▲ Low IPC ({ipc:.2f}) — likely stalled on memory or branch mispredicts")
-
-    cache_miss = ctrs.get("cache_miss_pct", -1.0)
-    if cache_miss >= 20:
-        tips.append(f"▲ High LLC miss rate ({cache_miss:.0f}%) — working set may exceed cache")
-
-    try:
-        from ..analysis.pop_efficiency import useful_time_by_pid, load_balance
-        lb = load_balance(useful_time_by_pid(trace))
-        if lb is not None and lb < 0.85:
-            tips.append(
-                f"▲ Load imbalance ({1/lb:.1f}×) — the busiest rank/thread does "
-                f"{(1/lb - 1)*100:.0f}% more useful work than average; likely the "
-                f"straggler others wait on")
-    except Exception:
-        pass
-
-    return tips
-
-
-def _diagnose(trace: Trace) -> tuple[str, str]:
-    """One-line overall diagnosis + a Rich color, for the Dashboard's
-    headline DIAGNOSIS card. Uses the same thresholds as
-    _bottleneck_analysis/_top_findings so all three never disagree."""
-    meta  = trace.metadata
-    backs = meta.backends_used or []
-
-    if any(b in _GPU_CATS for b in backs):
-        try:
-            from ..analysis.cct import gpu_starvation
-            sv = gpu_starvation(trace)
-            if sv["launch_gap_pct"] > 30:
-                return "GPU starvation", "red"
-            if sv["sync_stall_pct"] > 20:
-                return "GPU sync-bound", "yellow"
-            if sv["gpu_active_pct"] >= 70:
-                return "GPU-bound", "bright_green"
-        except Exception:
-            pass
-
-    if "mpi" in backs:
-        try:
-            from ..analysis.pop_efficiency import useful_time_by_pid, load_balance
-            lb = load_balance(useful_time_by_pid(trace))
-            if lb is not None and lb < 0.7:
-                return "Load imbalance", "red"
-            if lb is not None and lb < 0.85:
-                return "Mild imbalance", "yellow"
-        except Exception:
-            pass
-
-    stats = trace.aggregated_stats()
-    if stats and stats[0]["pct"] > 40:
-        return f"{stats[0]['category']}-bound", "cyan"
-
-    return "Balanced", "bright_green"
-
-
-def _top_findings(trace: Trace) -> list[tuple[str, str, str, str]]:
-    """(icon, color, title, metric) tuples for the Dashboard's "Top
-    findings" panel, most-actionable first. Always tries one cheap,
-    always-available fallback (the single hottest function's share of
-    total time) so even a plain single-threaded CPU trace shows something
-    instead of an empty panel."""
-    out: list[tuple[str, str, str, str]] = []
-    meta = trace.metadata
-
-    if any(b in _GPU_CATS for b in (meta.backends_used or [])):
-        try:
-            from ..analysis.cct import gpu_starvation
-            sv = gpu_starvation(trace)
-            if sv["launch_gap_pct"] > 30:
-                out.append(("!", "red", "Low GPU occupancy",
-                            f"{sv['gpu_active_pct']:.0f}% active"))
-            if sv["sync_stall_pct"] > 20:
-                out.append(("▲", "yellow", "High GPU sync stall",
-                            f"{sv['sync_stall_pct']:.0f}%"))
-        except Exception:
-            pass
-
-    try:
-        from ..analysis.pop_efficiency import useful_time_by_pid, load_balance
-        lb = load_balance(useful_time_by_pid(trace))
-        if lb is not None and lb < 0.85:
-            out.append(("▲", "yellow", "Load imbalance", f"{1/lb:.1f}×"))
-    except Exception:
-        pass
-
-    stats = trace.aggregated_stats()
-    if stats and stats[0]["pct"] > 30:
-        out.append((
-            "◆", "cyan",
-            f"{_fmt_kernel_name(stats[0]['name'])[:28]} dominates",
-            f"{stats[0]['pct']:.0f}% of total time",
-        ))
-
-    return out[:4]
+# _bottleneck_analysis/_diagnose/_top_findings/_GPU_CATS live in
+# analysis/dashboard.py now (shared with the Qt/QML GUI) -- imported at
+# the top of this file under their original names for every existing
+# call site here to keep working unchanged. _diagnose's color is now a
+# UI-agnostic severity family ("red"/"yellow"/"green"/"cyan"); _TUI_SHADE
+# maps "green" to the brighter "bright_green" this tab always used for
+# its one happy-path case, so the Rich-rendered result is unchanged.
+_TUI_SHADE = {"green": "bright_green"}
 
 
 def _mini_row(spans: list, width: int, view_start: int, view_dur: float, color: str) -> Text:
@@ -759,46 +575,20 @@ def _mini_row(spans: list, width: int, view_start: int, view_dur: float, color: 
 
 
 def _source_snippet(trace: Trace, context: int = 3) -> Text | None:
-    """Source lines around the top hotspot's file/line tag (the same
-    file=/line= tags HotspotsWidget already uses for its own inline
-    location column), or None if no hotspot carries one, the file doesn't
-    exist on THIS machine, or the tagged line is out of range. A profile
-    collected on a cluster and opened locally routinely hits the "file
-    doesn't exist here" case — that's an expected, not exceptional,
-    outcome, so callers should show an explanatory message, not blank."""
-    for row in trace.aggregated_stats():
-        file_tag = line_tag = None
-        for s in trace.spans:
-            if s.name == row["name"] and s.tags.get("file"):
-                file_tag, line_tag = s.tags["file"], s.tags.get("line")
-                break
-        if not file_tag:
-            continue
-        try:
-            line_no = int(line_tag)
-        except (TypeError, ValueError):
-            continue
-        path = Path(file_tag)
-        if not path.is_file():
-            continue
-        try:
-            lines = path.read_text(errors="replace").splitlines()
-        except OSError:
-            continue
-        if not (1 <= line_no <= len(lines)):
-            continue
-
-        lo = max(1, line_no - context)
-        hi = min(len(lines), line_no + context)
-        gw = len(str(hi))
-        out = Text()
-        out.append(f"{path.name}  ·  {row['name'][:24]}\n", style="dim cyan")
-        for ln in range(lo, hi + 1):
-            hot = ln == line_no
-            out.append(f"{'▶' if hot else ' '}{ln:>{gw}} │ ", style="bold yellow" if hot else "dim")
-            out.append(f"{lines[ln - 1]}\n", style="bold" if hot else "dim")
-        return out
-    return None
+    """Rich-formatted wrapper around analysis/dashboard.find_source_context
+    (the actual file/line lookup logic, shared with the Qt/QML GUI, which
+    renders the same SourceContext through its own QML component instead)."""
+    ctx = find_source_context(trace, context=context)
+    if ctx is None:
+        return None
+    gw = len(str(ctx.lines[-1][0])) if ctx.lines else 1
+    out = Text()
+    out.append(f"{ctx.display_name}  ·  {ctx.hotspot_name[:24]}\n", style="dim cyan")
+    for ln, text in ctx.lines:
+        hot = ln == ctx.hot_line
+        out.append(f"{'▶' if hot else ' '}{ln:>{gw}} │ ", style="bold yellow" if hot else "dim")
+        out.append(f"{text}\n", style="bold" if hot else "dim")
+    return out
 
 
 # ── Overview tab ─────────────────────────────────────────────────────────────
@@ -850,7 +640,8 @@ class DashboardWidget(Widget):
         wall_ns = _trace_wall_ns(trace)
         meta    = trace.metadata
 
-        diag_label, diag_color = _diagnose(trace)
+        diag_label, diag_severity = _diagnose(trace)
+        diag_color = _TUI_SHADE.get(diag_severity, diag_severity)
         self.query_one("#stat-diag", Static).update(Text.from_markup(
             f"[dim]DIAGNOSIS[/dim]\n[bold {diag_color}]{diag_label}[/bold {diag_color}]"))
         self.query_one("#stat-wall", Static).update(Text.from_markup(
@@ -2110,38 +1901,50 @@ class _StackNode:
 
 
 def _ct_build_from_stacks(spans: list[SpanEvent]) -> list[_CTNode]:
-    """Build call tree from captured CPU stack frames (from-main view)."""
+    """Build call tree from captured CPU stack frames (from-main view).
+
+    Walks each span's full root-first path -- its reversed stack_frames
+    (the caller chain) PLUS its own name appended as the definite final
+    leaf -- in one pass, with one dict key per level (the bare function
+    name). This used to be two separate steps: a frame-only path walk
+    keyed by bare name, then a second "add the span's own name as a
+    leaf" step keyed by f"__leaf__{name}" -- a DIFFERENT key for what is
+    often the SAME logical node. Any function that is both an
+    intermediate ancestor frame for some spans and its own separately-
+    measured leaf span for others (an extremely common pattern: a
+    function that does direct work AND calls sub-functions, e.g. a
+    driving loop that also does some work inline) never merged, and
+    showed up as two same-named sibling nodes at the same tree level
+    instead of one aggregated node -- contradicting _CTNode's own
+    docstring ("N spans with the same name at the same tree level").
+    Found via the Qt/QML GUI's Call Tree screen using a deliberately
+    two-level-deep synthetic trace; the TUI's Call Tree tab shares this
+    exact function, so it had the same bug whenever real profiled code
+    hit this shape, not just the GUI.
+    """
     roots: dict[str, _StackNode] = {}
 
     for span in spans:
-        # Frames arrive innermost-first (backtrace order); reverse to root-first.
-        path = list(reversed(span.stack_frames))
-        if not path:
-            continue
+        # Frames arrive innermost-first (backtrace order); reverse to
+        # root-first, then the span's own name is the guaranteed final
+        # leaf of its own path.
+        full_path = list(reversed(span.stack_frames)) + [span.name]
 
         level = roots
-        nodes_on_path: list[_StackNode] = []
-        for i, frame in enumerate(path):
-            is_leaf = (i == len(path) - 1)
-            cat = span.category.value if is_leaf else "other"
+        for i, frame in enumerate(full_path):
+            is_leaf = (i == len(full_path) - 1)
             if frame not in level:
-                level[frame] = _StackNode(name=frame, category=cat)
+                level[frame] = _StackNode(
+                    name=frame, category=span.category.value if is_leaf else "other")
             node = level[frame]
             node.total_ns += span.duration_ns
             if is_leaf:
                 node.count += 1
-                # Promote category to the actual span category on the leaf.
+                # Promote category in case this node was created earlier
+                # only as an ancestor frame (category "other") by some
+                # other span that passed through it.
                 node.category = span.category.value
-            nodes_on_path.append(node)
             level = node.children
-
-        # Add the span itself as the innermost leaf (the actual API call / kernel).
-        leaf_key = f"__leaf__{span.name}"
-        if leaf_key not in level:
-            level[leaf_key] = _StackNode(name=span.name, category=span.category.value)
-        leaf = level[leaf_key]
-        leaf.total_ns += span.duration_ns
-        leaf.count    += 1
 
     return sorted((n.to_ctnode() for n in roots.values()), key=lambda n: -n.total_ns)
 

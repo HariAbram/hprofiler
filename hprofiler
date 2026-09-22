@@ -89,15 +89,20 @@ def cli():
       hprofiler run -- ./app                           # auto-detect all backends
       hprofiler run --backend cuda,nccl -- ./app       # multiple backends
       hprofiler run --call-tree --backend cuda -- ./app  # + call tree from main
+      hprofiler run --gui -- ./app                     # pop up the Qt GUI (falls back to TUI)
       hprofiler roofline --backend cuda -- ./app       # hardware roofline chart
       hprofiler flamegraph -- ./app                    # CPU flame graph SVG
-      hprofiler view app.hprofiler.json                # reopen a saved trace
+      hprofiler view app.hprofiler.json                # reopen a saved trace in the TUI
+      hprofiler gui app.hprofiler.json                 # reopen a saved trace in the Qt GUI
 
     \b
     Output written after every run:
       <prog>.hprofiler.json — Chrome Trace (open in ui.perfetto.dev)
       TUI viewer            — opens automatically (tabs: Overview, Timeline,
-                              Hotspots, [Flame], [Call Tree], [Disasm])
+                              Kernels, [Call Tree], [Roofline], [Source],
+                              System, Profile). Pass --gui for the Qt/QML
+                              popup GUI instead (falls back to the TUI when
+                              no usable X11 display or PySide6 is found).
 
     Always separate hprofiler options from the target program with --:
 
@@ -113,7 +118,10 @@ def cli():
 @click.option("--output", "-o", default=None,
               help="Output trace file (JSON).  Default: <program>.hprofiler.json")
 @click.option("--ui/--no-ui", default=True,
-              help="Open the TUI viewer after profiling  [default: yes]")
+              help="Open a viewer after profiling  [default: yes]")
+@click.option("--gui", is_flag=True, default=False,
+              help="Open the Qt/QML popup GUI instead of the TUI (falls back to the "
+                   "TUI automatically if no usable X11 display or PySide6 is found)")
 @click.option("--summary/--no-summary", default=True,
               help="Print text summary after profiling  [default: yes]")
 @click.option("--perf-freq", default=9999, show_default=True,
@@ -144,7 +152,7 @@ def cli():
 @click.option("--analysis-report", default=None, metavar="PATH",
               help="Save AI analysis report to a Markdown file")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
-def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, call_tree,
+def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, call_tree,
         gpu_pc_sampling,
         otlp_endpoint, otlp_file, do_analyze, llm_provider, llm_model,
         llm_endpoint, llm_api_key, analysis_report, command):
@@ -248,10 +256,15 @@ def run(backend, output, ui, summary, perf_freq, perf_callgraph, disasm, call_tr
         runner._disasm_thread.join(timeout=60)
 
     if ui and trace.spans:
-        from src.ui.app import launch_viewer
-        launch_viewer(trace, collect_disasm=disasm)
+        shown = False
+        if gui:
+            from src.gui.launch import launch_gui
+            shown = launch_gui(out_path)
+        if not shown:
+            from src.ui.app import launch_viewer
+            launch_viewer(trace, collect_disasm=disasm)
     elif ui:
-        click.echo("[hprofiler] No spans captured — skipping TUI.", err=True)
+        click.echo("[hprofiler] No spans captured — skipping viewer.", err=True)
 
     # After TUI closes (or --no-ui), wait for remaining background disasm and update JSON.
     if disasm and runner._disasm_thread is not None:
@@ -457,19 +470,24 @@ def view(trace_file, disasm, otlp_endpoint, otlp_file):
     Tabs shown depend on what data the trace contains:
 
     \b
-      System     — device specs, peak compute/bandwidth, IPC, RSS
-      Profile    — GPU activity, time breakdown, hotspots, bottleneck advisor
+      Overview   — diagnosis, headline stats, top findings, hot kernels
       Timeline   — Gantt view; per-stream lanes for CUDA/ROCm
-      Hotspots   — filterable, sortable table (type to filter, 's' to sort)
-      Flame      — only when CPU/perf samples are present
+      Kernels    — filterable, sortable table (type to filter, 's' to sort)
       Call Tree  — only when trace was recorded with --call-tree
-      Disasm     — only when --disasm is passed to this command
+      Roofline   — only when hardware-counter/disasm kernel metrics exist
+      Source     — only when --disasm is passed to this command
+      System     — device specs, peak compute/bandwidth, IPC, RSS
+      Profile    — GPU activity, time breakdown, hotspots, insight tips
 
     \b
     Examples:
       hprofiler view app.hprofiler.json
       hprofiler view --disasm app.hprofiler.json
       hprofiler view --otlp-endpoint http://localhost:4318 app.hprofiler.json
+
+    \b
+    See also: 'hprofiler gui' opens the same trace in the Qt/QML popup GUI
+    instead (falls back to this TUI automatically if unavailable).
     """
     from src.ui.app import load_trace_from_json, launch_viewer
     click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)
@@ -488,6 +506,36 @@ def view(trace_file, disasm, otlp_endpoint, otlp_file):
             click.echo(f"[hprofiler] OTLP export failed: {exc}", err=True)
 
     launch_viewer(trace, collect_disasm=disasm)
+
+
+@cli.command()
+@click.argument("trace_file", type=click.Path(exists=True))
+@click.option("--disasm/--no-disasm", default=False,
+              help="Collect per-kernel disassembly in the background  [default: no]")
+def gui(trace_file, disasm):
+    """Open the Qt/QML popup GUI for a saved trace JSON file.
+
+    Same trace data as 'hprofiler view', in a native popup window instead
+    of the terminal — works over X11 forwarding (ssh -X/-Y). Falls back
+    to 'hprofiler view's TUI automatically if no usable X11 display is
+    reachable or PySide6 isn't installed (pip install 'hprofiler[gui]'),
+    so this is always safe to use as your default even on a machine you
+    haven't checked has GUI support.
+
+    \b
+    Examples:
+      hprofiler gui app.hprofiler.json
+      ssh -X cluster.example.edu   # X11 forwarding enabled
+      hprofiler gui app.hprofiler.json  # pops up locally over the tunnel
+    """
+    from src.gui.launch import launch_gui
+    shown = launch_gui(trace_file)
+    if not shown:
+        from src.ui.app import load_trace_from_json, launch_viewer
+        click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)
+        trace = load_trace_from_json(trace_file, collect_disasm=disasm)
+        click.echo(f"[hprofiler] {len(trace.spans)} spans loaded", err=True)
+        launch_viewer(trace, collect_disasm=disasm)
 
 
 def _open_browser(path: str) -> None:
