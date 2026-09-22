@@ -1115,18 +1115,70 @@ HPROFILER_LIKWID_GROUP=MEM hprofiler run --backend likwid -- ./my_program
 
 ## 5. TUI Viewer
 
-The TUI is built with [Textual](https://textual.textualize.io/). Four tabs are
-always present; additional tabs appear conditionally based on recorded data:
+The TUI is built with [Textual](https://textual.textualize.io/), as a
+card-based dashboard: every panel is a rounded-border box with its own
+title, a top bar replaces Textual's generic clock header with the command
+being profiled (left) and whatever run context actually applies — rank
+count, device, wall time — omitting anything that doesn't apply to this
+trace (right), and a bottom bar shows plain "key  description" hints for
+whichever tab is active instead of Textual's default reverse-video key
+chips. Tabs are numbered (`1 Overview`, `2 Timeline`, …) and `1`-`7` jump
+straight to a tab from anywhere. Three tabs are always present; the rest
+appear conditionally based on recorded data:
 
-| Tab | When shown |
-|-----|-----------|
-| System | Always |
-| Profile | Always |
-| Timeline | Always |
-| Hotspots | Always |
-| Flame | Only when CPU/perf samples are present (`--backend cpu` or `auto`) |
-| Call Tree | Only when `--call-tree` was passed during `hprofiler run` |
-| Disasm | Only when `--disasm` is passed to `run` or `view` |
+| # | Tab | When shown |
+|---|-----|-----------|
+| 1 | Overview | Always |
+| 2 | Timeline | Always |
+| 3 | Kernels | Always |
+| — | Call Tree | Only when `--call-tree` was passed during `hprofiler run` |
+| — | Roofline | Only when hardware-counter or disassembly-estimated kernel metrics exist |
+| — | Source | Only when `--disasm` is passed to `run` or `view` |
+| — | System | Always (positioned after the conditional tabs) |
+| — | Profile | Always (positioned after the conditional tabs) |
+
+Tab numbers shift to stay contiguous depending on which conditional tabs
+are actually present for a given trace — Call Tree/Roofline/Source are
+never shown as a numbered gap. CPU flame graphs are a separate,
+dedicated view (`hprofiler flamegraph`, native TUI or `--html` export),
+not a tab inside this main viewer.
+
+### Overview Tab
+
+The landing dashboard, built to answer "what's wrong with this run" in one
+screen rather than requiring a tour through every other tab first:
+
+- **Five headline stat cards** — Diagnosis (a one-line heuristic verdict:
+  e.g. "GPU starvation", "Load imbalance", "cuda-bound", "Balanced"), Wall
+  time, GPU Active % (merged kernel-active time; shows `n/a` when no GPU
+  backend was used), MPI Wait % (merged time at least one rank was inside
+  an MPI call — relabeled **Sync Wait %**, measuring `sync`-category spans
+  instead, when the trace has no MPI spans at all), and Peak Memory
+  (process RSS, falling back to summed GPU VRAM peak when RSS wasn't
+  captured).
+- **Execution timeline preview** — a condensed density row per the top 3
+  categories by accumulated time (reusing the same category colors as the
+  Timeline tab), with a legend.
+- **Top findings** — up to 4 actionable items, most-actionable first:
+  low GPU occupancy / high GPU sync stall (from `analysis/cct.gpu_starvation`,
+  same thresholds `hprofiler summary` uses), load imbalance (from
+  `analysis/pop_efficiency.load_balance`), and — always tried, as a
+  fallback so this panel is never empty even for a plain single-threaded
+  CPU trace — whichever single function dominates total time, when it's
+  above 30%.
+- **Hot kernels** — the top 8 rows of the same aggregated-stats table the
+  Kernels tab shows in full, condensed to Kernel/Calls/Total/Share.
+- **Source correlation** — source lines around the single hottest
+  function's `file=`/`line=` tag (the same tags the Kernels tab's
+  location column already uses), with the hot line marked. Falls back to
+  an explanatory message — not a blank panel — when the hottest function
+  carries no file/line tag, or when its source file isn't present on
+  *this* machine, which is the expected outcome when opening a trace that
+  was collected on a different machine (e.g. downloaded from a cluster).
+
+Diagnosis, findings, and the Profile tab's "Insight" tips all share one
+`_bottleneck_analysis`/`_diagnose`/`_top_findings` implementation, so they
+never disagree with each other or with `hprofiler summary`'s text output.
 
 ### System Tab
 
@@ -1144,11 +1196,13 @@ x86 CPUs have no native FP16 compute throughput.
 
 ### Profile Tab
 
-Activity dashboard: for CUDA/ROCm backends shows kernel active %, sync overhead %,
-GPU efficiency %, kernel count and average duration. Time breakdown by category
-with proportional bars. Top-12 hotspots table with name, category, share%, total,
-average, and invocation count. A **Bottleneck Advisor** section provides actionable
-tips derived from the hardware counter and activity data.
+The deeper activity breakdown behind the Overview tab's headline stats: for
+CUDA/ROCm backends, kernel active %, sync overhead %, GPU efficiency %,
+kernel count and average duration. Time breakdown by category with
+proportional bars. Top-12 hotspots table with name, category, share%,
+total, average, and invocation count. An **Insight** section lists the
+same actionable tips as the Overview tab's "Top findings" panel (shared
+`_bottleneck_analysis` implementation — see §5's Overview Tab section).
 
 **GPU kernel active %** is computed from the merged union of all kernel span
 intervals so concurrent streams never produce a percentage above 100%. The
@@ -1160,7 +1214,11 @@ summary output shows both `active` (merged wall-clock time) and `accumulated`
 A scrollable Gantt-style view. Lanes are grouped by (category, thread) for most
 backends. CUDA and ROCm spans with a `stream` tag are grouped into per-stream
 lanes (`cuda/stream-0`, `cuda/stream-1`, etc.) so kernel overlap across streams
-is visible.
+is visible. MPI lanes are labeled by the rank's own `rank=` tag (`mpi rank0`,
+`mpi rank3`, …) rather than a generic sequential thread number, since rank is
+what you actually think in terms of when reading an MPI trace; any lane
+without a resolvable rank (or a non-MPI lane) falls back to the sequential
+`T1`, `T2`, … numbering.
 
 **Keyboard controls:**
 
@@ -1172,21 +1230,38 @@ is visible.
 | `-` | Zoom out |
 | `r` | Reset zoom, scroll, and pan |
 
-**Cross-rank communication connectors:** MPI/NCCL spans get connector
-lines drawn between matched send/receive pairs and collective-rendezvous
-participants, directly in the live Timeline — a Paraver/Extrae-style view
-of the actual communication pattern, not just isolated per-rank bars.
-Reuses `criticalpath.py`'s already-resolved dependency-graph edges
-(resolved wildcard matching, `commid=`-scoped rendezvous, confidence
-tiers — see §18) rather than re-deriving matching logic in the UI, so the
-same edges `hprofiler critical-path` reports are what gets drawn here.
-Line color signals confidence, the same tiers §18's "Path evidence
-strength" uses: bright white = `certain`, bright cyan = `high`, grey =
-`medium`. Only cross-lane edges are drawn (same-lane ones are already
-visually adjacent in one row); an edge with one endpoint scrolled off the
-visible time window still draws a line running to that edge rather than
-disappearing, but an edge with *both* endpoints off the same side is
+**Cross-rank communication connectors:** hover over an MPI/NCCL span to draw
+connector lines from it to whatever it was matched with — the sender for a
+receive, the other participants' last-arriver for a collective rendezvous —
+directly in the live Timeline, a Paraver/Extrae-style view of the actual
+communication pattern instead of just isolated per-rank bars. The status bar
+shows a `⇄N` hint when the hovered span has N such links, so the feature is
+discoverable without needing to already know which spans have edges. Reuses
+`criticalpath.py`'s already-resolved dependency-graph edges (resolved
+wildcard matching, `commid=`-scoped rendezvous, confidence tiers — see §18)
+rather than re-deriving matching logic in the UI, so the same edges
+`hprofiler critical-path` reports are what gets drawn here. Line color
+signals confidence, the same tiers §18's "Path evidence strength" uses:
+bright white = `certain`, bright cyan = `high`, grey = `medium`.
+
+Only the *hovered* span's own edges are drawn, not every edge in the trace at
+once — rendering all of them simultaneously on a busy multi-rank trace
+produces a hairball of overlapping lines that reads as noise rather than
+information; hovering a specific call reveals just what it was waiting on,
+on demand. Only cross-lane edges are drawn at all (same-lane ones are
+already visually adjacent in one row); an edge with one endpoint scrolled
+off the visible time window still draws a line running to that edge rather
+than disappearing, but an edge with *both* endpoints off the same side is
 skipped since nothing about it would be visible anyway.
+
+Lines are routed as an elbow (vertical – horizontal – vertical), not a raw
+diagonal: the horizontal traversal runs along the *source* lane's own spacer
+row (the blank row between lanes), and only the short final vertical segment
+into the target actually crosses other lanes' rows — as a single thin line
+at one column, not a diagonal sweep painting over whatever span data
+happens to lie along the way. This was a real, user-visible readability
+problem with an earlier straight-diagonal version, not just a stylistic
+choice.
 
 Rendered via `src/ui/braille_canvas.py`: Unicode Braille Patterns
 (U+2800–U+28FF) pack 2×4 dots per character cell, giving roughly 8× the
@@ -1201,10 +1276,26 @@ don't. Braille rendering is plain Unicode text, so it works identically
 over any SSH session into any terminal, including a bare HPC cluster
 login-node terminal, which was the deciding factor for this project.
 
-### Hotspots Tab
+**Per-function coloring is now deterministic across runs.** Span colors were
+previously assigned by first-seen (encounter) order while building the
+widget, which depends on arbitrary thread-scheduling order — the same
+function could get a different color from one run of the same program to
+the next. Colors are now a stable hash of the function name (`zlib.crc32`,
+not Python's built-in `hash()`, which is randomly salted per process for
+strings by default) with open-addressing collision resolution, so up to 16
+distinct functions in one trace (the palette size) still always get visually
+distinct colors — matching the old within-trace guarantee — while the same
+function name now reliably gets the same color across different traces too.
+
+**Idle columns render as blank space**, not the previous visible `·` dot —
+quieter and less noisy on a sparse trace, where a field of dots could
+dominate the screen more than the actual data did.
+
+### Kernels Tab
 
 A filterable, sortable table of all events grouped by function name and
-category. Type to filter by name; press `s` to cycle the sort column.
+category. Type to filter by name; press `s` to cycle the sort column;
+`j`/`k` (or `↑`/`↓`) navigate rows.
 
 | Column | Description |
 |--------|-------------|
@@ -1213,11 +1304,6 @@ category. Type to filter by name; press `s` to cycle the sort column.
 | Count | Number of invocations |
 | Total / Avg / Min / Max | Duration statistics |
 | % | Fraction of total profiled time |
-
-### Flame Graph Tab *(only shown when CPU/perf data is present)*
-
-CPU sample data (from the `cpu` / perf backend) as horizontal bars sorted by
-total time. Only shown when at least one CPU span is present in the trace.
 
 ### Call Tree Tab *(only shown when `--call-tree` was used)*
 
@@ -1253,10 +1339,31 @@ do not include `main` even with `--call-tree`. Only `task_create` and
 `parallel_begin` callbacks fire from user-code context and show the full call
 path from `main`.
 
-### Disasm Tab *(only shown when `--disasm` is passed)*
+### Roofline Tab *(only shown when kernel metrics are available)*
+
+A log-log arithmetic-intensity (FLOPs/byte) vs. achieved-TFLOP/s scatter
+plot, one dot per profiled GPU kernel, rendered with the same Braille
+sub-cell canvas (`src/ui/braille_canvas.py`) the Timeline tab uses for its
+communication connectors — a genuine vector scatter plot, not a text
+table, drawn entirely in Unicode text so it works over a bare SSH session.
+Reuses `analysis/roofline.py`'s existing per-kernel metrics (hardware-
+counter based when available, disassembly-based estimate otherwise — see
+`KernelMetrics.data_source`) rather than computing anything new; this tab
+only plots them. Dots are colored by `KernelMetrics.bound`: bright cyan
+for compute-bound, bright magenta for memory-bound. The diagonal-then-flat
+line is the profiled device's own roofline knee (bandwidth-bound diagonal
+up to its ridge point, then a flat compute-bound ceiling at its peak
+FP32 TFLOP/s), drawn once per distinct device present. Only appears when
+`analyze_trace` actually returns at least one kernel with positive
+arithmetic intensity and achieved TFLOP/s — a trace with no GPU kernel
+metrics (no `--disasm`, no hardware counters) simply doesn't get this tab,
+the same conditional-visibility pattern Call Tree and Source already use.
+
+### Source Tab *(only shown when `--disasm` is passed)*
 
 Per-kernel disassembly with instruction-level color coding, runtime heat
-annotation, and static optimization hints.
+annotation, and static optimization hints. `j`/`k` (or `↑`/`↓`) select a
+kernel in the left pane.
 
 **Left pane** — kernel list:
 - `✓` prefix when disassembly is available
@@ -1877,7 +1984,7 @@ flowchart TB
             direction LR
             J["Chrome Trace JSON\nPerfetto / chrome://tracing"]
             S["Text\nSummary"]
-            T["TUI Viewer\nSystem · Profile · Timeline · Hotspots\n[Flame — CPU data]\n[Call Tree — --call-tree]\n[Disasm — --disasm]"]
+            T["TUI Viewer\nOverview · Timeline · Kernels\n[Call Tree — --call-tree]\n[Roofline — kernel metrics]\n[Source — --disasm]\nSystem · Profile"]
             FG["Flame Graph HTML\ncanvas · zoom · search\nhprofiler flamegraph"]
         end
 
@@ -2130,11 +2237,32 @@ counts as a fallback estimate.
 
 ### `src/ui/app.py` — Textual TUI
 
-`ProfilerApp.compose()` includes tabs conditionally:
+`ProfilerApp.compose()` yields Overview, Timeline, Kernels, System and
+Profile unconditionally, plus these tabs conditionally:
 
-- **Flame** tab: included only when `any(s.category == Category.CPU for s in trace.spans)`
-- **Call Tree** tab: included only when `any(s.stack_frames for s in trace.spans)`
-- **Disasm** tab: included only when `collect_disasm=True`
+- **Call Tree** tab: included only when `trace._has_stacks`
+  (`any(s.stack_frames for s in trace.spans)`)
+- **Roofline** tab: included only when `_has_roofline_data(trace)` --
+  `analysis/roofline.analyze_trace` returns at least one kernel with
+  positive arithmetic intensity and achieved TFLOP/s
+- **Source** tab: included only when `collect_disasm=True` or `trace.disasm`
+  is already populated
+
+Each composed `TabPane`'s id is appended to `self._tab_ids` in display
+order as `compose()` yields it, so `action_goto_tab(n)` (bound to keys
+`1`-`7`) can map a digit straight to the Nth tab actually present for
+*this* trace, without hardcoding ids that would shift depending on which
+conditional tabs exist. `TopBar`/`BottomBar` replace Textual's default
+`Header`/`Footer`; `BottomBar`'s hint text is swapped per active tab via
+`on_tabbed_content_tab_activated` and the `_TAB_HINTS` table, skipping any
+tab (Timeline) that already shows its own live keybinding footer inside
+the widget itself, to avoid showing the same hints twice.
+
+`FlameGraphWidget` is defined in this file but was never wired into
+`ProfilerApp.compose()` — dead code, superseded by the separate
+`hprofiler flamegraph` command (native TUI or `--html` export, see
+`src/output/flamegraph.py`), not a bug introduced by the dashboard
+redesign.
 
 `CallTreeWidget` uses Textual's `Tree` widget. It calls `_ct_build()` which
 selects between two tree-building strategies:

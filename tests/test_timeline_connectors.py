@@ -60,10 +60,15 @@ class TestConnectorComputation(unittest.TestCase):
                      tags={"type": "recv", "rank": "1", "peer": "0", "tag": "7"})
         w = TimelineWidget(_mk_trace([send, recv]))
         self.assertEqual(len(w._connectors), 1)
-        pred_lane, _pred_ns, succ_lane, _succ_ns, confidence = w._connectors[0]
+        pred_lane, _pred_ns, succ_lane, _succ_ns, confidence, pred_sid, succ_sid = w._connectors[0]
         self.assertEqual(pred_lane, "mpi/thread-101")
         self.assertEqual(succ_lane, "mpi/thread-201")
         self.assertEqual(confidence, "medium")
+        self.assertEqual(pred_sid, id(send))
+        self.assertEqual(succ_sid, id(recv))
+        # Precomputed hover-text link-count index (on_mouse_move's "⇄N" hint).
+        self.assertEqual(w._connector_count[id(send)], 1)
+        self.assertEqual(w._connector_count[id(recv)], 1)
 
     def test_same_lane_edges_produce_no_connector(self):
         # Both spans on the SAME thread -- already visually adjacent in one
@@ -98,7 +103,7 @@ class TestConnectorComputation(unittest.TestCase):
 
 
 class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
-    async def test_cross_lane_connector_renders_braille_overlay(self):
+    async def test_hovering_an_endpoint_renders_braille_overlay(self):
         send = _span(100, 101, Category.MPI, 1_000_000, 50_000, "MPI_Send",
                      tags={"type": "send", "rank": "0", "peer": "1", "tag": "7"})
         recv = _span(200, 201, Category.MPI, 1_100_000, 80_000, "MPI_Recv",
@@ -107,9 +112,40 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 30)):
             widget = app.query_one(TimelineWidget)
             self.assertEqual(len(widget._connectors), 1)
+            widget._hover_span_id = id(send)
             plain = widget.render().plain
             self.assertGreater(_braille_count(plain), 0,
-                              "expected connector overlay characters in the rendered output")
+                              "expected connector overlay characters once an endpoint is hovered")
+
+    async def test_connectors_present_but_nothing_hovered_renders_no_braille(self):
+        # The headline change from the raw always-on version: connectors
+        # existing is no longer sufficient to draw them -- a span must
+        # actually be hovered, to avoid a hairball of every edge at once
+        # on a busy trace.
+        send = _span(100, 101, Category.MPI, 1_000_000, 50_000, "MPI_Send",
+                     tags={"type": "send", "rank": "0", "peer": "1", "tag": "7"})
+        recv = _span(200, 201, Category.MPI, 1_100_000, 80_000, "MPI_Recv",
+                     tags={"type": "recv", "rank": "1", "peer": "0", "tag": "7"})
+        app = _HarnessApp(_mk_trace([send, recv]))
+        async with app.run_test(size=(120, 30)):
+            widget = app.query_one(TimelineWidget)
+            self.assertEqual(len(widget._connectors), 1)
+            self.assertEqual(widget._hover_span_id, 0)  # nothing hovered yet
+            plain = widget.render().plain
+            self.assertEqual(_braille_count(plain), 0)
+
+    async def test_hovering_an_unrelated_span_renders_no_braille(self):
+        send = _span(100, 101, Category.MPI, 1_000_000, 50_000, "MPI_Send",
+                     tags={"type": "send", "rank": "0", "peer": "1", "tag": "7"})
+        recv = _span(200, 201, Category.MPI, 1_100_000, 80_000, "MPI_Recv",
+                     tags={"type": "recv", "rank": "1", "peer": "0", "tag": "7"})
+        unrelated = _span(300, 301, Category.CPU, 1_000_000, 10_000, "other_work")
+        app = _HarnessApp(_mk_trace([send, recv, unrelated]))
+        async with app.run_test(size=(120, 30)):
+            widget = app.query_one(TimelineWidget)
+            widget._hover_span_id = id(unrelated)
+            plain = widget.render().plain
+            self.assertEqual(_braille_count(plain), 0)
 
     async def test_no_connectors_means_no_braille_chars_rendered(self):
         # Regression guard: a trace with nothing to connect must render
@@ -131,6 +167,7 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
         app = _HarnessApp(_mk_trace([send, recv]))
         async with app.run_test(size=(120, 30)):
             widget = app.query_one(TimelineWidget)
+            widget._hover_span_id = id(send)  # exercise the overlay path, not just computation
             # Zoom/pan far enough that both endpoints fall outside [0,
             # width) -- must not raise, just render without that connector
             # (or clipped) rather than crash on out-of-range dot coordinates.
@@ -159,12 +196,18 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(150, 60)):
             widget = app.query_one(TimelineWidget)
             self.assertGreater(len(widget._connectors), 0)
+            # Hover the busiest span (the allreduce cluster's "last
+            # arriver" has ~63 edges all pointing to it -- the worst case
+            # for the overlay path, not just connector computation).
+            busiest_sid = max(widget._connector_count, key=widget._connector_count.get)
+            widget._hover_span_id = busiest_sid
             t0 = time.monotonic()
             widget.render()
             elapsed = time.monotonic() - t0
             self.assertLess(elapsed, 2.0,
-                            f"render() took {elapsed:.2f}s for {len(widget._connectors)} "
-                            f"connectors -- likely a real performance problem, not just slow CI")
+                            f"render() took {elapsed:.2f}s for {widget._connector_count[busiest_sid]} "
+                            f"connectors on one hovered span -- likely a real performance problem, "
+                            f"not just slow CI")
 
 
 if __name__ == "__main__":

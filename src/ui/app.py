@@ -1,26 +1,39 @@
 """
-Profiler TUI — redesigned, inspired by Paraver and VTune.
+Profiler TUI — card-based dashboard layout, inspired by Paraver and VTune.
 
-Tabs:
-  Overview  — dashboard: duration, backend breakdown, top-10 hotspots
-  Timeline  — Paraver-style Gantt: one row per (category, thread), zoomable
-  Hotspots  — VTune-style: function table with bar visualization, sortable
+Tabs (numbered 1..N in the tab strip; Call Tree/Roofline/Source only
+appear when the trace actually has the data behind them):
+  Overview   — dashboard: diagnosis, headline stats, condensed timeline
+               preview, top findings, hot kernels, source correlation
+  Timeline   — Paraver-style Gantt: one row per (category, thread), zoomable,
+               hover a span to reveal MPI/NCCL communication connector lines
+  Kernels    — VTune-style: function table with bar visualization, sortable
+  Call Tree  — hierarchical call tree (only when stack traces were captured)
+  Roofline   — log-log arithmetic-intensity/TFLOP-s scatter (only when
+               hardware-counter or disassembly-estimated kernel metrics exist)
+  Source     — annotated disassembly with instruction-mix breakdown
+               (only when --disasm was passed or the trace already has it)
+  System     — device specs, GPU utilisation, CPU microarch counters
+  Profile    — per-backend activity, time breakdown, hotspots, insight tips
 
 Keyboard shortcuts:
+  1-7              jump directly to a tab
   Tab / Shift+Tab  cycle tabs
   ← →              scroll timeline
   + / -            zoom timeline
   r                reset timeline zoom
-  ↑ ↓              navigate hotspot rows
-  s                cycle sort column (hotspots)
-  /                focus name filter (hotspots)
+  j/k or ↑ ↓       navigate kernel/call-tree rows
+  s                cycle sort column (kernels)
+  /                focus name filter (kernels)
   ?                toggle help overlay
   q                quit
 """
 
 from __future__ import annotations
 import json
+import math
 import re
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,13 +46,13 @@ from rich.panel import Panel
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import ScrollableContainer, Horizontal, Vertical
+from textual.containers import ScrollableContainer, Horizontal, Vertical, Grid
 from textual.events import MouseMove
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
-    Header, Footer, TabbedContent, TabPane,
+    TabbedContent, TabPane,
     DataTable, Input, Static, RichLog, Tree,
 )
 
@@ -187,23 +200,40 @@ _HELP_TEXT = """\
 [bold]Keyboard Shortcuts[/bold]
 
 [bold]Global[/bold]
+  [yellow]1-7[/yellow]              jump directly to a tab
   [yellow]Tab / Shift+Tab[/yellow]  switch tabs
   [yellow]q[/yellow]                quit
   [yellow]?[/yellow]                this help
+
+[bold]Overview tab[/bold]
+  Dashboard: diagnosis + headline stats, a condensed
+  timeline preview, top findings, hot kernels, and
+  source context for the single hottest function.
 
 [bold]Timeline tab[/bold]
   [yellow]← →[/yellow]             scroll horizontally
   [yellow]↑ ↓[/yellow]             pan up / down (when lanes overflow)
   [yellow]+ -[/yellow]             zoom in / out
   [yellow]r[/yellow]               reset zoom, scroll & pan
+  Hover a span for its MPI/NCCL connector lines
+  (color: white/cyan/grey = certain/high/medium evidence)
 
-[bold]Hotspots tab[/bold]
-  [yellow]↑ ↓[/yellow]             navigate rows
+[bold]Kernels tab[/bold]
+  [yellow]j/k[/yellow] or [yellow]↑ ↓[/yellow]     navigate rows
   [yellow]s[/yellow]               cycle sort column
   [yellow]/[/yellow]               focus name filter
 
-[bold]Disasm tab[/bold]  (only shown when [yellow]--disasm[/yellow] is passed)
-  [yellow]↑ ↓[/yellow]             select kernel
+[bold]Roofline tab[/bold]  (shown when kernel metrics exist)
+  Log-log scatter, one dot per kernel:
+    [bright_cyan]cyan[/bright_cyan]    = compute-bound
+    [bright_magenta]magenta[/bright_magenta] = memory-bound
+  The diagonal-then-flat line is its roofline knee.
+  For hardware-counter based metrics, run first:
+    [yellow]hprofiler roofline --backend <backend> -- ./app[/yellow]
+  (disassembly-only estimates are used otherwise)
+
+[bold]Source tab[/bold]  (only shown when [yellow]--disasm[/yellow] is passed)
+  [yellow]j/k[/yellow] or [yellow]↑ ↓[/yellow]     select kernel
   Left pane: kernel list with arch + timing
   Right pane: annotated assembly
   Bottom: instruction mix (vec/scl/mem/ctl)
@@ -212,10 +242,6 @@ _HELP_TEXT = """\
     [bright_green]vec[/bright_green] SIMD/AVX/YMM/ZMM   [cyan]scl[/cyan] scalar ALU
     [yellow]mem[/yellow] load/store        [magenta]ctl[/magenta] branch/call
     [bright_blue]fma[/bright_blue] FMA/multiply-acc  [red]syn[/red] barrier/fence
-
-[bold]Roofline[/bold]
-  Use [yellow]hprofiler roofline --backend <backend> -- ./app[/yellow] for hardware-counter
-  roofline analysis (ncu for CUDA, perf stat for CPU/OpenMP).
 
 [bold]Output format[/bold]
   Traces are Perfetto-compatible JSON.
@@ -231,10 +257,11 @@ class HelpScreen(ModalScreen):
     DEFAULT_CSS = """
     HelpScreen { align: center middle; }
     #help-box {
-        width: 58; height: auto;
+        width: 66; height: auto;
+        max-height: 90%;
         padding: 1 2;
         background: $surface;
-        border: solid $accent;
+        border: round $accent;
     }
     """
 
@@ -299,7 +326,12 @@ class SystemWidget(Static):
         if len(cmd) > 50: cmd = cmd[:47] + "…"
         _kv("Command", f"[cyan]{cmd}[/cyan]")
         _kv("Host",    f"[dim]{meta.hostname or '—'}[/dim]")
-        _kv("Duration", f"[yellow]{_fmt_ns(trace.duration_ns)}[/yellow]")
+        # _trace_wall_ns, not trace.duration_ns -- the latter is meaningless
+        # for a trace reconstructed by load_trace_from_json (see
+        # tests/README.md's "A real bug this test suite caught"); every
+        # other tab already derives wall time from the spans themselves,
+        # so this was the one remaining place that could disagree with them.
+        _kv("Duration", f"[yellow]{_fmt_ns(_trace_wall_ns(trace))}[/yellow]")
         _kv("Backend",  "  ".join(
             f"[{_cat_color(b)}]{b}[/{_cat_color(b)}]"
             for b in (meta.backends_used or ["none"])
@@ -514,8 +546,11 @@ class ProfileWidget(Static):
                 )
 
         # ── Insight ───────────────────────────────────────────────────────
+        # _bottleneck_analysis is defined further down in this module (see
+        # "Dashboard analysis helpers") and shared with DashboardWidget's
+        # "Top findings" panel -- no import needed, it's a module global by
+        # the time any widget actually renders.
         try:
-            from ..output.summary import _bottleneck_analysis
             ctrs_d = {c.name: c.value for c in trace.counters}
             ctr_sub: dict[str, float] = {
                 k: ctrs_d[k]
@@ -547,314 +582,383 @@ class ProfileWidget(Static):
         return "\n".join(L)
 
 
-# ── Overview tab (legacy wrapper kept for direct write() callers) ──────────────
+# ── Dashboard analysis helpers ──────────────────────────────────────────────
+#
+# Everything here PRESENTS analysis that already lives elsewhere in the
+# codebase (analysis/cct.gpu_starvation, analysis/pop_efficiency.load_balance,
+# Trace.aggregated_stats) rather than computing new metrics -- so the
+# Dashboard tab and `hprofiler summary`/`efficiency` never disagree.
 
-class OverviewWidget(Static):
-    """Dashboard: key metrics, time-by-backend bars, top-10 hotspots."""
+_GPU_CATS = ("cuda", "rocm", "opencl")
 
-    def __init__(self, trace: Trace, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._trace = trace
 
-    def render(self) -> Any:  # noqa: ANN401
-        import time as _time
-        trace = self._trace
-        meta  = trace.metadata
-        spans = trace.spans
+def _bottleneck_analysis(trace: Trace, ctrs: dict[str, float]) -> list[str]:
+    """
+    Short "icon + one-liner" diagnostic tips. Each tip is prefixed with a
+    2-char icon; callers split via `icon, body = tip[:2], tip[2:].strip()`.
+    Shared by the Dashboard's "Top findings" panel and the Profile tab's
+    "Insight" section (this used to be a call to a same-named function in
+    output/summary.py that was never actually defined there -- a dead
+    import silently swallowed by `except Exception: pass`, so neither
+    section ever rendered anything; fixed by giving both a real,
+    local implementation).
+    """
+    tips: list[str] = []
+    meta = trace.metadata
 
-        # Hard limit: every rendered line must stay ≤ this many visible chars.
-        # Rich markup tags are invisible but Python f-string padding counts them,
-        # so we keep content short and never use markup inside padded fields.
-        _LIM = 72
-
-        L: list[str] = []
-
-        def _sec(title: str, icon: str = "◈") -> None:
-            pad = _LIM - len(title) - 3
-            L.append(
-                f"[bold bright_cyan]{icon} {title}[/bold bright_cyan]"
-                f"[dim] {'─' * pad}[/dim]"
-            )
-
-        # ── Header ────────────────────────────────────────────────────────
-        ts      = _time.strftime("%Y-%m-%d %H:%M:%S")
-        cmd_str = f"{meta.command} {' '.join(meta.args[:3])}"
-        if len(cmd_str) > 46: cmd_str = cmd_str[:43] + "…"
-        host    = (meta.hostname or "")[:20]
-        backs_plain = "  ".join(meta.backends_used or ["none"])
-        backs_rich  = "  ".join(
-            f"[{_cat_color(b)}]{b}[/{_cat_color(b)}]"
-            for b in (meta.backends_used or ["none"])
-        )
-        dur_str = _fmt_ns(trace.duration_ns)
-
-        L.append(
-            f"  [bold bright_white]◆ HPROFILER[/bold bright_white]"
-            f"  [dim cyan]{ts}[/dim cyan]"
-            f"  [dim]·  {host}[/dim]"
-        )
-        L.append(
-            f"  [cyan]{cmd_str}[/cyan]"
-        )
-        L.append(
-            f"  [bold yellow]{dur_str}[/bold yellow]"
-            f"  {backs_rich}"
-            f"  [dim]·  {len(spans)} spans"
-            f"  ·  {len(trace.instants)} instants"
-            f"  ·  {len(trace.counters)} counters[/dim]"
-        )
-        L.append(f"  [dim bright_cyan]{'─' * (_LIM - 2)}[/dim bright_cyan]")
-        L.append("")
-
-        # ── Collect counters ──────────────────────────────────────────────
-        ctrs_last: dict[str, float] = {}
-        gpu_util_peak: dict[str, float] = {}
-        gpu_mem_peak:  dict[str, float] = {}
-        gpu_util_series: dict[str, list] = defaultdict(list)
-        for c in trace.counters:
-            ctrs_last[c.name] = c.value
-            if c.name.startswith("gpu_utilization_pct"):
-                gpu_util_peak[c.name] = max(gpu_util_peak.get(c.name, 0.0), c.value)
-                gpu_util_series[c.name].append(c.value)
-            if c.name.startswith("gpu_mem_used_bytes"):
-                gpu_mem_peak[c.name] = max(gpu_mem_peak.get(c.name, 0.0), c.value)
-
-        wall_ns = _trace_wall_ns(trace)
-        devices = trace.devices
-
-        # ── DEVICES ───────────────────────────────────────────────────────
-        if devices:
-            _sec("DEVICES", "◈")
-            for idx, dev in enumerate(devices):
-                bk_col   = _cat_color(dev.backend)
-                sm_lbl   = "SMs" if dev.backend in ("cuda", "rocm") else "cores"
-                ridge_hint = (
-                    "[red]mem-bound[/red]"    if dev.ridge_point < 5  else
-                    "[yellow]balanced[/yellow]"  if dev.ridge_point < 30 else
-                    "[green]compute-bound[/green]"
-                ) if dev.ridge_point > 0 else ""
-
-                # line 1: name + topology
-                L.append(
-                    f"  [{bk_col}]GPU {idx}[/{bk_col}]"
-                    f"  [bold]{dev.name}[/bold]"
-                    f"  [dim]cap {dev.compute_cap or '?'}"
-                    f"  {dev.sm_count} {sm_lbl}[/dim]"
-                )
-                # line 2: FP peaks (only non-zero)
-                peaks = "  ".join(filter(None, [
-                    f"[bright_green]FP32 {_fmt_tf(dev.fp32_tflops)}[/bright_green]" if dev.fp32_tflops else "",
-                    f"[red]FP64 {_fmt_tf(dev.fp64_tflops)}[/red]"                   if dev.fp64_tflops else "",
-                    f"[magenta]FP16 {_fmt_tf(dev.fp16_tflops)}[/magenta]"            if dev.fp16_tflops else "",
-                    f"[cyan]Tensor {_fmt_tf(dev.tensor_tflops)}[/cyan]"              if dev.tensor_tflops > 0 else "",
-                ]))
-                L.append(f"       {peaks}")
-                # line 3: memory
-                mem = "  ".join(filter(None, [
-                    f"[bright_cyan]BW {dev.bandwidth_gbs:.0f} GB/s[/bright_cyan]" if dev.bandwidth_gbs else "",
-                    f"[blue]VRAM {dev.vram_gb:.1f} GB[/blue]"                      if dev.vram_gb > 0  else "",
-                    f"[dim]ridge {dev.ridge_point:.0f} F/B[/dim]"                  if dev.ridge_point > 0 else "",
-                    ridge_hint,
-                ]))
-                L.append(f"       {mem}")
-            L.append("")
-
-        # ── PERFORMANCE HEALTH ────────────────────────────────────────────
-        _sec("PERFORMANCE HEALTH", "◈")
-        BAR = 22  # bar width kept short so stats fit on same line
-
-        for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm")):
-            kspans = [s for s in spans
-                      if s.category.value == cat_val and s.tags.get("type") == "kernel"]
-            if not kspans:
-                continue
-            kern_ns    = _merged_ns(kspans)
-            kern_acc   = sum(s.duration_ns for s in kspans)
-            pct        = 100.0 * kern_ns / wall_ns
-            color      = _cat_color(cat_val)
-            grade, gc  = _grade(pct)
-            bar        = _grad_bar(pct / 100, BAR)
-            avg_ns     = kern_acc / len(kspans)
-            sync_ns    = _merged_ns([s for s in spans if s.category.value == "sync"])
-            sync_pct   = 100.0 * sync_ns / wall_ns
-            eff        = pct / (pct + sync_pct) * 100 if (pct + sync_pct) > 0 else 0
-            # line 1: bar + pct + grade
-            L.append(
-                f"  [bold]{label} Active[/bold]"
-                f"  [{color}]{bar}[/{color}]"
-                f"  [yellow]{pct:.1f}%[/yellow]"
-                f"  [{gc}]{grade}[/{gc}]"
-            )
-            # line 2: stats indented under the bar
-            L.append(
-                f"  [dim]  {len(kspans)}×"
-                f"  total {_fmt_ns(kern_acc)}"
-                f"  avg {_fmt_ns(avg_ns)}"
-                f"  sync {sync_pct:.1f}%"
-                f"  eff {eff:.0f}%[/dim]"
-            )
-
-        # CPU microarch — each metric on one concise line
-        ipc        = ctrs_last.get("ipc",            0.0)
-        cache_miss = ctrs_last.get("cache_miss_pct", -1.0)
-        br_miss    = ctrs_last.get("branch_miss_pct",-1.0)
-
-        if ipc > 0:
-            ipc_col  = "bright_green" if ipc >= 2 else ("yellow" if ipc >= 1 else "red")
-            ipc_hint = "excellent" if ipc >= 3 else ("good" if ipc >= 2 else
-                       "ok" if ipc >= 1 else "stalled")
-            L.append(
-                f"  [bold]IPC[/bold]"
-                f"  [{ipc_col}]{_grad_bar(min(ipc/4.0,1.0), BAR)}[/{ipc_col}]"
-                f"  [{ipc_col}]{ipc:.2f}[/{ipc_col}]"
-                f"  [dim]{ipc_hint}[/dim]"
-            )
-        if cache_miss >= 0:
-            cm_col  = "green" if cache_miss < 5 else ("yellow" if cache_miss < 20 else "red")
-            cm_hint = "hot" if cache_miss < 5 else ("warm" if cache_miss < 20 else "thrashing!")
-            L.append(
-                f"  [bold]LLC miss[/bold]"
-                f"  [{cm_col}]{_grad_bar(min(cache_miss/50.0,1.0), BAR)}[/{cm_col}]"
-                f"  [{cm_col}]{cache_miss:.1f}%[/{cm_col}]"
-                f"  [dim]{cm_hint}[/dim]"
-            )
-        if br_miss >= 0:
-            bm_col  = "green" if br_miss < 1 else ("yellow" if br_miss < 5 else "red")
-            bm_hint = "predictable" if br_miss < 1 else ("ok" if br_miss < 5 else "poor")
-            L.append(
-                f"  [bold]Branch[/bold]"
-                f"  [{bm_col}]{_grad_bar(min(br_miss/20.0,1.0), BAR)}[/{bm_col}]"
-                f"  [{bm_col}]{br_miss:.1f}%[/{bm_col}]"
-                f"  [dim]{bm_hint}[/dim]"
-            )
-
-        # Memory / GPU util — one compact line
-        rss    = ctrs_last.get("process_max_rss_bytes", 0.0)
-        leaked = ctrs_last.get("gpu_memory_leaked_bytes", 0.0)
-        mem_parts: list[str] = []
-        if rss > 0:
-            mem_parts.append(f"[bold]RSS[/bold] [yellow]{_fmt_bytes(rss)}[/yellow]")
-        for key, val in sorted(gpu_util_peak.items()):
-            lbl = key.replace("gpu_utilization_pct", "").strip("[]") or "0"
-            gu_bar = _grad_bar(val / 100, 10)
-            mem_parts.append(
-                f"[bold]GPU{lbl}[/bold] [cyan]{gu_bar}[/cyan] [yellow]{val:.0f}%[/yellow]"
-            )
-        for key, val in sorted(gpu_mem_peak.items()):
-            lbl = key.replace("gpu_mem_used_bytes", "").strip("[]") or "0"
-            vt  = next((d.vram_gb * 1024**3 for d in devices if d.backend in ("cuda","rocm")), 0)
-            mem_parts.append(
-                f"[bold]VRAM{lbl}[/bold] [blue]{_grad_bar(val/vt if vt else 0, 10)}[/blue]"
-                f" [yellow]{_fmt_bytes(val)}[/yellow]"
-            )
-        if leaked > 0:
-            mem_parts.append(f"[bold bright_red]LEAK {_fmt_bytes(leaked)}[/bold bright_red]")
-        if mem_parts:
-            L.append("  " + "  ·  ".join(mem_parts))
-
-        L.append("")
-
-        # ── TIME BY BACKEND ───────────────────────────────────────────────
-        _sec("TIME BY BACKEND", "◈")
-        by_cat: dict[str, dict] = defaultdict(
-            lambda: {"total_ns": 0, "count": 0, "dur_list": []}
-        )
-        for s in spans:
-            by_cat[s.category.value]["total_ns"] += s.duration_ns
-            by_cat[s.category.value]["count"]    += 1
-            by_cat[s.category.value]["dur_list"].append(s.duration_ns)
-
-        grand_total = sum(v["total_ns"] for v in by_cat.values()) or 1
-
-        for cat, info in sorted(by_cat.items(), key=lambda kv: -kv[1]["total_ns"]):
-            frac   = info["total_ns"] / grand_total
-            color  = _cat_color(cat)
-            dl     = sorted(info["dur_list"])
-            avg_ns = info["total_ns"] / max(info["count"], 1)
-            p99_ns = dl[min(int(len(dl)*0.99), len(dl)-1)] if dl else 0
-            spark  = _sparkline(info["dur_list"][-14:], 7)
-            # line 1: category  bar  %  total  count  sparkline
-            L.append(
-                f"  [{color}]{cat:<8}[/{color}]"
-                f"  [{color}]{_grad_bar(frac, 20)}[/{color}]"
-                f"  [yellow]{frac*100:5.1f}%[/yellow]"
-                f"  [white]{_fmt_ns(info['total_ns']):>9}[/white]"
-                f"  [dim]{info['count']:>4}×[/dim]"
-                f"  [dim cyan]{spark}[/dim cyan]"
-            )
-            # line 2: timing stats (indented to align under bar)
-            L.append(
-                f"  [dim]          "
-                f"avg {_fmt_ns(avg_ns):<10}"
-                f"  p99 {_fmt_ns(p99_ns)}[/dim]"
-            )
-
-        if not by_cat:
-            L.append("  [dim]No spans recorded.[/dim]")
-        L.append("")
-
-        # ── TOP HOTSPOTS ──────────────────────────────────────────────────
-        _sec("TOP HOTSPOTS", "◈")
-        stats = trace.aggregated_stats()
-        if not stats:
-            L.append("  [dim]No spans recorded.[/dim]")
-        else:
-            total_all = sum(r["total_ns"] for r in stats) or 1
-            L.append(f"  [dim]{'─' * 68}[/dim]")
-
-            for i, row in enumerate(stats[:12]):
-                frac    = row["total_ns"] / total_all
-                color   = _cat_color(row["category"])
-                bar     = _grad_bar(frac, 10)
-                # Truncate name to 28 chars — no padding (avoids column calc with markup)
-                name    = row["name"][:28]
-                avg_ns  = row["total_ns"] / max(row["count"], 1)
-                grade, gc = _grade(row["pct"])
-                cat_str   = row["category"][:6]
-                # Line 1: index  name  bar  grade  (narrow — always fits)
-                L.append(
-                    f"  [dim]{i+1:>2}[/dim]"
-                    f"  [bold {color}]{name}[/bold {color}]"
-                    f"  [{color}]{bar}[/{color}]"
-                    f"[{gc}]{grade}[/{gc}]"
-                )
-                # Line 2: indented stats — category / share / total / avg / count
-                L.append(
-                    f"      [dim][{cat_str}]"
-                    f"  {row['pct']:5.1f}%"
-                    f"  {_fmt_ns(row['total_ns']):>9}"
-                    f"  avg {_fmt_ns(avg_ns)}"
-                    f"  {row['count']}×[/dim]"
-                )
-        L.append("")
-
-        # ── BOTTLENECK ADVISOR ────────────────────────────────────────────
+    # Icons are plain box-drawing/geometric-shape glyphs (matching
+    # _top_findings' "!"/"▲"/"◆" vocabulary), deliberately not emoji --
+    # emoji glyph coverage over a bare SSH session to an HPC cluster is
+    # unreliable (missing glyphs silently fall back to whatever the local
+    # font substitutes, e.g. a stray unrelated letter) and many render as
+    # double-width, which would also throw off the fixed `tip[:2]` icon
+    # slice every caller here relies on.
+    if any(b in _GPU_CATS for b in (meta.backends_used or [])):
         try:
-            from ..output.summary import _bottleneck_analysis
-            ctr_sub: dict[str, float] = {}
-            for k in ("ipc", "cache_miss_pct", "branch_miss_pct"):
-                if k in ctrs_last: ctr_sub[k] = ctrs_last[k]
-            tips = _bottleneck_analysis(trace, ctr_sub)
-            if tips:
-                _sec("BOTTLENECK ADVISOR", "⚡")
-                for tip in tips:
-                    icon = tip[:2]
-                    body = tip[2:].strip()
-                    words, lines_w, cur = body.split(), [], ""
-                    for w in words:
-                        if len(cur) + len(w) + 1 > 64:
-                            lines_w.append(cur); cur = w
-                        else:
-                            cur = (cur + " " + w).strip()
-                    if cur: lines_w.append(cur)
-                    for j, wl in enumerate(lines_w):
-                        pfx = f"  {icon} " if j == 0 else "      "
-                        L.append(f"{pfx}[dim]{wl}[/dim]")
-                    L.append("")
+            from ..analysis.cct import gpu_starvation
+            sv = gpu_starvation(trace)
+            if sv["launch_gap_pct"] > 30:
+                tips.append(
+                    f"! Low GPU occupancy — idle {sv['launch_gap_pct']:.0f}% of wall "
+                    f"time between kernel launches; check CPU-side work in between")
+            if sv["sync_stall_pct"] > 20:
+                tips.append(
+                    f"▲ High GPU sync stall ({sv['sync_stall_pct']:.0f}%) — "
+                    f"consider async launches or batching kernel submissions")
         except Exception:
             pass
 
-        return "\n".join(L)
+    ipc = ctrs.get("ipc", 0.0)
+    if 0 < ipc < 1.0:
+        tips.append(f"▲ Low IPC ({ipc:.2f}) — likely stalled on memory or branch mispredicts")
+
+    cache_miss = ctrs.get("cache_miss_pct", -1.0)
+    if cache_miss >= 20:
+        tips.append(f"▲ High LLC miss rate ({cache_miss:.0f}%) — working set may exceed cache")
+
+    try:
+        from ..analysis.pop_efficiency import useful_time_by_pid, load_balance
+        lb = load_balance(useful_time_by_pid(trace))
+        if lb is not None and lb < 0.85:
+            tips.append(
+                f"▲ Load imbalance ({1/lb:.1f}×) — the busiest rank/thread does "
+                f"{(1/lb - 1)*100:.0f}% more useful work than average; likely the "
+                f"straggler others wait on")
+    except Exception:
+        pass
+
+    return tips
+
+
+def _diagnose(trace: Trace) -> tuple[str, str]:
+    """One-line overall diagnosis + a Rich color, for the Dashboard's
+    headline DIAGNOSIS card. Uses the same thresholds as
+    _bottleneck_analysis/_top_findings so all three never disagree."""
+    meta  = trace.metadata
+    backs = meta.backends_used or []
+
+    if any(b in _GPU_CATS for b in backs):
+        try:
+            from ..analysis.cct import gpu_starvation
+            sv = gpu_starvation(trace)
+            if sv["launch_gap_pct"] > 30:
+                return "GPU starvation", "red"
+            if sv["sync_stall_pct"] > 20:
+                return "GPU sync-bound", "yellow"
+            if sv["gpu_active_pct"] >= 70:
+                return "GPU-bound", "bright_green"
+        except Exception:
+            pass
+
+    if "mpi" in backs:
+        try:
+            from ..analysis.pop_efficiency import useful_time_by_pid, load_balance
+            lb = load_balance(useful_time_by_pid(trace))
+            if lb is not None and lb < 0.7:
+                return "Load imbalance", "red"
+            if lb is not None and lb < 0.85:
+                return "Mild imbalance", "yellow"
+        except Exception:
+            pass
+
+    stats = trace.aggregated_stats()
+    if stats and stats[0]["pct"] > 40:
+        return f"{stats[0]['category']}-bound", "cyan"
+
+    return "Balanced", "bright_green"
+
+
+def _top_findings(trace: Trace) -> list[tuple[str, str, str, str]]:
+    """(icon, color, title, metric) tuples for the Dashboard's "Top
+    findings" panel, most-actionable first. Always tries one cheap,
+    always-available fallback (the single hottest function's share of
+    total time) so even a plain single-threaded CPU trace shows something
+    instead of an empty panel."""
+    out: list[tuple[str, str, str, str]] = []
+    meta = trace.metadata
+
+    if any(b in _GPU_CATS for b in (meta.backends_used or [])):
+        try:
+            from ..analysis.cct import gpu_starvation
+            sv = gpu_starvation(trace)
+            if sv["launch_gap_pct"] > 30:
+                out.append(("!", "red", "Low GPU occupancy",
+                            f"{sv['gpu_active_pct']:.0f}% active"))
+            if sv["sync_stall_pct"] > 20:
+                out.append(("▲", "yellow", "High GPU sync stall",
+                            f"{sv['sync_stall_pct']:.0f}%"))
+        except Exception:
+            pass
+
+    try:
+        from ..analysis.pop_efficiency import useful_time_by_pid, load_balance
+        lb = load_balance(useful_time_by_pid(trace))
+        if lb is not None and lb < 0.85:
+            out.append(("▲", "yellow", "Load imbalance", f"{1/lb:.1f}×"))
+    except Exception:
+        pass
+
+    stats = trace.aggregated_stats()
+    if stats and stats[0]["pct"] > 30:
+        out.append((
+            "◆", "cyan",
+            f"{_fmt_kernel_name(stats[0]['name'])[:28]} dominates",
+            f"{stats[0]['pct']:.0f}% of total time",
+        ))
+
+    return out[:4]
+
+
+def _mini_row(spans: list, width: int, view_start: int, view_dur: float, color: str) -> Text:
+    """Coarse fixed-width density row for the Dashboard's timeline preview:
+    a simplified, loop-based cousin of TimelineWidget._density_row. Fine at
+    preview width/span-count — the numpy-vectorised path in TimelineWidget
+    exists specifically for that widget's full interactive zoom/pan over
+    potentially far more spans."""
+    row = Text()
+    if view_dur <= 0 or width <= 0:
+        return row
+    cov = [0.0] * width
+    scale = width / view_dur
+    for s in spans:
+        if s.duration_ns <= 0:
+            continue
+        x0 = max(0.0, min(float(width), (s.start_ns - view_start) * scale))
+        x1 = max(0.0, min(float(width), (s.start_ns + s.duration_ns - view_start) * scale))
+        if x1 <= x0:
+            ix = min(int(x0), width - 1)
+            if ix >= 0:
+                cov[ix] = max(cov[ix], 0.2)
+            continue
+        i0, i1 = int(x0), min(int(x1), width - 1)
+        for i in range(i0, i1 + 1):
+            cov[i] = 1.0
+    for c in cov:
+        row.append("█" if c > 0.05 else " ", style=color if c > 0.05 else "")
+    return row
+
+
+def _source_snippet(trace: Trace, context: int = 3) -> Text | None:
+    """Source lines around the top hotspot's file/line tag (the same
+    file=/line= tags HotspotsWidget already uses for its own inline
+    location column), or None if no hotspot carries one, the file doesn't
+    exist on THIS machine, or the tagged line is out of range. A profile
+    collected on a cluster and opened locally routinely hits the "file
+    doesn't exist here" case — that's an expected, not exceptional,
+    outcome, so callers should show an explanatory message, not blank."""
+    for row in trace.aggregated_stats():
+        file_tag = line_tag = None
+        for s in trace.spans:
+            if s.name == row["name"] and s.tags.get("file"):
+                file_tag, line_tag = s.tags["file"], s.tags.get("line")
+                break
+        if not file_tag:
+            continue
+        try:
+            line_no = int(line_tag)
+        except (TypeError, ValueError):
+            continue
+        path = Path(file_tag)
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        if not (1 <= line_no <= len(lines)):
+            continue
+
+        lo = max(1, line_no - context)
+        hi = min(len(lines), line_no + context)
+        gw = len(str(hi))
+        out = Text()
+        out.append(f"{path.name}  ·  {row['name'][:24]}\n", style="dim cyan")
+        for ln in range(lo, hi + 1):
+            hot = ln == line_no
+            out.append(f"{'▶' if hot else ' '}{ln:>{gw}} │ ", style="bold yellow" if hot else "dim")
+            out.append(f"{lines[ln - 1]}\n", style="bold" if hot else "dim")
+        return out
+    return None
+
+
+# ── Overview tab ─────────────────────────────────────────────────────────────
+
+class DashboardWidget(Widget):
+    """
+    Landing-page dashboard: five headline stat cards, a condensed
+    multi-category timeline preview, actionable findings, a hot-kernels
+    table, and (when file/line tags plus the source file itself are
+    available) correlated source context for the top hotspot.
+    """
+
+    DEFAULT_CSS = """
+    DashboardWidget { height: 1fr; }
+    #dash-stats { height: 5; margin: 0 0 1 0; }
+    .stat-card {
+        width: 1fr; height: 100%;
+        border: round $primary;
+        padding: 0 1;
+        margin: 0 1 0 0;
+    }
+    .stat-card:last-of-type { margin-right: 0; }
+    #dash-grid { height: 1fr; grid-size: 2 2; grid-gutter: 1; }
+    .dash-panel { border: round $primary; padding: 0 1; height: 1fr; }
+    """
+
+    def __init__(self, trace: Trace, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.trace = trace
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="dash-stats"):
+            yield Static(id="stat-diag", classes="stat-card")
+            yield Static(id="stat-wall", classes="stat-card")
+            yield Static(id="stat-gpu",  classes="stat-card")
+            yield Static(id="stat-wait", classes="stat-card")
+            yield Static(id="stat-mem",  classes="stat-card")
+        with Grid(id="dash-grid"):
+            yield Static(id="dash-timeline", classes="dash-panel")
+            yield Static(id="dash-findings", classes="dash-panel")
+            yield DataTable(id="dash-kernels", cursor_type="row", classes="dash-panel")
+            yield Static(id="dash-source", classes="dash-panel")
+
+    def on_mount(self) -> None:
+        self._populate()
+
+    def _populate(self) -> None:  # noqa: C901 — one straight-line pass over 5+4 panels
+        trace   = self.trace
+        wall_ns = _trace_wall_ns(trace)
+        meta    = trace.metadata
+
+        diag_label, diag_color = _diagnose(trace)
+        self.query_one("#stat-diag", Static).update(Text.from_markup(
+            f"[dim]DIAGNOSIS[/dim]\n[bold {diag_color}]{diag_label}[/bold {diag_color}]"))
+        self.query_one("#stat-wall", Static).update(Text.from_markup(
+            f"[dim]WALL TIME[/dim]\n[bold]{_fmt_ns(wall_ns)}[/bold]"))
+
+        gpu_pct = None
+        if any(b in _GPU_CATS for b in (meta.backends_used or [])):
+            try:
+                from ..analysis.cct import gpu_starvation
+                gpu_pct = gpu_starvation(trace)["gpu_active_pct"]
+            except Exception:
+                gpu_pct = None
+        if gpu_pct is not None:
+            _, gcol = _grade(gpu_pct)
+            gpu_text = f"[dim]GPU ACTIVE[/dim]\n[bold {gcol}]{gpu_pct:.0f}%[/bold {gcol}]"
+        else:
+            gpu_text = "[dim]GPU ACTIVE[/dim]\n[dim]n/a[/dim]"
+        self.query_one("#stat-gpu", Static).update(Text.from_markup(gpu_text))
+
+        mpi_present = any(s.category.value == "mpi" for s in trace.spans)
+        if mpi_present:
+            wait_ns    = _merged_ns([s for s in trace.spans if s.category.value == "mpi"])
+            wait_label = "MPI WAIT"
+        else:
+            wait_ns    = _merged_ns([s for s in trace.spans if s.category.value == "sync"])
+            wait_label = "SYNC WAIT"
+        wait_pct = 100.0 * wait_ns / wall_ns
+        wcol = "red" if wait_pct >= 40 else ("yellow" if wait_pct >= 20 else "bright_green")
+        self.query_one("#stat-wait", Static).update(Text.from_markup(
+            f"[dim]{wait_label}[/dim]\n[bold {wcol}]{wait_pct:.0f}%[/bold {wcol}]"))
+
+        ctrs = {c.name: c.value for c in trace.counters}
+        rss  = ctrs.get("process_max_rss_bytes", 0.0)
+        if rss > 0:
+            mem_str = _fmt_bytes(rss)
+        else:
+            vram_total = sum(v for k, v in ctrs.items() if k.startswith("gpu_mem_used_bytes"))
+            mem_str = _fmt_bytes(vram_total) if vram_total > 0 else "n/a"
+        self.query_one("#stat-mem", Static).update(Text.from_markup(
+            f"[dim]PEAK MEMORY[/dim]\n[bold]{mem_str}[/bold]"))
+
+        # ── Execution timeline preview: top-3 categories by accumulated time ──
+        tl_panel = self.query_one("#dash-timeline", Static)
+        tl_panel.border_title = "Execution timeline"
+        by_cat: dict[str, list] = defaultdict(list)
+        for s in trace.spans:
+            if s.duration_ns > 0:
+                by_cat[s.category.value].append(s)
+        top_cats = sorted(by_cat.items(), key=lambda kv: -sum(s.duration_ns for s in kv[1]))[:3]
+        timed = [s for s in trace.spans if s.duration_ns > 0]
+        view_start = min((s.start_ns for s in timed), default=0)
+        view_end   = max((s.end_ns for s in timed), default=1)
+        view_dur   = max(view_end - view_start, 1)
+        width = max(10, self.size.width // 2 - 12) if self.size.width else 40
+
+        body = Text()
+        if not top_cats:
+            body.append("No timed spans recorded.", style="dim")
+        for cat, cspans in top_cats:
+            color = _cat_color(cat)
+            body.append(f"{cat:<8}", style=f"bold {color}")
+            body.append_text(_mini_row(cspans, width, view_start, view_dur, color))
+            body.append("\n")
+        if top_cats:
+            body.append("\n")
+            body.append_text(Text.from_markup(
+                "  ".join(f"[{_cat_color(c)}]■[/{_cat_color(c)}] {c}" for c, _ in top_cats)))
+        tl_panel.update(body)
+
+        # ── Top findings ──────────────────────────────────────────────────
+        f_panel = self.query_one("#dash-findings", Static)
+        f_panel.border_title = "Top findings"
+        findings = _top_findings(trace)
+        if findings:
+            ftext = Text()
+            for icon, color, title, metric in findings:
+                ftext.append(f"{icon} ", style=f"bold {color}")
+                ftext.append(title, style="bold")
+                ftext.append(f"\n   {metric}\n", style=color)
+            f_panel.update(ftext)
+        else:
+            f_panel.update(Text("No actionable findings — looks balanced.", style="dim"))
+
+        # ── Hot kernels ───────────────────────────────────────────────────
+        dt = self.query_one("#dash-kernels", DataTable)
+        dt.border_title = "Hot kernels"
+        dt.add_columns("Kernel", "Calls", "Total", "Share")
+        stats     = trace.aggregated_stats()
+        total_all = sum(r["total_ns"] for r in stats) or 1
+        for row in stats[:8]:
+            color = _cat_color(row["category"])
+            dt.add_row(
+                Text(_fmt_kernel_name(row["name"])[:30], style=f"bold {color}"),
+                str(row["count"]),
+                _fmt_ns(row["total_ns"]),
+                f"{row['total_ns']/total_all*100:.1f}%",
+            )
+
+        # ── Source correlation ───────────────────────────────────────────
+        s_panel = self.query_one("#dash-source", Static)
+        s_panel.border_title = "Source correlation"
+        snippet = _source_snippet(trace)
+        s_panel.update(snippet if snippet is not None else Text(
+            "No source correlation available — either the hottest function "
+            "carries no file/line tag, or its source file isn't present on "
+            "this machine (expected when viewing a trace collected "
+            "elsewhere, e.g. on a cluster).",
+            style="dim"))
 
 
 # ── Timeline widget ───────────────────────────────────────────────────────────
@@ -873,11 +977,11 @@ class TimelineWidget(Widget):
     TimelineWidget {
         height: 1fr;
         background: $surface;
-        border: solid $primary;
+        border: round $primary;
         padding: 0 1;
     }
     TimelineWidget:focus {
-        border: solid $accent;
+        border: round $accent;
     }
     """
 
@@ -900,6 +1004,11 @@ class TimelineWidget(Widget):
     view_y: reactive[int]   = reactive(0)
     zoom:   reactive[float] = reactive(1.0)
     _hover: reactive[str]   = reactive("")   # hover info shown in status bar
+    # id() of the span currently under the cursor, or 0 for none -- gates
+    # which connector lines render() actually draws (see _connectors):
+    # drawing every MPI/NCCL edge at once on a busy trace is a hairball,
+    # so only the hovered span's own edges are shown, on demand.
+    _hover_span_id: reactive[int] = reactive(0)
 
     # label column: "omp  T12  (120)" = up to 17 chars
     _LABEL_W = 17
@@ -913,6 +1022,7 @@ class TimelineWidget(Widget):
 
     def __init__(self, trace: Trace, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.border_title = "Timeline view"
         self.trace        = trace
         self._lanes       = trace.lanes()
         self._lane_counts = {k: len(v) for k, v in self._lanes.items()}
@@ -932,6 +1042,26 @@ class TimelineWidget(Widget):
             if "/stream-" in ln
         })
         self._stream_seq: dict[int, int] = {sid: sid for sid in all_sids}
+
+        # MPI lane -> that rank's own rank= tag value, when known -- "mpi
+        # rank2" reads far more meaningfully than a generic "mpi T3"
+        # sequential thread number, since rank is what a user actually
+        # thinks in terms of. Every span on one OS thread within one MPI
+        # process reports the same rank, so the first one found suffices.
+        # Falls back to the generic thread-sequence label (via
+        # _lane_label's existing logic) for any mpi lane where no span
+        # happens to carry a rank= tag (e.g. collectives use rank= too, but
+        # a lane with zero mpi spans somehow wouldn't be a /mpi lane at
+        # all, so this is only a defensive fallback, not an expected case).
+        self._lane_rank: dict[str, str] = {}
+        for lane_name, lane_spans in self._lanes.items():
+            if not lane_name.startswith("mpi/"):
+                continue
+            for s in lane_spans:
+                rank = s.tags.get("rank")
+                if rank is not None:
+                    self._lane_rank[lane_name] = rank
+                    break
 
         # Build span_id → name lookup for hover parent annotation.
         self._sid_name: dict[str, str] = {
@@ -977,20 +1107,40 @@ class TimelineWidget(Widget):
             self._view_end   = trace.metadata.end_time_ns or self._view_start + 1
         self._trace_dur = max(self._view_end - self._view_start, 1)
 
-        # Per-function color map — encounter-order assignment avoids hash collisions.
-        seen: dict[str, int] = {}
-        for s in (all_spans if all_spans else []):
-            if s.name not in seen:
-                seen[s.name] = len(seen)
+        # Per-function color map — stable hash-based assignment: the same
+        # function name gets the same color across DIFFERENT traces/runs,
+        # not just within one. The previous scheme assigned colors by
+        # first-seen (encounter) order, which depends on arbitrary thread-
+        # scheduling order and so gave the same function a different color
+        # from one run to the next -- bad for building muscle memory
+        # across repeated profiling sessions of the same program.
+        #
+        # A function's PREFERRED palette slot is crc32(name) % palette size
+        # (crc32, not Python's builtin hash() -- the latter is randomly
+        # salted per-process for strings by default, defeating the whole
+        # point of a stable assignment). If two distinct names in THIS
+        # trace prefer the same slot, the one that sorts later probes
+        # forward (open addressing) to the next free slot -- so up to
+        # len(_SPAN_PALETTE) distinct functions still always get visually
+        # distinct colors within one trace, matching the old guarantee;
+        # a name only shifts off its preferred slot when the palette is
+        # genuinely crowded (more distinct functions than colors), and
+        # which names collide (not WHETHER any do) is itself a
+        # deterministic function of the name set, not of render order.
+        distinct_names = sorted({s.name for s in (all_spans if all_spans else [])})
+        assigned: dict[str, int] = {}
+        taken: set[int] = set()
+        for name in distinct_names:
+            idx = zlib.crc32(name.encode("utf-8")) % len(_SPAN_PALETTE)
+            while idx in taken and len(taken) < len(_SPAN_PALETTE):
+                idx = (idx + 1) % len(_SPAN_PALETTE)
+            assigned[name] = idx
+            taken.add(idx)
         self._func_colors: dict[str, str] = {
-            name: _SPAN_PALETTE[idx % len(_SPAN_PALETTE)]
-            for name, idx in seen.items()
+            name: _SPAN_PALETTE[idx] for name, idx in assigned.items()
         }
         # Integer palette index per function — used by the numpy render path.
-        self._func_color_idx: dict[str, int] = {
-            name: idx % len(_SPAN_PALETTE)
-            for name, idx in seen.items()
-        }
+        self._func_color_idx: dict[str, int] = assigned
 
         # ── Spatial index + numpy column arrays ──────────────────────────────
         # Sort each lane once by start_ns; keep numpy arrays of start, end, and
@@ -1028,8 +1178,15 @@ class TimelineWidget(Widget):
         # construction, same as every other precomputed structure above --
         # TimelineWidget is built once per loaded/completed trace (see
         # ProfilerApp.compose), not live-refreshed as new events stream in.
-        # (pred_lane, pred_mid_ns, succ_lane, succ_mid_ns, confidence)
-        self._connectors: list[tuple[str, float, str, float, str]] = []
+        #
+        # Drawing EVERY connector simultaneously on a busy trace produces a
+        # hairball of overlapping lines -- render() only actually draws the
+        # ones touching the currently-hovered span (see _hover_span_id),
+        # so pred_span_id/succ_span_id are kept alongside the lane/time
+        # data specifically to make that O(1)-per-connector filter possible
+        # without re-walking the dependency graph on every mouse move.
+        # (pred_lane, pred_mid_ns, succ_lane, succ_mid_ns, confidence, pred_span_id, succ_span_id)
+        self._connectors: list[tuple[str, float, str, float, str, int, int]] = []
         try:
             from ..analysis import criticalpath as _cp
             cp_spans, cp_preds = _cp.build_dependency_graph(trace)
@@ -1054,7 +1211,8 @@ class TimelineWidget(Widget):
                     if pred_lane is None or pred_lane == succ_lane:
                         continue
                     pred_mid = (pred.start_ns + pred.end_ns) / 2.0
-                    self._connectors.append((pred_lane, pred_mid, succ_lane, succ_mid, confidence))
+                    self._connectors.append(
+                        (pred_lane, pred_mid, succ_lane, succ_mid, confidence, id(pred), id(succ)))
         except Exception:
             # Connector lines are a display enhancement layered on an
             # otherwise-independent, already-working Timeline -- a failure
@@ -1062,6 +1220,15 @@ class TimelineWidget(Widget):
             # handle) must not take down the whole tab. Falls back to no
             # connectors, same as before this feature existed.
             self._connectors = []
+
+        # span id -> how many connectors touch it, precomputed once so the
+        # hover-text "(N links)" hint (on_mouse_move) is an O(1) lookup
+        # instead of a linear scan of self._connectors on every pixel of
+        # mouse movement.
+        self._connector_count: dict[int, int] = defaultdict(int)
+        for _pl, _pn, _sl, _sn, _conf, pred_sid, succ_sid in self._connectors:
+            self._connector_count[pred_sid] += 1
+            self._connector_count[succ_sid] += 1
 
     def _lane_label(self, lane_name: str) -> str:
         parts = lane_name.split("/", 1)
@@ -1072,12 +1239,19 @@ class TimelineWidget(Widget):
         if len(parts) > 1:
             suffix = parts[1]
             if suffix.startswith("thread-"):
-                try:
-                    tid = int(suffix.removeprefix("thread-"))
-                    seq = self._tid_seq.get(tid, tid)
-                    core = f"{abbr:<5} T{seq}"
-                except ValueError:
-                    core = abbr
+                rank = self._lane_rank.get(lane_name)
+                if rank is not None:
+                    # "mpi rank2" reads far more meaningfully than a
+                    # generic sequential "mpi T3" -- rank is what a user
+                    # actually thinks in terms of for an MPI trace.
+                    core = f"{abbr:<5} rank{rank}"
+                else:
+                    try:
+                        tid = int(suffix.removeprefix("thread-"))
+                        seq = self._tid_seq.get(tid, tid)
+                        core = f"{abbr:<5} T{seq}"
+                    except ValueError:
+                        core = abbr
             elif suffix.startswith("stream-"):
                 try:
                     sid = int(suffix.removeprefix("stream-"))
@@ -1113,7 +1287,8 @@ class TimelineWidget(Widget):
 
         Renders each pixel as:
           █  solid block colored by the function dominating that column
-          ·  dim dot for idle (no span coverage)
+             blank (unstyled space) for idle (no span coverage) -- quieter
+             than a visible dot, which read as noise on sparse traces
         """
         visible_ns = self._trace_dur / self.zoom
         offset_ns  = self._trace_dur * self.view_x / (width * self.zoom)
@@ -1128,7 +1303,7 @@ class TimelineWidget(Widget):
         hi = int(np.searchsorted(starts, vis_end,             side="right"))
 
         if lo >= hi:
-            return ["·"] * width, ["color(237)"] * width, 0.0
+            return [" "] * width, [""] * width, 0.0
 
         s_ns = self._starts_arr[lane_name][lo:hi].astype(np.float64)
         e_ns = self._ends_arr[lane_name][lo:hi].astype(np.float64)
@@ -1144,7 +1319,7 @@ class TimelineWidget(Widget):
         vis = cx1 > cx0 + 1e-6            # drop zero-width spans
         cx0 = cx0[vis]; cx1 = cx1[vis]; c_np = c_np[vis]
         if len(cx0) == 0:
-            return ["·"] * width, ["color(237)"] * width, 0.0
+            return [" "] * width, [""] * width, 0.0
 
         ix0 = cx0.astype(np.int32)
         ix1 = np.minimum(cx1.astype(np.int32), width - 1)
@@ -1218,8 +1393,8 @@ class TimelineWidget(Widget):
         # per-column Python loop is negligible next to the numpy work above
         # over however many thousand spans are actually in view.
         IDLE = 0.05
-        chars:  list[str] = ["·"] * width
-        styles: list[str] = ["color(237)"] * width
+        chars:  list[str] = [" "] * width
+        styles: list[str] = [""] * width
         for i in range(width):
             if activity[i] > IDLE:
                 ci = int(dom_idx[i])
@@ -1268,6 +1443,7 @@ class TimelineWidget(Widget):
         lane_row = y - 2
         if lane_row < 0 or x < 0 or x >= width:
             self._hover = ""
+            self._hover_span_id = 0
             return
 
         visible_ns = self._trace_dur / self.zoom
@@ -1284,12 +1460,14 @@ class TimelineWidget(Widget):
         actual_lane = lo + lane_idx
         if actual_lane >= hi:
             self._hover = ""
+            self._hover_span_id = 0
             return
 
         lane_name   = self._lane_names[actual_lane]
         sorted_spans = self._sorted_spans[lane_name]
         if not sorted_spans:
             self._hover = ""
+            self._hover_span_id = 0
             return
 
         # Time position the mouse is pointing at (absolute trace time)
@@ -1307,6 +1485,7 @@ class TimelineWidget(Widget):
                       if s.start_ns <= cursor_abs <= s.end_ns]
         if not containing:
             self._hover = ""
+            self._hover_span_id = 0
             return
 
         # If multiple spans overlap here, prefer the shortest (most specific)
@@ -1318,10 +1497,15 @@ class TimelineWidget(Widget):
         if span.parent_span_id:
             parent_name = self._sid_name.get(span.parent_span_id, span.parent_span_id[:8])
             hover += f"  ↑{parent_name}"
+        n_links = self._connector_count.get(id(span), 0)
+        if n_links:
+            hover += f"  ⇄{n_links}"
         self._hover = hover
+        self._hover_span_id = id(span)
 
     def on_leave(self, _event: Any) -> None:
         self._hover = ""
+        self._hover_span_id = 0
 
     def render(self) -> Any:  # noqa: ANN401
         UTIL_W = 6
@@ -1372,12 +1556,20 @@ class TimelineWidget(Widget):
         # which is more informative than vanishing entirely; a connector
         # with BOTH ends off the same side is skipped since nothing about
         # it would be visible anyway.
+        #
+        # Only the HOVERED span's own connectors are drawn, not every one
+        # at once — on a busy trace, rendering all of them simultaneously
+        # is a hairball of overlapping lines that reads as noise rather
+        # than information. Hovering a specific send/recv or collective
+        # call reveals just what that call was waiting on, on demand.
         canvas: BrailleCanvas | None = None
-        if self._connectors and lanes_drawn:
+        if self._connectors and lanes_drawn and self._hover_span_id:
             lane_row: dict[str, int] = {name: i for i, name in enumerate(visible_lanes)}
             canvas = BrailleCanvas(cols=width, rows=lanes_drawn * 2)
             scale = width * self.zoom / self._trace_dur
-            for pred_lane, pred_ns, succ_lane, succ_ns, confidence in self._connectors:
+            for pred_lane, pred_ns, succ_lane, succ_ns, confidence, pred_sid, succ_sid in self._connectors:
+                if self._hover_span_id not in (pred_sid, succ_sid):
+                    continue
                 pred_row = lane_row.get(pred_lane)
                 succ_row = lane_row.get(succ_lane)
                 if pred_row is None or succ_row is None:
@@ -1389,13 +1581,26 @@ class TimelineWidget(Widget):
                 pred_col = max(0.0, min(float(width), pred_col))
                 succ_col = max(0.0, min(float(width), succ_col))
                 style = _CONNECTOR_STYLE.get(confidence, "grey58")
-                # Target the middle dot-row of each lane's DATA row
-                # specifically (row*2 = that lane's starting character row;
-                # *4 = dot rows per character row; +2 = vertical center of
-                # the 4-dot-tall data row, not the spacer row after it).
-                dot_y0 = pred_row * 2 * 4 + 2
-                dot_y1 = succ_row * 2 * 4 + 2
-                canvas.line(int(pred_col * 2), dot_y0, int(succ_col * 2), dot_y1, style=style)
+                # Elbow routing (vertical - horizontal - vertical), not a
+                # raw diagonal: a straight line from one lane's data row to
+                # another's sweeps across every column AND every
+                # intermediate row along the way, painting over whatever
+                # span data happens to be there. Routing the long
+                # horizontal traversal through the SOURCE lane's own
+                # spacer row (never a data row) means only the final short
+                # vertical drop/rise into the target actually crosses
+                # other lanes' content — as a single thin vertical line at
+                # one column, not a diagonal smear across the whole width.
+                # (row*8 = that lane's starting dot-row, 2 char rows x 4
+                # dots each; +2 = data row's own vertical center; +6 =
+                # its adjacent spacer row's center.)
+                pred_data_y   = pred_row * 8 + 2
+                pred_spacer_y = pred_row * 8 + 6
+                succ_data_y   = succ_row * 8 + 2
+                x0, x1 = int(pred_col * 2), int(succ_col * 2)
+                canvas.line(x0, pred_data_y, x0, pred_spacer_y, style=style)
+                canvas.line(x0, pred_spacer_y, x1, pred_spacer_y, style=style)
+                canvas.line(x1, pred_spacer_y, x1, succ_data_y, style=style)
 
         for row_idx, lane_name in enumerate(visible_lanes):
             cat   = lane_name.split("/")[0]
@@ -1492,15 +1697,20 @@ _SORT_LABELS = ["Total ▼",  "Avg ▼",  "Count ▼","Min ▼", "Max ▼"]
 class HotspotsWidget(Widget):
     """
     VTune-style sortable function table with inline % bars.
-    s → cycle sort column; / → focus filter input; ↑↓ → navigate rows.
+    s → cycle sort column; / → focus filter input; j/k or ↑↓ → navigate rows.
     """
 
     DEFAULT_CSS = """
-    HotspotsWidget { height: 1fr; layout: vertical; }
+    HotspotsWidget { height: 1fr; layout: vertical; border: round $primary; padding: 0 1; }
     #hs-filter    { height: 3; dock: top; }
     #hs-table     { height: 1fr; }
     #hs-sort-hint { height: 1; dock: bottom; color: $text-muted; }
     """
+
+    BINDINGS = [
+        Binding("j", "cursor_down_row", "↓", show=False),
+        Binding("k", "cursor_up_row",   "↑", show=False),
+    ]
 
     sort_idx:    reactive[int] = reactive(0)
     filter_text: reactive[str] = reactive("")
@@ -1508,14 +1718,28 @@ class HotspotsWidget(Widget):
     def __init__(self, trace: Trace, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.trace = trace
+        self.border_title = "Kernels"
 
     def compose(self) -> ComposeResult:
         yield Input(placeholder="  / filter by name…", id="hs-filter")
         yield DataTable(id="hs-table", cursor_type="row")
-        yield Static("  [dim][s] cycle sort  [/] filter  [↑↓] navigate[/dim]", id="hs-sort-hint")
+        # NOTE: the literal brackets below must be escaped (\[) -- unescaped
+        # "[s]"/"[/]" collide with Rich markup (strikethrough-open /
+        # close-most-recent-tag), which silently struck through and
+        # truncated this exact hint text before this fix.
+        yield Static(
+            "  [dim]\\[s] cycle sort   \\[/] filter   \\[j/k ↑↓] navigate[/dim]",
+            id="hs-sort-hint",
+        )
 
     def on_mount(self) -> None:
         self._rebuild()
+
+    def action_cursor_down_row(self) -> None:
+        self.query_one("#hs-table", DataTable).action_cursor_down()
+
+    def action_cursor_up_row(self) -> None:
+        self.query_one("#hs-table", DataTable).action_cursor_up()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "hs-filter":
@@ -1582,6 +1806,128 @@ class HotspotsWidget(Widget):
                 Text(bar, style=f"bold {color}"),
                 key=row["name"],
             )
+
+
+# ── Roofline widget ───────────────────────────────────────────────────────────
+
+def _has_roofline_data(trace: Trace) -> bool:
+    """Cheap existence check used by ProfilerApp.compose() to decide
+    whether the Roofline tab is worth showing at all — mirrors the
+    trace._has_stacks / trace.disasm checks already used for the Call
+    Tree / Disasm tabs' own conditional visibility."""
+    try:
+        from ..analysis.roofline import analyze_trace
+        pts = analyze_trace(trace)
+        return any(m.arith_intensity > 0 and m.achieved_tflops > 0 for _, m in pts)
+    except Exception:
+        return False
+
+
+class RooflineWidget(Widget):
+    """
+    Log-log roofline scatter — one dot per profiled GPU kernel — drawn with
+    the same Braille sub-cell canvas Timeline uses for its communication
+    connectors (src/ui/braille_canvas.py). Reuses analysis/roofline.py's
+    existing per-kernel arithmetic-intensity / achieved-TFLOP/s estimates
+    (hardware-counter based when available, disassembly-based estimate
+    otherwise — see KernelMetrics.data_source) rather than computing
+    anything new here; this widget's job is only to plot them.
+    """
+
+    DEFAULT_CSS = """
+    RooflineWidget { height: 1fr; border: round $primary; padding: 0 1; }
+    """
+
+    _BOUND_COLOR = {"compute": "bright_cyan", "memory": "bright_magenta", "unknown": "grey58"}
+
+    def __init__(self, trace: Trace, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.trace = trace
+        self.border_title = "Roofline"
+        try:
+            from ..analysis.roofline import analyze_trace
+            self._metrics = analyze_trace(trace)
+        except Exception:
+            self._metrics = []
+
+    def render(self) -> Any:  # noqa: ANN401
+        pts = [(d, m) for d, m in self._metrics
+               if m.arith_intensity > 0 and m.achieved_tflops > 0]
+        if not pts:
+            return Text(
+                "No roofline data for this trace — needs GPU hardware-counter\n"
+                "or disassembly-estimated kernel metrics. Try:\n\n"
+                "  hprofiler roofline --backend <backend> -- ./app",
+                style="dim",
+            )
+
+        width  = max(20, self.size.width - 2) if self.size.width else 60
+        height = max(8, self.size.height - 3) if self.size.height else 20
+
+        ai_vals    = [m.arith_intensity  for _, m in pts]
+        tflop_vals = [m.achieved_tflops  for _, m in pts]
+        ridge_vals = [m.ridge            for _, m in pts if m.ridge > 0]
+        peak_vals  = [d.fp32_tflops      for d, _ in pts if d.fp32_tflops > 0]
+
+        lo_x = math.log10(max(min(ai_vals) * 0.5, 1e-3))
+        hi_x = math.log10(max(max(ai_vals + ridge_vals) * 2.0, 10 ** (lo_x + 1)))
+        lo_y = math.log10(max(min(tflop_vals) * 0.3, 1e-4))
+        hi_y = math.log10(max(max(tflop_vals + peak_vals) * 1.3, 10 ** (lo_y + 1)))
+
+        def to_dot(ai: float, tf: float) -> tuple[int, int]:
+            fx = (math.log10(max(ai, 1e-6)) - lo_x) / (hi_x - lo_x)
+            fy = (math.log10(max(tf, 1e-6)) - lo_y) / (hi_y - lo_y)
+            fx = min(1.0, max(0.0, fx))
+            fy = min(1.0, max(0.0, fy))
+            return int(fx * (width * 2 - 1)), int((1.0 - fy) * (height * 4 - 1))
+
+        canvas = BrailleCanvas(cols=width, rows=height)
+
+        # Roofline knee per distinct device (bandwidth-bound diagonal up to
+        # the ridge point, then a flat compute-bound ceiling), drawn first
+        # so kernel dots always render on top of it, not underneath.
+        seen: set[str] = set()
+        for dev, m in pts:
+            key = f"{dev.name}:{dev.fp32_tflops:.3f}"
+            if key in seen or dev.fp32_tflops <= 0 or dev.bandwidth_gbs <= 0 or m.ridge <= 0:
+                continue
+            seen.add(key)
+            ai_lo = 10 ** lo_x
+            tf_lo = max(dev.bandwidth_gbs * ai_lo / 1000.0, 1e-6)
+            p0 = to_dot(ai_lo, tf_lo)
+            p1 = to_dot(m.ridge, dev.fp32_tflops)
+            p2 = to_dot(10 ** hi_x, dev.fp32_tflops)
+            canvas.line(p0[0], p0[1], p1[0], p1[1], style="dim white")
+            canvas.line(p1[0], p1[1], p2[0], p2[1], style="dim white")
+
+        for dev, m in pts:
+            x, y = to_dot(m.arith_intensity, m.achieved_tflops)
+            canvas.set_dot(x, y, style=f"bold {self._BOUND_COLOR.get(m.bound, 'grey58')}")
+
+        body = Text()
+        for cy in range(height):
+            for cx in range(width):
+                cell = canvas.cell(cx, cy)
+                if cell is not None:
+                    ch, style = cell
+                    body.append(ch, style=style)
+                else:
+                    body.append(" ")
+            body.append("\n")
+
+        n_compute = sum(1 for _, m in pts if m.bound == "compute")
+        n_memory  = sum(1 for _, m in pts if m.bound == "memory")
+        n_unknown = len(pts) - n_compute - n_memory
+        legend = (
+            f"AI {10**lo_x:.2g}–{10**hi_x:.2g} FLOP/B"
+            f"   TFLOP/s {10**lo_y:.2g}–{10**hi_y:.2g}"
+            f"   [bold bright_cyan]●[/bold bright_cyan] compute {n_compute}"
+            f"   [bold bright_magenta]●[/bold bright_magenta] memory {n_memory}"
+        )
+        if n_unknown:
+            legend += f"   [bold grey58]●[/bold grey58] unknown {n_unknown}"
+        body.append_text(Text.from_markup(legend))
+        return body
 
 
 # ── Flame graph widget ────────────────────────────────────────────────────────
@@ -1872,19 +2218,25 @@ class CallTreeWidget(Widget):
     """
 
     DEFAULT_CSS = """
-    CallTreeWidget { height: 1fr; layout: vertical; }
+    CallTreeWidget { height: 1fr; layout: vertical; border: round $primary; padding: 0 1; }
     #ct-tree      { height: 1fr; }
     #ct-hint      { height: 1; dock: bottom; color: $text-muted; }
     """
 
     def __init__(self, trace: Trace, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.border_title = "Call Tree"
         self._trace = trace
 
     def compose(self) -> ComposeResult:
         yield Tree("Call Tree", id="ct-tree")
+        # NOTE: literal brackets must be escaped (\[) -- see HotspotsWidget's
+        # #hs-sort-hint for why an unescaped "[u]"/"[e]"/"[enter/space]"
+        # collides with Rich markup (u = underline shorthand; anything else
+        # bracketed is still consumed as an unrecognised style tag and
+        # silently vanishes from the rendered text either way).
         yield Static(
-            "  [dim][↑↓] navigate  [enter/space] expand  [e] expand all  [u] collapse all[/dim]",
+            "  [dim]\\[↑↓] navigate  \\[enter/space] expand  \\[e] expand all  \\[u] collapse all[/dim]",
             id="ct-hint",
         )
 
@@ -1894,7 +2246,7 @@ class CallTreeWidget(Widget):
     def _rebuild(self) -> None:
         tree: Tree = self.query_one("#ct-tree", Tree)  # type: ignore[type-arg]
         tree.clear()
-        wall_ns = max(self._trace.duration_ns, 1)
+        wall_ns = max(_trace_wall_ns(self._trace), 1)
         spans = [s for s in self._trace.spans if s.duration_ns > 0]
 
         if not spans:
@@ -1957,6 +2309,8 @@ class DisasmWidget(Widget):
     DisasmWidget {
         height: 1fr;
         layout: vertical;
+        border: round $primary;
+        padding: 0 1;
     }
     #disasm-h {
         height: 1fr;
@@ -1989,12 +2343,15 @@ class DisasmWidget(Widget):
     BINDINGS = [
         Binding("up",   "prev_kernel", "↑", show=False),
         Binding("down", "next_kernel", "↓", show=False),
+        Binding("k",    "prev_kernel", "↑", show=False),
+        Binding("j",    "next_kernel", "↓", show=False),
     ]
 
     _sel: reactive[int] = reactive(0)
 
     def __init__(self, trace: Trace, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.border_title = "Source"
         self._trace    = trace
         # Build the ordered kernel list: profiled kernels first (by total time),
         # supplemented by kernels only present in disasm data.
@@ -2342,25 +2699,107 @@ class DisasmWidget(Widget):
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 
+class TopBar(Horizontal):
+    """
+    Replaces Textual's default `Header()` (a generic app-title + clock bar
+    that doesn't carry any profiler-specific context). Left: app name +
+    command. Right: whatever run context actually applies to this trace
+    (rank count, device, wall time) -- fields that don't apply (e.g. no
+    MPI spans, no GPU device) are simply omitted rather than shown as a
+    fake "n/a", since a single-process CPU-only trace has no "rank" concept
+    to begin with.
+    """
+
+    DEFAULT_CSS = """
+    TopBar { height: 1; background: $boost; }
+    TopBar > #topbar-left  { width: 1fr;  content-align: left middle;  padding: 0 1; }
+    TopBar > #topbar-right { width: auto; content-align: right middle; padding: 0 1; color: $text-muted; }
+    """
+
+    def __init__(self, trace: Trace, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._trace = trace
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._left_text(), id="topbar-left")
+        yield Static(self._right_text(), id="topbar-right")
+
+    def _left_text(self) -> Text:
+        meta = self._trace.metadata
+        cmd = f"{meta.command} {' '.join(meta.args[:2])}".strip() or "(no command)"
+        if len(cmd) > 50:
+            cmd = cmd[:47] + "…"
+        return Text.from_markup(f"[bold bright_white]hprofiler[/bold bright_white]  [dim]{cmd}[/dim]")
+
+    def _right_text(self) -> Text:
+        trace = self._trace
+        parts: list[str] = []
+        n_ranks = len({
+            s.tags.get("rank") for s in trace.spans
+            if s.category.value == "mpi" and s.tags.get("rank") is not None
+        })
+        if n_ranks > 1:
+            parts.append(f"{n_ranks} ranks")
+        if trace.devices:
+            dev = trace.devices[0]
+            suffix = f" ×{len(trace.devices)}" if len(trace.devices) > 1 else ""
+            parts.append(f"{dev.name}{suffix}")
+        parts.append(_fmt_ns(_trace_wall_ns(trace)))
+        return Text("  ·  ".join(parts), style="dim")
+
+
+class BottomBar(Static):
+    """
+    Replaces Textual's default `Footer()` (reverse-video key chips) with a
+    plain "key  description" hint row. Text is swapped per active tab (see
+    ProfilerApp.on_tabbed_content_tab_activated / _TAB_HINTS) so the hints
+    shown are always ones that actually do something on the current tab.
+    """
+
+    DEFAULT_CSS = "BottomBar { height: 1; background: $boost; padding: 0 1; }"
+
+    _GLOBAL_HINTS = [("?", "help"), ("1-7", "jump tab"), ("tab", "cycle"), ("q", "quit")]
+
+    def show_hints(self, extra: list[tuple[str, str]]) -> None:
+        text = Text()
+        for i, (key, desc) in enumerate(list(extra) + self._GLOBAL_HINTS):
+            if i:
+                text.append("    ")
+            text.append(key, style="bold bright_cyan")
+            text.append(f" {desc}", style="dim")
+        self.update(text)
+
+
+# Per-tab key hints shown in BottomBar, prepended to BottomBar._GLOBAL_HINTS
+# -- keyed by TabPane id, kept next to ProfilerApp.compose()'s tab wiring so
+# the two stay easy to update together.
+_TAB_HINTS: dict[str, list[tuple[str, str]]] = {
+    "tab-overview": [],
+    # Timeline shows its own live scroll/zoom/offset footer inside the
+    # widget itself (with real-time state the static hint row below can't
+    # carry) -- repeating the same key list here would just duplicate it.
+    "tab-timeline": [],
+    "tab-kernels":  [("j/k", "navigate"), ("s", "sort"), ("/", "filter")],
+    "tab-calltree": [("↑↓", "navigate"), ("enter", "expand")],
+    "tab-roofline": [],
+    "tab-source":   [("j/k", "select kernel")],
+    "tab-system":   [("↑↓", "scroll")],
+    "tab-profile":  [("↑↓", "scroll")],
+}
+
+
 class ProfilerApp(App):
     """Multi-backend profiler TUI."""
 
     CSS = """
     Screen { background: $surface; }
     TabbedContent { height: 1fr; }
-    TabPane { padding: 1 2; }
-    .status-bar {
-        height: 3;
-        background: $boost;
-        padding: 0 2;
-        content-align: left middle;
-        color: $text;
+    TabPane { padding: 1 1; }
+    #system-scroll, #profile-scroll {
+        height: 1fr;
+        border: round $primary;
+        padding: 0 1;
     }
-    HotspotsWidget   { height: 1fr; }
-    DisasmWidget     { height: 1fr; }
-    #system-scroll   { height: 1fr; }
-    #profile-scroll  { height: 1fr; }
-    #overview-scroll { height: 1fr; }
     """
 
     BINDINGS = [
@@ -2368,59 +2807,96 @@ class ProfilerApp(App):
         Binding("question_mark", "help",         "Help"),
         Binding("s",             "cycle_sort",   "Sort",   show=False),
         Binding("slash",         "focus_filter", "Filter", show=False),
+        Binding("1", "goto_tab(1)", "1", show=False),
+        Binding("2", "goto_tab(2)", "2", show=False),
+        Binding("3", "goto_tab(3)", "3", show=False),
+        Binding("4", "goto_tab(4)", "4", show=False),
+        Binding("5", "goto_tab(5)", "5", show=False),
+        Binding("6", "goto_tab(6)", "6", show=False),
+        Binding("7", "goto_tab(7)", "7", show=False),
     ]
 
-    TITLE = "Profiler"
+    TITLE = "hprofiler"
 
     def __init__(self, trace: Trace, collect_disasm: bool = False, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.trace = trace
         self._collect_disasm = collect_disasm
+        # Populated by compose(), in display order -- lets action_goto_tab
+        # map digit keys to whichever tabs actually got composed (Call
+        # Tree/Roofline/Source are conditional), instead of hardcoding ids
+        # that could shift depending on what this trace contains.
+        self._tab_ids: list[str] = []
 
     def compose(self) -> ComposeResult:
-        meta  = self.trace.metadata
-        cmd   = f"{meta.command} {' '.join(meta.args[:2])}"
-        yield Header(name=f"Profiler — {cmd[:60]}")
+        yield TopBar(self.trace, id="top-bar")
 
-        with TabbedContent():
-            with TabPane("System", id="tab-system"):
-                with ScrollableContainer(id="system-scroll"):
-                    yield SystemWidget(self.trace)
+        with TabbedContent(id="main-tabs"):
+            with TabPane("1 Overview", id="tab-overview"):
+                yield DashboardWidget(self.trace)
+            self._tab_ids.append("tab-overview")
 
-            with TabPane("Profile", id="tab-profile"):
-                with ScrollableContainer(id="profile-scroll"):
-                    yield ProfileWidget(self.trace)
-
-            with TabPane("Timeline  [T]", id="tab-timeline"):
+            with TabPane("2 Timeline", id="tab-timeline"):
                 yield TimelineWidget(self.trace)
+            self._tab_ids.append("tab-timeline")
 
-            with TabPane("Hotspots  [H]", id="tab-hotspots"):
+            with TabPane("3 Kernels", id="tab-kernels"):
                 yield HotspotsWidget(self.trace, id="hotspots")
+            self._tab_ids.append("tab-kernels")
 
+            n = 3
             if self.trace._has_stacks:
-                with TabPane("Call Tree  [C]", id="tab-calltree"):
+                n += 1
+                with TabPane(f"{n} Call Tree", id="tab-calltree"):
                     yield CallTreeWidget(self.trace)
+                self._tab_ids.append("tab-calltree")
+
+            if _has_roofline_data(self.trace):
+                n += 1
+                with TabPane(f"{n} Roofline", id="tab-roofline"):
+                    yield RooflineWidget(self.trace)
+                self._tab_ids.append("tab-roofline")
 
             if self._collect_disasm or self.trace.disasm:
-                with TabPane("Disasm  [D]", id="tab-disasm"):
+                n += 1
+                with TabPane(f"{n} Source", id="tab-source"):
                     yield DisasmWidget(self.trace, id="disasm")
+                self._tab_ids.append("tab-source")
 
-        yield Static(self._status_bar(), classes="status-bar")
-        yield Footer()
+            n += 1
+            with TabPane(f"{n} System", id="tab-system"):
+                with ScrollableContainer(id="system-scroll"):
+                    yield SystemWidget(self.trace)
+            self._tab_ids.append("tab-system")
 
-    def _status_bar(self) -> str:
-        meta  = self.trace.metadata
-        dur   = _fmt_ns(self.trace.duration_ns)
-        backs = "  ".join(
-            f"[{_cat_color(b)}]■ {b}[/{_cat_color(b)}]"
-            for b in meta.backends_used
-        ) or "[dim]none[/dim]"
-        return (
-            f"  [bold]Duration:[/bold] [yellow]{dur}[/yellow]    "
-            f"[bold]Spans:[/bold] {len(self.trace.spans)}    "
-            f"{backs}    "
-            f"[dim][?] help[/dim]"
-        )
+            n += 1
+            with TabPane(f"{n} Profile", id="tab-profile"):
+                with ScrollableContainer(id="profile-scroll"):
+                    yield ProfileWidget(self.trace)
+            self._tab_ids.append("tab-profile")
+
+        yield BottomBar(id="bottom-bar")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#system-scroll").border_title = "System"
+            self.query_one("#profile-scroll").border_title = "Profile"
+        except Exception:
+            pass
+        self._update_hints("tab-overview")
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        self._update_hints(event.pane.id)
+
+    def _update_hints(self, tab_id: str | None) -> None:
+        try:
+            self.query_one("#bottom-bar", BottomBar).show_hints(_TAB_HINTS.get(tab_id or "", []))
+        except Exception:
+            pass
+
+    def action_goto_tab(self, n: int) -> None:
+        if 1 <= n <= len(self._tab_ids):
+            self.query_one("#main-tabs", TabbedContent).active = self._tab_ids[n - 1]
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

@@ -50,11 +50,34 @@ Four layers:
     headless `App.run_test()` harness rather than only exercising the
     analysis/hook layers directly. Verifies connector computation
     (cross-lane vs. same-lane skip, MPI/NCCL-only filtering, confidence
-    tiers), that rendering actually produces Braille overlay characters
-    when expected and *none* when there's nothing to connect (a
-    regression guard against the feature silently corrupting the
-    pre-existing Timeline appearance), crash-safety under extreme
-    zoom/pan, and a 64-rank scale check.
+    tiers), that hovering a connector's endpoint actually produces Braille
+    overlay characters while nothing hovered (or an unrelated span
+    hovered) produces *none* -- a regression guard for the hover-gating
+    behavior specifically, which replaced an earlier always-on version --
+    crash-safety under extreme zoom/pan, and a 64-rank scale check.
+  - `test_timeline_widget.py` -- the readability/consistency fixes made
+    alongside the connector feature: deterministic per-function color
+    hashing (same function name gets the same color regardless of
+    insertion order, checked directly, not just "some color got
+    assigned"), MPI lanes labeled by actual `rank=` instead of a generic
+    sequential thread number (with its fallback when no rank is present),
+    and idle columns rendering as blank space instead of a visible dot.
+  - `test_dashboard.py` -- the card-based dashboard redesign of the TUI
+    (`src/ui/app.py`): the Overview tab's diagnosis/stat-card/findings/
+    source-correlation logic (including every adaptive fallback -- no MPI
+    spans, no GPU backend, no file/line tag, source file missing locally,
+    a single-span trace), the Roofline tab's coordinate math and "no data"
+    fallback (verified against synthetic `KernelMetrics`, since this
+    machine has no working GPU driver to produce real ones), numbered/
+    conditional tab composition and digit-key jump (`1`-`7`), and two real
+    bugs the redesign surfaced along the way: `_bottleneck_analysis` was a
+    dead import that silently produced empty results (now a real, shared,
+    tested implementation), and two hint strings relied on unescaped
+    brackets that collide with Rich markup syntax (`[s]`/`[u]` are
+    strikethrough/underline shorthand; anything else bracketed was
+    silently eaten as an unrecognised style tag) -- caught by literally
+    screenshotting the rendered TUI and noticing "cycle sort" struck
+    through, not just by reading the source.
 
 - **Native (C-level) stress tests** (`tests/native/`): infrastructure with
   no GPU/MPI dependency, verified with much stronger tools than the Python
