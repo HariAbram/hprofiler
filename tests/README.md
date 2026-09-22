@@ -29,6 +29,16 @@ Four layers:
     `tests/integration/test_gomp_hook.py`/`test_mpi_protocol.py` for the
     hook side of the same fix). Mocks `disasm/extractor.collect_disasm`
     rather than needing a real binary + `nm`/`objdump`.
+  - `test_disasm_widget_message.py` -- `DisasmWidget`'s (`src/ui/app.py`)
+    "No disassembly available" message: after the fix above, a real user
+    was STILL seeing it -- turned out they were viewing a trace captured
+    before rebuilding the hooks, but the message unconditionally told
+    them to go install `objdump`/`cuobjdump`, which was never the actual
+    problem. It now checks the span's own tags first and gives a
+    different, correct message when no `sym=`/`lib=` tag was ever
+    resolved at all (blames a stale trace / unrebuilt hooks, not missing
+    tools) versus when one IS present but disassembly still failed
+    (where the tool-installation tips are actually relevant).
   - `test_pop_efficiency.py` -- `src/analysis/pop_efficiency.py`: Load
     Balance / Communication Efficiency exact-formula checks, the
     self-calibrated alpha/beta latency-bandwidth fit (verified against a

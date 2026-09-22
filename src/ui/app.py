@@ -2448,13 +2448,71 @@ class DisasmWidget(Widget):
         if name not in disasm:
             msg = Text()
             msg.append(name, style="bold")
-            msg.append("\n\nNo disassembly available for this kernel.\n\n"
-                       "Tips:\n"
-                       "  • For CUDA AoT: install cuobjdump (CUDA toolkit)\n"
-                       "  • For CPU/ACPP: objdump must be installed\n"
-                       "  • For ROCm: install llvm-objdump\n"
-                       "  • JIT cubins are auto-captured when the CUDA hook is loaded",
-                       style="dim")
+
+            # Distinguish two very different failure points that both land
+            # here, so the message doesn't send someone chasing a missing
+            # objdump/cuobjdump install when the real issue is that no
+            # call-site symbol was ever captured for this event in the
+            # first place (e.g. a trace captured before the hooks were
+            # rebuilt with codeptr resolution, or a construct that
+            # genuinely doesn't resolve one yet -- point-to-point MPI,
+            # omp_critical_hold). A real user hit exactly this: the old,
+            # always-the-same "install objdump" tip was actively
+            # misleading when the actual fix was "rebuild and re-capture".
+            tag_info: tuple[str, str] | None = None
+            for s in self._trace.spans:
+                if s.name != name:
+                    continue
+                if s.tags.get("sym"):
+                    tag_info = ("sym", s.tags["sym"])
+                    break
+                if s.tags.get("lib"):
+                    off = s.tags.get("offset", "?")
+                    tag_info = ("lib", f"{s.tags['lib']},offset={off}")
+                    break
+                if s.tags.get("type") == "kernel":
+                    tag_info = ("kernel", "")
+                    break
+
+            if tag_info is None:
+                msg.append(
+                    "\n\nNo disassembly available -- this event has no "
+                    "resolved call-site symbol at all (no sym=/lib= tag on "
+                    "any captured span), so there was nothing to "
+                    "disassemble in the first place. This is NOT a missing "
+                    "objdump/nm problem.\n\n"
+                    "Most likely cause: this trace was captured with an "
+                    "older build of the profiler hooks, from before they "
+                    "resolved call sites for this construct. Rebuild the "
+                    "hooks and capture a FRESH trace -- re-opening an old "
+                    "trace file will never show disassembly here even "
+                    "after rebuilding, since the tag is only written at "
+                    "capture time.\n\n"
+                    "If you already rebuilt and re-ran: point-to-point MPI "
+                    "calls (Send/Recv/Isend/Irecv/Wait*) and OpenMP's "
+                    "omp_critical_hold don't resolve a call site yet -- a "
+                    "known, disclosed gap, not a bug.",
+                    style="dim")
+            elif tag_info[0] == "kernel":
+                msg.append(
+                    "\n\nNo disassembly available for this GPU kernel.\n\n"
+                    "Tips:\n"
+                    "  • For CUDA AoT: install cuobjdump (CUDA toolkit)\n"
+                    "  • For ROCm: install llvm-objdump\n"
+                    "  • JIT cubins are auto-captured when the CUDA hook is loaded",
+                    style="dim")
+            else:
+                kind, detail = tag_info
+                tag_str = f"sym={detail}" if kind == "sym" else detail
+                msg.append(
+                    f"\n\nCall site resolved ({tag_str}) but disassembly "
+                    "still failed -- likely a missing tool, or the symbol/"
+                    "library wasn't found where expected on this machine.\n\n"
+                    "Tips:\n"
+                    "  • objdump and/or nm must be installed\n"
+                    "  • Check the binary/library path above still exists "
+                    "and is readable from where the TUI is running",
+                    style="dim")
             log.write(msg)
             return
 
