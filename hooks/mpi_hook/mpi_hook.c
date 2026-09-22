@@ -120,6 +120,31 @@ static void send_all(const char *buf, int n) {
 }
 
 #include "../common/callstack.h"
+#include "../common/codeptr_resolve.h"
+
+/* Appends ",sym=<name>" or ",lib=<path>,offset=0x<hex>" to `buf` (which
+ * must already hold the tag string built so far, null-terminated) when
+ * `codeptr` resolves to something -- lets src/core/runner.py's
+ * _collect_disasm() disassemble the user's own call site for this MPI
+ * call. Without this, every "mpi"-category span has no sym=/lib= tag,
+ * and _collect_disasm()'s span-scanning loop doesn't even look at the
+ * "mpi" category in the first place (see runner.py) -- both need fixing
+ * together for the Source tab to show anything for e.g. MPI_Bcast. */
+static void append_codeptr_tag(char *buf, size_t bufsz, const void *codeptr) {
+    const char *sym = NULL;
+    char lib[256];
+    uint64_t off = 0;
+    if (!hprofiler_resolve_codeptr(codeptr, &sym, lib, sizeof(lib), &off))
+        return;
+    size_t used = strlen(buf);
+    if (used >= bufsz) return;
+    if (sym) {
+        snprintf(buf + used, bufsz - used, ",sym=%s", sym);
+    } else if (lib[0]) {
+        snprintf(buf + used, bufsz - used, ",lib=%s,offset=0x%llx",
+                 lib, (unsigned long long)off);
+    }
+}
 
 static void emit_span(const char *cat, uint64_t start_ns, uint64_t dur_ns,
                       const char *name, const char *extra) {
@@ -890,12 +915,14 @@ int MPI_Cancel(MPI_Request *request) {
 
 #define _COLL(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)             \
 int FNAME(__VA_ARGS__) {                                                \
-    char extra[160];                                                    \
+    const void *_ret_addr = __builtin_return_address(0);                \
+    char extra[512];                                                    \
     size_t nb = (BYTES_EXPR);                                           \
     int64_t cid = comm_id_for(comm);                                    \
     snprintf(extra, sizeof(extra),                                      \
              "type=%s,bytes=%zu,rank=%d,commid=%lld",                   \
              TYPE_STR, nb, g_mpi_rank, (long long)cid);                \
+    append_codeptr_tag(extra, sizeof(extra), _ret_addr);                \
     uint64_t t0 = now_ns();                                             \
     int ret = PMPI_CALL;                                                \
     emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                  \
@@ -944,11 +971,13 @@ _COLL(MPI_Gather,
       void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm)
 
 int MPI_Barrier(MPI_Comm comm) {
+    const void *ret_addr = __builtin_return_address(0);
     int64_t cid = comm_id_for(comm);
     uint64_t t0 = now_ns();
     int ret = PMPI_Barrier(comm);
-    char extra[64];
+    char extra[512];
     snprintf(extra, sizeof(extra), "type=barrier,rank=%d,commid=%lld", g_mpi_rank, (long long)cid);
+    append_codeptr_tag(extra, sizeof(extra), ret_addr);
     emit_span("mpi", t0, now_ns()-t0, "MPI_Barrier", extra);
     return ret;
 }

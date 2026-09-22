@@ -855,9 +855,16 @@ def _collect_disasm(
                     "so_path": "",
                     "path":    jit_path,
                 })
-        # OpenMP/CPU: extract the first resolved codeptr info per span name.
-        # Hook emits sym=<mangled> (dladdr success) or lib=<path>,offset=0x<off>
-        if span.category.value in ("openmp", "sync", "cpu") and span.name not in omp_syms:
+        # OpenMP/MPI/CPU: extract the first resolved codeptr info per span
+        # name. Hook emits sym=<mangled> (dladdr success) or
+        # lib=<path>,offset=0x<off> (fallback) -- "mpi" was missing here
+        # even though mpi_hook.c's collectives + MPI_Barrier do emit these
+        # tags, so an MPI span's own call-site info was silently never
+        # looked at; the Source tab's kernel list includes every profiled
+        # span name (not just GPU kernels), so MPI_Bcast/MPI_Allreduce/
+        # MPI_Barrier showed up there with "No disassembly available"
+        # unconditionally, not because objdump was missing.
+        if span.category.value in ("openmp", "sync", "cpu", "mpi") and span.name not in omp_syms:
             sym = span.tags.get("sym", "")
             if sym:
                 omp_syms[span.name] = ("sym", sym)

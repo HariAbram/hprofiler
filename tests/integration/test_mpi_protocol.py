@@ -249,6 +249,25 @@ class TestMpiProtocolSemantics(unittest.TestCase):
         self.assertNotEqual(commids.pop(), "0", "sub-communicator must not reuse "
                             "MPI_COMM_WORLD's reserved commid=0")
 
+    def test_allreduce_spans_carry_a_resolved_codeptr_tag_for_disasm(self):
+        # Regression test: mpi_hook.c never captured/resolved a call-site
+        # codeptr at all (no sym=/lib= tag on any "mpi"-category span),
+        # AND src/core/runner.py's _collect_disasm() unconditionally
+        # excluded category "mpi" from the spans it even looks at for
+        # this -- two separate gaps that together made the Source tab's
+        # "No disassembly available" unconditional for every MPI call,
+        # not a missing-objdump problem. Fixed on both sides; this checks
+        # the hook side (the wire-protocol tag actually being present).
+        events = self._run_and_capture()
+        allreduces = [e for e in events if isinstance(e, SpanEvent) and e.name == "MPI_Allreduce"]
+        self.assertTrue(allreduces)
+        resolved = [e for e in allreduces if e.tags.get("sym") or e.tags.get("lib")]
+        self.assertTrue(
+            resolved,
+            f"none of the {len(allreduces)} MPI_Allreduce spans carry a sym=/lib= "
+            f"tag; sample tags={allreduces[0].tags!r}",
+        )
+
     def test_no_events_silently_dropped_by_inst_tag_parsing(self):
         # Regression guard for the _parse_record inst: fix in runner.py:
         # every inst: line this fixture's run produces must carry a

@@ -1656,21 +1656,43 @@ passed. Collection runs in a background thread — the TUI is not blocked.
 | ROCm JIT (ACPP) | AMDGCN ELF from `hipModuleLoadData` | `llvm-objdump` | `amdgcn` |
 | OpenCL JIT (ACPP SSCP generic) | `.jit.so` emitted by ACPP SSCP | `objdump` | `x86-64` / `aarch64` |
 | OpenCL CPU (Intel CPU OCL) | x86-64 ELF from `clGetProgramInfo`, inner `.ocl.obj` section unwrapped from Intel's proprietary outer ELF | `nm` + `objdump` | `x86-64` |
-| OpenMP / CPU | ELF symbol at `codeptr_ra` | `capstone` (fast) or `objdump` | `x86-64` / `aarch64` / `rv64` |
+| OpenMP / MPI / CPU | ELF symbol at the call-site return address | `capstone` (fast) or `objdump` | `x86-64` / `aarch64` / `rv64` |
 
 > **Requirement for source-line annotation:** compile your binary with `-g` (full debug) or at minimum `-lineinfo` (`nvcc -lineinfo`) to embed DWARF line tables. Without debug info, source file:line annotations are silently skipped — disassembly still works, but no `// file.cpp:42` comments appear in the Disasm tab.
 
-### CPU / OpenMP disasm pipeline
+### CPU / OpenMP / MPI disasm pipeline
 
-For CPU and OpenMP backends the OMPT hook records a `codeptr_ra` for every
-span. The profiler:
+hprofiler's own event names (`omp_parallel_region`, `omp_barrier`,
+`MPI_Bcast`, ...) are never themselves ELF symbols objdump/nm can find --
+they're event labels this project invents, not functions in the profiled
+binary. What IS meaningful to disassemble is the user's own call site: the
+line of C/C++/Fortran code that actually invoked `#pragma omp parallel` or
+`MPI_Bcast(...)`. Every hook capable of capturing that -- `ompt_tool.c`
+(OMPT path), `gomp_hook.c` (direct `GOMP_*` interception, for binaries
+linked against GNU's libgomp, which has no OMPT support in typical
+builds), and `mpi_hook.c` (its collective calls and `MPI_Barrier`) --
+captures the call's return address (`__builtin_return_address(0)` /
+OMPT's own `codeptr_ra`) and resolves it via the shared
+`hooks/common/codeptr_resolve.h` helper, tagging the span `sym=<name>`
+(when `dladdr()` finds an exported symbol) or `lib=<path>,offset=0x<off>`
+(a `/proc/self/maps`-derived fallback for non-exported/internal
+symbols). The profiler then:
 
-1. Resolves the address to a symbol name via `dladdr()` or `/proc/self/maps`.
+1. Reads whichever `sym=`/`lib=` tag the hook attached (falls back to
+   trying resolution itself for perf-sampled CPU spans, which carry
+   neither tag).
 2. Looks up the symbol's address and size with `nm -S --defined-only`.
 3. Reads only those function bytes from the ELF file (no subprocess) and
    disassembles with [capstone](https://www.capstone-engine.org/) (~40ms vs
    ~1500ms for `objdump` on the whole binary).
 4. Falls back to `objdump` if capstone is not installed.
+
+**Known gap:** point-to-point MPI calls (`MPI_Send`/`Recv`/`Isend`/`Irecv`/
+`Wait*`) don't capture a call-site codeptr yet -- only the collectives
+(`MPI_Bcast`/`Reduce`/`Allreduce`/`Alltoall`/`Allgather`/`Scatter`/`Gather`)
+and `MPI_Barrier` do. `gomp_hook.c`'s `omp_critical_hold` span (the
+region between `GOMP_critical_end` and its matching `_start`) also has no
+tag of its own yet, only `omp_critical_wait` does.
 
 The architecture is auto-detected from the ELF `e_machine` field
 (`_elf_arch()` helper) so x86-64, AArch64, and RISC-V binaries all get the
@@ -2028,7 +2050,7 @@ flowchart TB
    - OpenCL SSCP: disassembles ACPP `.jit.so` files
    - OpenCL Intel CPU: disassembles `/tmp/hprofiler_ocl_<pid>_*.bin` — standard
      x86-64 ELF relocatables extracted and unwrapped from the Intel OCL driver
-   - OpenMP/CPU: resolves `sym=` / `lib=,offset=` tags to ELF symbols; auto-detects
+   - OpenMP/MPI/CPU: resolves `sym=` / `lib=,offset=` tags to ELF symbols; auto-detects
      x86-64, AArch64, or RISC-V from `e_machine`; uses capstone (fast) or objdump
    - All `/tmp/hprofiler_*_<pid>_*` scratch files are deleted after processing;
      any left over from a crashed run are cleaned up at the end of the next run
@@ -2320,6 +2342,8 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | `mpi` | `rpeer=P,rtag=T` | Resolved wildcard match, on the completing `Wait`/`Waitany`/`Test`/`Testany` span |
 | `mpi` | `rmatches=<req_id>/<peer>/<tag>;...` | Resolved wildcard matches for `MPI_Waitall`/`MPI_Waitsome` (multiple requests at once) |
 | `mpi` | `completed_index=N` | Which array slot completed, on `MPI_Waitany`/`MPI_Testany` |
+| `mpi` | `sym=<mangled>` | Collective/`MPI_Barrier` call-site symbol, resolved via `dladdr()` (point-to-point calls don't capture this yet) |
+| `mpi` | `lib=<path>,offset=0x<n>` | Library + static offset (fallback, same as `openmp`'s) |
 
 **Names containing `:`:** hook-side names (e.g. demangled C++ kernel names
 like `Namespace::kernel`, or NVTX labels) are not escaped before being
@@ -2663,7 +2687,8 @@ The TUI remains responsive at 250k spans at all zoom levels.
 | **`xs=` exec-start calibration unverified on real GPU hardware** | `cuda_hook.c`/`rocm_hook.c`'s reference-event calibration (§4 `cuda`) has no working GPU to run against on this development machine (broken NVIDIA driver, no AMD GPU) — only compile-checked (`gcc -Wall -Wextra` clean, and via `./hprofiler build`), and `src/analysis/criticalpath.py`'s consumption of it (`_effective_start_ns`/`_edge_gap_and_gate`) is only unit-tested against hand-constructed synthetic spans with a fake `xs=` tag, never a real captured trace. | Treat `xs=`-derived gap/idle-time numbers as unverified until confirmed on a working CUDA/ROCm GPU; the underlying technique mirrors `opencl_hook.c`'s calibration, which *is* hardware-verified. |
 | **Lock-free ring buffer (`hooks/common/ringbuffer.h`) not wired into any hook** | Built and verified in isolation (stress-tested, ThreadSanitizer-clean, benchmarked — see §13 "Reducing collection-path overhead"), but no hook's `emit_span()` actually uses it yet; today's real collection path is still the mutex+`send()` pattern for every hook. | The measured 1.5–58x overhead reduction is real for the primitive itself, not yet realized end-to-end in a profiling run; treat it as available infrastructure for a future integration pass, not a shipped speedup. |
 | **eBPF OS tracer (`hooks/os_tracer/`) never loaded into a kernel** | `kernel.unprivileged_bpf_disabled=2` on this development machine blocks BPF loading for non-root — see §19. Compiled, linked, and run up to `EPERM` at the exact expected privilege wall; the kernel BPF verifier (a distinct pass beyond compilation) has never actually run against it. | Needs root/`CAP_BPF` on a machine where that's authorized to confirm the tracepoint handlers pass kernel verification and emit semantically correct events under real scheduler activity. |
-| **`gomp_hook.c` (direct `GOMP_*` interception) not yet confirmed on the real cluster that motivated it** | Built in response to a real user run on the Dardel HPC cluster (`ldd gmx_mpi` showed `libgomp.so.1`, confirming OMPT alone would never capture events there) and fully verified end-to-end on this development machine (real `gcc`+`libgomp`, unlike most of this project's other recent hardware-dependent work) — see §4 `openmp`. | Dardel's specific GCC version (`cpeGNU` toolchain) and the exact GROMACS code paths exercised there haven't been checked against what was verified here; ask for the actual Dardel trace/output before treating this as confirmed working there. |
+| **`gomp_hook.c` (direct `GOMP_*` interception) — now confirmed on the real cluster that motivated it** | Built in response to a real user run on the Dardel HPC cluster (`ldd gmx_mpi` showed `libgomp.so.1`, confirming OMPT alone would never capture events there); fully verified end-to-end on this development machine, and subsequently confirmed working on Dardel itself via a real GROMACS run's Timeline screenshots (populated `omp`/`sync`/`mpi` lanes with real per-thread/per-rank span counts) — see §4 `openmp`. | None currently open for event capture itself. The GCC/`cpeGNU` toolchain-version specifics of what was actually exercised on Dardel beyond what this development machine's `gcc` produces are still not independently confirmed. |
+| **Call-site disassembly (`sym=`/`lib=` codeptr tags) doesn't cover every construct yet** | `ompt_tool.c` always resolved this; `gomp_hook.c` (`omp_parallel_region`, `omp_barrier`, `omp_critical_wait`/`_name_wait`, work-sharing loops) and `mpi_hook.c` (the collectives + `MPI_Barrier`) were fixed to do the same, via the shared `hooks/common/codeptr_resolve.h` helper, after a real Dardel run showed the Source tab's "No disassembly available" for every OpenMP/MPI construct — not an `objdump`-availability problem, but that `gomp_hook.c` never resolved/emitted the tag at all, and `src/core/runner.py`'s `_collect_disasm` unconditionally excluded category `"mpi"` from even looking for one. Verified end-to-end (hook → wire protocol → real disassembly attached to the trace) on this development machine. | Point-to-point MPI calls (`MPI_Send`/`Recv`/`Isend`/`Irecv`/`Wait*`) and `gomp_hook.c`'s `omp_critical_hold` span don't capture a call-site tag yet — those still show "No disassembly available" regardless of `objdump`/`nm` availability. |
 
 ---
 

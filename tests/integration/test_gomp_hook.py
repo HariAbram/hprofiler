@@ -200,6 +200,27 @@ class TestGompHook(unittest.TestCase):
         singles = [e for e in events if isinstance(e, InstantEvent) and e.name == "omp_single"]
         self.assertEqual(len(singles), 1, "exactly one thread executes a #pragma omp single region")
 
+    def test_spans_carry_a_resolved_codeptr_tag_for_disasm(self):
+        # Regression test: gomp_hook.c used to capture codeptr_ra (in
+        # GOMP_parallel's closure) but never resolve or emit it, so every
+        # span from this hook had no sym=/lib= tag at all -- the Source
+        # tab's "No disassembly available" was unconditional for GNU-
+        # libgomp binaries, not a missing-objdump problem. At least one of
+        # sym=/lib= must be present so src/core/runner.py's
+        # _collect_disasm() has something to disassemble (the user's own
+        # call site -- there's no ELF symbol literally named
+        # "omp_parallel_region" for objdump to find on its own).
+        events = self._run_and_capture()
+        for name in ("omp_parallel_region", "omp_barrier", "omp_critical_wait"):
+            spans = [e for e in events if isinstance(e, SpanEvent) and e.name == name]
+            self.assertTrue(spans, f"no {name} spans captured")
+            resolved = [e for e in spans if e.tags.get("sym") or e.tags.get("lib")]
+            self.assertTrue(
+                resolved,
+                f"none of the {len(spans)} {name!r} spans carry a sym=/lib= tag; "
+                f"sample tags={spans[0].tags!r}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

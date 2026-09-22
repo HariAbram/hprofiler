@@ -18,6 +18,17 @@ Four layers:
   - `test_wire_protocol.py` -- `_parse_record`'s `inst:` tag-segment parsing
     (`src/core/runner.py`): regression test for a bug where instant events'
     trailing tags were silently discarded entirely.
+  - `test_disasm_categories.py` -- `_collect_disasm`'s (`src/core/runner.py`)
+    category filter for which spans' `sym=`/`lib=` codeptr tags get handed
+    to the disassembler: regression test for a real user-reported bug
+    where MPI spans (`MPI_Bcast`, `MPI_Allreduce`, ...) always showed "No
+    disassembly available" in the Source tab -- not because `objdump` was
+    missing, but because category `"mpi"` was silently excluded from the
+    filter even after `mpi_hook.c` started emitting the tags (see the
+    `..._carry_a_resolved_codeptr_tag_for_disasm` tests in
+    `tests/integration/test_gomp_hook.py`/`test_mpi_protocol.py` for the
+    hook side of the same fix). Mocks `disasm/extractor.collect_disasm`
+    rather than needing a real binary + `nm`/`objdump`.
   - `test_pop_efficiency.py` -- `src/analysis/pop_efficiency.py`: Load
     Balance / Communication Efficiency exact-formula checks, the
     self-calibrated alpha/beta latency-bandwidth fit (verified against a
@@ -126,7 +137,10 @@ Four layers:
     `AF_UNIX` socket, and parses them with the production `_parse_record`
     -- asserting on resolved semantics (wildcard matching, `Waitany`/
     `Waitsome`/`Test*` completion, `commid=` self-consistency), not just
-    that the process didn't crash.
+    that the process didn't crash. Also checks that `MPI_Allreduce` spans
+    carry a `sym=`/`lib=` codeptr tag (regression test for a real user-
+    reported "no disassembly available" bug -- see `test_disasm_categories.py`
+    below).
 
     ```bash
     python3 -m unittest tests.integration.test_mpi_protocol -v
@@ -140,8 +154,10 @@ Four layers:
     `ldd` to link `libgomp`, not `libomp`), `LD_PRELOAD`s the hook, and
     asserts on per-thread/per-construct correctness: exactly one
     `omp_parallel_region` span per thread (not just one for the whole
-    region), correct barrier/critical-section/single counts, and that the
-    interception doesn't change the program's own computed result.
+    region), correct barrier/critical-section/single counts, that the
+    interception doesn't change the program's own computed result, and
+    that `omp_parallel_region`/`omp_barrier`/`omp_critical_wait` spans
+    carry a resolved `sym=`/`lib=` codeptr tag (same regression as above).
 
     ```bash
     python3 -m unittest tests.integration.test_gomp_hook -v
