@@ -29,10 +29,11 @@ class X11Status:
 
 def _parse_display(display: str) -> tuple[str | None, int]:
     """Parse a $DISPLAY string ("[host]:display[.screen]") into
-    (host_or_None, display_number). host is None for a local (Unix
-    socket) display -- the common case for SSH X11 forwarding, where
-    sshd sets DISPLAY to "localhost:N.0" or "hostname/unix:N.0", both of
-    which should be treated as local for socket-path purposes."""
+    (host_or_None, display_number). host is None for "local" displays
+    (bare ":N", "localhost:N", or ".../unix:N") -- the common case for
+    SSH X11 forwarding, where sshd sets DISPLAY to "localhost:N.0". Note
+    "local" here means "on this machine", NOT "reachable only via a Unix
+    socket" -- see _socket_reachable for why that distinction matters."""
     if ":" not in display:
         raise ValueError(f"not a valid DISPLAY string: {display!r}")
     host_part, rest = display.rsplit(":", 1)
@@ -49,7 +50,25 @@ def _socket_reachable(display: str, timeout: float) -> bool:
     listening, without speaking the X11 protocol itself (which would
     need Xlib or a real Qt/X11 client). A closed/refused/timed-out
     connection means the display is not usable regardless of what
-    $DISPLAY claims."""
+    $DISPLAY claims.
+
+    A "local" DISPLAY (host is None: bare ":N", "localhost:N", or
+    ".../unix:N") has TWO possible real transports, and which one is
+    live depends on what's on the other end, not on the DISPLAY string:
+      - A real local X server (Xorg/Xwayland/Xvfb) listens on the Unix
+        domain socket /tmp/.X11-unix/XN.
+      - SSH X11 forwarding (the common case for `ssh -X`/`-Y` into an
+        HPC login node) sets DISPLAY=localhost:N.0 but is NOT a real X
+        server -- sshd just proxies the connection over the existing SSH
+        channel, and with the default `X11UseLocalhost yes` it does this
+        via a plain TCP listener on 127.0.0.1:(6000+N). It never creates
+        a /tmp/.X11-unix socket at all, since there's no local server.
+    Real X11 client libraries (Xlib/xcb) handle this by trying whichever
+    transport is actually there; checking only the Unix socket path (as
+    this function used to) reports SSH-forwarded displays as unreachable
+    even though `xclock`/a real Qt app would connect over TCP just fine
+    -- confirmed against a real `ssh -Y` session onto an HPC cluster,
+    where $DISPLAY was 'localhost:10.0' with no matching Unix socket."""
     try:
         host, num = _parse_display(display)
     except ValueError:
@@ -57,15 +76,15 @@ def _socket_reachable(display: str, timeout: float) -> bool:
 
     if host is None:
         sock_path = f"/tmp/.X11-unix/X{num}"
-        if not os.path.exists(sock_path):
-            return False
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(timeout)
-                s.connect(sock_path)
-            return True
-        except OSError:
-            return False
+        if os.path.exists(sock_path):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(timeout)
+                    s.connect(sock_path)
+                return True
+            except OSError:
+                pass  # fall through to the TCP-loopback check below
+        host = "127.0.0.1"
 
     try:
         with socket.create_connection((host, 6000 + num), timeout=timeout):
