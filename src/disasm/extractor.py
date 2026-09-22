@@ -1049,7 +1049,7 @@ def collect_disasm(
     # sym_cache: (target_path, sym_name) → KernelDisasm
     # Prevents running objdump twice when multiple span names (e.g. omp_loop and
     # omp_barrier_implicit) fall at different offsets within the same function.
-    if binary and Path(binary).exists() and omp_syms:
+    if omp_syms:
         seen_keys: set[str] = set()
         sym_cache: dict[tuple[str, str], Optional[KernelDisasm]] = {}
         for span_name, sym_info in omp_syms.items():
@@ -1058,11 +1058,22 @@ def collect_disasm(
             kind, payload = sym_info
 
             if kind == "sym":
-                sym_name: str = payload
+                # payload is (sym_name, symfile) -- symfile is the ELF
+                # file dladdr() actually found the symbol in (see
+                # hooks/common/codeptr_resolve.h), which is NOT
+                # necessarily `binary` (command[0]): the profiled command
+                # is routinely a launcher wrapping the real binary
+                # (`hprofiler run -- srun -n 4 gmx_mpi ...`), where
+                # command[0] is `srun`, not the profiled program at all.
+                # Falls back to `binary` for tags from an older hook
+                # build that predates symfile= (payload[1] is None then).
+                sym_name, symfile = payload
+                target_path = symfile if symfile and Path(symfile).exists() else binary
+                if not target_path or not Path(target_path).exists():
+                    continue
                 if sym_name in seen_keys:
                     continue
                 seen_keys.add(sym_name)
-                target_path = binary
             elif kind == "lib":
                 lib_path, static_off = payload
                 key = f"{lib_path}:{static_off}"

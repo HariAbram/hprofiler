@@ -137,7 +137,7 @@ static void emit_span(const char *cat, pid_t tid,
     pthread_mutex_lock(&g_sock_mutex);
     ensure_connected();
     if (g_sock >= 0) {
-        char buf[512]; int n;
+        char buf[900]; int n;
         if (extra && *extra)
             n = snprintf(buf, sizeof(buf), "span:%s:%d:%d:%llu:%llu:%s:%s\n",
                         cat, g_pid, tid, (unsigned long long)start_ns,
@@ -173,14 +173,24 @@ static void *real_sym(const char *name) {
  * disassembly that IS meaningful here is of the user's own call site. */
 static void append_codeptr_tag(char *buf, size_t bufsz, const void *codeptr) {
     const char *sym = NULL;
+    char symfile[256];
     char lib[256];
     uint64_t off = 0;
-    if (!hprofiler_resolve_codeptr(codeptr, &sym, lib, sizeof(lib), &off))
+    if (!hprofiler_resolve_codeptr(codeptr, &sym, symfile, sizeof(symfile),
+                                   lib, sizeof(lib), &off))
         return;
     size_t used = strlen(buf);
     if (used >= bufsz) return;
     if (sym) {
-        snprintf(buf + used, bufsz - used, ",sym=%s", sym);
+        /* symfile= (dladdr's own dli_fname -- the actual ELF containing
+         * this symbol) matters because the profiled command is routinely
+         * a launcher (srun/mpirun) wrapping the real binary -- without
+         * it, _collect_disasm() would look for this symbol in the
+         * launcher's own binary and silently find nothing. */
+        if (symfile[0])
+            snprintf(buf + used, bufsz - used, ",sym=%s,symfile=%s", sym, symfile);
+        else
+            snprintf(buf + used, bufsz - used, ",sym=%s", sym);
     } else if (lib[0]) {
         snprintf(buf + used, bufsz - used, ",lib=%s,offset=0x%llx",
                  lib, (unsigned long long)off);
@@ -207,7 +217,7 @@ static void parallel_trampoline(void *arg) {
     uint64_t t0 = now_ns();
     c->real_fn(c->real_data);
     uint64_t dur = now_ns() - t0;
-    char extra[512];
+    char extra[768];
     snprintf(extra, sizeof(extra), "type=parallel_region");
     append_codeptr_tag(extra, sizeof(extra), c->codeptr_ra);
     emit_span("openmp", gettid_compat(), t0, dur, "omp_parallel_region", extra);
@@ -310,7 +320,7 @@ bool GOMP_loop_maybe_nonmonotonic_runtime_start(long start, long end, long incr,
 static void _loop_end_common(const char *name) {
     if (tls_loop_active) {
         uint64_t dur = now_ns() - tls_loop_start_ns;
-        char extra[512];
+        char extra[768];
         snprintf(extra, sizeof(extra), "type=work");
         append_codeptr_tag(extra, sizeof(extra), tls_loop_codeptr);
         emit_span("openmp", gettid_compat(), tls_loop_start_ns, dur, name, extra);
@@ -348,7 +358,7 @@ void GOMP_barrier(void) {
     const void *ret = __builtin_return_address(0);
     uint64_t t0 = now_ns();
     if (real_GOMP_barrier) real_GOMP_barrier();
-    char extra[512];
+    char extra[768];
     snprintf(extra, sizeof(extra), "type=sync");
     append_codeptr_tag(extra, sizeof(extra), ret);
     emit_span("sync", gettid_compat(), t0, now_ns() - t0, "omp_barrier", extra);
@@ -375,7 +385,7 @@ void GOMP_critical_start(void) {
     uint64_t t0 = now_ns();
     if (real_GOMP_critical_start) real_GOMP_critical_start();
     uint64_t t1 = now_ns();
-    char extra[512];
+    char extra[768];
     snprintf(extra, sizeof(extra), "type=sync");
     append_codeptr_tag(extra, sizeof(extra), ret);
     emit_span("sync", gettid_compat(), t0, t1 - t0, "omp_critical_wait", extra);
@@ -402,7 +412,7 @@ void GOMP_critical_name_start(void **pptr) {
     uint64_t t0 = now_ns();
     if (real_GOMP_critical_name_start) real_GOMP_critical_name_start(pptr);
     uint64_t t1 = now_ns();
-    char extra[512];
+    char extra[768];
     snprintf(extra, sizeof(extra), "type=sync,named=1");
     append_codeptr_tag(extra, sizeof(extra), ret);
     emit_span("sync", gettid_compat(), t0, t1 - t0, "omp_critical_wait", extra);

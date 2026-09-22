@@ -18,19 +18,28 @@ Four layers:
   - `test_wire_protocol.py` -- `_parse_record`'s `inst:` tag-segment parsing
     (`src/core/runner.py`): regression test for a bug where instant events'
     trailing tags were silently discarded entirely.
-  - `test_disasm_categories.py` -- `_collect_disasm`'s (`src/core/runner.py`)
-    category filter for which spans' `sym=`/`lib=` codeptr tags get handed
-    to the disassembler: regression test for a real user-reported bug
-    where MPI spans (`MPI_Bcast`, `MPI_Allreduce`, ...) always showed "No
-    disassembly available" in the Source tab -- not because `objdump` was
-    missing, but because category `"mpi"` was silently excluded from the
-    filter even after `mpi_hook.c` started emitting the tags (see the
+  - `test_disasm_categories.py` -- two fixes to `_collect_disasm`
+    (`src/core/runner.py`) and `collect_disasm` (`src/disasm/extractor.py`),
+    both found from the SAME real user report and fixed in sequence:
+    (1) the category filter for which spans' `sym=`/`lib=` codeptr tags
+    get looked at excluded `"mpi"` entirely, so `MPI_Bcast`/`MPI_Allreduce`/
+    etc. always showed "No disassembly available" -- not because `objdump`
+    was missing, but because nothing ever tried (mocks
+    `collect_disasm` for this part; see the
     `..._carry_a_resolved_codeptr_tag_for_disasm` tests in
     `tests/integration/test_gomp_hook.py`/`test_mpi_protocol.py` for the
-    hook side of the same fix). Mocks `disasm/extractor.collect_disasm`
-    rather than needing a real binary + `nm`/`objdump`.
+    hook side of the same fix); (2) even after (1), a resolved `sym=` tag
+    STILL produced "No disassembly available", because `collect_disasm`
+    always disassembled `command[0]` for a "sym" entry -- but the
+    profiled command is routinely a launcher wrapping the real binary
+    (`hprofiler run -- srun -n 4 gmx_mpi ...`, where `command[0]` is
+    `srun`, not `gmx_mpi`). Fixed via a new `symfile=` tag (dladdr's own
+    `dli_fname`) the hooks now also emit; `TestCollectDisasmUsesSymfileNotLauncher`
+    is a REAL (non-mocked) reproduction -- compiles an actual binary,
+    passes a deliberately-bogus `command[0]` standing in for `srun`, and
+    confirms disassembly is still found via `symfile=`.
   - `test_disasm_widget_message.py` -- `DisasmWidget`'s (`src/ui/app.py`)
-    "No disassembly available" message: after the fix above, a real user
+    "No disassembly available" message: after fix (1) above, a real user
     was STILL seeing it -- turned out they were viewing a trace captured
     before rebuilding the hooks, but the message unconditionally told
     them to go install `objdump`/`cuobjdump`, which was never the actual
@@ -39,6 +48,15 @@ Four layers:
     resolved at all (blames a stale trace / unrebuilt hooks, not missing
     tools) versus when one IS present but disassembly still failed
     (where the tool-installation tips are actually relevant).
+  - `test_zero_event_warning.py` -- `_total_zero_event_warning`
+    (`src/core/runner.py`): regression test for a real, intermittent bug
+    report -- a run via `srun` completed normally but captured zero
+    events across every backend, then the identical command worked on
+    the very next invocation. Checks the warning correctly names every
+    active backend, gives `srun`/`mpirun`/etc.-specific environment-
+    propagation advice only when the command actually is launcher-
+    wrapped (and not otherwise, where that advice would be wrong), and
+    doesn't crash on an empty command list.
   - `test_pop_efficiency.py` -- `src/analysis/pop_efficiency.py`: Load
     Balance / Communication Efficiency exact-formula checks, the
     self-calibrated alpha/beta latency-bandwidth fit (verified against a

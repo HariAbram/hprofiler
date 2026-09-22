@@ -511,6 +511,12 @@ class Runner:
         if _likwid_backend is not None:
             _likwid_backend.post_process(trace)
 
+        # ── Total zero-event sanity check ───────────────────────────────────────
+        if self.backends and not trace.spans and not trace.instants:
+            import sys as _sys1
+            msg = _total_zero_event_warning(self.backends, self.command)
+            print(msg, file=_sys1.stderr)
+
         # ── OpenMP zero-event sanity check ────────────────────────────────────
         # Two independent capture paths are injected together (see
         # src/backends/openmp.py's module docstring): OMPT (needs LLVM
@@ -760,6 +766,60 @@ def _parse_perf_stat_microarch(text: str) -> dict[str, float]:
     return result
 
 
+_LAUNCHER_NAMES = {"srun", "mpirun", "mpiexec", "aprun", "jsrun", "ibrun"}
+
+
+def _total_zero_event_warning(backends: list[str], command: list[str]) -> str:
+    """
+    Message for when a run completes but captures ZERO events of any
+    kind across every active backend -- a much stronger signal than any
+    one backend's own zero-event check (see the "openmp" one right after
+    this is used in .run()): it means the hooks never connected to the
+    collector socket for this entire run, not that one backend's
+    particular constructs simply weren't exercised.
+
+    A real user hit exactly this running via `srun` (SLURM): the run
+    completed normally (GROMACS printed its full performance summary)
+    but captured zero spans of any kind, then the IDENTICAL command
+    captured 60381 events on the very next invocation with no code
+    change in between. Every hook's ensure_connected() is retried on
+    every single emit call, not just once at process startup, so a
+    transient "listener wasn't ready yet" race would only ever lose the
+    first few events -- not literally all of them across a multi-second
+    run. A total loss for the whole run instead points to
+    HPROFILER_SOCKET/LD_PRELOAD never having reached the profiled
+    process's environment at all, which is exactly what happens when a
+    job launcher (srun/mpirun/aprun/...) doesn't propagate the parent
+    environment to the process(es) it actually spawns -- SLURM in
+    particular can do this depending on site defaults / whether
+    `--export` was set, and it can be intermittent (site-dependent
+    scheduling/environment-cache behavior), matching the user's "works
+    on the very next run" report -- not something hprofiler's own retry
+    logic can work around from inside the already-spawned process.
+    """
+    launcher = command[0] if command else ""
+    launcher_hint = ""
+    if launcher in _LAUNCHER_NAMES:
+        launcher_hint = (
+            f"\n  '{launcher}' is a job launcher -- it must propagate "
+            f"HPROFILER_SOCKET and LD_PRELOAD to the process(es) it actually "
+            f"spawns, not just see them itself. If this is intermittent (same "
+            f"command works on a later run with no changes), check your site's "
+            f"{launcher} environment-export defaults, e.g. try "
+            f"`{launcher} --export=ALL ...` (SLURM) or the equivalent for your "
+            f"launcher; this is a launcher/site config issue, not something "
+            f"hprofiler's own retry logic can work around from inside the "
+            f"already-spawned process.\n"
+        )
+    return (
+        f"[hprofiler][warn] run completed but captured ZERO events of any "
+        f"kind across all active backends ({', '.join(backends)}) -- "
+        f"this points to the hooks never connecting to the collector socket "
+        f"for this entire run, not any one backend's constructs simply not "
+        f"being used." + launcher_hint
+    )
+
+
 def _collect_microarch_counters(stat_file: str, trace: Trace, ts_ns: int) -> None:
     try:
         text = Path(stat_file).read_text(errors="replace")
@@ -864,10 +924,21 @@ def _collect_disasm(
         # span name (not just GPU kernels), so MPI_Bcast/MPI_Allreduce/
         # MPI_Barrier showed up there with "No disassembly available"
         # unconditionally, not because objdump was missing.
+        #
+        # sym=<mangled> is paired with an optional symfile=<path> -- the
+        # ELF file dladdr() actually found the symbol in. The profiled
+        # command is routinely a launcher wrapping the real binary
+        # (`hprofiler run -- srun -n 4 gmx_mpi ...`), so command[0] (what
+        # collect_disasm() used to assume was always the right file to
+        # `nm`/disassemble) is `srun`, not the profiled program -- a real
+        # user's genuinely-resolved sym= still produced "No disassembly
+        # available" for exactly this reason. symfile is None when the
+        # hook build predates this fix; collect_disasm() falls back to
+        # command[0] in that case, same as before.
         if span.category.value in ("openmp", "sync", "cpu", "mpi") and span.name not in omp_syms:
             sym = span.tags.get("sym", "")
             if sym:
-                omp_syms[span.name] = ("sym", sym)
+                omp_syms[span.name] = ("sym", (sym, span.tags.get("symfile") or None))
                 continue
             lib = span.tags.get("lib", "")
             off_s = span.tags.get("offset", "")

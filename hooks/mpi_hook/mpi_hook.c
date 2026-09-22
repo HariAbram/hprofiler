@@ -132,14 +132,23 @@ static void send_all(const char *buf, int n) {
  * together for the Source tab to show anything for e.g. MPI_Bcast. */
 static void append_codeptr_tag(char *buf, size_t bufsz, const void *codeptr) {
     const char *sym = NULL;
+    char symfile[256];
     char lib[256];
     uint64_t off = 0;
-    if (!hprofiler_resolve_codeptr(codeptr, &sym, lib, sizeof(lib), &off))
+    if (!hprofiler_resolve_codeptr(codeptr, &sym, symfile, sizeof(symfile),
+                                   lib, sizeof(lib), &off))
         return;
     size_t used = strlen(buf);
     if (used >= bufsz) return;
     if (sym) {
-        snprintf(buf + used, bufsz - used, ",sym=%s", sym);
+        /* symfile= (dladdr's dli_fname) matters because the profiled
+         * command is routinely `srun`/`mpirun` wrapping the real binary
+         * -- without it, _collect_disasm() looks for this symbol in the
+         * launcher's own binary and silently finds nothing. */
+        if (symfile[0])
+            snprintf(buf + used, bufsz - used, ",sym=%s,symfile=%s", sym, symfile);
+        else
+            snprintf(buf + used, bufsz - used, ",sym=%s", sym);
     } else if (lib[0]) {
         snprintf(buf + used, bufsz - used, ",lib=%s,offset=0x%llx",
                  lib, (unsigned long long)off);
@@ -916,7 +925,7 @@ int MPI_Cancel(MPI_Request *request) {
 #define _COLL(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)             \
 int FNAME(__VA_ARGS__) {                                                \
     const void *_ret_addr = __builtin_return_address(0);                \
-    char extra[512];                                                    \
+    char extra[768];                                                    \
     size_t nb = (BYTES_EXPR);                                           \
     int64_t cid = comm_id_for(comm);                                    \
     snprintf(extra, sizeof(extra),                                      \
@@ -975,7 +984,7 @@ int MPI_Barrier(MPI_Comm comm) {
     int64_t cid = comm_id_for(comm);
     uint64_t t0 = now_ns();
     int ret = PMPI_Barrier(comm);
-    char extra[512];
+    char extra[768];
     snprintf(extra, sizeof(extra), "type=barrier,rank=%d,commid=%lld", g_mpi_rank, (long long)cid);
     append_codeptr_tag(extra, sizeof(extra), ret_addr);
     emit_span("mpi", t0, now_ns()-t0, "MPI_Barrier", extra);

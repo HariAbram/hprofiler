@@ -91,22 +91,40 @@ static int hprofiler_vma_lookup(uintptr_t addr, char *out_lib, size_t lib_sz, ui
  *  2. Fall back to the VMA cache -- finds the library and computes the
  *     static file offset even for non-exported / internal symbols.
  *
- * On success, writes into `out_sym` (symbol name) or `out_lib`+`out_off`
- * (library path + offset). At most one of sym / lib+off is filled.
- * Returns 1 if anything was resolved, 0 otherwise.
- */
+ * On success, writes into `out_sym`+`out_symfile` (symbol name + the ELF
+ * file it was found in) or `out_lib`+`out_off` (library path + static
+ * offset). At most one of sym / lib+off is filled. Returns 1 if anything
+ * was resolved, 0 otherwise.
+ *
+ * `out_symfile` (dladdr's own `dli_fname`, the actual shared object/
+ * executable containing the resolved address) matters because the
+ * profiled command is routinely a launcher wrapping the real binary --
+ * `hprofiler run -- srun -n 4 gmx_mpi ...`, `-- mpirun -np 4 ./app` --
+ * where `command[0]` (what src/core/runner.py's _collect_disasm used to
+ * assume the symbol must live in) is `srun`/`mpirun`, not the profiled
+ * program at all. Without this, `nm`/`objdump` gets pointed at the
+ * wrong ELF file and silently finds nothing -- confirmed against a real
+ * user's `srun`-launched GROMACS run, where a genuinely-resolved
+ * `sym=_ZN3gmx19ThreadedForceBufferIA4_fEC2Eibi` still produced "No
+ * disassembly available" for exactly this reason. */
 static int hprofiler_resolve_codeptr(const void *codeptr,
                                      const char **out_sym,
+                                     char *out_symfile, size_t symfile_sz,
                                      char *out_lib, size_t lib_sz,
                                      uint64_t *out_off) {
     if (!codeptr) return 0;
     *out_sym = NULL;
+    if (symfile_sz) out_symfile[0] = '\0';
     out_lib[0] = '\0';
     *out_off   = 0;
 
     Dl_info info;
     if (dladdr(codeptr, &info) && info.dli_sname && info.dli_sname[0]) {
         *out_sym = info.dli_sname;
+        if (info.dli_fname && info.dli_fname[0] && symfile_sz) {
+            strncpy(out_symfile, info.dli_fname, symfile_sz - 1);
+            out_symfile[symfile_sz - 1] = '\0';
+        }
         return 1;
     }
 
