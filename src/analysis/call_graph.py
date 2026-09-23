@@ -102,11 +102,23 @@ def layout_call_graph(
     is a compact overview panel, not a general-purpose graph-drawing
     engine.
 
-    Returns {"nodes": [{name, category, totalNs, count, x, y}, ...],
+    Returns {"nodes": [{name, category, totalNs, count, x, y,
+                        layer, layerIndex}, ...],
              "edges": [{caller, callee, count, totalNs,
-                        callerIdx, calleeIdx}, ...]}
+                        callerIdx, calleeIdx}, ...],
+             "numLayers": N, "maxLayerSize": M, "truncated": K}
     keyed by index into the returned "nodes" list (QML-friendly: no
-    string lookups needed at paint time).
+    string lookups needed at paint time). `x`/`y` are normalized [0,1]
+    for a caller that just wants "roughly where" (e.g. a quick
+    minimap); `layer`/`layerIndex` are the raw, un-normalized BFS
+    layer and within-layer position, alongside `numLayers`/
+    `maxLayerSize` -- together these let a renderer give every node a
+    FIXED pixel size and spacing regardless of how many total
+    layers/nodes there are (normalized x/y alone can't do this: cramming
+    a layer of 10 nodes into the same fixed pixel height as a layer of
+    2 is exactly what made nodes visually overlap in the GUI's call-graph
+    panel before this field existed), sizing a scrollable canvas to fit
+    instead of squeezing everything into one fixed viewport.
     """
     kept = nodes[:max_nodes]
     kept_names = {n.name for n in kept}
@@ -153,6 +165,7 @@ def layout_call_graph(
         layer_nodes.sort(key=lambda n: -n.total_ns)
 
     max_layer = max(layer_of.values()) if kept else 0
+    max_layer_size = max((len(v) for v in by_layer.values()), default=0)
     out_nodes = [None] * len(kept)
     for layer, layer_nodes in by_layer.items():
         x = layer / max_layer if max_layer > 0 else 0.5
@@ -163,6 +176,7 @@ def layout_call_graph(
                 "name": n.name, "category": n.category,
                 "totalNs": n.total_ns, "count": n.count,
                 "x": x, "y": y,
+                "layer": layer, "layerIndex": i,
             }
 
     out_edges = [
@@ -173,4 +187,9 @@ def layout_call_graph(
         }
         for e in kept_edges
     ]
-    return {"nodes": out_nodes, "edges": out_edges, "truncated": len(nodes) - len(kept)}
+    return {
+        "nodes": out_nodes, "edges": out_edges,
+        "numLayers": max_layer + 1 if kept else 0,
+        "maxLayerSize": max_layer_size,
+        "truncated": len(nodes) - len(kept),
+    }

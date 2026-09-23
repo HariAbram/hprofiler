@@ -23,6 +23,23 @@ Item {
     property int hoverSpanIdx: -1
     property string hoverText: ""
 
+    // True when at least one lane pairs with a "sync" lane on the same
+    // thread (see each lane Canvas's syncOverlayLaneIndex) -- gates the
+    // legend below so traces with no OpenMP/sync data (e.g. pure MPI,
+    // pure GPU) don't show an explanation for an overlay that never
+    // appears anywhere in them.
+    readonly property bool hasSyncOverlay: {
+        var lanes = TimelineModel.lanes
+        var names = {}
+        for (var i = 0; i < lanes.length; i++) names[lanes[i].name] = true
+        for (i = 0; i < lanes.length; i++) {
+            var n = lanes[i].name
+            if (n.indexOf("sync/") !== 0 && n.indexOf("/thread-") > 0 &&
+                names["sync/" + n.split("/")[1]]) return true
+        }
+        return false
+    }
+
     function resetView() {
         zoom = 1.0
         viewStartNs = TimelineModel.viewStartNs
@@ -69,6 +86,22 @@ Item {
                 font.bold: true
             }
             Item { Layout.fillWidth: true }
+            RowLayout {
+                visible: root.hasSyncOverlay
+                spacing: 4
+                Rectangle {
+                    width: 10
+                    height: 10
+                    radius: 2
+                    color: AppTheme.categoryColor("sync")
+                    opacity: 0.8
+                }
+                Text {
+                    text: "= blocked at a nested sync event"
+                    color: AppTheme.textMuted
+                    font.pixelSize: 10
+                }
+            }
             Text {
                 text: "wheel: zoom · drag: pan · double-click: reset"
                 color: AppTheme.textMuted
@@ -141,9 +174,37 @@ Item {
                                 width: parent.width - root.labelWidth
                                 height: parent.height
                                 property int laneIndex: index
+                                property string laneName: modelData.name
                                 property var cachedSpans: []
                                 property real boundZoom: root.zoom
                                 property real boundStart: root.viewStartNs
+
+                                // Which OTHER lane (if any) holds the "sync" events
+                                // nested inside this lane's own spans -- e.g.
+                                // "openmp/thread-5" pairs with "sync/thread-5".
+                                // Resolved once (lanes is a constant list), not
+                                // per-paint: a span like omp_parallel_region times
+                                // its ENTIRE call including any nested
+                                // GOMP_barrier()/critical-section wait that's
+                                // ALSO separately reported as its own "sync" span
+                                // on the same thread -- so the same wall-clock
+                                // interval gets drawn once here (as "busy") and
+                                // once on the sync lane (as "waiting"), which is
+                                // exactly what made a thread deep in barrier waits
+                                // still look continuously busy. This lane draws
+                                // that paired lane's spans as a dimmed overlay ON
+                                // TOP of its own bars afterward, so the idle
+                                // portion is visible without needing to
+                                // cross-reference a separate row.
+                                property int syncOverlayLaneIndex: {
+                                    if (laneName.indexOf("/thread-") < 0) return -1
+                                    if (laneName.indexOf("sync/") === 0) return -1
+                                    var pairedName = "sync/" + laneName.split("/")[1]
+                                    var lanes = TimelineModel.lanes
+                                    for (var i = 0; i < lanes.length; i++)
+                                        if (lanes[i].name === pairedName) return i
+                                    return -1
+                                }
                                 // Throttled, not immediate: a drag/wheel gesture fires
                                 // dozens of these changes per second, and each repaint
                                 // means a Python round-trip (TimelineModel.visibleSpans)
@@ -164,6 +225,29 @@ Item {
                                     onTriggered: laneCanvas.requestPaint()
                                 }
 
+                                // Shared by both the lane's own spans and the sync
+                                // overlay below -- fills `spans` left-to-right with
+                                // the same gap-aware 1px floor (see the comment this
+                                // replaced): every rect gets at least 1px for
+                                // visibility, but never so wide it eats the real gap
+                                // before the next span in the SAME list.
+                                function _paintSpans(ctx, spans, scale, colorOf, alpha) {
+                                    ctx.globalAlpha = alpha
+                                    for (var i = 0; i < spans.length; i++) {
+                                        var sp = spans[i]
+                                        var x0 = (sp.startNs - root.viewStartNs) * scale
+                                        var wReal = sp.durNs * scale
+                                        var w = Math.max(1, wReal)
+                                        if (i + 1 < spans.length) {
+                                            var nextX0 = (spans[i + 1].startNs - root.viewStartNs) * scale
+                                            w = Math.max(wReal, Math.min(w, nextX0 - x0))
+                                        }
+                                        ctx.fillStyle = colorOf(sp)
+                                        ctx.fillRect(Math.max(0, x0), 3, Math.min(w, width - x0), height - 6)
+                                    }
+                                    ctx.globalAlpha = 1.0
+                                }
+
                                 onPaint: {
                                     var ctx = getContext("2d")
                                     ctx.reset()
@@ -171,12 +255,27 @@ Item {
                                         laneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs, 2000)
                                     cachedSpans = spans
                                     var scale = width / root.visibleNs
-                                    for (var i = 0; i < spans.length; i++) {
-                                        var sp = spans[i]
-                                        var x0 = (sp.startNs - root.viewStartNs) * scale
-                                        var w = Math.max(1, sp.durNs * scale)
-                                        ctx.fillStyle = sp.color
-                                        ctx.fillRect(Math.max(0, x0), 3, Math.min(w, width - x0), height - 6)
+                                    _paintSpans(ctx, spans, scale, function(sp) { return sp.color }, 1.0)
+
+                                    // Overlay the paired sync lane's spans ON TOP,
+                                    // dimmed, so a barrier/critical-section wait
+                                    // nested inside one of the spans just painted
+                                    // above reads as visibly idle instead of being
+                                    // silently absorbed into the parent's solid
+                                    // "busy" color -- see syncOverlayLaneIndex's
+                                    // comment for why the same time interval can
+                                    // legitimately belong to both lanes at once.
+                                    if (syncOverlayLaneIndex >= 0) {
+                                        var syncSpans = TimelineModel.visibleSpans(
+                                            syncOverlayLaneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs, 2000)
+                                        // Each span's OWN per-function color (sp.color,
+                                        // the same field the sync lane's own bars use),
+                                        // not a flat category color -- so a given
+                                        // function (e.g. "omp_barrier") overlays here in
+                                        // the exact same hue it renders as on the sync
+                                        // lane directly below, letting the two be
+                                        // visually correlated at a glance.
+                                        _paintSpans(ctx, syncSpans, scale, function(sp) { return sp.color }, 0.8)
                                     }
                                 }
 
@@ -397,6 +496,17 @@ Item {
         // answering "which functions call which, overall" for the
         // CURRENT TIME WINDOW, not "how expensive is this specific path"
         // for the whole trace.
+        //
+        // The canvas is wrapped in a Flickable and sized from the
+        // layout's raw numLayers/maxLayerSize (fixed per-node pixel
+        // pitch, not "squeeze everything into 210px") so nodes never
+        // visually overlap regardless of how wide/tall the graph is --
+        // a real crowding bug seen on a live GROMACS trace where a
+        // layer of ~8-10 nodes packed into one fixed-height column made
+        // labels overlap and become unreadable. Scrolling (not just a
+        // bigger fixed canvas) is what makes raising max_nodes from 30
+        // to 60 in TimelineModel.callGraph() viable instead of just
+        // moving the crowding problem to a bigger box.
         Rectangle {
             id: callGraphPanel
             Layout.fillWidth: true
@@ -408,9 +518,15 @@ Item {
             radius: 6
             clip: true
 
-            property var graphData: ({nodes: [], edges: [], truncated: 0})
+            readonly property real boxW: 130
+            readonly property real boxH: 32
+            readonly property real colGap: 46
+            readonly property real rowGap: 14
+
+            property var graphData: ({nodes: [], edges: [], numLayers: 0, maxLayerSize: 0, truncated: 0})
             property var hoveredNode: null
-            property var hoverPos: Qt.point(0, 0)
+            property real hoverViewX: 0
+            property real hoverViewY: 0
 
             function refresh() {
                 graphData = TimelineModel.callGraph(root.viewStartNs, root.viewStartNs + root.visibleNs)
@@ -450,6 +566,7 @@ Item {
             Component.onCompleted: refresh()
 
             Text {
+                id: graphTitle
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.margins: 6
@@ -471,124 +588,159 @@ Item {
                 font.pixelSize: 12
             }
 
-            Canvas {
-                id: graphCanvas
-                anchors.fill: parent
-                anchors.topMargin: 20
-                anchors.margins: 8
+            Flickable {
+                id: graphFlick
+                anchors.top: graphTitle.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.margins: 4
+                contentWidth: graphCanvas.width
+                contentHeight: graphCanvas.height
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.horizontal: ScrollBar {
+                    policy: graphFlick.contentWidth > graphFlick.width ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+                }
+                ScrollBar.vertical: ScrollBar {
+                    policy: graphFlick.contentHeight > graphFlick.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+                }
 
-                readonly property real boxW: 120
-                readonly property real boxH: 30
+                Canvas {
+                    id: graphCanvas
+                    objectName: "callGraphCanvas"
 
-                onPaint: {
-                    var ctx = getContext("2d")
-                    ctx.reset()
-                    var data = callGraphPanel.graphData
-                    var nodes = data.nodes
-                    var edges = data.edges
-                    if (nodes.length === 0) return
+                    // NOT named "data" -- that's QtQuick's built-in
+                    // Item.data default property (holds child objects);
+                    // shadowing it with a custom property of the same
+                    // name is a real footgun, not just a style nit.
+                    readonly property var layoutData: callGraphPanel.graphData
+                    width: Math.max(layoutData.numLayers * (callGraphPanel.boxW + callGraphPanel.colGap) + callGraphPanel.colGap,
+                                     graphFlick.width)
+                    height: Math.max(layoutData.maxLayerSize * (callGraphPanel.boxH + callGraphPanel.rowGap) + callGraphPanel.rowGap,
+                                      graphFlick.height)
 
-                    var W = width, H = height
-                    function px(n) { return n.x * (W - graphCanvas.boxW) + graphCanvas.boxW / 2 }
-                    function py(n) { return n.y * (H - graphCanvas.boxH) + graphCanvas.boxH / 2 }
+                    // Raw layer/layerIndex (not the normalized x/y) give
+                    // every node the SAME pixel size/spacing no matter
+                    // how many layers/nodes exist -- this is what
+                    // actually fixes the overlap, not just a bigger canvas.
+                    function px(n) { return colGapHalf + n.layer * (callGraphPanel.boxW + callGraphPanel.colGap) + callGraphPanel.boxW / 2 }
+                    function py(n) { return rowGapHalf + n.layerIndex * (callGraphPanel.boxH + callGraphPanel.rowGap) + callGraphPanel.boxH / 2 }
+                    readonly property real colGapHalf: callGraphPanel.colGap / 2
+                    readonly property real rowGapHalf: callGraphPanel.rowGap / 2
 
-                    // Edges first (under the node boxes), thickness/alpha
-                    // scaled by relative time weight so hot call paths
-                    // visually stand out.
-                    var maxEdgeNs = 1
-                    for (var i = 0; i < edges.length; i++)
-                        maxEdgeNs = Math.max(maxEdgeNs, edges[i].totalNs)
-                    for (i = 0; i < edges.length; i++) {
-                        var e = edges[i]
-                        var a = nodes[e.callerIdx], b = nodes[e.calleeIdx]
-                        var x0 = px(a), y0 = py(a), x1 = px(b), y1 = py(b)
-                        var weight = e.totalNs / maxEdgeNs
-                        ctx.strokeStyle = AppTheme.dark
-                            ? "rgba(139,148,158," + (0.3 + 0.6 * weight) + ")"
-                            : "rgba(101,109,118," + (0.3 + 0.6 * weight) + ")"
-                        ctx.lineWidth = 1 + 2 * weight
-                        ctx.beginPath()
-                        ctx.moveTo(x0, y0)
-                        ctx.lineTo(x1, y1)
-                        ctx.stroke()
-                        // Arrowhead at the callee end
-                        var ang = Math.atan2(y1 - y0, x1 - x0)
-                        var ah = 6
-                        var tx = x1 - Math.cos(ang) * (graphCanvas.boxW / 2)
-                        var ty = y1 - Math.sin(ang) * (graphCanvas.boxH / 2)
-                        ctx.beginPath()
-                        ctx.moveTo(tx, ty)
-                        ctx.lineTo(tx - ah * Math.cos(ang - Math.PI / 6), ty - ah * Math.sin(ang - Math.PI / 6))
-                        ctx.lineTo(tx - ah * Math.cos(ang + Math.PI / 6), ty - ah * Math.sin(ang + Math.PI / 6))
-                        ctx.closePath()
-                        ctx.fill()
-                    }
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.reset()
+                        var nodes = layoutData.nodes
+                        var edges = layoutData.edges
+                        if (nodes.length === 0) return
 
-                    // Nodes on top.
-                    for (i = 0; i < nodes.length; i++) {
-                        var n = nodes[i]
-                        var cx = px(n), cy = py(n)
-                        var hovered = callGraphPanel.hoveredNode === n
-                        ctx.fillStyle = n.color
-                        ctx.globalAlpha = hovered ? 1.0 : 0.85
-                        ctx.beginPath()
-                        // Plain rect, not roundedRect -- QML's Canvas 2D
-                        // context doesn't implement that method (a
-                        // relatively recent addition to the HTML5 Canvas
-                        // spec); calling it threw and silently aborted
-                        // the rest of this paint (everything after the
-                        // FIRST node in the loop), which is why edges
-                        // rendered correctly but no node boxes ever did.
-                        ctx.rect(cx - graphCanvas.boxW / 2, cy - graphCanvas.boxH / 2,
-                                 graphCanvas.boxW, graphCanvas.boxH)
-                        ctx.fill()
-                        ctx.globalAlpha = 1.0
-                        if (hovered) {
-                            ctx.strokeStyle = AppTheme.text
-                            ctx.lineWidth = 2
+                        // Edges first (under the node boxes), thickness/alpha
+                        // scaled by relative time weight so hot call paths
+                        // visually stand out.
+                        var maxEdgeNs = 1
+                        for (var i = 0; i < edges.length; i++)
+                            maxEdgeNs = Math.max(maxEdgeNs, edges[i].totalNs)
+                        for (i = 0; i < edges.length; i++) {
+                            var e = edges[i]
+                            var a = nodes[e.callerIdx], b = nodes[e.calleeIdx]
+                            var x0 = px(a), y0 = py(a), x1 = px(b), y1 = py(b)
+                            var weight = e.totalNs / maxEdgeNs
+                            ctx.strokeStyle = AppTheme.dark
+                                ? "rgba(139,148,158," + (0.3 + 0.6 * weight) + ")"
+                                : "rgba(101,109,118," + (0.3 + 0.6 * weight) + ")"
+                            ctx.lineWidth = 1 + 2 * weight
+                            ctx.beginPath()
+                            ctx.moveTo(x0, y0)
+                            ctx.lineTo(x1, y1)
                             ctx.stroke()
+                            // Arrowhead at the callee end
+                            var ang = Math.atan2(y1 - y0, x1 - x0)
+                            var ah = 6
+                            var tx = x1 - Math.cos(ang) * (callGraphPanel.boxW / 2)
+                            var ty = y1 - Math.sin(ang) * (callGraphPanel.boxH / 2)
+                            ctx.beginPath()
+                            ctx.moveTo(tx, ty)
+                            ctx.lineTo(tx - ah * Math.cos(ang - Math.PI / 6), ty - ah * Math.sin(ang - Math.PI / 6))
+                            ctx.lineTo(tx - ah * Math.cos(ang + Math.PI / 6), ty - ah * Math.sin(ang + Math.PI / 6))
+                            ctx.closePath()
+                            ctx.fill()
                         }
-                        ctx.fillStyle = "#111111"
-                        ctx.font = "11px sans-serif"
-                        ctx.textAlign = "center"
-                        var label = n.name
-                        var maxCh = Math.floor(graphCanvas.boxW / 6.5)
-                        if (label.length > maxCh) label = label.slice(0, maxCh - 1) + "…"
-                        ctx.fillText(label, cx, cy + 4)
-                    }
-                    ctx.textAlign = "left"
-                }
 
-                function hitTest(mx, my) {
-                    var nodes = callGraphPanel.graphData.nodes
-                    for (var i = nodes.length - 1; i >= 0; i--) {
-                        var n = nodes[i]
-                        var cx = n.x * (width - boxW) + boxW / 2
-                        var cy = n.y * (height - boxH) + boxH / 2
-                        if (Math.abs(mx - cx) <= boxW / 2 && Math.abs(my - cy) <= boxH / 2)
-                            return n
+                        // Nodes on top.
+                        for (i = 0; i < nodes.length; i++) {
+                            var n = nodes[i]
+                            var cx = px(n), cy = py(n)
+                            var hovered = callGraphPanel.hoveredNode === n
+                            ctx.fillStyle = n.color
+                            ctx.globalAlpha = hovered ? 1.0 : 0.85
+                            ctx.beginPath()
+                            // Plain rect, not roundedRect -- QML's Canvas 2D
+                            // context doesn't implement that method (a
+                            // relatively recent addition to the HTML5 Canvas
+                            // spec); calling it threw and silently aborted
+                            // the rest of this paint (everything after the
+                            // FIRST node in the loop), which is why edges
+                            // rendered correctly but no node boxes ever did.
+                            ctx.rect(cx - callGraphPanel.boxW / 2, cy - callGraphPanel.boxH / 2,
+                                     callGraphPanel.boxW, callGraphPanel.boxH)
+                            ctx.fill()
+                            ctx.globalAlpha = 1.0
+                            if (hovered) {
+                                ctx.strokeStyle = AppTheme.text
+                                ctx.lineWidth = 2
+                                ctx.stroke()
+                            }
+                            ctx.fillStyle = "#111111"
+                            ctx.font = "11px sans-serif"
+                            ctx.textAlign = "center"
+                            var label = n.name
+                            var maxCh = Math.floor(callGraphPanel.boxW / 6.5)
+                            if (label.length > maxCh) label = label.slice(0, maxCh - 1) + "…"
+                            ctx.fillText(label, cx, cy + 4)
+                        }
+                        ctx.textAlign = "left"
                     }
-                    return null
-                }
 
-                MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    onPositionChanged: (mouse) => {
-                        var hit = graphCanvas.hitTest(mouse.x, mouse.y)
-                        if (hit === callGraphPanel.hoveredNode) return
-                        callGraphPanel.hoveredNode = hit
-                        callGraphPanel.hoverPos = Qt.point(mouse.x, mouse.y)
-                        graphCanvas.requestPaint()
+                    function hitTest(mx, my) {
+                        var nodes = layoutData.nodes
+                        for (var i = nodes.length - 1; i >= 0; i--) {
+                            var n = nodes[i]
+                            var cx = px(n), cy = py(n)
+                            if (Math.abs(mx - cx) <= callGraphPanel.boxW / 2 && Math.abs(my - cy) <= callGraphPanel.boxH / 2)
+                                return n
+                        }
+                        return null
                     }
-                    onExited: {
-                        callGraphPanel.hoveredNode = null
-                        graphCanvas.requestPaint()
+
+                    Connections {
+                        target: callGraphPanel
+                        function onGraphDataChanged() { graphCanvas.requestPaint() }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onPositionChanged: (mouse) => {
+                            var hit = graphCanvas.hitTest(mouse.x, mouse.y)
+                            callGraphPanel.hoverViewX = mouse.x - graphFlick.contentX
+                            callGraphPanel.hoverViewY = mouse.y - graphFlick.contentY
+                            if (hit === callGraphPanel.hoveredNode) return
+                            callGraphPanel.hoveredNode = hit
+                            graphCanvas.requestPaint()
+                        }
+                        onExited: {
+                            callGraphPanel.hoveredNode = null
+                            graphCanvas.requestPaint()
+                        }
                     }
                 }
             }
 
-            // Tooltip for the hovered node.
+            // Tooltip for the hovered node -- follows the cursor, clamped
+            // to stay within the panel (not the scrollable canvas, which
+            // can be much bigger than the visible viewport).
             Rectangle {
                 visible: !!callGraphPanel.hoveredNode
                 color: "#000000"
@@ -598,8 +750,8 @@ Item {
                 border.width: 1
                 width: tipCol.width + 18
                 height: tipCol.height + 12
-                x: Math.min(callGraphPanel.hoverPos.x + 30, callGraphPanel.width - width - 6)
-                y: Math.min(callGraphPanel.hoverPos.y + 28, callGraphPanel.height - height - 6)
+                x: Math.min(callGraphPanel.hoverViewX + 14, callGraphPanel.width - width - 6)
+                y: Math.min(graphTitle.height + callGraphPanel.hoverViewY + 8, callGraphPanel.height - height - 6)
                 z: 20
 
                 ColumnLayout {

@@ -142,6 +142,40 @@ class TestLayoutCallGraph(unittest.TestCase):
         self.assertEqual(layout["nodes"], [])
         self.assertEqual(layout["edges"], [])
         self.assertEqual(layout["truncated"], 0)
+        self.assertEqual(layout["numLayers"], 0)
+        self.assertEqual(layout["maxLayerSize"], 0)
+
+    def test_nodes_carry_raw_layer_and_layer_index(self):
+        # x/y are normalized [0,1] -- can't reconstruct "how many layers
+        # total" or "how many nodes share this layer" from them alone.
+        # layer/layerIndex are the raw ints a pixel-based QML layout
+        # needs to give every node a fixed size/spacing regardless of
+        # how many nodes/layers there are.
+        spans = [
+            _span("leaf1", ["mid1", "root"], dur_ns=100),
+            _span("leaf2", ["mid2", "root"], dur_ns=200),
+        ]
+        nodes, edges = build_call_graph(spans)
+        layout = layout_call_graph(nodes, edges)
+        by_name = {n["name"]: n for n in layout["nodes"]}
+        self.assertEqual(by_name["root"]["layer"], 0)
+        self.assertEqual(by_name["mid1"]["layer"], 1)
+        self.assertEqual(by_name["leaf1"]["layer"], 2)
+        # mid1/mid2 are both in layer 1 -- distinct layerIndex values.
+        self.assertNotEqual(by_name["mid1"]["layerIndex"], by_name["mid2"]["layerIndex"])
+
+    def test_num_layers_and_max_layer_size_match_the_layout(self):
+        spans = [
+            _span("leaf1", ["mid1", "root"], dur_ns=100),
+            _span("leaf2", ["mid2", "root"], dur_ns=200),
+            _span("leaf3", ["mid2", "root"], dur_ns=50),
+        ]
+        nodes, edges = build_call_graph(spans)
+        layout = layout_call_graph(nodes, edges)
+        # root(0) -> mid1/mid2(1) -> leaf1/leaf2/leaf3(2): 3 layers.
+        self.assertEqual(layout["numLayers"], 3)
+        # Layer 2 (leaf1, leaf2, leaf3) is the widest, at 3 nodes.
+        self.assertEqual(layout["maxLayerSize"], 3)
 
 
 if __name__ == "__main__":

@@ -282,7 +282,11 @@ class TimelineModel(QObject):
         ]
         from ..analysis.call_graph import build_call_graph, layout_call_graph
         nodes, edges = build_call_graph(visible)
-        layout = layout_call_graph(nodes, edges)
+        # 60, not the module default of 30: the panel now scrolls (a
+        # dynamically-sized Flickable canvas, sized off numLayers/
+        # maxLayerSize) instead of squeezing every node into one fixed
+        # 210px box, so a less aggressive cap no longer costs readability.
+        layout = layout_call_graph(nodes, edges, max_nodes=60)
         for n in layout["nodes"]:
             n["color"] = self._theme.categoryColor(n["category"])
         return layout
