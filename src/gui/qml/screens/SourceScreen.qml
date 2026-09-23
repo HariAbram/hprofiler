@@ -77,46 +77,108 @@ RowLayout {
         radius: 6
         clip: true
 
-        ListView {
-            id: asmView
+        ColumnLayout {
             anchors.fill: parent
             anchors.margins: 8
-            clip: true
-            model: root.selectedKernel && root.selectedKernel.hasDisasm
-                   ? Source.disasmLines(root.selectedKernel.rawName) : []
-            delegate: RowLayout {
-                width: ListView.view.width
-                height: 18
+            spacing: 4
+            visible: root.selectedKernel && root.selectedKernel.hasDisasm
+
+            // What function this actually is: the span list on the left
+            // shows event labels hprofiler invents ("omp_barrier",
+            // "MPI_Bcast") -- there's no ELF symbol by that name. This is
+            // the real resolved call site that got disassembled: for an
+            // OpenMP/MPI event, that's the function in YOUR OWN profiled
+            // program that triggered it (the runtime library's own
+            // implementation is never what's shown -- see
+            // hooks/common/codeptr_resolve.h). Empty when nothing
+            // resolved (e.g. plain perf-sampled-by-name CPU functions,
+            // where the kernel list name already IS the real symbol).
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 18
+                Layout.maximumHeight: 18
                 spacing: 8
+                visible: !!(root.selectedKernel && root.selectedKernel.symbol)
                 Text {
-                    text: modelData.addr
+                    text: "call site:"
                     color: AppTheme.textMuted
-                    font.family: "monospace"
                     font.pixelSize: 11
-                    Layout.preferredWidth: 60
                 }
                 Text {
-                    text: modelData.mnemonic
-                    color: modelData.color
-                    font.family: "monospace"
+                    text: root.selectedKernel ? root.selectedKernel.symbol : ""
+                    color: AppTheme.text
                     font.bold: true
                     font.pixelSize: 11
-                    Layout.preferredWidth: 90
-                }
-                Text {
-                    text: modelData.operands
-                    color: AppTheme.text
-                    font.family: "monospace"
-                    font.pixelSize: 11
-                    Layout.fillWidth: true
                     elide: Text.ElideRight
+                    Layout.fillWidth: true
                 }
-                Text {
-                    visible: modelData.samplePct > 0
-                    text: modelData.samplePct.toFixed(1) + "%"
-                    color: modelData.samplePct >= 10 ? "#f87171" : (modelData.samplePct >= 1 ? "#fbbf24" : AppTheme.textMuted)
-                    font.pixelSize: 10
-                    Layout.preferredWidth: 40
+            }
+
+            ListView {
+                id: asmView
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: root.selectedKernel && root.selectedKernel.hasDisasm
+                       ? Source.disasmLines(root.selectedKernel.rawName) : []
+                delegate: ColumnLayout {
+                    width: ListView.view.width
+                    spacing: 0
+
+                    // Source correlation: shown once per source line (not
+                    // once per instruction) via sourceChanged, computed
+                    // Python-side in SourceBridge.disasmLines(). Empty
+                    // whenever the binary has no debug info for this
+                    // function, or addr2line/llvm-symbolizer isn't
+                    // installed -- silently absent, not an error.
+                    Text {
+                        visible: modelData.sourceChanged
+                        text: "// " + modelData.sourceFile + ":" + modelData.sourceLine
+                        color: AppTheme.textMuted
+                        font.family: "monospace"
+                        font.italic: true
+                        font.pixelSize: 10
+                        Layout.topMargin: 4
+                        elide: Text.ElideLeft
+                        Layout.fillWidth: true
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 18
+                        Layout.maximumHeight: 18
+                        spacing: 8
+                        Text {
+                            text: modelData.addr
+                            color: AppTheme.textMuted
+                            font.family: "monospace"
+                            font.pixelSize: 11
+                            Layout.preferredWidth: 60
+                        }
+                        Text {
+                            text: modelData.mnemonic
+                            color: modelData.color
+                            font.family: "monospace"
+                            font.bold: true
+                            font.pixelSize: 11
+                            Layout.preferredWidth: 90
+                        }
+                        Text {
+                            text: modelData.operands
+                            color: AppTheme.text
+                            font.family: "monospace"
+                            font.pixelSize: 11
+                            Layout.fillWidth: true
+                            elide: Text.ElideRight
+                        }
+                        Text {
+                            visible: modelData.samplePct > 0
+                            text: modelData.samplePct.toFixed(1) + "%"
+                            color: modelData.samplePct >= 10 ? "#f87171" : (modelData.samplePct >= 1 ? "#fbbf24" : AppTheme.textMuted)
+                            font.pixelSize: 10
+                            Layout.preferredWidth: 40
+                        }
+                    }
                 }
             }
         }

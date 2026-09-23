@@ -18,7 +18,9 @@ UI formats in its own idiom.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,27 @@ from ..core.trace import Trace
 _GPU_CATS = ("cuda", "rocm", "opencl")
 
 _JIT_HASH_RE = re.compile(r'^(\d+)\.(\d+)\.jit\.so$')
+
+
+@lru_cache(maxsize=256)
+def demangle(name: str) -> str:
+    """C++-demangle a symbol via c++filt (same subprocess pattern already
+    used in core/runner.py's _resolve_jit_sym), for showing a resolved
+    call-site symbol (KernelDisasm.mangled_name) to the user as a readable
+    function name instead of a raw mangled string. Cached: the Source tab
+    re-demangles the same handful of symbols repeatedly as the user
+    navigates between kernels. Returns `name` unchanged (not an error) if
+    c++filt is unavailable or the name isn't a mangled C++ symbol (e.g. a
+    plain C function, or a library offset with no symbol at all)."""
+    if not name:
+        return name
+    try:
+        dm = subprocess.run(["c++filt", name], capture_output=True, text=True, timeout=2)
+        if dm.returncode == 0 and dm.stdout.strip():
+            return dm.stdout.strip()
+    except Exception:
+        pass
+    return name
 
 
 # ── Formatting helpers ──────────────────────────────────────────────────────

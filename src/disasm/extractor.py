@@ -1109,6 +1109,20 @@ def collect_disasm(
                                 arch=_elf_arch(target_path))
                 if kd:
                     kd.name = span_name
+            if kd:
+                # kd.name is the span/event name (e.g. "omp_barrier") for
+                # display grouping -- there's no real ELF symbol by that
+                # name (it's an hprofiler-invented event label, not
+                # something objdump/perf/nm ever heard of); sym_name here
+                # is the REAL resolved symbol at the call site (what
+                # dladdr/nm actually found and what was disassembled).
+                # Keep it on mangled_name (same field CUPTI lookups
+                # already use this way, see runner.py's kd.mangled_name
+                # fallback) so annotate_with_perf() can filter `perf
+                # annotate` by the symbol that actually exists, and so
+                # UIs can show the user what function they're really
+                # looking at instead of just the event label.
+                kd.mangled_name = sym_name
             sym_cache[cache_key] = kd   # record result (None = not found)
             if kd and kd.lines:
                 result[span_name] = kd
@@ -1163,8 +1177,18 @@ def annotate_with_perf(kd: KernelDisasm, perf_data: str, binary: str = "") -> in
     if not addr_to_line:
         return 0
 
+    # Filter by the REAL resolved symbol (kd.mangled_name) when we have
+    # one, not kd.name: for OMP/MPI-hook-resolved kernels, kd.name is an
+    # hprofiler-invented event label (e.g. "omp_barrier") that no real
+    # ELF symbol is ever named, so `perf annotate -s omp_barrier` matches
+    # nothing and every line silently stays at sample_pct=0 regardless of
+    # whether perf actually recorded samples in that function. kd.name IS
+    # the real symbol for perf-sampled-by-name kernels (the other caller
+    # of this function), where mangled_name is unset -- falls back to it.
+    sym_filter = kd.mangled_name or kd.name
+
     # Try with --no-source first (skips source interleaving), fall back without it
-    base = ["perf", "annotate", "--stdio", "-s", kd.name, "-i", perf_data]
+    base = ["perf", "annotate", "--stdio", "-s", sym_filter, "-i", perf_data]
     if binary:
         base.append(binary)
     out = _run(base + ["--no-source", "-q"], timeout=30)

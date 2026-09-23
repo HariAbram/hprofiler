@@ -2105,6 +2105,18 @@ class DisasmWidget(Widget):
         if stat:
             hdr.append(f"   {_fmt_ns(stat['total_ns'])}", style="yellow")
             hdr.append(f"  {stat['count']}×  {stat['pct']:.1f}%", style="dim")
+        if kd.mangled_name:
+            # `name` (this row's label) is an event label hprofiler itself
+            # invents ("omp_barrier", "MPI_Bcast") -- there's no ELF symbol
+            # by that name. This is the real resolved call site that got
+            # disassembled: for an OpenMP/MPI event, the function in the
+            # PROFILED PROGRAM's own code that triggered it (never the
+            # runtime library's own implementation -- see
+            # hooks/common/codeptr_resolve.h). A real user asked "what does
+            # 'omp_barrier assembly' even mean" with no way to tell from
+            # this screen -- this answers it.
+            from ..analysis.dashboard import demangle as _demangle
+            hdr.append(f"\ncall site: {_demangle(kd.mangled_name)}", style="cyan")
 
         sep = Text("─" * 80, style="dim")
 

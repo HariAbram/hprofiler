@@ -173,6 +173,108 @@ class TestCollectDisasmUsesSymfileNotLauncher(unittest.TestCase):
         )
         self.assertIn("omp_parallel_region", result)
 
+    def test_mangled_name_is_the_real_symbol_not_the_span_label(self):
+        # Regression test for a real user question ("what does 'omp_barrier
+        # assembly' even mean?"): kd.name stays the span/event label
+        # ("omp_parallel_region") for display grouping -- unchanged -- but
+        # kd.mangled_name must carry the REAL resolved symbol that was
+        # actually disassembled (here: hprofiler_test_target_function),
+        # not be left empty. Two things depend on this: annotate_with_perf
+        # filtering `perf annotate` by a symbol that actually exists (see
+        # the sibling test below), and UIs showing the user what function
+        # they're really looking at.
+        omp_syms = {
+            "omp_parallel_region": (
+                "sym", ("hprofiler_test_target_function", self.real_binary)
+            ),
+        }
+        result = collect_disasm(
+            command=[self.real_binary], backends=["openmp"], jit_spans=[],
+            omp_syms=omp_syms,
+        )
+        kd = result["omp_parallel_region"]
+        self.assertEqual(kd.name, "omp_parallel_region")
+        self.assertEqual(kd.mangled_name, "hprofiler_test_target_function")
+
+
+class TestAnnotateWithPerfSymbolFilter(unittest.TestCase):
+    """Regression test for a real bug: annotate_with_perf() always filtered
+    `perf annotate -s <kd.name>`, but for an OMP/MPI-hook-resolved kernel
+    kd.name is an hprofiler-invented event label ("omp_barrier",
+    "MPI_Bcast") that no real ELF symbol is ever named -- perf's own
+    symbol table has no such entry, so the filter silently matched
+    nothing and every DisasmLine.sample_pct stayed 0 regardless of
+    whether perf actually recorded real samples elsewhere in the binary.
+    A real user reported exactly this: working disassembly, but "no
+    statistical information" shown at all.
+
+    Can't exercise this against a REAL `perf record`/`perf annotate` in
+    this sandbox (perf_event_paranoid=4 here blocks perf record entirely,
+    confirmed empirically -- see project_paper4_benchmark_suite memory
+    for this machine's other confirmed perf limits), so this mocks the
+    subprocess call and asserts on the constructed argv -- which is
+    exactly the one-line change the bug fix actually was."""
+
+    def test_uses_mangled_name_as_the_symbol_filter_when_present(self):
+        from src.disasm.extractor import annotate_with_perf, KernelDisasm, DisasmLine
+        kd = KernelDisasm(
+            name="omp_barrier", arch="x86-64", source="/bin/gmx_mpi",
+            mangled_name="hprofiler_test_target_function",
+            lines=[DisasmLine(addr=0x1000, mnemonic="push", operands="rbp")],
+        )
+        with patch("src.disasm.extractor.shutil.which", return_value="/usr/bin/perf"), \
+             patch("src.disasm.extractor.Path.exists", return_value=True), \
+             patch("src.disasm.extractor._run", return_value="") as mock_run:
+            annotate_with_perf(kd, "/tmp/fake_perf.data")
+        first_call_argv = mock_run.call_args_list[0].args[0]
+        self.assertIn("hprofiler_test_target_function", first_call_argv)
+        self.assertNotIn("omp_barrier", first_call_argv)
+
+    def test_falls_back_to_kd_name_when_mangled_name_is_unset(self):
+        # The OTHER caller of annotate_with_perf (perf-sampled-by-name CPU
+        # kernels, src/core/runner.py) never sets mangled_name at all --
+        # kd.name there already IS the real symbol, so it must still be
+        # used as the filter in that case.
+        from src.disasm.extractor import annotate_with_perf, KernelDisasm, DisasmLine
+        kd = KernelDisasm(
+            name="hot_cpu_function", arch="x86-64", source="/bin/a.out",
+            lines=[DisasmLine(addr=0x1000, mnemonic="push", operands="rbp")],
+        )
+        with patch("src.disasm.extractor.shutil.which", return_value="/usr/bin/perf"), \
+             patch("src.disasm.extractor.Path.exists", return_value=True), \
+             patch("src.disasm.extractor._run", return_value="") as mock_run:
+            annotate_with_perf(kd, "/tmp/fake_perf.data")
+        first_call_argv = mock_run.call_args_list[0].args[0]
+        self.assertIn("hot_cpu_function", first_call_argv)
+
+
+class TestDemangle(unittest.TestCase):
+    """analysis/dashboard.py's demangle() -- added alongside the
+    mangled_name fix above so both UIs can show the user a readable
+    function name (e.g. "gmx::ThreadedForceBuffer<...>::ThreadedForceBuffer(...)")
+    instead of the raw mangled symbol or, worse, nothing at all."""
+
+    @unittest.skipUnless(shutil.which("c++filt"), "c++filt not installed")
+    def test_demangles_a_real_mangled_cpp_symbol(self):
+        from src.analysis.dashboard import demangle
+        # The exact symbol from a real Dardel/GROMACS trace (see
+        # hooks/common/codeptr_resolve.h's own docstring example).
+        result = demangle("_ZN3gmx19ThreadedForceBufferIA4_fEC2Eibi")
+        self.assertIn("ThreadedForceBuffer", result)
+        self.assertNotEqual(result, "_ZN3gmx19ThreadedForceBufferIA4_fEC2Eibi")
+
+    def test_returns_input_unchanged_when_cxxfilt_unavailable(self):
+        from src.analysis.dashboard import demangle
+        demangle.cache_clear()
+        with patch("src.analysis.dashboard.subprocess.run",
+                   side_effect=FileNotFoundError):
+            self.assertEqual(demangle("some_plain_c_function"), "some_plain_c_function")
+        demangle.cache_clear()
+
+    def test_empty_name_returns_empty_without_shelling_out(self):
+        from src.analysis.dashboard import demangle
+        self.assertEqual(demangle(""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

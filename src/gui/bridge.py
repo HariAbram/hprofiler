@@ -453,12 +453,25 @@ class SourceBridge(QObject):
         for name in names:
             kd = disasm.get(name)
             stat = stats_by_name.get(name)
+            # kd.name (== `name` here) is the span/event label hprofiler
+            # itself invents ("omp_barrier", "MPI_Bcast") -- there is no
+            # real ELF symbol by that name. kd.mangled_name, when set, is
+            # the REAL function that was actually disassembled: for an
+            # OMP/MPI-hook-resolved kernel this is the call site in the
+            # PROFILED PROGRAM's own code that triggered the event (the
+            # OpenMP/MPI runtime's own implementation is never what gets
+            # shown -- see hooks/common/codeptr_resolve.h), i.e. "which of
+            # YOUR functions hit this barrier/collective". Demangled here
+            # so the Source screen can tell the user what they're actually
+            # looking at instead of just the event label.
+            symbol = dash.demangle(kd.mangled_name) if kd and kd.mangled_name else ""
             kernels.append({
                 "name": dash.fmt_kernel_name(name),
                 "rawName": name,
                 "hasDisasm": kd is not None,
                 "arch": kd.arch if kd else "—",
                 "total": dash.fmt_ns(stat["total_ns"]) if stat else "—",
+                "symbol": symbol,
             })
         self._kernels = kernels
         self.kernelsChanged.emit()
@@ -473,8 +486,19 @@ class SourceBridge(QObject):
         if kd is None:
             return []
         out = []
+        prev_loc = (None, None)
         for ln in kd.lines:
             itype = ln.itype.value if hasattr(ln.itype, "value") else str(ln.itype)
+            # Source location (populated by disasm/source_ann.py, which
+            # runs unconditionally after every disasm collection -- same
+            # data the TUI's DisasmWidget already interleaves as "//
+            # file:line" comment rows). sourceChanged marks only the
+            # first instruction at a given file:line, so the QML delegate
+            # can show the label once per source line instead of on every
+            # single instruction row.
+            loc = (ln.source_file, ln.source_line)
+            source_changed = bool(ln.source_file) and loc != prev_loc
+            prev_loc = loc
             out.append({
                 "addr": f"{ln.addr:x}",
                 "mnemonic": ln.mnemonic,
@@ -483,6 +507,9 @@ class SourceBridge(QObject):
                 "itype": itype,
                 "color": _ITYPE_HEX.get(itype, "#9ca3af"),
                 "samplePct": ln.sample_pct,
+                "sourceFile": ln.source_file,
+                "sourceLine": ln.source_line,
+                "sourceChanged": source_changed,
             })
         return out
 

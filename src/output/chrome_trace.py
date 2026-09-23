@@ -134,6 +134,8 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             name: {
                 "arch": kd.arch,
                 "source": kd.source,
+                "mangledName": kd.mangled_name,
+                "ptxasDerived": kd.ptxas_derived,
                 "lines": [
                     {
                         "addr": ln.addr,
@@ -142,6 +144,11 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
                         "itype": ln.itype.value,
                         "comment": ln.comment,
                         "raw": ln.raw,
+                        "sourceFile": ln.source_file,
+                        "sourceLine": ln.source_line,
+                        "samplePct": ln.sample_pct,
+                        "stallCycles": ln.stall_cycles,
+                        "stallReason": ln.stall_reason,
                     }
                     for ln in kd.lines
                 ],
@@ -242,6 +249,11 @@ def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trac
                         itype=InsnType(ln.get("itype", "other")),
                         comment=ln.get("comment", ""),
                         raw=ln.get("raw", ""),
+                        source_file=ln.get("sourceFile", ""),
+                        source_line=ln.get("sourceLine", 0),
+                        sample_pct=ln.get("samplePct", 0.0),
+                        stall_cycles=ln.get("stallCycles", -1),
+                        stall_reason=ln.get("stallReason", ""),
                     )
                     for ln in kd_raw.get("lines", [])
                 ]
@@ -249,6 +261,8 @@ def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trac
                     name=name,
                     arch=kd_raw.get("arch", ""),
                     source=kd_raw.get("source", ""),
+                    mangled_name=kd_raw.get("mangledName", ""),
+                    ptxas_derived=kd_raw.get("ptxasDerived", False),
                     lines=lines,
                 ))
         except Exception:

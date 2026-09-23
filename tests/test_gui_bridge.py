@@ -316,6 +316,75 @@ class TestGuiBridge(unittest.TestCase):
         sb._poll.timeout.emit()
         self.assertEqual(received, [])
 
+    def test_source_bridge_exposes_demangled_call_site_symbol(self):
+        # Regression test for a real user question: the kernel list shows
+        # the span/event label ("omp_barrier"), not the real function that
+        # was disassembled -- with no way to tell what code they're
+        # actually looking at. `symbol` now carries the demangled
+        # resolved call site (KernelDisasm.mangled_name).
+        from src.gui.bridge import SourceBridge
+        from src.disasm.extractor import KernelDisasm
+        span = _span(1, 1, Category.SYNC, 0, 100, "omp_barrier", tags={"sym": "caller_fn"})
+        trace = _mk_trace([span], backends=["openmp"])
+        trace.add_disasm(KernelDisasm(
+            name="omp_barrier", arch="x86-64", source="/bin/a.out",
+            mangled_name="_Z9caller_fnv", lines=[],
+        ))
+        sb = SourceBridge(trace)
+        row = next(k for k in sb.kernels if k["rawName"] == "omp_barrier")
+        self.assertIn("caller_fn", row["symbol"])
+
+    def test_source_bridge_symbol_empty_when_mangled_name_unset(self):
+        from src.gui.bridge import SourceBridge
+        from src.disasm.extractor import KernelDisasm
+        span = _span(1, 1, Category.CPU, 0, 100, "hot_fn")
+        trace = _mk_trace([span], backends=["cpu"])
+        trace.add_disasm(KernelDisasm(name="hot_fn", arch="x86-64", source="/bin/a.out", lines=[]))
+        sb = SourceBridge(trace)
+        row = next(k for k in sb.kernels if k["rawName"] == "hot_fn")
+        self.assertEqual(row["symbol"], "")
+
+    def test_source_bridge_disasm_lines_carry_source_correlation(self):
+        # source_file/source_line come from disasm/source_ann.py, which
+        # runs unconditionally after every disasm collection -- the data
+        # already existed, it just wasn't threaded through to QML before.
+        # sourceChanged marks only the first instruction at a given
+        # file:line so the delegate shows the label once, not per line.
+        from src.gui.bridge import SourceBridge
+        from src.disasm.extractor import KernelDisasm, DisasmLine
+        span = _span(1, 1, Category.CPU, 0, 100, "hot_fn")
+        trace = _mk_trace([span], backends=["cpu"])
+        trace.add_disasm(KernelDisasm(
+            name="hot_fn", arch="x86-64", source="/bin/a.out",
+            lines=[
+                DisasmLine(addr=0x10, mnemonic="push", operands="rbp",
+                          source_file="gmx.cpp", source_line=42),
+                DisasmLine(addr=0x14, mnemonic="mov", operands="rbp, rsp",
+                          source_file="gmx.cpp", source_line=42),
+                DisasmLine(addr=0x18, mnemonic="call", operands="0x20",
+                          source_file="gmx.cpp", source_line=43),
+            ],
+        ))
+        sb = SourceBridge(trace)
+        lines = sb.disasmLines("hot_fn")
+        self.assertEqual([ln["sourceLine"] for ln in lines], [42, 42, 43])
+        self.assertEqual([ln["sourceChanged"] for ln in lines], [True, False, True])
+        self.assertTrue(all(ln["sourceFile"] == "gmx.cpp" for ln in lines))
+
+    def test_source_bridge_disasm_lines_source_fields_empty_without_debug_info(self):
+        from src.gui.bridge import SourceBridge
+        from src.disasm.extractor import KernelDisasm, DisasmLine
+        span = _span(1, 1, Category.CPU, 0, 100, "hot_fn")
+        trace = _mk_trace([span], backends=["cpu"])
+        trace.add_disasm(KernelDisasm(
+            name="hot_fn", arch="x86-64", source="/bin/a.out",
+            lines=[DisasmLine(addr=0x10, mnemonic="push", operands="rbp")],
+        ))
+        sb = SourceBridge(trace)
+        lines = sb.disasmLines("hot_fn")
+        self.assertEqual(lines[0]["sourceFile"], "")
+        self.assertFalse(lines[0]["sourceChanged"])
+
     # ── SystemBridge ─────────────────────────────────────────────────────
 
     def test_system_bridge_exposes_run_info_and_devices(self):
