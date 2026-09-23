@@ -247,7 +247,19 @@ def gpu_starvation(trace: "Trace") -> dict:
 
     for span in trace.spans:
         if span.category in _GPU_CATS:
-            if span.tags.get("type") == "kernel" or span.tags.get("side") in ("gpu", None):
+            # AND, not OR: CUDA/ROCm kernel spans never carry a `side` tag
+            # (side is OpenCL-only, distinguishing its CPU-side enqueue-
+            # latency span from its GPU-side execution span -- both of
+            # which carry type=="kernel"), so `side in ("gpu", None)` alone
+            # is True for BOTH of an OpenCL kernel's two spans, and an OR
+            # here counted both as separate "kernel active" intervals --
+            # double-counting every OpenCL kernel's enqueue latency as
+            # additional GPU-active time. AND requires type=="kernel" AND
+            # (no side tag, i.e. CUDA/ROCm, or side=="gpu", i.e. OpenCL's
+            # real execution span) -- excludes exactly OpenCL's side=="cpu"
+            # span while leaving CUDA/ROCm (which never set `type` to
+            # anything but "kernel" for an actual kernel launch) unaffected.
+            if span.tags.get("type") == "kernel" and span.tags.get("side") in ("gpu", None):
                 kernel_intervals.append((span.start_ns, span.start_ns + span.duration_ns))
         if span.name in _SYNC_NAMES and span.duration_ns > 0:
             sync_intervals.append((span.start_ns, span.start_ns + span.duration_ns))

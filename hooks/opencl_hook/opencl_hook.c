@@ -210,8 +210,12 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
 #define CL_CALLBACK
 #endif
 
-/* Heap-allocated context passed to the OpenCL event callback. */
-typedef struct { char name[128]; char extra[128]; } event_cb_data_t;
+/* Heap-allocated context passed to the OpenCL event callback. `category`
+ * is set explicitly by each register_event_callback() caller (which
+ * already knows whether it's timing a kernel or a memory transfer)
+ * rather than re-derived by parsing `extra`'s "type=" tag back apart at
+ * completion time -- simpler and can't drift out of sync with it. */
+typedef struct { char name[128]; char extra[128]; char category[16]; } event_cb_data_t;
 
 typedef void (*event_cb_fn_t)(cl_event, cl_int, void *);
 typedef cl_int (*SetCB_t)(cl_event, cl_int, event_cb_fn_t, void *);
@@ -273,17 +277,26 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
         cl_calibrate_if_needed(gpu_end);
         uint64_t wall_start = cl_to_wall_ns(gpu_start);
         uint64_t dur_ns     = (gpu_end >= gpu_start) ? (gpu_end - gpu_start) : 0;
-        emit_span("opencl", gettid_compat(), wall_start, dur_ns, d->name, d->extra);
+        /* d->category, NOT a hardcoded "opencl" -- a memory-transfer
+         * event completing here must land in category "memory" (same
+         * as its CPU-side sibling span) so it reaches the Memory tab's
+         * bandwidth accounting; only an actual kernel event belongs in
+         * "opencl". Was hardcoded to "opencl" for every completion
+         * regardless of operation kind until this fix. */
+        emit_span(d->category, gettid_compat(), wall_start, dur_ns, d->name, d->extra);
     }
     if (g_real_release) g_real_release(ev);
     free(d);
 }
 
 /* Register an async GPU-profiling callback.  Returns immediately.
-   parent_sid: if non-zero, appends psid=<parent_sid> to the GPU span's extra tags. */
+   parent_sid: if non-zero, appends psid=<parent_sid> to the GPU span's extra tags.
+   category: the span category this completion should be emitted under
+   ("opencl" for a kernel, "memory" for a buffer/SVM transfer) -- passed
+   by the caller rather than inferred later, see event_cb_data_t. */
 static void register_event_callback(cl_event ev,
                                     const char *name, const char *extra,
-                                    uint64_t parent_sid) {
+                                    uint64_t parent_sid, const char *category) {
     /* g_real_setcb / g_real_retain are initialised once via g_ecb_once. */
     pthread_once(&g_ecb_once, _ecb_init_fns);
     if (!g_real_setcb || !ev) return;
@@ -291,6 +304,7 @@ static void register_event_callback(cl_event ev,
     event_cb_data_t *d = (event_cb_data_t *)malloc(sizeof(*d));
     if (!d) return;
     snprintf(d->name,  sizeof(d->name),  "%s", name  ? name  : "");
+    snprintf(d->category, sizeof(d->category), "%s", category ? category : "opencl");
     if (parent_sid)
         snprintf(d->extra, sizeof(d->extra), "%s,psid=%llu",
                  extra ? extra : "", (unsigned long long)parent_sid);
@@ -404,7 +418,7 @@ cl_int clEnqueueNDRangeKernel(
                  (unsigned long long)cpu_t0);
         emit_span("opencl", gettid_compat(), cpu_t0, cpu_dur, kname, cpu_extra);
         /* GPU-side span: async callback carries psid= linking back to the CPU span. */
-        register_event_callback(*event, kname, "type=kernel,side=gpu", cpu_t0);
+        register_event_callback(*event, kname, "type=kernel,side=gpu", cpu_t0, "opencl");
         /* Release our internal event reference if the caller didn't want it. */
         if (our_event) {
             typedef cl_int (*ReleaseEvent_t)(cl_event);
@@ -434,8 +448,16 @@ cl_int clEnqueueSVMMemcpy(
     uint64_t t0 = now_ns();
     cl_int ret = real(q, blocking, dst, src, size, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueSVMMemcpy", extra);
-    if (ret == CL_SUCCESS && *ev)
-        register_event_callback(*ev, "clEnqueueSVMMemcpy", extra, 0);
+    /* Only register the async GPU-event callback for a NON-blocking call.
+     * The event still reaches CL_COMPLETE and fires its callback either
+     * way (blocking only affects whether THIS call returns early, not
+     * whether the event completion callback fires) -- for a blocking
+     * call the CPU-side span above already has the correct, complete
+     * duration, so also registering the callback would emit a SECOND
+     * span for the exact same transfer (same bytes, same duration),
+     * double-counting it in any bandwidth/time total. */
+    if (ret == CL_SUCCESS && *ev && !blocking)
+        register_event_callback(*ev, "clEnqueueSVMMemcpy", extra, 0, "memory");
     return ret;
 }
 
@@ -457,8 +479,12 @@ cl_int clEnqueueReadBuffer(
     uint64_t t0 = now_ns();
     cl_int ret = real(q, buf, blocking, offset, size, ptr, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueReadBuffer", extra);
-    if (ret == CL_SUCCESS && *ev)
-        register_event_callback(*ev, "clReadBuffer_gpu", extra, 0);
+    /* NON-blocking only -- see clEnqueueSVMMemcpy's comment: a blocking
+     * call's CPU-side span above already has the complete, correct
+     * duration, so also firing the GPU-event callback would double-
+     * report this exact transfer. */
+    if (ret == CL_SUCCESS && *ev && !blocking)
+        register_event_callback(*ev, "clReadBuffer_gpu", extra, 0, "memory");
     return ret;
 }
 
@@ -478,8 +504,9 @@ cl_int clEnqueueWriteBuffer(
     uint64_t t0 = now_ns();
     cl_int ret = real(q, buf, blocking, offset, size, ptr, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueWriteBuffer", extra);
-    if (ret == CL_SUCCESS && *ev)
-        register_event_callback(*ev, "clWriteBuffer_gpu", extra, 0);
+    /* NON-blocking only -- see clEnqueueSVMMemcpy's comment above. */
+    if (ret == CL_SUCCESS && *ev && !blocking)
+        register_event_callback(*ev, "clWriteBuffer_gpu", extra, 0, "memory");
     return ret;
 }
 

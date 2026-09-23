@@ -160,8 +160,23 @@ def _all_comm_spans(trace: "Trace") -> list["SpanEvent"]:
     tag (they don't transfer application data) but are still real
     communication/sync cost; excluding them would make Serialization
     Efficiency look artificially good whenever a lot of the actual overhead
-    is in barriers rather than point-to-point/collective data transfer."""
-    return [s for s in trace.spans if s.category.value in _COMM_CATS and s.duration_ns > 0]
+    is in barriers rather than point-to-point/collective data transfer.
+
+    EXCLUDES type=="group" (nccl_hook.c's "ncclGroup" span, emitted for
+    ncclGroupStart/End): its [start,end] interval structurally CONTAINS
+    every individual collective/P2P call made inside that group, each of
+    which is ALSO in this list as its own span -- summing both (this
+    function's only consumer, serialization_efficiency_from_path, does a
+    naive sum(duration_ns), not an interval union) would double-count
+    every grouped operation's duration in the "total communication time"
+    denominator. No corresponding MPI construct needs the same exclusion
+    (PMPI's profiling-interface convention doesn't produce a wrapper span
+    like this for any MPI call)."""
+    return [
+        s for s in trace.spans
+        if s.category.value in _COMM_CATS and s.duration_ns > 0
+        and s.tags.get("type") != "group"
+    ]
 
 
 def fit_alpha_beta(spans: list["SpanEvent"]) -> tuple[float, float] | None:

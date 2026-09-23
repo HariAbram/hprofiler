@@ -347,8 +347,15 @@ static void cb_parallel_begin(
         tls_parallel_start[tls_parallel_depth]   = now_ns();
         tls_parallel_id[tls_parallel_depth]      = par_unique;
         tls_parallel_codeptr[tls_parallel_depth] = codeptr_ra;
-        tls_parallel_depth++;
     }
+    /* Depth increments UNCONDITIONALLY, even past MAX_DEPTH -- see
+     * cb_parallel_end's matching comment for why: this keeps begin/end
+     * calls balanced from the OMPT runtime's perspective (one increment
+     * per begin, one decrement per end, regardless of whether the arrays
+     * above actually captured this level), which is what lets end tell
+     * an overflowed level apart from a real one instead of reading
+     * another, still-open region's data out from under it. */
+    tls_parallel_depth++;
     (void)requested_parallelism;
 }
 
@@ -360,26 +367,40 @@ static void cb_parallel_end(
     (void)encountering_task_data; (void)flags; (void)codeptr_ra;
     if (tls_parallel_depth > 0) {
         tls_parallel_depth--;
-        uint64_t t0         = tls_parallel_start[tls_parallel_depth];
-        ompt_id_t pid       = tls_parallel_id[tls_parallel_depth];
-        const void *cptr    = tls_parallel_codeptr[tls_parallel_depth];
-        const char *sym = NULL; char lib[256]; uint64_t off = 0;
-        char extra[512];
-        if (resolve_codeptr_full(cptr, &sym, lib, sizeof(lib), &off)) {
-            if (sym)
-                snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu,sym=%s",
-                         (unsigned long long)pid, (unsigned long long)pid, sym);
-            else
-                snprintf(extra, sizeof(extra),
-                         "type=parallel,id=%llu,sid=%llu,lib=%s,offset=0x%llx",
-                         (unsigned long long)pid, (unsigned long long)pid,
-                         lib, (unsigned long long)off);
-        } else {
-            snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu",
-                     (unsigned long long)pid, (unsigned long long)pid);
+        /* If this level's depth was ever >= MAX_DEPTH (i.e. this begin/end
+         * pair overflowed the stack), cb_parallel_begin never wrote
+         * anything at this index -- reading it here would silently pop a
+         * DIFFERENT, still-legitimately-open region's data (whatever
+         * happens to occupy tls_parallel_start[MAX_DEPTH-1], the last
+         * real slot) and misattribute it to the wrong end event, then
+         * permanently desync every subsequent end on this thread by one
+         * level. Emitting nothing for an overflowed level is honest --
+         * consistent with this file's own "omit rather than guess"
+         * convention elsewhere (see compute_exec_start_ns in the CUDA/
+         * ROCm hooks for the same principle) -- we genuinely never
+         * captured this level's start data. */
+        if (tls_parallel_depth < MAX_DEPTH) {
+            uint64_t t0         = tls_parallel_start[tls_parallel_depth];
+            ompt_id_t pid       = tls_parallel_id[tls_parallel_depth];
+            const void *cptr    = tls_parallel_codeptr[tls_parallel_depth];
+            const char *sym = NULL; char lib[256]; uint64_t off = 0;
+            char extra[512];
+            if (resolve_codeptr_full(cptr, &sym, lib, sizeof(lib), &off)) {
+                if (sym)
+                    snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu,sym=%s",
+                             (unsigned long long)pid, (unsigned long long)pid, sym);
+                else
+                    snprintf(extra, sizeof(extra),
+                             "type=parallel,id=%llu,sid=%llu,lib=%s,offset=0x%llx",
+                             (unsigned long long)pid, (unsigned long long)pid,
+                             lib, (unsigned long long)off);
+            } else {
+                snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu",
+                         (unsigned long long)pid, (unsigned long long)pid);
+            }
+            emit_span("openmp", gettid_compat(), t0, now_ns() - t0,
+                      "parallel_region", extra);
         }
-        emit_span("openmp", gettid_compat(), t0, now_ns() - t0,
-                  "parallel_region", extra);
     }
     (void)parallel_data;
 }
@@ -404,10 +425,15 @@ static void cb_work(
             tls_work_start[tls_work_depth]   = now_ns();
             tls_work_type[tls_work_depth]    = wstype;
             tls_work_codeptr[tls_work_depth] = codeptr_ra;
-            tls_work_depth++;
         }
+        /* Unconditional -- see cb_parallel_begin/end's comments for why:
+         * keeps begin/end balanced even past MAX_DEPTH, so end can tell
+         * an overflowed level apart from a real one instead of reading
+         * another, still-open level's data out from under it. */
+        tls_work_depth++;
     } else if (tls_work_depth > 0) {
         tls_work_depth--;
+        if (tls_work_depth >= MAX_DEPTH) return;  /* overflowed level -- never captured, omit */
         const char *sym = NULL; char lib[256]; uint64_t off = 0;
         char extra[512];
         if (resolve_codeptr_full(tls_work_codeptr[tls_work_depth], &sym, lib, sizeof(lib), &off)) {
@@ -463,10 +489,11 @@ static void cb_sync_region(
         if (tls_sync_depth < MAX_DEPTH) {
             tls_sync_start[tls_sync_depth]   = now_ns();
             tls_sync_codeptr[tls_sync_depth] = codeptr_ra;
-            tls_sync_depth++;
         }
+        tls_sync_depth++;  /* unconditional -- see cb_parallel_begin's comment */
     } else if (tls_sync_depth > 0) {
         tls_sync_depth--;
+        if (tls_sync_depth >= MAX_DEPTH) return;  /* overflowed level -- never captured, omit */
         uint64_t t0      = tls_sync_start[tls_sync_depth];
         const void *cptr = tls_sync_codeptr[tls_sync_depth];
         const char *sym = NULL; char lib[256]; uint64_t off = 0;
@@ -583,9 +610,11 @@ static void cb_target(
 
     if (endpoint == ompt_scope_begin) {
         if (tls_target_depth < MAX_DEPTH)
-            tls_target_start[tls_target_depth++] = now_ns();
+            tls_target_start[tls_target_depth] = now_ns();
+        tls_target_depth++;  /* unconditional -- see cb_parallel_begin's comment */
     } else if (tls_target_depth > 0) {
         tls_target_depth--;
+        if (tls_target_depth >= MAX_DEPTH) return;  /* overflowed level -- never captured, omit */
         char extra[64];
         snprintf(extra, sizeof(extra), "type=offload,device=%d", device_num);
         emit_span("openmp", gettid_compat(),

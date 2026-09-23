@@ -155,6 +155,32 @@ class TestRendezvousClustering(unittest.TestCase):
         path = cp.compute_critical_path(spans_list, {r1_idx: preds[r1_idx]})
         self.assertEqual(path, [2, 0])  # r3 (idx2) then r1 (idx0)
 
+    def test_mpi_exscan_gets_rendezvous_clustered(self):
+        # Regression test: mpi_hook.c's _COLL macro emits MPI_Exscan with
+        # type=exscan, but _MPI_COLLECTIVE_TYPES omitted "exscan" (every
+        # OTHER _COLL-generated collective -- scan, bcast, reduce, etc. --
+        # was already in the set) -- so exscan silently never got a
+        # rendezvous arrival edge, unlike every other MPI collective this
+        # hook emits.
+        r1 = _span(1, 1, Category.MPI, 0, 400, name="MPI_Exscan", tags={"type": "exscan"})
+        r2 = _span(2, 1, Category.MPI, 100, 250, name="MPI_Exscan", tags={"type": "exscan"})
+        trace = _mk_trace([r1, r2])
+        spans_list, preds = cp.build_dependency_graph(trace)
+        arrival_edges = [(p, conf) for p, kind, conf in preds.get(0, []) if kind == "arrival"]
+        self.assertEqual({p for p, _ in arrival_edges}, {1})
+
+    def test_nccl_alltoall_gets_rendezvous_clustered(self):
+        # Same gap as MPI_Exscan above, but for nccl_hook.c's ncclAllToAll
+        # (type=alltoall) against _NCCL_COLLECTIVE_TYPES, which had every
+        # other NCCL collective (allreduce/broadcast/reduce/allgather/
+        # reduce_scatter) but not alltoall.
+        r1 = _span(1, 1, Category.NCCL, 0, 400, name="ncclAllToAll", tags={"type": "alltoall"})
+        r2 = _span(2, 1, Category.NCCL, 100, 250, name="ncclAllToAll", tags={"type": "alltoall"})
+        trace = _mk_trace([r1, r2])
+        spans_list, preds = cp.build_dependency_graph(trace)
+        arrival_edges = [(p, conf) for p, kind, conf in preds.get(0, []) if kind == "arrival"]
+        self.assertEqual({p for p, _ in arrival_edges}, {1})
+
 
 class TestCausalityEnforcement(unittest.TestCase):
     """Regression test for a bug caught while validating this module against

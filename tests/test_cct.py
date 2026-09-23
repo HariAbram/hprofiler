@@ -57,6 +57,39 @@ class TestGPUStarvation(unittest.TestCase):
         sv = cct.gpu_starvation(trace)
         self.assertEqual(sv["wall_ns"], 500)
 
+    def test_opencl_cpu_side_span_not_double_counted_as_kernel_active(self):
+        # opencl_hook.c emits TWO spans per kernel launch: a CPU-side
+        # enqueue-latency span (type=kernel,side=cpu) and a GPU-side
+        # execution span (type=kernel,side=gpu) -- both carry
+        # type=="kernel", distinguished only by `side`. An `or` here
+        # (instead of `and`) would count the CPU-side span's own interval
+        # as ADDITIONAL kernel-active time even where it doesn't overlap
+        # the real GPU-side span, inflating gpu_active_ns/pct.
+        # CPU-side: enqueue latency [0,10). GPU-side (the real execution):
+        # [50,150). They don't overlap -- if the CPU-side span were wrongly
+        # counted, gpu_active_ns would include [0,10) too (110 total
+        # instead of the correct 100).
+        spans = [
+            _span(Category.GPU_OPENCL, 0, 10, name="k", tags={"type": "kernel", "side": "cpu"}),
+            _span(Category.GPU_OPENCL, 50, 100, name="k", tags={"type": "kernel", "side": "gpu"}),
+        ]
+        trace = _mk_trace(spans)
+        sv = cct.gpu_starvation(trace)
+        self.assertEqual(sv["wall_ns"], 150)
+        self.assertEqual(sv["gpu_active_ns"], 100)
+
+    def test_opencl_memory_transfer_not_counted_as_kernel_active(self):
+        # A "memory"-category span (e.g. a buffer read/write, correctly
+        # NOT in _GPU_CATS) must never contribute to kernel_intervals
+        # regardless of its tags.
+        spans = [
+            _span(Category.MEMORY, 0, 100, name="clEnqueueReadBuffer",
+                  tags={"type": "read", "bytes": "1024"}),
+        ]
+        trace = _mk_trace(spans)
+        sv = cct.gpu_starvation(trace)
+        self.assertEqual(sv["gpu_active_ns"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

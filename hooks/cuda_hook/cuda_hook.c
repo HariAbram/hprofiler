@@ -523,6 +523,23 @@ static void mark_cpu_fallback(char *extra, size_t cap) {
 
 static int pk_try_begin(cudaStream_t stream,
                         cudaEvent_t *ev_s, cudaEvent_t *ev_e) {
+    /* Calibrate the xs= reference event HERE, before this kernel's own
+     * ev_s is recorded below -- not lazily deferred to first-use inside
+     * pk_flush() (the previous approach). exec_start_calibrate_if_needed()
+     * itself SYNCS the calibration event before returning, so by
+     * construction it can only ever complete AFTER every kernel already
+     * enqueued on the GPU at the moment it's called -- deferring it into
+     * pk_flush() (which only runs once kernels are already pending/
+     * completed) meant the calibration event was GUARANTEED to postdate
+     * every kernel in whatever batch triggered it, making
+     * compute_exec_start_ns()'s elapsed-time-from-calibration always
+     * negative (silently omitting xs= entirely) for that whole first
+     * flushed batch. Calling it here, before the very first kernel this
+     * process ever launches has even been recorded, means calibration
+     * happens against an (essentially) empty GPU queue and genuinely
+     * precedes every real kernel's ev_s from then on. Idempotent (guarded
+     * by g_calib_state) -- a no-op after the first call. */
+    exec_start_calibrate_if_needed();
     *ev_s = *ev_e = NULL;
     if (!ev_api_ok()) return 0;
     if (f_evCreate(ev_s) != 0) return 0;
@@ -628,7 +645,12 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count,
     snprintf(extra, sizeof(extra), "type=memcpy,dir=%s,bytes=%zu", dir, count);
     uint64_t t0 = now_ns();
     cudaError_t ret = real(dst, src, count, kind);
-    emit_span("cuda", gettid_compat(), t0, now_ns() - t0, "cudaMemcpy", extra);
+    /* "memory", not "cuda" -- matches cudaMemcpyAsync/cuMemcpyAsync below
+     * (both already "memory") so a blocking vs. async memcpy of the same
+     * data lands in the same category; being "cuda" meant this transfer's
+     * bytes/duration were silently excluded from the Memory tab's
+     * bandwidth accounting and miscounted as compute time instead. */
+    emit_span("memory", gettid_compat(), t0, now_ns() - t0, "cudaMemcpy", extra);
 
     in_hook = 0;
     return ret;

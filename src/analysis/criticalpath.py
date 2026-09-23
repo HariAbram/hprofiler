@@ -124,10 +124,11 @@ _DEVICE_SYNC_NAMES = frozenset({"cudaDeviceSynchronize", "hipDeviceSynchronize",
 _GPU_CATS = frozenset({"cuda", "rocm"})
 _MPI_COLLECTIVE_TYPES = frozenset({
     "allreduce", "bcast", "reduce", "alltoall", "allgather",
-    "scatter", "gather", "barrier", "scan",
+    "scatter", "gather", "barrier", "scan", "exscan",
 })
 _NCCL_COLLECTIVE_TYPES = frozenset({
     "allreduce", "broadcast", "reduce", "allgather", "reduce_scatter",
+    "alltoall",
 })
 # MPI_Test/MPI_Testany/MPI_Testsome/MPI_Testall/MPI_Cancel are emitted as
 # *instant* events (mpi_hook.c) since they're meant to be non-blocking

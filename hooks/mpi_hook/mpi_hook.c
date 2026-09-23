@@ -17,7 +17,9 @@
  *   Collectives    : MPI_Bcast, MPI_Reduce, MPI_Allreduce, MPI_Alltoall,
  *                    MPI_Allgather, MPI_Scatter, MPI_Gather, MPI_Barrier,
  *                    MPI_Scan, MPI_Exscan
- *   One-sided      : MPI_Put, MPI_Get, MPI_Accumulate
+ *   One-sided      : MPI_Put, MPI_Get, MPI_Accumulate, MPI_Win_fence,
+ *                    MPI_Win_flush, MPI_Win_flush_all, MPI_Win_lock,
+ *                    MPI_Win_lock_all, MPI_Win_unlock, MPI_Win_unlock_all
  *   Lifecycle      : MPI_Init, MPI_Init_thread, MPI_Finalize
  *   Communicators  : MPI_Comm_dup, MPI_Comm_split, MPI_Comm_create --
  *                    hooked only to assign a cross-rank-agreed commid=,
@@ -1046,6 +1048,79 @@ int MPI_Accumulate(const void *origin_addr, int origin_count,
                                target_rank, target_disp, target_count,
                                target_datatype, op, win);
     emit_span("mpi", t0, now_ns()-t0, "MPI_Accumulate", extra);
+    return ret;
+}
+
+/* ── One-sided synchronization ──────────────────────────────────────────
+ * MPI_Put/Get/Accumulate above are permitted by the standard to return
+ * before the transfer actually completes -- real completion is only
+ * guaranteed after one of these synchronization calls. Without them, an
+ * MPI implementation/transport that defers RMA completion past the
+ * Put/Get/Accumulate call's own return would have its actual transfer
+ * time attributed to nothing at all (not even miscounted -- simply never
+ * captured), and any real stall waiting for a slow remote target would
+ * be invisible in the trace. These are wrapped the same minimal way as
+ * every other call in this file -- category "mpi", matching MPI_Barrier's
+ * own precedent for a blocking-but-not-itself-a-data-transfer call in
+ * this file, not "sync" (this file has no existing "sync"-category
+ * convention to match, unlike the OpenMP/OpenCL hooks). */
+
+int MPI_Win_fence(int assert, MPI_Win win) {
+    char extra[32]; snprintf(extra, sizeof(extra), "type=win_fence,rank=%d", g_mpi_rank);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Win_fence(assert, win);
+    emit_span("mpi", t0, now_ns()-t0, "MPI_Win_fence", extra);
+    return ret;
+}
+
+int MPI_Win_flush(int rank, MPI_Win win) {
+    char extra[64];
+    snprintf(extra, sizeof(extra), "type=win_flush,rank=%d,peer=%d", g_mpi_rank, rank);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Win_flush(rank, win);
+    emit_span("mpi", t0, now_ns()-t0, "MPI_Win_flush", extra);
+    return ret;
+}
+
+int MPI_Win_flush_all(MPI_Win win) {
+    char extra[32]; snprintf(extra, sizeof(extra), "type=win_flush_all,rank=%d", g_mpi_rank);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Win_flush_all(win);
+    emit_span("mpi", t0, now_ns()-t0, "MPI_Win_flush_all", extra);
+    return ret;
+}
+
+int MPI_Win_lock(int lock_type, int rank, int assert, MPI_Win win) {
+    char extra[64];
+    snprintf(extra, sizeof(extra), "type=win_lock,rank=%d,peer=%d", g_mpi_rank, rank);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Win_lock(lock_type, rank, assert, win);
+    emit_span("mpi", t0, now_ns()-t0, "MPI_Win_lock", extra);
+    return ret;
+}
+
+int MPI_Win_lock_all(int assert, MPI_Win win) {
+    char extra[32]; snprintf(extra, sizeof(extra), "type=win_lock_all,rank=%d", g_mpi_rank);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Win_lock_all(assert, win);
+    emit_span("mpi", t0, now_ns()-t0, "MPI_Win_lock_all", extra);
+    return ret;
+}
+
+int MPI_Win_unlock(int rank, MPI_Win win) {
+    char extra[64];
+    snprintf(extra, sizeof(extra), "type=win_unlock,rank=%d,peer=%d", g_mpi_rank, rank);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Win_unlock(rank, win);
+    emit_span("mpi", t0, now_ns()-t0, "MPI_Win_unlock", extra);
+    return ret;
+}
+
+int MPI_Win_unlock_all(MPI_Win win) {
+    char extra[32]; snprintf(extra, sizeof(extra), "type=win_unlock_all,rank=%d", g_mpi_rank);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Win_unlock_all(win);
+    emit_span("mpi", t0, now_ns()-t0, "MPI_Win_unlock_all", extra);
     return ret;
 }
 

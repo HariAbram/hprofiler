@@ -125,6 +125,24 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
     pthread_mutex_unlock(&g_sock_mutex);
 }
 
+/* Appends ",timing=cpu" (or sets it bare if `extra` is empty) -- exact
+ * mirror of cuda_hook.c's mark_cpu_fallback(). Marks a span whose
+ * duration came from host wall-clock timing around the call rather than
+ * from a synced GPU event pair, so a degraded measurement (event
+ * creation/recording failed, or f_evElapsed reported a negative delta)
+ * is never silently indistinguishable from a real GPU-accurate one --
+ * this file's own header claims GPU-accurate timing "same mechanism as
+ * the CUDA hook", so its fallback path should be marked the same way
+ * the CUDA hook's is. */
+static void mark_cpu_fallback(char *extra, size_t cap) {
+    size_t len = strlen(extra);
+    if (len == 0) {
+        snprintf(extra, cap, "timing=cpu");
+    } else if (len + 12 < cap) {
+        snprintf(extra + len, cap - len, ",timing=cpu");
+    }
+}
+
 /* ── GPU event pair helpers (borrowed from cuda_hook pattern) ────────── */
 typedef int (*fn_EvCreate_t)(cudaEvent_t*);
 typedef int (*fn_EvRecord_t)(cudaEvent_t, cudaStream_t);
@@ -170,6 +188,7 @@ static int ev_ok(void) {
                       (uint64_t)(_ms * 1e6f), (name), (extra));          \
         f_evDestroy(_ev_s); f_evDestroy(_ev_e);                          \
     } else {                                                             \
+        mark_cpu_fallback((extra), sizeof(extra));                       \
         emit_span((cat), gettid_compat(), _t0, now_ns()-_t0,            \
                   (name), (extra));                                       \
         if (_ev_s) f_evDestroy(_ev_s);                                   \
@@ -411,6 +430,19 @@ ncclResult_t ncclAllToAll(const void *sb, void *rb, size_t count,
 }
 
 /* ── Group boundaries ───────────────────────────────────────────────── */
+/* KNOWN, UNVERIFIED LIMITATION: NCCL's documented group semantics defer
+ * the actual kernel launch for every op issued inside
+ * ncclGroupStart()/ncclGroupEnd() until ncclGroupEnd() itself returns --
+ * so a GPU_SPAN_BEGIN/END event pair recorded for an op called INSIDE a
+ * group may be recording/syncing against a stream that, at that point,
+ * doesn't have the real work enqueued yet, meaning its measured duration
+ * (and this wrapper's own, which uses plain CPU timing, not events)
+ * might not reflect real GPU execution time for anything issued inside a
+ * group. This follows from NCCL's own documented group contract, not a
+ * guess, but hasn't been confirmed by observing real timestamps from an
+ * actual multi-GPU run (none available in this project's dev/CI
+ * environment) -- verify against real hardware before trusting grouped-
+ * op durations in a performance-sensitive comparison. */
 static __thread uint64_t _group_start = 0;
 static __thread int      _group_depth = 0;
 

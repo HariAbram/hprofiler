@@ -467,6 +467,18 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
 }
 
 static int pk_try_begin(hipStream_t stream, hipEvent_t *ev_s, hipEvent_t *ev_e) {
+    /* Calibrate the xs= reference event HERE, before this kernel's own
+     * ev_s is recorded below -- same fix and same rationale as
+     * cuda_hook.c's pk_try_begin: exec_start_calibrate_if_needed()
+     * SYNCS the calibration event before returning, so deferring it to
+     * first-use inside pk_flush() (the previous approach) guaranteed it
+     * would postdate every kernel in whatever batch triggered it there,
+     * silently omitting xs= for that entire first flushed batch. Calling
+     * it here, before this process's very first kernel launch has even
+     * been recorded, means it precedes every real kernel's ev_s from
+     * then on. Idempotent (guarded by g_calib_state) -- a no-op after
+     * the first call. */
+    exec_start_calibrate_if_needed();
     *ev_s = *ev_e = NULL;
     if (!ev_api_ok()) return 0;
     if (f_evCreate(ev_s) != 0) return 0;
@@ -644,7 +656,11 @@ hipError_t hipMemcpy(void *dst, const void *src, size_t size, hipMemcpyKind kind
     snprintf(extra, sizeof(extra), "type=memcpy,bytes=%zu", size);
     uint64_t t0 = now_ns();
     hipError_t ret = real(dst, src, size, kind);
-    emit_span("rocm", gettid_compat(), t0, now_ns()-t0, "hipMemcpy", extra);
+    /* "memory", not "rocm" -- matches hipMemcpyAsync/hipMemcpyHtoD/
+     * hipMemcpyDtoH below (all already "memory"); this was the one
+     * memcpy variant in this file still miscategorized as compute time,
+     * silently excluding it from the Memory tab's bandwidth accounting. */
+    emit_span("memory", gettid_compat(), t0, now_ns()-t0, "hipMemcpy", extra);
 
     in_hook = 0;
     return ret;

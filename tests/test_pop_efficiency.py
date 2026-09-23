@@ -113,6 +113,37 @@ class TestAlphaBetaFit(unittest.TestCase):
         self.assertAlmostEqual(eff, 0.5, delta=0.05)
 
 
+class TestAllCommSpansExcludesGroupWrapper(unittest.TestCase):
+    """nccl_hook.c's ncclGroupStart/End emits an "ncclGroup" wrapper span
+    (type=group) whose [start,end] interval structurally CONTAINS every
+    individual collective/P2P call made inside that group -- each of
+    which is ALSO its own separate "nccl" span. _all_comm_spans() feeds
+    serialization_efficiency_from_path's naive sum(duration_ns), so
+    including the wrapper double-counts every grouped op's duration in
+    the "total communication time" denominator."""
+
+    def test_group_wrapper_span_excluded(self):
+        spans = [
+            _span(1, Category.NCCL, 0, 100, tags={"type": "group"}, name="ncclGroup"),
+            _span(1, Category.NCCL, 10, 30, tags={"type": "allreduce", "bytes": "1024"}, name="ncclAllReduce"),
+            _span(1, Category.NCCL, 50, 20, tags={"type": "broadcast", "bytes": "512"}, name="ncclBroadcast"),
+        ]
+        trace = _mk_trace(spans)
+        result = pe._all_comm_spans(trace)
+        names = {s.name for s in result}
+        self.assertEqual(names, {"ncclAllReduce", "ncclBroadcast"})
+        self.assertEqual(sum(s.duration_ns for s in result), 50)  # 30 + 20, NOT +100
+
+    def test_non_group_mpi_and_nccl_spans_unaffected(self):
+        spans = [
+            _span(1, Category.MPI, 0, 40, tags={"type": "barrier"}, name="MPI_Barrier"),
+            _span(1, Category.NCCL, 0, 30, tags={"type": "send", "bytes": "64"}, name="ncclSend"),
+        ]
+        trace = _mk_trace(spans)
+        result = pe._all_comm_spans(trace)
+        self.assertEqual(len(result), 2)
+
+
 class TestNCCLBusBandwidth(unittest.TestCase):
     def test_known_formula(self):
         # 4 ranks, 1 GiB message, 0.1s -> busBW = 2*(4-1)/4 * bytes/time
