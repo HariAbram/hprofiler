@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 import Hprofiler 1.0
 
@@ -87,10 +88,29 @@ Item {
 
             Flickable {
                 id: flick
+                objectName: "timelineFlick"
                 anchors.fill: parent
                 anchors.margins: 1
+                anchors.rightMargin: 13
+                anchors.bottomMargin: 13
                 contentHeight: laneColumn.height
                 boundsBehavior: Flickable.StopAtBounds
+
+                // Real lanes (rows), for a trace with more of them than
+                // fit the window -- Flickable already supported this
+                // (contentHeight was always bound correctly), it just had
+                // no way to actually GET there: the pan/zoom MouseArea
+                // below sits on top of the whole area and only reads
+                // mouse.x, so a vertical drag silently did nothing at
+                // all. A real ScrollBar thumb, in its own reserved strip
+                // the pan MouseArea explicitly excludes (rightMargin
+                // below), fixes that without the two drag gestures
+                // (Flickable's native drag-to-scroll vs. the pan
+                // MouseArea's drag-to-pan-in-time) fighting each other.
+                ScrollBar.vertical: ScrollBar {
+                    policy: TimelineModel.lanes.length * root.rowHeight > flick.height
+                            ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
+                }
 
                 Column {
                     id: laneColumn
@@ -265,9 +285,15 @@ Item {
             }
 
             // ── Zoom (wheel) + pan (drag) ─────────────────────────────────
+            // rightMargin/bottomMargin match the Flickable's above --
+            // reserves the vertical/horizontal scrollbar strips so this
+            // (which covers everything else and consumes all drag input
+            // for time-panning) never overlaps and steals their clicks.
             MouseArea {
                 anchors.fill: parent
                 anchors.leftMargin: root.labelWidth
+                anchors.rightMargin: 13
+                anchors.bottomMargin: 13
                 propagateComposedEvents: true
                 acceptedButtons: Qt.LeftButton
 
@@ -290,6 +316,312 @@ Item {
                     var factor = wheel.angleDelta.y > 0 ? 1.25 : 0.8
                     root.zoom = Math.max(1.0, Math.min(256.0, root.zoom * factor))
                     root.clampViewStart()
+                }
+            }
+
+            // ── Horizontal time-scrollbar ───────────────────────────────
+            // A real QtQuick.Controls ScrollBar wouldn't work here the way
+            // the vertical one above does -- panning isn't driven by a
+            // real Flickable's contentX, it's the custom viewStartNs/zoom
+            // state the wheel-zoom/drag-pan MouseArea manages, so this is
+            // a small custom thumb driven by that same state instead.
+            // Doubles as an at-a-glance "how much of the trace am I
+            // looking at" indicator, which wheel-zoom + drag-pan alone
+            // don't give you.
+            Rectangle {
+                id: hScrollTrack
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.leftMargin: root.labelWidth + 1
+                anchors.rightMargin: 14
+                anchors.bottomMargin: 1
+                height: 12
+                radius: 4
+                color: AppTheme.background
+                visible: root.visibleNs < TimelineModel.traceDurationNs
+
+                Rectangle {
+                    id: hScrollThumb
+                    readonly property real thumbFrac: Math.min(1.0, root.visibleNs / TimelineModel.traceDurationNs)
+                    readonly property real scrollRangeNs: Math.max(TimelineModel.traceDurationNs - root.visibleNs, 1)
+                    readonly property real scrollFrac: Math.max(0.0, Math.min(1.0,
+                        (root.viewStartNs - TimelineModel.viewStartNs) / scrollRangeNs))
+                    // Bindings, never imperatively assigned (e.g. via
+                    // drag.target) -- this stays a pure function of
+                    // root.viewStartNs/zoom so it's always correct
+                    // regardless of whether THIS thumb, the main pan
+                    // drag, or the wheel is what last changed the view.
+                    x: (hScrollTrack.width - width) * scrollFrac
+                    width: Math.max(20, hScrollTrack.width * thumbFrac)
+                    height: parent.height
+                    radius: 4
+                    color: hDrag.pressed ? AppTheme.accent : AppTheme.panelBorder
+                }
+
+                // Fills the whole (fixed, non-moving) track rather than
+                // just the thumb, so mouse.x during a drag is measured
+                // against a stable reference frame -- a MouseArea on the
+                // thumb itself would be measuring against a target that's
+                // moving out from under the cursor as a RESULT of that
+                // same drag, corrupting the delta.
+                MouseArea {
+                    id: hDrag
+                    anchors.fill: parent
+                    property real dragStartX: 0
+                    property real dragStartViewNs: 0
+
+                    onPressed: (mouse) => {
+                        dragStartX = mouse.x
+                        dragStartViewNs = root.viewStartNs
+                    }
+                    onPositionChanged: (mouse) => {
+                        if (!pressed) return
+                        var trackSpan = hScrollTrack.width - hScrollThumb.width
+                        if (trackSpan <= 0) return
+                        var deltaFrac = (mouse.x - dragStartX) / trackSpan
+                        root.viewStartNs = dragStartViewNs + deltaFrac * hScrollThumb.scrollRangeNs
+                        root.clampViewStart()
+                    }
+                }
+            }
+        }
+
+        // ── Call graph: who-calls-whom for whatever's currently visible ────
+        // A node-and-edge diagram (analysis/call_graph.py), NOT the same
+        // thing as the Call Tree tab: that shows time breakdown down each
+        // specific call PATH (the same function under two different
+        // callers is two separate rows there, by design); this merges
+        // every occurrence of a function into ONE box regardless of
+        // caller, with edges showing the distinct call relationships --
+        // answering "which functions call which, overall" for the
+        // CURRENT TIME WINDOW, not "how expensive is this specific path"
+        // for the whole trace.
+        Rectangle {
+            id: callGraphPanel
+            Layout.fillWidth: true
+            Layout.preferredHeight: 210
+            Layout.maximumHeight: 210
+            color: AppTheme.surface
+            border.color: AppTheme.panelBorder
+            border.width: 1
+            radius: 6
+            clip: true
+
+            property var graphData: ({nodes: [], edges: [], truncated: 0})
+            property var hoveredNode: null
+            property var hoverPos: Qt.point(0, 0)
+
+            function refresh() {
+                graphData = TimelineModel.callGraph(root.viewStartNs, root.viewStartNs + root.visibleNs)
+                graphCanvas.requestPaint()
+            }
+
+            // Rebuilding the graph is a real Python round-trip over
+            // every visible span (twice: once to aggregate, once to
+            // lay out) -- much heavier than a single lane's
+            // visibleSpans() call, so this uses a slower, separate
+            // throttle (~4/sec) rather than the lane canvases' ~60fps
+            // one; still feels live while panning/zooming without
+            // costing a rebuild on every single pixel of drag.
+            Timer {
+                id: graphRefreshThrottle
+                interval: 250
+                repeat: false
+                onTriggered: callGraphPanel.refresh()
+            }
+            // NOTE: zoom/viewStartNs are root's properties, not this
+            // item's -- bare onZoomChanged/onViewStartNsChanged handlers
+            // declared directly here would silently never fire (exactly
+            // the class of bug already found once this session in the
+            // per-lane hover handlers: an unqualified reference to an
+            // ancestor's property). Connections{target: root} is the
+            // correct way to listen to a DIFFERENT item's property
+            // changes from here.
+            Connections {
+                target: root
+                function onViewStartNsChanged() {
+                    if (!graphRefreshThrottle.running) graphRefreshThrottle.start()
+                }
+                function onZoomChanged() {
+                    if (!graphRefreshThrottle.running) graphRefreshThrottle.start()
+                }
+            }
+            Component.onCompleted: refresh()
+
+            Text {
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.margins: 6
+                text: "Call graph (visible window)" +
+                      (callGraphPanel.graphData.truncated > 0
+                       ? "  ·  +" + callGraphPanel.graphData.truncated + " more not shown"
+                       : "")
+                color: AppTheme.textMuted
+                font.pixelSize: 10
+                z: 5
+            }
+
+            Text {
+                anchors.centerIn: parent
+                visible: callGraphPanel.graphData.nodes.length === 0
+                text: "No call-stack data for the current view.\nRun with --call-tree to capture it."
+                horizontalAlignment: Text.AlignHCenter
+                color: AppTheme.textMuted
+                font.pixelSize: 12
+            }
+
+            Canvas {
+                id: graphCanvas
+                anchors.fill: parent
+                anchors.topMargin: 20
+                anchors.margins: 8
+
+                readonly property real boxW: 120
+                readonly property real boxH: 30
+
+                onPaint: {
+                    var ctx = getContext("2d")
+                    ctx.reset()
+                    var data = callGraphPanel.graphData
+                    var nodes = data.nodes
+                    var edges = data.edges
+                    if (nodes.length === 0) return
+
+                    var W = width, H = height
+                    function px(n) { return n.x * (W - graphCanvas.boxW) + graphCanvas.boxW / 2 }
+                    function py(n) { return n.y * (H - graphCanvas.boxH) + graphCanvas.boxH / 2 }
+
+                    // Edges first (under the node boxes), thickness/alpha
+                    // scaled by relative time weight so hot call paths
+                    // visually stand out.
+                    var maxEdgeNs = 1
+                    for (var i = 0; i < edges.length; i++)
+                        maxEdgeNs = Math.max(maxEdgeNs, edges[i].totalNs)
+                    for (i = 0; i < edges.length; i++) {
+                        var e = edges[i]
+                        var a = nodes[e.callerIdx], b = nodes[e.calleeIdx]
+                        var x0 = px(a), y0 = py(a), x1 = px(b), y1 = py(b)
+                        var weight = e.totalNs / maxEdgeNs
+                        ctx.strokeStyle = AppTheme.dark
+                            ? "rgba(139,148,158," + (0.3 + 0.6 * weight) + ")"
+                            : "rgba(101,109,118," + (0.3 + 0.6 * weight) + ")"
+                        ctx.lineWidth = 1 + 2 * weight
+                        ctx.beginPath()
+                        ctx.moveTo(x0, y0)
+                        ctx.lineTo(x1, y1)
+                        ctx.stroke()
+                        // Arrowhead at the callee end
+                        var ang = Math.atan2(y1 - y0, x1 - x0)
+                        var ah = 6
+                        var tx = x1 - Math.cos(ang) * (graphCanvas.boxW / 2)
+                        var ty = y1 - Math.sin(ang) * (graphCanvas.boxH / 2)
+                        ctx.beginPath()
+                        ctx.moveTo(tx, ty)
+                        ctx.lineTo(tx - ah * Math.cos(ang - Math.PI / 6), ty - ah * Math.sin(ang - Math.PI / 6))
+                        ctx.lineTo(tx - ah * Math.cos(ang + Math.PI / 6), ty - ah * Math.sin(ang + Math.PI / 6))
+                        ctx.closePath()
+                        ctx.fill()
+                    }
+
+                    // Nodes on top.
+                    for (i = 0; i < nodes.length; i++) {
+                        var n = nodes[i]
+                        var cx = px(n), cy = py(n)
+                        var hovered = callGraphPanel.hoveredNode === n
+                        ctx.fillStyle = n.color
+                        ctx.globalAlpha = hovered ? 1.0 : 0.85
+                        ctx.beginPath()
+                        // Plain rect, not roundedRect -- QML's Canvas 2D
+                        // context doesn't implement that method (a
+                        // relatively recent addition to the HTML5 Canvas
+                        // spec); calling it threw and silently aborted
+                        // the rest of this paint (everything after the
+                        // FIRST node in the loop), which is why edges
+                        // rendered correctly but no node boxes ever did.
+                        ctx.rect(cx - graphCanvas.boxW / 2, cy - graphCanvas.boxH / 2,
+                                 graphCanvas.boxW, graphCanvas.boxH)
+                        ctx.fill()
+                        ctx.globalAlpha = 1.0
+                        if (hovered) {
+                            ctx.strokeStyle = AppTheme.text
+                            ctx.lineWidth = 2
+                            ctx.stroke()
+                        }
+                        ctx.fillStyle = "#111111"
+                        ctx.font = "11px sans-serif"
+                        ctx.textAlign = "center"
+                        var label = n.name
+                        var maxCh = Math.floor(graphCanvas.boxW / 6.5)
+                        if (label.length > maxCh) label = label.slice(0, maxCh - 1) + "…"
+                        ctx.fillText(label, cx, cy + 4)
+                    }
+                    ctx.textAlign = "left"
+                }
+
+                function hitTest(mx, my) {
+                    var nodes = callGraphPanel.graphData.nodes
+                    for (var i = nodes.length - 1; i >= 0; i--) {
+                        var n = nodes[i]
+                        var cx = n.x * (width - boxW) + boxW / 2
+                        var cy = n.y * (height - boxH) + boxH / 2
+                        if (Math.abs(mx - cx) <= boxW / 2 && Math.abs(my - cy) <= boxH / 2)
+                            return n
+                    }
+                    return null
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onPositionChanged: (mouse) => {
+                        var hit = graphCanvas.hitTest(mouse.x, mouse.y)
+                        if (hit === callGraphPanel.hoveredNode) return
+                        callGraphPanel.hoveredNode = hit
+                        callGraphPanel.hoverPos = Qt.point(mouse.x, mouse.y)
+                        graphCanvas.requestPaint()
+                    }
+                    onExited: {
+                        callGraphPanel.hoveredNode = null
+                        graphCanvas.requestPaint()
+                    }
+                }
+            }
+
+            // Tooltip for the hovered node.
+            Rectangle {
+                visible: !!callGraphPanel.hoveredNode
+                color: "#000000"
+                opacity: 0.92
+                radius: 5
+                border.color: "#444444"
+                border.width: 1
+                width: tipCol.width + 18
+                height: tipCol.height + 12
+                x: Math.min(callGraphPanel.hoverPos.x + 30, callGraphPanel.width - width - 6)
+                y: Math.min(callGraphPanel.hoverPos.y + 28, callGraphPanel.height - height - 6)
+                z: 20
+
+                ColumnLayout {
+                    id: tipCol
+                    anchors.centerIn: parent
+                    spacing: 2
+                    Text {
+                        text: callGraphPanel.hoveredNode ? callGraphPanel.hoveredNode.name : ""
+                        color: "#eeeeee"
+                        font.bold: true
+                        font.pixelSize: 11
+                    }
+                    Text {
+                        text: callGraphPanel.hoveredNode
+                              ? (callGraphPanel.hoveredNode.count > 0
+                                 ? root.fmtNs(callGraphPanel.hoveredNode.totalNs) + " · " +
+                                   callGraphPanel.hoveredNode.count + " calls"
+                                 : "(ancestor frame only -- not directly measured)")
+                              : ""
+                        color: "#cccccc"
+                        font.pixelSize: 10
+                    }
                 }
             }
         }

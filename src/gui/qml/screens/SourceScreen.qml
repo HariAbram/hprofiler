@@ -225,13 +225,24 @@ RowLayout {
         visible: root.hasSelection
 
         ScrollView {
+            id: analysisScroll
             anchors.fill: parent
             anchors.margins: 8
             clip: true
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                width: parent.width
+                // NOT parent.width -- inside a ScrollView, the direct
+                // child's "parent" is an internal Flickable whose own
+                // width is sized to CONTENT, not the visible viewport
+                // (that's the whole mechanism that lets it scroll) -- so
+                // binding to it is circular and settles wider than the
+                // panel, which is why wrapMode: Text.WordWrap below had
+                // no effect (a Text never wraps until something gives it
+                // a real bounded width to wrap AT). availableWidth is
+                // ScrollView's own documented "content area, viewport-
+                // bounded" property, made for exactly this.
+                width: analysisScroll.availableWidth
                 spacing: 10
 
                 Text {

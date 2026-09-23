@@ -66,6 +66,35 @@ def _tree_to_json(node: dict) -> dict:
     }
 
 
+def _tree_to_qml(node: dict) -> dict:
+    """Same shape/sort/pruning as _tree_to_json (terse n/v/c keys, used to
+    keep the embedded HTML payload small) but with full field names --
+    used by the Qt/QML GUI's FlameGraphBridge, which has no payload-size
+    concern (it's a Python dict handed to PySide6 directly, never
+    serialized to a page)."""
+    return {
+        "name": node["name"],
+        "value": node["value"],
+        "children": [
+            _tree_to_qml(c)
+            for c in sorted(node["children"].values(),
+                            key=lambda x: x["value"], reverse=True)
+            if c["value"] > 0
+        ],
+    }
+
+
+def build_qml_tree(folded_stacks: str) -> dict | None:
+    """Parse folded-stacks text into the {name, value, children} shape
+    FlameGraphBridge exposes to QML. Returns None (not an empty dict) for
+    empty/unparseable input, mirroring generate_html's own "nothing to
+    render" check -- callers branch on that the same way."""
+    tree = _build_tree(folded_stacks)
+    if tree["value"] == 0:
+        return None
+    return _tree_to_qml(tree)
+
+
 # ── JavaScript ─────────────────────────────────────────────────────────────────
 
 _JS = r"""

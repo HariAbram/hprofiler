@@ -31,6 +31,54 @@ import sys
 from .x11_check import check_x11
 
 
+def _run_gui_tiers(argv: list[str], verbose: bool) -> bool:
+    """Shared tier-1/tier-2 subprocess retry loop -- checks X11 + PySide6
+    availability, then runs `argv` (already pointed at whichever
+    bootstrap script the caller wants: app.py for the main dashboard,
+    flamegraph_app.py for the standalone flame graph popup) once with
+    GPU rendering and, on failure, once more with QT_QUICK_BACKEND=
+    software. Returns True if either attempt exits 0, False if the
+    caller should fall back to a TUI/text rendering of its own.
+    """
+    def log(msg: str) -> None:
+        if verbose:
+            print(f"[hprofiler][gui] {msg}", file=sys.stderr)
+
+    status = check_x11()
+    if not status.available:
+        log(f"no usable X11 display ({status.reason}) -- falling back to the TUI")
+        return False
+
+    try:
+        import PySide6  # noqa: F401
+    except ImportError:
+        log("PySide6 is not installed (pip install 'hprofiler[gui]') -- "
+            "falling back to the TUI")
+        return False
+
+    log(f"{status.reason} -- attempting the GUI (GPU-rendered)")
+
+    for tier_name, extra_env in (
+        ("GPU-rendered", {}),
+        ("software-rendered", {"QT_QUICK_BACKEND": "software"}),
+    ):
+        env = dict(os.environ)
+        env.update(extra_env)
+        try:
+            rc = subprocess.run(argv, env=env).returncode
+        except OSError as e:
+            log(f"could not launch the GUI process ({tier_name}): {e}")
+            rc = 1
+
+        if rc == 0:
+            return True
+        log(f"{tier_name} GUI attempt exited with code {rc}"
+            + (" -- retrying with software rendering" if not extra_env else
+               " -- falling back to the TUI"))
+
+    return False
+
+
 def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False) -> bool:
     """
     Attempts the Qt/QML GUI on a trace JSON file already written to disk
@@ -55,42 +103,23 @@ def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False) -> b
     the TUI-fallback path), so `--disasm` had no effect on a working GUI
     -- a real bug, not by design.
     """
-    def log(msg: str) -> None:
-        if verbose:
-            print(f"[hprofiler][gui] {msg}", file=sys.stderr)
-
-    status = check_x11()
-    if not status.available:
-        log(f"no usable X11 display ({status.reason}) -- falling back to the TUI")
-        return False
-
-    try:
-        import PySide6  # noqa: F401
-    except ImportError:
-        log("PySide6 is not installed (pip install 'hprofiler[gui]') -- "
-            "falling back to the TUI")
-        return False
-
-    log(f"{status.reason} -- attempting the GUI (GPU-rendered)")
     app_main = os.path.join(os.path.dirname(__file__), "app.py")
     argv = [sys.executable, app_main, trace_path] + (["--disasm"] if disasm else [])
+    return _run_gui_tiers(argv, verbose)
 
-    for tier_name, extra_env in (
-        ("GPU-rendered", {}),
-        ("software-rendered", {"QT_QUICK_BACKEND": "software"}),
-    ):
-        env = dict(os.environ)
-        env.update(extra_env)
-        try:
-            rc = subprocess.run(argv, env=env).returncode
-        except OSError as e:
-            log(f"could not launch the GUI process ({tier_name}): {e}")
-            rc = 1
 
-        if rc == 0:
-            return True
-        log(f"{tier_name} GUI attempt exited with code {rc}"
-            + (" -- retrying with software rendering" if not extra_env else
-               " -- falling back to the TUI"))
-
-    return False
+def launch_flamegraph_gui(folded_stacks_path: str, title: str, verbose: bool = True) -> bool:
+    """
+    Same 3-tier fallback as launch_gui(), for the standalone `hprofiler
+    flamegraph --gui` popup -- a genuinely separate window/data source
+    (a perf-collected folded-stacks tree, not a Trace/JSON file), so it
+    gets its own bootstrap script (flamegraph_app.py) and QML
+    (FlameGraphWindow.qml) rather than being shoehorned into the main
+    8-tab dashboard's app.py/Main.qml. `folded_stacks_path` is a file,
+    not inline text, for the same reason trace data is always passed as
+    a path: a real HPC binary's collected stacks can be many MB of text,
+    past comfortable subprocess-argv limits on some systems.
+    """
+    app_main = os.path.join(os.path.dirname(__file__), "flamegraph_app.py")
+    argv = [sys.executable, app_main, folded_stacks_path, title]
+    return _run_gui_tiers(argv, verbose)

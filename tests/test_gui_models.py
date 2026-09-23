@@ -121,6 +121,42 @@ class TestTimelineModel(unittest.TestCase):
     def test_minimal_single_span_trace_does_not_crash(self):
         self._model(_mk_trace([_span(1, 1, Category.CPU, 0, 10, "main")]))
 
+    def test_call_graph_scoped_to_visible_window(self):
+        # Two spans with captured stacks, one inside the queried window,
+        # one entirely before it -- only the visible one should
+        # contribute nodes/edges.
+        visible = SpanEvent(name="in_view", category=Category.CPU,
+                            start_ns=1000, duration_ns=100, pid=1, tid=1,
+                            stack_frames=["caller_a"])
+        offscreen = SpanEvent(name="out_of_view", category=Category.CPU,
+                              start_ns=0, duration_ns=10, pid=1, tid=1,
+                              stack_frames=["caller_b"])
+        m = self._model(_mk_trace([visible, offscreen]))
+        result = m.callGraph(900.0, 1200.0)
+        names = {n["name"] for n in result["nodes"]}
+        self.assertIn("in_view", names)
+        self.assertIn("caller_a", names)
+        self.assertNotIn("out_of_view", names)
+        self.assertNotIn("caller_b", names)
+
+    def test_call_graph_nodes_have_normalized_positions_and_colors(self):
+        span = SpanEvent(name="leaf", category=Category.CPU,
+                         start_ns=0, duration_ns=100, pid=1, tid=1,
+                         stack_frames=["root"])
+        m = self._model(_mk_trace([span]))
+        result = m.callGraph(0.0, 1000.0)
+        self.assertEqual(len(result["nodes"]), 2)
+        for n in result["nodes"]:
+            self.assertGreaterEqual(n["x"], 0.0)
+            self.assertLessEqual(n["x"], 1.0)
+            self.assertTrue(n["color"].startswith("#"))
+
+    def test_call_graph_empty_when_no_spans_have_stack_frames(self):
+        m = self._model(_mk_trace([_span(1, 1, Category.CPU, 0, 100, "fn")]))
+        result = m.callGraph(0.0, 1000.0)
+        self.assertEqual(result["nodes"], [])
+        self.assertEqual(result["edges"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

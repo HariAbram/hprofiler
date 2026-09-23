@@ -261,3 +261,28 @@ class TimelineModel(QObject):
             "durNs": float(s.duration_ns),
             "tags": dict(s.tags),
         }
+
+    @Slot(float, float, result='QVariantMap')
+    def callGraph(self, view_start_ns: float, view_end_ns: float) -> dict[str, Any]:
+        """Node-and-edge call graph (analysis/call_graph.py) for whatever
+        spans overlap [view_start_ns, view_end_ns) -- the Timeline's
+        currently visible window, not the whole trace, so the graph
+        reflects "what's on screen right now" and updates as the user
+        pans/zooms (throttled QML-side, this rebuild -- an O(visible
+        spans) pass twice over, once for the graph, once for layout --
+        isn't cheap enough to run on every single pixel of drag).
+        Silently returns an empty graph if no visible spans have
+        captured stack frames (HPROFILER_CALLSTACK/--call-tree wasn't
+        enabled for this run) -- same "no data" convention as the Call
+        Tree tab, not an error."""
+        visible = [
+            s for s in self._trace.spans
+            if s.duration_ns > 0 and s.start_ns < view_end_ns
+            and s.start_ns + s.duration_ns > view_start_ns
+        ]
+        from ..analysis.call_graph import build_call_graph, layout_call_graph
+        nodes, edges = build_call_graph(visible)
+        layout = layout_call_graph(nodes, edges)
+        for n in layout["nodes"]:
+            n["color"] = self._theme.categoryColor(n["category"])
+        return layout

@@ -804,6 +804,9 @@ def roofline(backend, output, use_html, target):
               help="Output HTML file path  (only used with --html)")
 @click.option("--html", "use_html", is_flag=True, default=False,
               help="Write an HTML flamegraph and open in the browser instead of the TUI")
+@click.option("--gui", is_flag=True, default=False,
+              help="Pop up the Qt/QML flame graph GUI (X11-forwarding-aware, falls back "
+                   "to the TUI automatically if unavailable). Takes priority over --html.")
 @click.option("--callgraph", default="fp", show_default=True,
               type=click.Choice(["fp", "dwarf", "lbr"]),
               help="perf call-graph method.  fp = frame-pointer (fast, needs "
@@ -812,11 +815,13 @@ def roofline(backend, output, use_html, target):
 @click.option("--freq", "-F", default=99, show_default=True,
               help="perf sampling frequency (Hz)")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
-def flamegraph(backend, output, use_html, callgraph, freq, command):
+def flamegraph(backend, output, use_html, gui, callgraph, freq, command):
     """Profile COMMAND and show an interactive flame graph in the terminal.
 
     By default opens a native TUI flamegraph (works on HPC clusters without a
-    browser).  Pass --html to write an HTML file and open it in the browser.
+    browser).  Pass --html to write an HTML file and open it in the browser,
+    or --gui to pop up the Qt/QML GUI (falls back to the TUI automatically
+    over a plain SSH session with no X11 forwarding).
 
     Runs COMMAND under 'perf record --call-graph' to collect CPU stack samples,
     then renders the call tree interactively.
@@ -830,6 +835,13 @@ def flamegraph(backend, output, use_html, callgraph, freq, command):
       w                write HTML and open in browser
       q                quit
 
+    \b
+    GUI controls (--gui):
+      click            zoom into frame
+      right-click / Up button   zoom out one level
+      Esc / Reset button        reset to full view
+      search field (regex)      highlight matching frames
+
     Use --backend to inject GPU/MPI/OpenMP hooks alongside perf so the flame
     graph shows time spent inside CUDA, OpenCL, ROCm, MPI, etc. API calls
     (kernel launches, synchronisation waits, collectives).
@@ -839,6 +851,7 @@ def flamegraph(backend, output, use_html, callgraph, freq, command):
       hprofiler flamegraph -- ./my_program
       hprofiler flamegraph --backend cuda -- ./cuda_app
       hprofiler flamegraph --html -- ./my_program        (browser mode)
+      hprofiler flamegraph --gui -- ./my_program          (popup GUI mode)
       hprofiler flamegraph --callgraph dwarf -- ./my_program
     """
     import os, shutil as _shutil
@@ -924,6 +937,22 @@ def flamegraph(backend, output, use_html, callgraph, freq, command):
         click.echo(f"[hprofiler] ✗  {e}", err=True)
         raise SystemExit(1)
     click.echo(f"[hprofiler] Flame graph → {out}  (open in any browser)", err=True)
+
+    if gui:
+        import tempfile as _tempfile
+        from src.gui.launch import launch_flamegraph_gui
+        fd, folded_path = _tempfile.mkstemp(suffix=".folded.txt", prefix="hprofiler_fg_")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(folded)
+            shown = launch_flamegraph_gui(folded_path, title)
+        finally:
+            try:
+                os.unlink(folded_path)
+            except OSError:
+                pass
+        if shown:
+            return
 
     if use_html:
         _open_browser(out)
