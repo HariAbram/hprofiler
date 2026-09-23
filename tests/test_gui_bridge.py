@@ -277,6 +277,45 @@ class TestGuiBridge(unittest.TestCase):
         self.assertIn("Not a missing-tool", sb.noDisasmReason("a"))
         self.assertIn("sym=main", sb.noDisasmReason("b"))
 
+    def test_source_bridge_picks_up_disasm_added_after_construction(self):
+        # Regression test for a real user report: `hprofiler gui --disasm`
+        # started background disassembly collection correctly, but
+        # SourceBridge built its kernel list ONCE at construction time
+        # (a constant Property) and never looked again -- so a function
+        # that resolved a second later than the window opening (the
+        # common case: collection takes a moment) stayed stuck showing
+        # "disassembly still failed" forever, even though the exact same
+        # trace's TUI (which polls trace._disasm_version every 0.5s)
+        # showed it correctly. SourceBridge now polls the same way.
+        from src.gui.bridge import SourceBridge
+        from src.disasm.extractor import KernelDisasm
+        span = _span(1, 1, Category.OPENMP, 0, 100, "hot_fn", tags={"sym": "hot_fn"})
+        trace = _mk_trace([span], backends=["openmp"])
+        sb = SourceBridge(trace)
+        self.assertFalse(sb.kernels[0]["hasDisasm"])
+
+        received = []
+        sb.kernelsChanged.connect(lambda: received.append(True))
+        trace.add_disasm(KernelDisasm(name="hot_fn", arch="x86_64", source="objdump", lines=[]))
+        sb._poll.timeout.emit()  # simulate one poll tick without waiting 0.5s in the test
+
+        self.assertTrue(received, "kernelsChanged did not fire after add_disasm")
+        self.assertTrue(sb.kernels[0]["hasDisasm"])
+
+    def test_source_bridge_poll_is_a_noop_when_disasm_version_unchanged(self):
+        # The poll runs every 0.5s for the lifetime of the window; it must
+        # not rebuild/re-emit on every tick regardless of whether anything
+        # actually changed, or every open Source screen would repaint 2x/
+        # sec forever for no reason.
+        from src.gui.bridge import SourceBridge
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "hot_fn")], backends=["cpu"])
+        sb = SourceBridge(trace)
+        received = []
+        sb.kernelsChanged.connect(lambda: received.append(True))
+        sb._poll.timeout.emit()
+        sb._poll.timeout.emit()
+        self.assertEqual(received, [])
+
     # ── SystemBridge ─────────────────────────────────────────────────────
 
     def test_system_bridge_exposes_run_info_and_devices(self):

@@ -20,6 +20,29 @@ dependencies = [
 # working with zero Qt installed -- most profiling targets (cluster
 # compute nodes, minimal containers) have no GUI libraries at all, and
 # PySide6 alone is a large (~250MB) download.
+#
+# ADDITIONAL SYSTEM REQUIREMENT pip cannot install or declare (not a
+# PyPI package): Qt >=6.5's "xcb" platform plugin -- what PySide6 uses
+# to talk to a real X server, including over `ssh -X`/`-Y` forwarding --
+# hard-depends on the system library libxcb-cursor0 (Debian/Ubuntu name)
+# / xcb-util-cursor (RHEL/Rocky/Fedora/conda-forge name). Without it,
+# PySide6 imports fine but every GUI launch fails at window-open time
+# with "Could not load the Qt platform plugin 'xcb' ... even though it
+# was found" (both the GPU and software-rendering tiers fail identically
+# -- it's the platform/X11-connection layer, not the renderer, so
+# QT_QUICK_BACKEND=software does not route around it). hprofiler falls
+# back to the TUI automatically when this happens, so nothing breaks,
+# but the popup GUI stays unavailable until the library is present.
+# Install it with (root):  apt install libxcb-cursor0 (Debian/Ubuntu)
+#                           dnf install xcb-util-cursor (RHEL/Rocky/Fedora)
+# or without root, e.g. on an HPC login node:
+#                           conda install -c conda-forge xcb-util-cursor
+#                           spack install xcb-util-cursor
+# then make sure its lib/ dir is on LD_LIBRARY_PATH (conda activation
+# does not always set this automatically). Confirmed hit on Dardel
+# (PDC/KTH) 2026-09-22 -- see project_qml_gui memory for the full
+# diagnosis, including a QT_QPA_PLATFORM=vnc workaround for machines
+# where installing the library isn't an option at all.
 gui = ["PySide6>=6.5"]
 
 [project.scripts]

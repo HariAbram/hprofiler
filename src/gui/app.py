@@ -31,9 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: app.py <trace.json>", file=sys.stderr)
+        print("usage: app.py <trace.json> [--disasm]", file=sys.stderr)
         return 2
     trace_path = sys.argv[1]
+    disasm = "--disasm" in sys.argv[2:]
 
     from PySide6.QtCore import QUrl, QObject, Property
     from PySide6.QtGui import QGuiApplication
@@ -44,7 +45,13 @@ def main() -> int:
     # src.gui package, so relative imports would fail with "attempted
     # relative import with no known parent package"; the sys.path insert
     # above makes the repo root importable as `src.*` instead).
-    from src.ui.app import load_trace_from_json
+    #
+    # load_trace_from_json comes from output.chrome_trace, NOT src.ui.app
+    # (which re-exports the same name) -- importing it from src.ui.app
+    # would pull in the whole Textual-based TUI module (textual+rich,
+    # ~180ms) for a GUI process that never uses it, measured as a real,
+    # avoidable chunk of GUI startup latency.
+    from src.output.chrome_trace import load_trace_from_json
     from src.gui.theme import Theme
     from src.gui.bridge import (
         DashboardBridge, KernelsBridge, CallTreeBridge, RooflineBridge, SourceBridge,
@@ -52,7 +59,7 @@ def main() -> int:
     )
     from src.gui.models import TimelineModel
 
-    trace = load_trace_from_json(trace_path)
+    trace = load_trace_from_json(trace_path, collect_disasm=disasm)
 
     app = QGuiApplication(sys.argv[:1])
     app.setApplicationName("hprofiler")

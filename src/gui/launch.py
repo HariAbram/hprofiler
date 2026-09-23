@@ -31,7 +31,7 @@ import sys
 from .x11_check import check_x11
 
 
-def launch_gui(trace_path: str, verbose: bool = True) -> bool:
+def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False) -> bool:
     """
     Attempts the Qt/QML GUI on a trace JSON file already written to disk
     (both `hprofiler run --gui` and `hprofiler gui <trace.json>` go
@@ -45,6 +45,15 @@ def launch_gui(trace_path: str, verbose: bool = True) -> bool:
     (a real possibility with broken/partial GLX over some X11 forwarding
     setups) is a segfault-class failure in the underlying Qt/driver
     stack, not a catchable Python exception.
+
+    `disasm`: forwarded to the GUI subprocess as `--disasm` so it starts
+    background disassembly collection for any function whose call site
+    resolved (sym=/lib= tag) but wasn't already disassembled in the trace
+    file -- mirrors `hprofiler view --disasm`'s TUI behavior. Previously
+    this flag existed on the `hprofiler gui`/`run --gui` CLI commands but
+    was silently dropped whenever the GUI actually launched (only used on
+    the TUI-fallback path), so `--disasm` had no effect on a working GUI
+    -- a real bug, not by design.
     """
     def log(msg: str) -> None:
         if verbose:
@@ -64,6 +73,7 @@ def launch_gui(trace_path: str, verbose: bool = True) -> bool:
 
     log(f"{status.reason} -- attempting the GUI (GPU-rendered)")
     app_main = os.path.join(os.path.dirname(__file__), "app.py")
+    argv = [sys.executable, app_main, trace_path] + (["--disasm"] if disasm else [])
 
     for tier_name, extra_env in (
         ("GPU-rendered", {}),
@@ -72,9 +82,7 @@ def launch_gui(trace_path: str, verbose: bool = True) -> bool:
         env = dict(os.environ)
         env.update(extra_env)
         try:
-            rc = subprocess.run(
-                [sys.executable, app_main, trace_path], env=env,
-            ).returncode
+            rc = subprocess.run(argv, env=env).returncode
         except OSError as e:
             log(f"could not launch the GUI process ({tier_name}): {e}")
             rc = 1

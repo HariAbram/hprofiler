@@ -14,8 +14,8 @@ import json
 from pathlib import Path
 from typing import IO
 
-from ..core.trace import Trace
-from ..core.events import SpanEvent, InstantEvent, CounterEvent
+from ..core.trace import Trace, TraceMetadata
+from ..core.events import SpanEvent, InstantEvent, CounterEvent, Category
 
 
 def _category_color(cat: str) -> str:
@@ -155,3 +155,113 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             json.dump(payload, f, indent=indent)
     else:
         json.dump(payload, out, indent=indent)
+
+
+def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trace:
+    """Reconstruct a Trace from a Chrome Trace JSON file written by write()
+    above -- the read side of this module's format, moved here from
+    src/ui/app.py (which re-exports this name for backward compatibility)
+    so loading a trace doesn't require importing the whole Textual-based
+    TUI module; every UI (TUI, GUI, `hprofiler compare`/`export`/etc.)
+    needs this regardless of which viewer it ends up using, if any."""
+    with open(path) as f:
+        data = json.load(f)
+
+    meta_raw = data.get("metadata", {})
+    metadata = TraceMetadata(
+        command=meta_raw.get("command", ""),
+        args=meta_raw.get("args", []),
+        backends_used=meta_raw.get("backends", []),
+        hostname=meta_raw.get("hostname", ""),
+        cwd=meta_raw.get("cwd", ""),
+    )
+    trace = Trace(metadata)
+
+    for ev in data.get("traceEvents", []):
+        ph      = ev.get("ph", "")
+        cat_str = ev.get("cat", "other")
+        try:
+            cat = Category(cat_str)
+        except ValueError:
+            cat = Category.OTHER
+
+        if ph == "X":
+            args = ev.get("args", {})
+            stack = args.pop("_stack", [])
+            trace.add(SpanEvent(
+                name=ev.get("name", ""),
+                category=cat,
+                start_ns=int(ev.get("ts", 0) * 1_000),
+                duration_ns=int(ev.get("dur", 0) * 1_000),
+                pid=ev.get("pid", 0),
+                tid=ev.get("tid", 0),
+                tags=args,
+                stack_frames=stack if isinstance(stack, list) else [],
+            ))
+        elif ph == "i":
+            trace.add(InstantEvent(
+                name=ev.get("name", ""),
+                category=cat,
+                timestamp_ns=int(ev.get("ts", 0) * 1_000),
+                pid=ev.get("pid", 0),
+                tid=ev.get("tid", 0),
+            ))
+        elif ph == "C":
+            args = ev.get("args", {})
+            name = ev.get("name", "counter")
+            val  = list(args.values())[0] if args else 0
+            trace.add(CounterEvent(
+                name=name,
+                category=cat,
+                timestamp_ns=int(ev.get("ts", 0) * 1_000),
+                value=float(val),
+                pid=ev.get("pid", 0),
+            ))
+
+    # Restore device peaks saved at profile time
+    for d in meta_raw.get("devices", []):
+        try:
+            from ..analysis.device import DevicePeak
+            trace.set_devices([DevicePeak.from_dict(x) for x in meta_raw["devices"]])
+            break
+        except Exception:
+            pass
+
+    # Restore serialized disasm if present in the JSON.
+    disasm_raw = data.get("disasm")
+    if disasm_raw:
+        try:
+            from ..disasm.extractor import KernelDisasm, DisasmLine
+            from ..disasm.classifier import InsnType
+            for name, kd_raw in disasm_raw.items():
+                lines = [
+                    DisasmLine(
+                        addr=ln.get("addr", 0),
+                        mnemonic=ln.get("mnemonic", ""),
+                        operands=ln.get("operands", ""),
+                        itype=InsnType(ln.get("itype", "other")),
+                        comment=ln.get("comment", ""),
+                        raw=ln.get("raw", ""),
+                    )
+                    for ln in kd_raw.get("lines", [])
+                ]
+                trace.add_disasm(KernelDisasm(
+                    name=name,
+                    arch=kd_raw.get("arch", ""),
+                    source=kd_raw.get("source", ""),
+                    lines=lines,
+                ))
+        except Exception:
+            pass
+
+    if collect_disasm and not trace.disasm:
+        import threading as _threading
+        def _bg_disasm():
+            try:
+                from ..core.runner import _collect_disasm
+                _collect_disasm(trace, [metadata.command] + metadata.args, metadata.backends_used)
+            except Exception:
+                pass
+        _threading.Thread(target=_bg_disasm, daemon=True).start()
+
+    return trace

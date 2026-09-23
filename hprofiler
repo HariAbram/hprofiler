@@ -259,7 +259,7 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
         shown = False
         if gui:
             from src.gui.launch import launch_gui
-            shown = launch_gui(out_path)
+            shown = launch_gui(out_path, disasm=disasm)
         if not shown:
             from src.ui.app import launch_viewer
             launch_viewer(trace, collect_disasm=disasm)
@@ -529,7 +529,7 @@ def gui(trace_file, disasm):
       hprofiler gui app.hprofiler.json  # pops up locally over the tunnel
     """
     from src.gui.launch import launch_gui
-    shown = launch_gui(trace_file)
+    shown = launch_gui(trace_file, disasm=disasm)
     if not shown:
         from src.ui.app import load_trace_from_json, launch_viewer
         click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)

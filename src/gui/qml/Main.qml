@@ -67,20 +67,38 @@ ApplicationWindow {
     }
 
     // ── Tab content ──────────────────────────────────────────────────────
+    // Each tab is behind a Loader, active only once selected (then stays
+    // loaded, so revisiting a tab doesn't rebuild it) -- a StackLayout
+    // with plain screen children instead builds and paints EVERY tab
+    // eagerly at startup, including the Timeline's per-lane Canvases
+    // (each doing a real Python round-trip via TimelineModel.visibleSpans
+    // on first paint), which was pure wasted work for the 7 tabs the user
+    // hasn't opened yet and a real, measured contributor to slow startup
+    // on a large trace.
     StackLayout {
+        id: stack
         anchors.fill: parent
         anchors.margins: 10
         currentIndex: tabBar.currentIndex
 
-        OverviewScreen {}
-        TimelineScreen {}
-        KernelsScreen {}
-        CallTreeScreen {}
-        RooflineScreen {}
-        SourceScreen {}
-        SystemScreen {}
-        ProfileScreen {}
+        Loader { objectName: "tabLoader0"; active: stack.currentIndex === 0 || item !== null; sourceComponent: overviewComp }
+        Loader { objectName: "tabLoader1"; active: stack.currentIndex === 1 || item !== null; sourceComponent: timelineComp }
+        Loader { objectName: "tabLoader2"; active: stack.currentIndex === 2 || item !== null; sourceComponent: kernelsComp }
+        Loader { objectName: "tabLoader3"; active: stack.currentIndex === 3 || item !== null; sourceComponent: callTreeComp }
+        Loader { objectName: "tabLoader4"; active: stack.currentIndex === 4 || item !== null; sourceComponent: rooflineComp }
+        Loader { objectName: "tabLoader5"; active: stack.currentIndex === 5 || item !== null; sourceComponent: sourceComp }
+        Loader { objectName: "tabLoader6"; active: stack.currentIndex === 6 || item !== null; sourceComponent: systemComp }
+        Loader { objectName: "tabLoader7"; active: stack.currentIndex === 7 || item !== null; sourceComponent: profileComp }
     }
+
+    Component { id: overviewComp; OverviewScreen {} }
+    Component { id: timelineComp; TimelineScreen {} }
+    Component { id: kernelsComp; KernelsScreen {} }
+    Component { id: callTreeComp; CallTreeScreen {} }
+    Component { id: rooflineComp; RooflineScreen {} }
+    Component { id: sourceComp; SourceScreen {} }
+    Component { id: systemComp; SystemScreen {} }
+    Component { id: profileComp; ProfileScreen {} }
 
     // ── Footer ───────────────────────────────────────────────────────────
     footer: Rectangle {

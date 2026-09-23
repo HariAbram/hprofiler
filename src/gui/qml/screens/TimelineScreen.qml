@@ -124,8 +124,25 @@ Item {
                                 property var cachedSpans: []
                                 property real boundZoom: root.zoom
                                 property real boundStart: root.viewStartNs
-                                onBoundZoomChanged: requestPaint()
-                                onBoundStartChanged: requestPaint()
+                                // Throttled, not immediate: a drag/wheel gesture fires
+                                // dozens of these changes per second, and each repaint
+                                // means a Python round-trip (TimelineModel.visibleSpans)
+                                // per lane -- with 17 lanes, painting on every single
+                                // change made dragging feel very sluggish, worse still
+                                // over X11 forwarding where each composited frame also
+                                // pays network latency. Capped to ~60fps via a THROTTLE
+                                // (start-if-not-already-running), not a debounce/restart
+                                // -- it keeps repainting periodically throughout a long
+                                // continuous drag instead of only once movement pauses.
+                                onBoundZoomChanged: if (!repaintThrottle.running) repaintThrottle.start()
+                                onBoundStartChanged: if (!repaintThrottle.running) repaintThrottle.start()
+
+                                Timer {
+                                    id: repaintThrottle
+                                    interval: 16
+                                    repeat: false
+                                    onTriggered: laneCanvas.requestPaint()
+                                }
 
                                 onPaint: {
                                     var ctx = getContext("2d")
@@ -157,10 +174,33 @@ Item {
                                                 break
                                             }
                                         }
+                                        // Skip the Python round-trip (spanAt) and repaint
+                                        // entirely when the hovered span hasn't actually
+                                        // changed -- onPositionChanged fires on every
+                                        // single mouse-moved pixel, not just on entering a
+                                        // new span, so without this guard a 500px-wide
+                                        // hover over one long span meant ~500 redundant
+                                        // Python calls + overlay repaints for no visible
+                                        // change at all.
+                                        //
+                                        // NOTE: laneIndex is a property of the enclosing
+                                        // Canvas (laneCanvas), not of this MouseArea --
+                                        // QML does not resolve a parent item's custom
+                                        // properties unqualified from a nested child's
+                                        // scope, only via its id. Referencing bare
+                                        // `laneIndex` here throws a silent JS
+                                        // ReferenceError on every hover move (visible only
+                                        // via engine.warnings, which nothing was reading
+                                        // at runtime) -- hover was completely non-
+                                        // functional from when this screen was first
+                                        // built; only ever verified via static screenshots,
+                                        // never a real synthesized mouse move, so this
+                                        // never surfaced until tested with QTest.mouseMove.
+                                        if (found === root.hoverSpanIdx && laneCanvas.laneIndex === root.hoverLane) return
                                         if (found >= 0) {
-                                            root.hoverLane = laneIndex
+                                            root.hoverLane = laneCanvas.laneIndex
                                             root.hoverSpanIdx = found
-                                            var detail = TimelineModel.spanAt(laneIndex, found)
+                                            var detail = TimelineModel.spanAt(laneCanvas.laneIndex, found)
                                             root.hoverText = detail.name + "  @" + root.fmtNs(detail.startNs) +
                                                              "  dur " + root.fmtNs(detail.durNs)
                                         } else {
@@ -171,6 +211,7 @@ Item {
                                         overlay.requestPaint()
                                     }
                                     onExited: {
+                                        if (root.hoverLane !== laneCanvas.laneIndex) return
                                         root.hoverLane = -1
                                         root.hoverSpanIdx = -1
                                         root.hoverText = ""

@@ -3,7 +3,10 @@ QObject bridges exposing Trace/analysis data to QML. Each bridge computes
 once at construction (a loaded trace never changes afterwards, same
 assumption the TUI's widgets already make) and exposes `constant=True`
 Properties -- no change notification machinery needed for data that's
-fixed for the lifetime of the window.
+fixed for the lifetime of the window. SourceBridge is the one exception
+(see its own docstring): background disassembly collection can still be
+running when the window opens, so its kernel list needs real change
+notification, polled the same way the TUI's DisasmWidget does.
 
 Reuses analysis/dashboard.py (shared with the TUI's Overview tab) and the
 existing analysis modules directly -- this file's job is turning that
@@ -19,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QObject, Property, Slot
+from PySide6.QtCore import QObject, Property, Signal, Slot, QTimer
 
 from ..core.trace import Trace
 from ..analysis import dashboard as dash
@@ -270,21 +273,20 @@ def _ct_node_to_dict(node, theme) -> dict[str, Any]:
 
 
 class CallTreeBridge(QObject):
-    """Backs the Call Tree screen. Reuses src/ui/app.py's _ct_build
+    """Backs the Call Tree screen. Reuses analysis/call_tree.py's _ct_build
     (stack-based when HPROFILER_CALLSTACK data is present, temporal-
     containment fallback otherwise -- see that function's own docstring)
     directly rather than re-deriving call-tree construction here; this
     class's only job is reshaping _CTNode's dataclass tree into plain
-    nested dicts a QML recursive component can walk. _ct_build is
-    private/TUI-module-local today (not yet extracted to
-    analysis/dashboard.py like the Overview helpers were) -- imported
-    across modules as a pragmatic reuse rather than duplicated; a good
-    candidate for a future shared-module extraction pass."""
+    nested dicts a QML recursive component can walk. Also used by the
+    TUI's CallTreeWidget (src/ui/app.py, via a re-export) -- extracted to
+    analysis/call_tree.py specifically so importing it here doesn't pull
+    in the whole Textual-based TUI module."""
 
     def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
         super().__init__(parent)
         try:
-            from ..ui.app import _ct_build
+            from ..analysis.call_tree import _ct_build
             roots = _ct_build(trace.spans)
         except Exception:
             roots = []
@@ -400,34 +402,68 @@ _ITYPE_HEX = {
 
 class SourceBridge(QObject):
     """Backs the Source screen -- the GUI's equivalent of the TUI's
-    DisasmWidget (src/ui/app.py). Kernel list is a constant Property
-    (small: one row per profiled/disassembled function); each kernel's
-    actual instruction lines are fetched on demand via disasmLines() so
-    a trace with many disassembled kernels doesn't pay to reshape all of
-    them upfront."""
+    DisasmWidget (src/ui/app.py). Kernel list is small (one row per
+    profiled/disassembled function); each kernel's actual instruction
+    lines are fetched on demand via disasmLines() so a trace with many
+    disassembled kernels doesn't pay to reshape all of them upfront.
+
+    Unlike this file's other bridges, `kernels` is NOT a constant
+    Property: `hprofiler gui --disasm` (or `run --gui --disasm`) starts
+    disassembly collection as a background thread (see
+    output/chrome_trace.py's load_trace_from_json) that can still be
+    running when this window opens -- a real trace's disasm often isn't
+    fully resolved yet at load time. A constant snapshot from __init__
+    would permanently show "disassembly still failed" for any function
+    that resolves a few seconds later, which is exactly the bug a user
+    reported (disasm worked in the TUI -- which polls -- but never
+    appeared in the GUI, which didn't poll at all). Mirrors the TUI's
+    DisasmWidget._poll_disasm_ready: a 0.5s QTimer watches
+    trace._disasm_version (bumped by Trace.add_disasm) and rebuilds/
+    re-emits only when it actually changes."""
+
+    kernelsChanged = Signal()
 
     def __init__(self, trace: Trace, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._trace = trace
+        self._last_disasm_version = -1
+        self._kernels: list[dict[str, Any]] = []
+        self._rebuild_kernels()
+
+        self._poll = QTimer(self)
+        self._poll.setInterval(500)
+        self._poll.timeout.connect(self._rebuild_kernels)
+        self._poll.start()
+
+    def _rebuild_kernels(self) -> None:
+        cur_version = self._trace._disasm_version
+        if cur_version == self._last_disasm_version:
+            return
+        self._last_disasm_version = cur_version
+
+        trace = self._trace
         stats = trace.aggregated_stats()
         profiled_names = [r["name"] for r in stats]
         stats_by_name = {r["name"]: r for r in stats}
-        disasm_only = [n for n in trace.disasm if n not in profiled_names]
+        disasm = trace.disasm
+        disasm_only = [n for n in disasm if n not in profiled_names]
         names = profiled_names + disasm_only
 
-        self._kernels: list[dict[str, Any]] = []
+        kernels: list[dict[str, Any]] = []
         for name in names:
-            kd = trace.disasm.get(name)
+            kd = disasm.get(name)
             stat = stats_by_name.get(name)
-            self._kernels.append({
+            kernels.append({
                 "name": dash.fmt_kernel_name(name),
                 "rawName": name,
                 "hasDisasm": kd is not None,
                 "arch": kd.arch if kd else "—",
                 "total": dash.fmt_ns(stat["total_ns"]) if stat else "—",
             })
+        self._kernels = kernels
+        self.kernelsChanged.emit()
 
-    @Property('QVariantList', constant=True)
+    @Property('QVariantList', notify=kernelsChanged)
     def kernels(self) -> list[dict[str, Any]]:
         return self._kernels
 

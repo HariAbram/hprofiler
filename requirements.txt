@@ -3,3 +3,11 @@ textual>=0.47
 rich>=13.0
 capstone>=5.0
 numpy>=1.23
+
+# GUI (popup Qt/QML viewer) is intentionally NOT listed here -- it's a large
+# (~250MB) optional extra most profiling targets (cluster compute nodes,
+# minimal containers) never need; the TUI works with none of it installed.
+# To get it: pip install "hprofiler[gui]"  (see pyproject.toml's [gui] extra
+# and DOCUMENTATION.md's Requirements table for the additional system
+# library -- libxcb-cursor0/xcb-util-cursor -- that PySide6 itself can't
+# install since it isn't a PyPI package).

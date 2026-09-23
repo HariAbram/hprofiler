@@ -148,6 +148,8 @@ python3 hprofiler run --no-ui -- ./my_program
 | Roofline (CUDA) | `ncu` (Nsight Compute, ships with CUDA toolkit) |
 | Roofline (CPU/OpenMP) | `perf stat` (linux-tools) |
 | Roofline (ROCm) | `rocprof` (ships with ROCm) |
+| GUI (optional) | `PySide6>=6.5` — popup Qt/QML viewer (`hprofiler run --gui`, `hprofiler gui <trace.json>`); falls back to the TUI automatically if unavailable, so nothing else needs this |
+| GUI (optional, system lib) | `libxcb-cursor0` (Debian/Ubuntu) / `xcb-util-cursor` (RHEL/Rocky/Fedora/conda-forge) — Qt ≥6.5's `xcb` platform plugin hard-requires this to open a window over X11 (including `ssh -X`/`-Y`), even though PySide6 itself imports fine without it |
 
 ### Install Python dependencies
 
@@ -155,7 +157,34 @@ python3 hprofiler run --no-ui -- ./my_program
 pip install click textual rich capstone
 pip install plotly "kaleido==0.2.1"   # required for TUI flamegraph/roofline viewers
 # kaleido 0.2.1 specifically — 0.3+ requires an external Chrome install and breaks on clusters
+
+pip install "hprofiler[gui]"          # optional: popup Qt/QML viewer instead of the TUI
 ```
+
+If the GUI opens the TUI instead of the popup window, or fails with `Could not
+load the Qt platform plugin "xcb"`, the system library above is missing —
+PySide6 can't install it (it isn't a PyPI package). On a machine without root
+(e.g. an HPC login node), install it without sudo via:
+
+```bash
+conda install -c conda-forge xcb-util-cursor   # or: spack install xcb-util-cursor
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"   # conda activation doesn't always set this
+```
+
+If installing it isn't an option at all, Qt's built-in VNC platform plugin
+sidesteps `xcb` entirely (no X11 involved) at the cost of needing a separate
+VNC viewer + SSH tunnel instead of direct X forwarding:
+
+```bash
+export QT_QPA_PLATFORM='vnc:addr=127.0.0.1:port=5901:size=1280x800'
+hprofiler gui trace.hprofiler.json
+# then, from your local machine: ssh -L 5901:localhost:5901 <login-node>
+# and point a VNC viewer (TigerVNC, RealVNC, macOS Screen Sharing) at localhost:5901
+```
+
+`addr=127.0.0.1` is not optional here — the open-source Qt VNC plugin has no
+built-in authentication, so keep it loopback-only and reachable only through
+your own SSH tunnel on a shared login node.
 
 ### Build the C hook libraries
 
