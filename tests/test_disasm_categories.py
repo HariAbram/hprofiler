@@ -173,6 +173,55 @@ class TestCollectDisasmUsesSymfileNotLauncher(unittest.TestCase):
         )
         self.assertIn("omp_parallel_region", result)
 
+    def test_real_binary_param_overrides_command0_with_no_tags_at_all(self):
+        # The CPU-perf-sampled-by-name path (cpu_names) has no sym=/lib=
+        # tag to fall back on at all -- it just does nm/objdump on
+        # `binary` directly, same as CUDA/ROCm AoT disasm (which needs
+        # real CUDA/ROCm hardware+toolchain to test end-to-end here, but
+        # goes through this exact same `binary` variable -- see
+        # collect_disasm()'s real_binary override, applied once, before
+        # any backend-specific branch). Proves the override actually
+        # takes effect for this "no per-span tag at all" case, not just
+        # the OpenMP sym=/lib= paths the other tests here cover.
+        fake_launcher = "/definitely/not/a/real/path/srun"
+        result = collect_disasm(
+            command=[fake_launcher], backends=["cpu"], jit_spans=[],
+            cpu_names={"hprofiler_test_target_function"},
+            real_binary=self.real_binary,
+        )
+        self.assertIn("hprofiler_test_target_function", result,
+                      "collect_disasm did not use real_binary -- it likely tried "
+                      "(nonexistent) command[0] instead")
+
+    def test_real_binary_absent_falls_back_to_command0_unchanged(self):
+        # No real_binary passed at all (e.g. no hook ever connected, or
+        # SO_PEERCRED isn't available) -- must behave exactly as before
+        # this fix: command[0] is used, unchanged default behavior.
+        result = collect_disasm(
+            command=[self.real_binary], backends=["cpu"], jit_spans=[],
+            cpu_names={"hprofiler_test_target_function"},
+        )
+        self.assertIn("hprofiler_test_target_function", result)
+
+    def test_symfile_still_takes_priority_over_real_binary(self):
+        # symfile= (dladdr-resolved, exact) is more specific than
+        # real_binary (SO_PEERCRED-resolved, whole-process) -- must not
+        # regress: when both are available, symfile= still wins. In this
+        # test they happen to point at the same real binary, so this
+        # mainly proves passing real_binary doesn't break the existing
+        # symfile= path at all.
+        omp_syms = {
+            "omp_parallel_region": (
+                "sym", ("hprofiler_test_target_function", self.real_binary)
+            ),
+        }
+        result = collect_disasm(
+            command=["/definitely/not/a/real/path/srun"], backends=["openmp"],
+            jit_spans=[], omp_syms=omp_syms, real_binary=self.real_binary,
+        )
+        self.assertIn("omp_parallel_region", result)
+        self.assertTrue(result["omp_parallel_region"].lines)
+
     def test_mangled_name_is_the_real_symbol_not_the_span_label(self):
         # Regression test for a real user question ("what does 'omp_barrier
         # assembly' even mean?"): kd.name stays the span/event label

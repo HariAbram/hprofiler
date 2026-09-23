@@ -171,6 +171,41 @@ def _find_recent_span(
     return None
 
 
+def _peer_real_exe(client: "socket.socket") -> str:
+    """Resolve the REAL executable path of whatever process is on the
+    other end of this Unix-domain socket connection, via SO_PEERCRED --
+    a kernel-verified credential (the accepting side cannot be lied to
+    about it), not anything a hook has to self-report.
+
+    Why this exists: CUDA/ROCm AoT disassembly (disasm_cuda_sass/
+    disasm_rocm_binary) disassembles the WHOLE BINARY, keyed off
+    `command[0]` -- unlike OpenMP/MPI's disasm, which resolves a specific
+    call site via dladdr inside the profiled process (sym=/symfile=
+    tags) and so already gets the right binary regardless of how the
+    process was launched. When `command[0]` is a launcher
+    (`hprofiler run -- srun -n 4 gmx_mpi ...`), it's `srun`, never the
+    real GPU binary, and there's no per-span tag to fall back on for
+    this whole-binary case. Every hook connects to HPROFILER_SOCKET from
+    INSIDE the real profiled process (that's how LD_PRELOAD hooking
+    works), so the peer credentials of that exact connection give the
+    real PID for free -- /proc/<pid>/exe then resolves to the real
+    binary, launcher or no launcher.
+
+    Returns "" (not an exception) on any failure -- a process that's
+    already exited by the time this runs, permission issues, or a non-
+    Linux platform (SO_PEERCRED is Linux-specific) are all just "we
+    don't know", the same as command[0] not existing today.
+    """
+    import struct
+    try:
+        creds = client.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        peer_pid, _uid, _gid = struct.unpack("3i", creds)
+        return os.readlink(f"/proc/{peer_pid}/exe")
+    except Exception:
+        return ""
+
+
 class Runner:
     def __init__(
         self,
@@ -294,9 +329,20 @@ class Runner:
         events_lock = threading.Lock()
         client_threads: list[threading.Thread] = []
         _recent_spans: dict[tuple[int, int], deque[SpanEvent]] = {}
+        # Real exe path(s) of whatever process(es) actually connected to
+        # the socket -- see _peer_real_exe's docstring. A set, not a
+        # single value: an MPI job launches one hook connection per rank,
+        # typically all the same binary (SPMD), but nothing here assumes
+        # that -- collect_disasm() just needs ANY one real binary path,
+        # strictly better than the launcher command[0] it'd use otherwise.
+        _real_binary_paths: set[str] = set()
 
         def handle_client(client: sock_mod.socket) -> None:
             buf = ""
+            real_exe = _peer_real_exe(client)
+            if real_exe:
+                with events_lock:
+                    _real_binary_paths.add(real_exe)
             try:
                 while True:
                     data = client.recv(4096)
@@ -561,6 +607,7 @@ class Runner:
             self._disasm_thread = threading.Thread(
                 target=_collect_disasm,
                 args=(trace, self.command, self.backends, pid, perf_data),
+                kwargs={"real_binary_paths": _real_binary_paths},
                 daemon=True,
             )
             self._disasm_thread.start()
@@ -866,12 +913,21 @@ def _collect_disasm(
     backends: list[str],
     profiled_pid: int = 0,
     perf_data: str | None = None,
+    real_binary_paths: "set[str] | None" = None,
 ) -> None:
     """
     Post-run: extract disassembly for all profiled kernels and attach to trace.
 
     JIT .so paths come from spans emitted by the OpenCL hook when it
     intercepts dlopen of ACPP SSCP .jit.so files (tag type=jit_load, path=...).
+
+    real_binary_paths: real exe path(s) resolved via SO_PEERCRED on each
+    hook's socket connection (see _peer_real_exe) -- the actual profiled
+    binary, correct regardless of whether `command[0]` is a launcher
+    (`srun`/`mpirun`). Passed through to collect_disasm() for the CUDA/
+    ROCm AoT disasm paths, which (unlike OpenMP/MPI's dladdr-resolved
+    sym=/symfile= tags) disassemble the whole binary keyed off
+    command[0] and had no launcher-aware fallback at all until this.
     """
     # Resolve the binary path: it may be relative (e.g. './main').
     # Use the saved cwd from the trace metadata to make it absolute.
@@ -961,9 +1017,15 @@ def _collect_disasm(
             sm_version = f"sm_{major}{minor}"
             break
 
+    # Any ONE real binary path is strictly better than command[0] when
+    # that's a launcher -- for the common SPMD case (all ranks running
+    # the same binary) any one is correct; picking one is not an attempt
+    # at "the right" rank, there generally isn't a wrong one here.
+    real_binary = next(iter(real_binary_paths), "") if real_binary_paths else ""
+
     try:
         disasm_map = collect_disasm(command, backends, jit_spans, omp_syms, profiled_pid, cpu_names,
-                                    sm_version=sm_version)
+                                    sm_version=sm_version, real_binary=real_binary)
 
         import copy as _copy
 

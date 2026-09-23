@@ -385,6 +385,65 @@ class TestGuiBridge(unittest.TestCase):
         self.assertEqual(lines[0]["sourceFile"], "")
         self.assertFalse(lines[0]["sourceChanged"])
 
+    def test_source_bridge_instruction_mix_counts_and_percentages(self):
+        # Regression test: KernelDisasm.itype_counts()/itype_pcts()
+        # already existed and were already used by the TUI's
+        # DisasmWidget._show_mix -- the GUI's Source screen never called
+        # them at all, so a real user reported "no vector/memory
+        # instruction counts" with no way to see them.
+        from src.gui.bridge import SourceBridge
+        from src.disasm.extractor import KernelDisasm, DisasmLine
+        from src.disasm.classifier import InsnType
+        span = _span(1, 1, Category.CPU, 0, 100, "hot_fn")
+        trace = _mk_trace([span], backends=["cpu"])
+        lines = (
+            [DisasmLine(addr=i, mnemonic="vaddps", operands="ymm0, ymm1, ymm2",
+                        itype=InsnType.VEC_SP) for i in range(3)]
+            + [DisasmLine(addr=100 + i, mnemonic="mov", operands="rax, [rbx]",
+                          itype=InsnType.MEMORY) for i in range(1)]
+        )
+        trace.add_disasm(KernelDisasm(name="hot_fn", arch="x86-64", source="/bin/a.out", lines=lines))
+        sb = SourceBridge(trace)
+        mix = sb.instructionMix("hot_fn")
+        by_type = {row["type"]: row for row in mix}
+        self.assertEqual(by_type["vec_sp"]["count"], 3)
+        self.assertEqual(by_type["memory"]["count"], 1)
+        self.assertAlmostEqual(by_type["vec_sp"]["pct"], 75.0)
+        self.assertAlmostEqual(by_type["memory"]["pct"], 25.0)
+
+    def test_source_bridge_instruction_mix_empty_for_unknown_kernel(self):
+        from src.gui.bridge import SourceBridge
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "hot_fn")], backends=["cpu"])
+        sb = SourceBridge(trace)
+        self.assertEqual(sb.instructionMix("does_not_exist"), [])
+
+    def test_source_bridge_advisor_hints_flags_low_vectorisation(self):
+        # Regression test for the same report: analysis/asm_advisor.py
+        # already existed (pure static analysis, no LLM/network call) and
+        # was already used by the TUI -- the GUI never called it either.
+        from src.gui.bridge import SourceBridge
+        from src.disasm.extractor import KernelDisasm, DisasmLine
+        from src.disasm.classifier import InsnType
+        span = _span(1, 1, Category.CPU, 0, 100, "hot_fn")
+        trace = _mk_trace([span], backends=["cpu"])
+        # 20 scalar instructions, zero vector -- triggers asm_advisor's
+        # "low vectorisation" rule (vec_pct < 10%, n >= 20).
+        lines = [DisasmLine(addr=i, mnemonic="add", operands="rax, rbx",
+                            itype=InsnType.SCALAR) for i in range(20)]
+        trace.add_disasm(KernelDisasm(name="hot_fn", arch="x86-64", source="/bin/a.out", lines=lines))
+        sb = SourceBridge(trace)
+        hints = sb.advisorHints("hot_fn")
+        self.assertTrue(any(h["category"] == "vectorize" for h in hints))
+        vec_hint = next(h for h in hints if h["category"] == "vectorize")
+        self.assertEqual(vec_hint["severity"], "warn")
+        self.assertTrue(vec_hint["color"].startswith("#"))
+
+    def test_source_bridge_advisor_hints_empty_for_unknown_kernel(self):
+        from src.gui.bridge import SourceBridge
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "hot_fn")], backends=["cpu"])
+        sb = SourceBridge(trace)
+        self.assertEqual(sb.advisorHints("does_not_exist"), [])
+
     # ── SystemBridge ─────────────────────────────────────────────────────
 
     def test_system_bridge_exposes_run_info_and_devices(self):

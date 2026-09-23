@@ -26,6 +26,7 @@ from PySide6.QtCore import QObject, Property, Signal, Slot, QTimer
 
 from ..core.trace import Trace
 from ..analysis import dashboard as dash
+from ..disasm.classifier import InsnType
 
 
 def _bucket_coverage(spans: list, n_buckets: int, view_start: int, view_dur: float) -> list[float]:
@@ -399,6 +400,21 @@ _ITYPE_HEX = {
     "compute": "#60a5fa", "int_compute": "#3b82f6", "tensor": "#c084fc", "other": "#9ca3af",
 }
 
+# Fuller labels than the TUI's ITYPE_LABEL (classifier.py) -- that one is
+# terse (3 chars: "vsp", "mem", ...) to fit the TUI's narrow bar; this
+# panel has room for real words. Same instruction-type set as _ITYPE_HEX
+# (classifier.py's ITYPE_LABEL is missing int_compute/tensor entirely).
+_ITYPE_MIX_LABEL = {
+    "vec_sp": "Vector (FP32)", "vec_dp": "Vector (FP64)", "vec_mem": "Vector load/store",
+    "vector": "Vector (int/misc)", "scalar": "Scalar", "memory": "Memory",
+    "control": "Control flow", "sync": "Sync/barrier", "compute": "FMA/compute",
+    "int_compute": "Int compute", "tensor": "Tensor core", "other": "Other",
+}
+_ITYPE_MIX_ORDER = [
+    "vec_sp", "vec_dp", "vec_mem", "vector", "tensor", "compute", "int_compute",
+    "scalar", "memory", "control", "sync", "other",
+]
+
 
 class SourceBridge(QObject):
     """Backs the Source screen -- the GUI's equivalent of the TUI's
@@ -538,6 +554,64 @@ class SourceBridge(QObject):
         return "No resolved call-site symbol at all for this event -- most likely a " \
                "trace captured before rebuilding the hooks, or a construct that doesn't " \
                "resolve one yet (point-to-point MPI, omp_critical_hold). Not a missing-tool problem."
+
+    @Slot(str, result='QVariantList')
+    def instructionMix(self, raw_name: str) -> list[dict[str, Any]]:
+        """Instruction-type breakdown (vector/memory/scalar/control/...)
+        for the disassembled kernel -- the GUI's equivalent of the TUI's
+        DisasmWidget._show_mix. KernelDisasm.itype_counts() already
+        existed and was already used by the TUI; the GUI's Source screen
+        never called it at all, so this was blank-but-should-have-been-
+        computed, not a new metric being invented here."""
+        kd = self._trace.disasm.get(raw_name)
+        if kd is None or not kd.lines:
+            return []
+        counts = kd.itype_counts()
+        total = sum(counts.values()) or 1
+        rows = []
+        for itype in _ITYPE_MIX_ORDER:
+            count = counts.get(InsnType(itype), 0)
+            if count <= 0:
+                continue
+            rows.append({
+                "type": itype,
+                "label": _ITYPE_MIX_LABEL.get(itype, itype),
+                "color": _ITYPE_HEX.get(itype, "#9ca3af"),
+                "count": count,
+                "pct": 100.0 * count / total,
+            })
+        return rows
+
+    @Slot(str, result='QVariantList')
+    def advisorHints(self, raw_name: str) -> list[dict[str, Any]]:
+        """Static-analysis hints for the disassembled kernel (missed
+        vectorization, register spills, memory-bound sections, ...) --
+        the GUI's equivalent of the TUI's DisasmWidget._show_hints.
+        analysis/asm_advisor.py already existed, already purely static
+        (no runtime data needed) and already used by the TUI; the GUI
+        never called it at all. No LLM/network call involved -- pure
+        pattern analysis of the instruction stream, same as the TUI,
+        so this works identically on an air-gapped HPC compute node."""
+        kd = self._trace.disasm.get(raw_name)
+        if kd is None or not kd.lines:
+            return []
+        try:
+            from ..analysis.asm_advisor import advise
+            advices = advise(kd)
+        except Exception:
+            return []
+        _SEV_HEX = {"crit": "#f87171", "warn": "#fbbf24", "info": "#22d3ee"}
+        return [
+            {
+                "severity": adv.severity,
+                "category": adv.category,
+                "message": adv.message,
+                "detail": adv.detail,
+                "icon": adv.icon,
+                "color": _SEV_HEX.get(adv.severity, "#e6edf3"),
+            }
+            for adv in advices
+        ]
 
 
 class SystemBridge(QObject):

@@ -875,6 +875,7 @@ def collect_disasm(
     profiled_pid: int = 0,              # PID of the profiled process; used to filter /tmp files
     cpu_names:    set[str] | None = None,  # CPU function names from perf sampling
     sm_version:   str = "",             # e.g. "sm_86" — enables ptxas PTX→SASS for JIT kernels
+    real_binary:  str = "",             # actual profiled exe (SO_PEERCRED-resolved), see below
 ) -> dict[str, KernelDisasm]:
     """
     Collect disassembly for all profiled kernels.
@@ -891,6 +892,22 @@ def collect_disasm(
     """
     result: dict[str, KernelDisasm] = {}
     binary = command[0] if command else ""
+    # command[0] is WRONG whenever the profiled command is launcher-
+    # wrapped (`hprofiler run -- srun -n 4 gmx_mpi ...` -> command[0] is
+    # "srun", never the real binary). OpenMP/MPI disasm doesn't care --
+    # it resolves a specific call site via dladdr from inside the
+    # profiled process (sym=/symfile= tags), which is launcher-agnostic
+    # by construction. CUDA/ROCm AoT disasm below, and the CPU
+    # perf-sampled-by-name path further down, disassemble/nm the WHOLE
+    # BINARY keyed off `binary` directly, with no per-span tag to fall
+    # back on -- real_binary (resolved via SO_PEERCRED on the hook's own
+    # socket connection, runner.py's _peer_real_exe/_collect_disasm) is
+    # the actual profiled exe regardless of how it was launched, and
+    # strictly better than command[0] whenever it's available, so it
+    # takes priority for every subsequent use of `binary` in this
+    # function.
+    if real_binary and Path(real_binary).exists():
+        binary = real_binary
     if omp_syms is None:
         omp_syms = {}
     if cpu_names is None:

@@ -1,10 +1,14 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 import Hprofiler 1.0
 
 // GUI equivalent of the TUI's DisasmWidget -- split-pane disassembly
-// viewer. Left: kernel list. Right: annotated assembly (instruction
-// type colored, matching disasm/classifier.py's scheme).
+// viewer. Left: kernel list. Middle: annotated assembly (instruction
+// type colored, matching disasm/classifier.py's scheme). Right:
+// instruction-mix breakdown + static analysis hints (analysis/
+// asm_advisor.py) -- both already existed and were already shown in the
+// TUI (_show_mix/_show_hints); this screen just never called them.
 RowLayout {
     id: root
     spacing: 8
@@ -12,6 +16,11 @@ RowLayout {
     property int selectedIndex: 0
     readonly property var selectedKernel: Source.kernels.length > selectedIndex
                                           ? Source.kernels[selectedIndex] : null
+    readonly property bool hasSelection: !!selectedKernel && selectedKernel.hasDisasm
+    // Computed once per kernel selection (not once per delegate/binding
+    // evaluation) -- both are read from multiple places in the panel below.
+    readonly property var mixData: hasSelection ? Source.instructionMix(selectedKernel.rawName) : []
+    readonly property var hintsData: hasSelection ? Source.advisorHints(selectedKernel.rawName) : []
 
     Rectangle {
         Layout.preferredWidth: 260
@@ -200,6 +209,139 @@ RowLayout {
                 text: root.selectedKernel ? Source.noDisasmReason(root.selectedKernel.rawName) : ""
                 color: AppTheme.textMuted
                 font.pixelSize: 12
+            }
+        }
+    }
+
+    // ── Analysis panel: instruction mix + static advisor hints ─────────────
+    Rectangle {
+        Layout.preferredWidth: 300
+        Layout.fillHeight: true
+        color: AppTheme.surface
+        border.color: AppTheme.panelBorder
+        border.width: 1
+        radius: 6
+        clip: true
+        visible: root.hasSelection
+
+        ScrollView {
+            anchors.fill: parent
+            anchors.margins: 8
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+            ColumnLayout {
+                width: parent.width
+                spacing: 10
+
+                Text {
+                    text: "Instruction mix"
+                    color: AppTheme.text
+                    font.bold: true
+                    font.pixelSize: 12
+                }
+                Text {
+                    text: {
+                        var total = 0
+                        for (var i = 0; i < root.mixData.length; i++) total += root.mixData[i].count
+                        return total + " instructions"
+                    }
+                    color: AppTheme.textMuted
+                    font.pixelSize: 10
+                    Layout.bottomMargin: 2
+                }
+                Repeater {
+                    model: root.mixData
+                    delegate: ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 1
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text {
+                                text: modelData.label
+                                color: modelData.color
+                                font.pixelSize: 11
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                text: modelData.count
+                                color: AppTheme.text
+                                font.pixelSize: 11
+                            }
+                            Text {
+                                text: modelData.pct.toFixed(0) + "%"
+                                color: AppTheme.textMuted
+                                font.pixelSize: 10
+                                Layout.preferredWidth: 30
+                                horizontalAlignment: Text.AlignRight
+                            }
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true
+                            height: 5
+                            radius: 2
+                            color: AppTheme.background
+                            Rectangle {
+                                width: parent.width * modelData.pct / 100
+                                height: parent.height
+                                radius: 2
+                                color: modelData.color
+                            }
+                        }
+                    }
+                }
+                Text {
+                    visible: root.mixData.length === 0
+                    text: "No instruction data."
+                    color: AppTheme.textMuted
+                    font.pixelSize: 11
+                }
+
+                Rectangle { Layout.fillWidth: true; height: 1; color: AppTheme.panelBorder; Layout.topMargin: 4; Layout.bottomMargin: 4 }
+
+                Text {
+                    text: "Analysis"
+                    color: AppTheme.text
+                    font.bold: true
+                    font.pixelSize: 12
+                }
+                Repeater {
+                    model: root.hintsData
+                    delegate: ColumnLayout {
+                        Layout.fillWidth: true
+                        Layout.bottomMargin: 6
+                        spacing: 2
+                        RowLayout {
+                            spacing: 6
+                            Text { text: modelData.icon; color: modelData.color; font.pixelSize: 11; font.bold: true }
+                            Text { text: modelData.category; color: AppTheme.textMuted; font.pixelSize: 10 }
+                        }
+                        Text {
+                            text: modelData.message
+                            color: modelData.color
+                            font.pixelSize: 11
+                            font.bold: true
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+                        Text {
+                            visible: modelData.detail.length > 0
+                            text: modelData.detail
+                            color: AppTheme.textMuted
+                            font.pixelSize: 10
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+                    }
+                }
+                Text {
+                    visible: root.hasSelection && root.hintsData.length === 0
+                    text: "No notable issues found in this function's assembly."
+                    color: AppTheme.textMuted
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
             }
         }
     }
