@@ -73,6 +73,7 @@ hunted for, not to replace it.
 18. [Critical Path and Cross-Runtime Blame Attribution](#18-critical-path-and-cross-runtime-blame-attribution)
 19. [OS-Level Observability (eBPF Scheduler Tracer)](#19-os-level-observability-ebpf-scheduler-tracer)
 20. [Multi-Node Trace Merging and Clock Synchronization](#20-multi-node-trace-merging-and-clock-synchronization)
+21. [GUI Viewer](#21-gui-viewer)
 
 ---
 
@@ -235,6 +236,7 @@ hprofiler run [OPTIONS] -- COMMAND [ARGS...]
 | `--disasm / --no-disasm` | `--no-disasm` | Collect per-kernel disassembly after the run; adds the Disasm tab to the TUI |
 | `--gpu-pc-sampling` | off | Enable CUPTI PC sampling for per-instruction GPU heat and stall annotation (CUDA only; **AoT-compiled kernels only** — see note). `libcupti.so` is loaded at runtime via `dlopen` — no recompile or CUPTI headers needed. Adds **Heat %** and **Stall** columns to the Disasm tab. Requires `--disasm`. |
 | `--call-tree / --no-call-tree` | `--no-call-tree` | Capture C++ call stacks at every API interception point; adds the Call Tree tab to the TUI and a CCT hotspot section to the text summary. When libunwind is available (detected at build time), unwinding is accurate without requiring `-fno-omit-frame-pointer`. Source file:line annotations are resolved automatically via `addr2line` / `llvm-symbolizer` when available. Adds ~5–50 µs per intercepted call — do not use during benchmarking. |
+| `--gui` | off | Open the native Qt/QML GUI instead of the TUI after profiling (falls back to the TUI automatically if PySide6/X11 aren't available). See §21. |
 
 Always separate the profiler's options from the target program with `--`:
 
@@ -281,6 +283,35 @@ hprofiler view --disasm my_program.hprofiler.json
 
 Disassembly is collected in a background thread when `--disasm` is passed, so
 the TUI opens immediately and the Disasm tab populates after a few seconds.
+
+---
+
+### `hprofiler gui`
+
+Open the native Qt/QML GUI for a previously saved trace file — the GUI
+equivalent of `hprofiler view`.
+
+```
+hprofiler gui [OPTIONS] TRACE_FILE
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--disasm / --no-disasm` | `--no-disasm` | Collect disassembly in the background; populates the Source tab |
+| `--verbose / --no-verbose` | `--no-verbose` | Print which rendering tier was used (GPU-rendered Qt Quick, software-rendered, or TUI fallback) and why |
+
+```bash
+hprofiler gui my_program.hprofiler.json
+hprofiler gui --disasm my_program.hprofiler.json
+```
+
+Falls back to the TUI automatically — with no error — if PySide6 isn't
+installed, X11 isn't reachable (e.g. no `ssh -X`/`-Y`), or GPU-rendered Qt
+Quick fails to start over indirect/forwarded X11 (retried once with
+software rendering before giving up). See §21 for the full tab reference,
+and §2's Requirements/troubleshooting for the PySide6 + `libxcb-cursor0`
+install and the VNC fallback for machines where installing that system
+library isn't possible.
 
 ---
 
@@ -509,6 +540,11 @@ hprofiler flamegraph [OPTIONS] -- COMMAND [ARGS...]
 | `--callgraph` | `fp` | Call-graph method: `fp` (frame-pointer), `dwarf`, or `lbr` |
 | `--freq`, `-F` | `99` | perf sampling frequency in Hz |
 | `--html` | off | Open browser instead of TUI viewer |
+| `--gui` | off | Open the flame graph in the native Qt/QML GUI instead of the terminal TUI. Takes priority over `--html` when both are given. Same click/right-click/search interaction as the TUI viewer below, no terminal-graphics-protocol requirement. Falls back to the TUI if PySide6/X11 aren't available. |
+
+```bash
+hprofiler flamegraph --gui -- ./my_program
+```
 
 **TUI keyboard controls:**
 
@@ -609,8 +645,8 @@ Injects `libhprofiler_cuda.so` via `LD_PRELOAD` to wrap CUDA API calls.
 |----------|---------|------|
 | `cudaLaunchKernel` | `cuda` | `type=kernel,grid=NxNxN,block=NxNxN,stream=N` |
 | `cuLaunchKernel` (driver API) | `cuda` | `type=kernel,grid=...,stream=N` |
-| `cudaMemcpy` | `cuda` | `type=memcpy,dir=HtoD,bytes=N` |
-| `cudaMemcpyAsync` | `cuda` | `type=memcpy_async,bytes=N,stream=N` |
+| `cudaMemcpy` | `memory` | `type=memcpy,dir=HtoD,bytes=N` |
+| `cudaMemcpyAsync` | `memory` | `type=memcpy_async,bytes=N,stream=N` |
 | `cuMemcpyHtoDAsync` | `memory` | `type=HtoD,bytes=N,stream=N` |
 | `cuMemcpyDtoHAsync` | `memory` | `type=DtoH,bytes=N,stream=N` |
 | `cudaMalloc` / `cudaMallocManaged` | `memory` | `type=alloc,bytes=N` |
@@ -618,6 +654,12 @@ Injects `libhprofiler_cuda.so` via `LD_PRELOAD` to wrap CUDA API calls.
 | `cudaDeviceSynchronize` / `cuCtxSynchronize` | `sync` | `type=sync` |
 | `cudaStreamSynchronize` / `cuStreamSynchronize` | `sync` | `type=sync,stream=N` |
 | `nvtxRangePushA/W/Ex` + `nvtxRangePop` | `nvtx` | `type=nvtx_range` |
+
+All memory-transfer variants (`cudaMemcpy`/`Async`, `cuMemcpy*`) use category
+`memory`, not `cuda` — this is what makes their bytes/duration count toward
+the Memory tab's bandwidth accounting rather than being silently folded into
+compute time; only the kernel-launch/graph-launch functions above are
+category `cuda`.
 
 **GPU-accurate kernel timing:** The hook creates `cudaEvent_t` pairs around
 each kernel launch. The end-of-kernel event is recorded (`cuEventRecord`)
@@ -719,9 +761,21 @@ buffer-transfer timestamps via event callbacks, and emits `jit` spans for
 |----------|----------|-----------------|
 | `clCreateCommandQueue` / `clCreateCommandQueueWithProperties` | — | Forces `CL_QUEUE_PROFILING_ENABLE` on every queue |
 | `clEnqueueNDRangeKernel` / `clEnqueueTask` | `opencl` | GPU-side kernel duration from `CL_PROFILING_COMMAND_START/END` |
-| `clEnqueueReadBuffer` / `clEnqueueWriteBuffer` / `clEnqueueCopyBuffer` | `opencl` | Buffer transfer timing |
+| `clEnqueueReadBuffer` / `clEnqueueWriteBuffer` / `clEnqueueSVMMemcpy` | `memory` | Buffer/SVM transfer timing (GPU-accurate when non-blocking; see below) |
 | `clBuildProgram` | `jit` | JIT compile time; extracts compiled binary for disassembly |
 | `clFinish` / `clWaitForEvents` | `sync` | Host-side synchronisation barriers |
+
+**Kernel launches emit two spans, memory transfers emit one:** each
+`clEnqueueNDRangeKernel` call produces a CPU-side span (`type=kernel,
+side=cpu` — enqueue/scheduling latency) and a GPU-side span (`type=kernel,
+side=gpu` — the real execution time, from the async completion callback),
+both category `opencl`, distinguished by `side=`. A memory transfer
+(`clEnqueueReadBuffer`/`WriteBuffer`/`SVMMemcpy`) emits only **one**: for a
+**blocking** call the CPU-side span alone already spans the full transfer
+(the call doesn't return until it's done), so the GPU-event callback isn't
+also registered; for a **non-blocking** call the GPU-event callback fires
+instead, giving GPU-accurate timing. Either way there's exactly one span
+per transfer, never both.
 
 **JIT binary extraction for disassembly:** After every successful `clBuildProgram`
 call the hook calls `clGetProgramInfo(CL_PROGRAM_BINARIES)` to retrieve the
@@ -925,18 +979,32 @@ all NCCL symbols at runtime via `dlsym(RTLD_NEXT, ...)`.
 | `ncclReduce` | `type=reduce` | Many-to-one reduction |
 | `ncclAllGather` | `type=allgather` | All-to-all gather |
 | `ncclReduceScatter` | `type=reduce_scatter` | Reduce + scatter |
+| `ncclAllToAll` | `type=alltoall` | All-to-all exchange |
 | `ncclSend` | `type=send,peer=N` | Point-to-point send |
 | `ncclRecv` | `type=recv,peer=N` | Point-to-point receive |
 | `ncclGroupStart` / `ncclGroupEnd` | `type=group` | Group-operation boundary span |
 
-Every span carries `bytes=N` (count × dtype size) and `stream=ID`.
+Every span carries `bytes=N` (count × dtype size) and `stream=ID`. A span
+whose duration came from CPU wall-clock timing rather than a synced GPU
+event pair (event creation/recording/sync failed) additionally carries
+`timing=cpu`, so a degraded measurement is never silently indistinguishable
+from a real GPU-accurate one.
 
 **Stream ID tracking:** Each unique `cudaStream_t` pointer is assigned a
 sequential integer ID (1, 2, 3, …). Stream 0 means the default/null stream.
 Up to 512 streams are tracked; beyond that, spans are tagged `stream=-1`.
 
 **Group operations:** `ncclGroupStart` / `ncclGroupEnd` nest correctly — only
-the outermost pair emits a `ncclGroup` span covering the full group duration.
+the outermost pair emits a `ncclGroup` span covering the full group
+duration. That span's [start, end] interval structurally contains every
+individual op called inside the group, each of which is *also* its own
+separate span — `hprofiler efficiency`'s Serialization Efficiency (§17)
+excludes the `ncclGroup` wrapper span itself from its "total communication
+time" sum for exactly this reason (it would otherwise double-count every
+grouped operation's duration); nothing else needs to, since no other
+current analysis sums "nccl"-category durations additively. See §13 for
+what's still unverified about timing for operations issued *inside* a
+group specifically.
 
 **GPU timing accuracy:** The CPU timestamp for each NCCL collective is captured
 *before* `cuEventRecord` is called on the start event. This ensures the wall-clock
@@ -967,13 +1035,28 @@ Link the library alongside the program.
 | Non-blocking collectives | `MPI_Ibcast`, `MPI_Iallreduce`, `MPI_Ireduce`, `MPI_Iallgather`, `MPI_Ialltoall`, `MPI_Iscatter`, `MPI_Igather` |
 | Persistent requests | `MPI_Send_init`, `MPI_Recv_init`, `MPI_Start`, `MPI_Startall` |
 | Collectives | `MPI_Bcast`, `MPI_Reduce`, `MPI_Allreduce`, `MPI_Alltoall`, `MPI_Allgather`, `MPI_Scatter`, `MPI_Gather`, `MPI_Barrier`, `MPI_Scan`, `MPI_Exscan` |
-| One-sided | `MPI_Put`, `MPI_Get`, `MPI_Accumulate` |
+| One-sided | `MPI_Put`, `MPI_Get`, `MPI_Accumulate`, `MPI_Win_fence`, `MPI_Win_flush`, `MPI_Win_flush_all`, `MPI_Win_lock`, `MPI_Win_lock_all`, `MPI_Win_unlock`, `MPI_Win_unlock_all` |
 | Lifecycle | `MPI_Init`, `MPI_Init_thread`, `MPI_Finalize` |
 | Communicators | `MPI_Comm_dup`, `MPI_Comm_split`, `MPI_Comm_create` (hooked only to assign `commid=`, see below) |
 
 Every span is in category `mpi` and carries `type=<call>`, `bytes=N`
 (count × datatype size), `rank=<own rank>`, and where applicable `peer=<rank>`,
 `tag=N`, and `commid=<N>`.
+
+**One-sided (RMA) completion tracking:** the MPI standard permits an
+implementation to let `MPI_Put`/`MPI_Get`/`MPI_Accumulate` return before the
+transfer actually completes — real completion is only guaranteed after a
+synchronization call. `MPI_Win_fence` (active-target/BSP-style epochs) and
+`MPI_Win_flush`/`_flush_all`/`_lock`/`_lock_all`/`_unlock`/`_unlock_all`
+(passive-target/lock-based epochs) are all tracked as their own `mpi`-
+category spans (category `mpi`, matching `MPI_Barrier`'s own precedent in
+this file, not `sync`), so the real completion-wait cost is visible even
+when it falls outside the Put/Get/Accumulate call's own (potentially much
+shorter) span. This tracks the *synchronization calls' own* cost; it does
+not retroactively attribute a specific Put/Get/Accumulate's real transfer
+time to that call's span — the standard doesn't guarantee a 1:1
+correlation exists between one RMA op and one later sync call in the
+general case (arbitrarily many other RMA ops can occur in between).
 
 **Timing:** All timings are **wall-clock** from `CLOCK_MONOTONIC` on the host
 calling thread. For blocking collectives (`MPI_Allreduce`, `MPI_Barrier`, etc.)
@@ -1052,6 +1135,14 @@ semantics end-to-end, but it cannot exercise genuine *cross-process*
 `commid=` agreement (only self-consistency across calls on one process);
 `tests/fixtures/mpi_proto.c` is the real 4-rank design, compile-verified
 here and intended to be run on a working cluster (e.g. Dardel).
+
+The one-sided RMA wrappers (`MPI_Win_fence`/`flush`/`flush_all`/`lock`/
+`lock_all`/`unlock`/`unlock_all`) have their own equivalent real end-to-end
+test, `tests/integration/test_mpi_rma.py` (5 tests), using a new
+`MPI_COMM_SELF`-based fixture (`tests/fixtures/mpi_win_self.c`) that drives
+a real `MPI_Win_create`/fence/Put/Get active-target epoch and a real
+lock/Accumulate/flush/unlock passive-target epoch — same single-process
+constraint and same rationale as `mpi_proto_self.c` above.
 
 **Build and use:**
 
@@ -2609,8 +2700,8 @@ lost) that is real additional work with its own failure modes — a stuck or
 crashed drain thread silently losing events is a *worse* failure than
 today's synchronous-but-simple path, and that integration hasn't been
 stress-tested under this machine's actual GPU/multi-node workloads (no
-working GPU here, no working multi-rank MPI — see §13's limitations and
-[[project-paper4-benchmark-suite]]). Replacing a collection path that
+working GPU here, no working multi-rank MPI — see §13's limitations).
+Replacing a collection path that
 currently works, is well-tested, and has a 28-check crash-safety matrix
 behind it, with one whose lifecycle edge cases couldn't be fully verified
 here, was judged too large a risk for this pass relative to shipping the
@@ -2721,6 +2812,8 @@ The TUI remains responsive at 250k spans at all zoom levels.
 | **`gomp_hook.c` (direct `GOMP_*` interception) — now confirmed on the real cluster that motivated it** | Built in response to a real user run on the Dardel HPC cluster (`ldd gmx_mpi` showed `libgomp.so.1`, confirming OMPT alone would never capture events there); fully verified end-to-end on this development machine, and subsequently confirmed working on Dardel itself via a real GROMACS run's Timeline screenshots (populated `omp`/`sync`/`mpi` lanes with real per-thread/per-rank span counts) — see §4 `openmp`. | None currently open for event capture itself. The GCC/`cpeGNU` toolchain-version specifics of what was actually exercised on Dardel beyond what this development machine's `gcc` produces are still not independently confirmed. |
 | **Call-site disassembly (`sym=`/`lib=` codeptr tags) doesn't cover every construct yet** | `ompt_tool.c` always resolved this; `gomp_hook.c` (`omp_parallel_region`, `omp_barrier`, `omp_critical_wait`/`_name_wait`, work-sharing loops) and `mpi_hook.c` (the collectives + `MPI_Barrier`) were fixed to do the same, via the shared `hooks/common/codeptr_resolve.h` helper, after a real Dardel run showed the Source tab's "No disassembly available" for every OpenMP/MPI construct — not an `objdump`-availability problem, but that `gomp_hook.c` never resolved/emitted the tag at all, and `src/core/runner.py`'s `_collect_disasm` unconditionally excluded category `"mpi"` from even looking for one. A SECOND, separate bug surfaced immediately after: a genuinely-resolved `sym=` still produced "No disassembly available" because `collect_disasm` always disassembled `command[0]`, but the profiled command is routinely a launcher (`srun`/`mpirun`) wrapping the real binary — fixed via a new `symfile=` tag carrying `dladdr()`'s own `dli_fname` (see §12's Span record tag table). Verified end-to-end (hook → wire protocol → real disassembly attached to the trace, including a real reproduction of the launcher-wrapped case) on this development machine. | Point-to-point MPI calls (`MPI_Send`/`Recv`/`Isend`/`Irecv`/`Wait*`) and `gomp_hook.c`'s `omp_critical_hold` span don't capture a call-site tag yet — those still show "No disassembly available" regardless of `objdump`/`nm` availability. `ompt_tool.c`'s own `sym=` tags don't carry `symfile=` yet, so the same launcher-wrapped-binary problem this fix solved for `gomp_hook.c`/`mpi_hook.c` could still affect a pure-OMPT (LLVM libomp) profiling run of a launcher-wrapped command — not confirmed broken, just not yet fixed the same way. |
 | **Zero-event runs via a job launcher can be intermittent, and hprofiler can't fix it from inside the profiled process** | A real user's `srun`-launched GROMACS run completed normally but captured zero events across every active backend, then the IDENTICAL command captured 60381 events on the next invocation with no code change in between — consistent with `srun` not propagating `HPROFILER_SOCKET`/`LD_PRELOAD` to the spawned job step on that particular invocation (every hook's `ensure_connected()` retries on every emit call, so a total loss across a multi-second run rules out a simple startup race). `src/core/runner.py` now has a `_total_zero_event_warning` check (see §4) that fires when EVERY active backend captured zero events and gives launcher-specific advice (e.g. `srun --export=ALL`) when the command is a recognized launcher (`srun`/`mpirun`/`mpiexec`/`aprun`/`jsrun`/`ibrun`). | This is a launcher/site environment-export configuration issue, not something fixable from inside the already-spawned profiled process — if the warning fires, check your site's launcher environment-export defaults, or just re-run (the user's own report suggests it may not reproduce every time). |
+| **NCCL timing for operations issued inside `ncclGroupStart`/`ncclGroupEnd` is unverified** | NCCL's documented group semantics defer the actual kernel launch for every grouped op until `ncclGroupEnd()` itself returns — a `cudaEvent_t` pair recorded for an op called *inside* a group may record/sync against a stream that doesn't have the real work enqueued yet at that point. Follows directly from NCCL's own documented contract (not a guess), but has never been confirmed against real timestamps from an actual multi-GPU run (§4 `nccl`). | Treat per-op durations for anything issued inside a group as unverified until confirmed on real multi-GPU hardware; ungrouped NCCL calls are unaffected. |
+| **`ompt_tool.c` per-worker-thread `parallel_begin`/`end` firing semantics not independently confirmed** | `ompt_callback_implicit_task` (the OMPT callback specifically meant for per-thread region participation) is not registered by this hook; whether `ompt_callback_parallel_begin`/`end` fire once per region on the encountering thread only, or once per participating worker thread too, could not be determined from source alone (§4 `openmp`). | If per-worker-thread `parallel_region` spans look sparse or duplicated for an LLVM-libomp-linked binary, this is the first thing to check against LLVM's actual OMPT implementation. |
 
 ---
 
@@ -3687,9 +3780,8 @@ silently treated as exact. The C-side round-trip *capture itself*
 zero-effect-when-disabled and size-under-2 no-op paths are exercised, but
 the real 2-or-more-rank exchange has never executed on this development
 machine, which cannot form a real multi-rank `MPI_COMM_WORLD` at all (see
-§13's Known Limitations / [[project-paper4-benchmark-suite]] memory) — the
-same limitation already affecting cross-process `commid=` agreement (§4
-`mpi`).
+§13's Known Limitations) — the same limitation already affecting
+cross-process `commid=` agreement (§4 `mpi`).
 
 ### Merging: `hprofiler merge-nodes`
 
@@ -3737,3 +3829,156 @@ means either a wrong clock-offset estimate for one of the merged nodes or
 a genuine anomaly, surfaced explicitly rather than silently accepted into
 a critical-path report that would then misattribute blame across a false
 ordering.
+
+---
+
+## 21. GUI Viewer
+
+A native Qt/QML desktop GUI (`src/gui/`, PySide6), built as an alternative
+to the Textual TUI for the same trace data — same underlying `Trace`
+object, same analysis modules, real vector-rendered Canvas views instead
+of terminal character-cell rendering. It opens in a **separate process**
+from the CLI (`src/gui/app.py`, launched via `subprocess.run`), specifically
+so a hard GLX/rendering crash — a real risk over indirect/forwarded X11,
+the exact scenario the fallback chain below exists for — can't take the
+profiling process down with it.
+
+### Launching
+
+```bash
+hprofiler run --gui --backend cuda -- ./app     # profile, then open the GUI
+hprofiler gui trace.hprofiler.json              # open a previously saved trace
+hprofiler gui --disasm trace.hprofiler.json      # + background disassembly collection
+hprofiler flamegraph --gui -- ./my_program       # standalone flame graph popup (see below)
+```
+
+### Three-tier fallback
+
+Every GUI entry point goes through the same fallback chain, so a machine
+without a working GPU-accelerated X11 session (a common HPC login-node
+situation) still gets *something* usable rather than a crash:
+
+1. **GPU-rendered Qt Quick** — the default. Requires `check_x11()`
+   (`src/gui/x11_check.py`) to confirm a real, reachable X11 display first
+   — checked via an actual socket connect, not just `$DISPLAY` being set.
+   Handles both a local Unix-domain-socket X server *and* SSH X11
+   forwarding, which proxies over a plain TCP listener on
+   `127.0.0.1:(6000+N)` instead (no Unix socket exists in that case at
+   all — a real bug found and fixed via a live `ssh -Y` report: the
+   original check only ever tried the Unix socket path).
+2. **Software-rendered Qt Quick** (`QT_QUICK_BACKEND=software`) — retried
+   automatically if tier 1's subprocess exits non-zero. Note this only
+   changes the Qt Quick *scene graph* rendering backend, not the
+   underlying X11 *platform plugin* (`xcb`) — a missing system library
+   for the platform plugin itself (see below) fails identically on both
+   tiers, since the platform plugin has to load successfully before
+   either rendering path even starts.
+3. **TUI fallback** (`src/ui/app.py`, the existing Textual viewer) — used
+   automatically, with no error shown to the user, if PySide6 isn't
+   installed, X11 isn't reachable at all, or both rendering tiers failed.
+   Pass `--verbose` to `hprofiler gui` to see which tier was actually
+   used and why.
+
+**`libxcb-cursor0`/`xcb-util-cursor` note:** Qt ≥6.5's `xcb` platform
+plugin has a hard runtime dependency on this system library (not a PyPI
+package — `pip install hprofiler[gui]` cannot install it). See §2's
+Requirements table and troubleshooting subsection for root and root-free
+(conda-forge/Spack) install paths, and the VNC platform-plugin fallback
+for machines where installing it isn't an option at all.
+
+### Tabs
+
+Mirrors the TUI's tab set (§5) exactly, same conditional-visibility rules
+(Call Tree only with `--call-tree`, Source only with `--disasm`):
+
+| # | Tab | Notes vs. the TUI equivalent |
+|---|-----|-------------------------------|
+| 1 | Overview | Same stat cards / top findings / hot kernels / source correlation as §5's Overview Tab |
+| 2 | Timeline | Real vector Gantt view, not character cells — see below for GUI-specific additions |
+| 3 | Kernels | Same aggregated-stats table |
+| 4 | Call Tree | Same stack-frame tree, proportional-width tree rows instead of ASCII indentation |
+| 5 | Roofline | Canvas-drawn scatter instead of a Plotly-rendered static image |
+| 6 | Source | Same per-kernel disassembly, plus a third panel (see below) not present in the TUI |
+| 7 | System | Same hardware info |
+| 8 | Profile | Same activity breakdown |
+
+**Timeline tab, GUI-specific additions beyond the TUI's equivalent:**
+
+- **Smooth wheel-zoom and drag-to-pan** over the full trace duration, not
+  fixed `+`/`-` zoom steps — plus a horizontal scrollbar (custom thumb,
+  bound to the same pan state) and a vertical `ScrollBar` for traces with
+  more lanes than fit the window.
+- **A call-graph panel** below the lanes (`analysis/call_graph.py`): a
+  node-and-edge diagram of which functions call which, aggregated over
+  whatever time window is currently visible — not the same thing as the
+  Call Tree tab, which shows time breakdown down each specific call
+  *path* (the same function under two different callers is two separate
+  rows there, by design); this merges every occurrence of a function into
+  one node regardless of caller. Edge thickness/opacity scales with
+  relative time weight. Capped to the 60 hottest nodes by time, reports
+  how many were truncated; scrolls (fixed pixel pitch per node, sized off
+  the actual layer count) rather than squeezing an unbounded number of
+  nodes into a fixed-height box.
+- **Idle-time overlay within each lane's own bars:** a span like an
+  OpenMP `omp_parallel_region` or an OpenCL kernel enqueue times its
+  *entire* call, which can include time genuinely spent blocked at a
+  nested barrier/critical-section/sync call — reported correctly as its
+  own separate `sync`-category span, but otherwise invisible within the
+  parent span's own solid-colored bar. Any lane paired with a same-thread
+  `sync` lane (by name: `<category>/thread-N` pairs with
+  `sync/thread-N`) automatically overlays that sync time, dimmed, in
+  place — so a thread blocked at a barrier for half of an
+  `omp_parallel_region` call shows that visually within the one bar,
+  rather than requiring a separate look at the `sync` lane underneath. A
+  small legend appears in the status row when at least one lane has this
+  pairing.
+
+**Source tab, GUI-specific addition:** a third panel (kernel list |
+assembly+source | mix+analysis) beyond what the TUI's Disasm tab shows —
+instruction-type mix breakdown (vector/memory/branch/etc. percentages,
+`KernelDisasm.itype_pcts()`) and static optimization hints
+(`analysis/asm_advisor.py`'s `advise()` — the same deterministic,
+threshold-based advisor described in §8, not an LLM call) rendered
+side-by-side with the assembly instead of requiring a separate summary
+view.
+
+### Standalone flame graph popup (`hprofiler flamegraph --gui`)
+
+A separate window (`src/gui/qml/FlameGraphWindow.qml`), not a tab inside
+the main 8-tab viewer — same relationship the TUI's own flame graph
+viewer has to the main TUI (§5's closing note). Reads the same
+`perf record`-collected folded-stacks data the `--html`/native-TUI paths
+use (`output/flamegraph.py`'s `collect_folded_stacks()`); the rendering
+algorithm, warm hash-based color function, and interaction model were
+ported near-verbatim from the existing HTML/JS flame graph's own
+JavaScript, so this window behaves identically to `--html` mode, just
+natively and without a browser.
+
+| Action | Control |
+|--------|---------|
+| Zoom into a frame | Click |
+| Zoom out one level | Right-click |
+| Reset to full view | `Esc` or the Reset button |
+| Search — highlight matching frames | Type in the search box (regex) |
+| Hover | Tooltip with full name + time |
+
+Goes through the same launch mechanism and three-tier fallback as the
+main GUI (falls back to the existing TUI flame graph viewer, §5's Flame
+Graph controls, if PySide6/X11 aren't available).
+
+### Verification status
+
+Built and verified via real `grabWindow()` screenshots against a real X
+server (`DISPLAY=:1`) for every tab and feature above, and via the real
+CLI entry points (`hprofiler gui`/`run --gui`/`flamegraph --gui`), not
+bypass scripts — confirmed via `xwininfo`/`ps aux` that the expected
+window/process architecture (parent CLI process, separate child GUI
+subprocess) actually appears on a live X display. Subsequently confirmed
+working over a real `ssh -Y` session to the Dardel HPC cluster (the X11-
+forwarding TCP-loopback fix above was found and fixed from exactly that
+report). Data displayed in any GPU/MPI-specific panel is only as accurate
+as the underlying hook data feeding it — see §4's per-backend Verification
+status notes and §13's Known Limitations for what's independently
+confirmed on real hardware vs. compile-checked only; the GUI itself
+doesn't add or remove any of those caveats, it only renders the same
+`Trace` data the TUI does.

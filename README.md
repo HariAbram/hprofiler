@@ -1,6 +1,6 @@
 # hprofiler — Heterogeneous Profiler
 
-Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI simultaneously — with a terminal UI, native TUI viewers for flame graphs and roofline charts, and cross-layer causal attribution: one dependency graph over every backend active in a run, with a confidence-graded, formally-computed critical path instead of a single-runtime or heuristic one (see [Cross-Layer Causal Attribution](#cross-layer-causal-attribution) below). CPU sampling is provided via Linux `perf`.
+Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI simultaneously — with a terminal UI (and an optional native Qt GUI, see [GUI Viewer](#gui-viewer) below), native TUI viewers for flame graphs and roofline charts, and cross-layer causal attribution: one dependency graph over every backend active in a run, with a confidence-graded, formally-computed critical path instead of a single-runtime or heuristic one (see [Cross-Layer Causal Attribution](#cross-layer-causal-attribution) below). CPU sampling is provided via Linux `perf`.
 
 ## Requirements
 
@@ -52,11 +52,17 @@ python3 hprofiler view trace.json
 # Text summary only
 python3 hprofiler summary trace.json
 
+# Native Qt GUI instead of the TUI (falls back to the TUI automatically
+# if PySide6/X11 aren't available — see GUI Viewer below)
+python3 hprofiler run --gui --backend cuda -- ./cuda_app
+python3 hprofiler gui trace.json
+
 # Flame graph — opens TUI viewer by default (requires plotly + kaleido)
 python3 hprofiler flamegraph -- ./my_program
 python3 hprofiler flamegraph --backend cuda -- ./cuda_app
 python3 hprofiler flamegraph --callgraph dwarf -- ./my_program  # no frame-pointer binary
 python3 hprofiler flamegraph --html -- ./my_program             # write HTML + open browser
+python3 hprofiler flamegraph --gui -- ./my_program               # native GUI popup instead
 
 # Roofline chart — opens TUI viewer by default (requires plotly + kaleido)
 python3 hprofiler roofline --backend cuda    -- ./cuda_app
@@ -98,6 +104,18 @@ Opens automatically after `hprofiler run`. Tabs:
 | Hotspots | Always | Filterable/sortable function table |
 | Call Tree | Only with `--call-tree` | Stack-frame tree from captured call graphs |
 | Disasm | Only with `--disasm` | Per-kernel assembly with instruction-type color coding, runtime heat % and stall columns (CPU via perf, CUDA via `--gpu-pc-sampling`), and static optimization hints |
+
+## GUI Viewer
+
+An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI, plus a few GUI-specific additions: smooth wheel-zoom/drag-pan on the Timeline, a scrollable node-and-edge call-graph panel showing which functions call which for whatever's currently visible, an idle-time overlay, so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy, and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
+
+```bash
+hprofiler run --gui --backend cuda -- ./cuda_app
+hprofiler gui trace.hprofiler.json
+hprofiler flamegraph --gui -- ./my_program   # standalone flame graph popup
+```
+
+Falls back to the TUI automatically — no error shown — if PySide6 isn't installed, X11 isn't reachable, or GPU-rendered Qt Quick fails over indirect/forwarded X11 (retried once with software rendering first). See [DOCUMENTATION.md](DOCUMENTATION.md) §21 for the full tab reference and §2 for install/troubleshooting (including the `libxcb-cursor0` system-library requirement and a VNC fallback for machines where installing it isn't an option).
 
 ## Flamegraph TUI Controls
 

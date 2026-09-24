@@ -187,6 +187,20 @@ ApplicationWindow {
                 property var frames: []
                 width: Math.max(flick.width, 200)
                 height: (window.treeDepth(window.currentRoot) + 1) * window.frameH + 4
+                // Bottom-anchor within the viewport when the tree is shallow
+                // enough that its content is shorter than the window (the
+                // common case): a Flickable's content item defaults to
+                // y=0 (top), so a short canvas -- e.g. depth 9 * 20px =
+                // 184px inside an ~700px-tall window -- left the "all"
+                // root row stranded partway down the window with a large
+                // dead black area below it, instead of at the window's
+                // actual bottom edge where "the ground" is expected to
+                // be. Math.max(0, ...) collapses back to the normal
+                // top-anchored 0 the instant content is tall enough to
+                // need scrolling at all, so this never fights Flickable's
+                // own scroll behavior once a trace is deep enough to
+                // overflow the window.
+                y: Math.max(0, flick.height - height)
 
                 Connections {
                     target: window
