@@ -59,10 +59,11 @@ ApplicationWindow {
             TabButton { text: "2 Timeline" }
             TabButton { text: "3 Kernels" }
             TabButton { text: "4 Call Tree" }
-            TabButton { text: "5 Roofline" }
-            TabButton { text: "6 Source" }
-            TabButton { text: "7 System" }
-            TabButton { text: "8 Profile" }
+            TabButton { text: "5 Flame Graph" }
+            TabButton { text: "6 Roofline" }
+            TabButton { text: "7 Source" }
+            TabButton { text: "8 System" }
+            TabButton { text: "9 Profile" }
         }
     }
 
@@ -85,16 +86,18 @@ ApplicationWindow {
         Loader { objectName: "tabLoader1"; active: stack.currentIndex === 1 || item !== null; sourceComponent: timelineComp }
         Loader { objectName: "tabLoader2"; active: stack.currentIndex === 2 || item !== null; sourceComponent: kernelsComp }
         Loader { objectName: "tabLoader3"; active: stack.currentIndex === 3 || item !== null; sourceComponent: callTreeComp }
-        Loader { objectName: "tabLoader4"; active: stack.currentIndex === 4 || item !== null; sourceComponent: rooflineComp }
-        Loader { objectName: "tabLoader5"; active: stack.currentIndex === 5 || item !== null; sourceComponent: sourceComp }
-        Loader { objectName: "tabLoader6"; active: stack.currentIndex === 6 || item !== null; sourceComponent: systemComp }
-        Loader { objectName: "tabLoader7"; active: stack.currentIndex === 7 || item !== null; sourceComponent: profileComp }
+        Loader { objectName: "tabLoader4"; active: stack.currentIndex === 4 || item !== null; sourceComponent: flameGraphComp }
+        Loader { objectName: "tabLoader5"; active: stack.currentIndex === 5 || item !== null; sourceComponent: rooflineComp }
+        Loader { objectName: "tabLoader6"; active: stack.currentIndex === 6 || item !== null; sourceComponent: sourceComp }
+        Loader { objectName: "tabLoader7"; active: stack.currentIndex === 7 || item !== null; sourceComponent: systemComp }
+        Loader { objectName: "tabLoader8"; active: stack.currentIndex === 8 || item !== null; sourceComponent: profileComp }
     }
 
     Component { id: overviewComp; OverviewScreen {} }
     Component { id: timelineComp; TimelineScreen {} }
     Component { id: kernelsComp; KernelsScreen {} }
     Component { id: callTreeComp; CallTreeScreen {} }
+    Component { id: flameGraphComp; FlameGraphScreen {} }
     Component { id: rooflineComp; RooflineScreen {} }
     Component { id: sourceComp; SourceScreen {} }
     Component { id: systemComp; SystemScreen {} }

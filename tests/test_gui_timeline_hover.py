@@ -1,11 +1,20 @@
 """
-Regression test for a real bug in src/gui/qml/screens/TimelineScreen.qml:
-hovering over the Timeline never showed anything, in any GUI session,
-since the screen was first built. Root cause: the per-lane Canvas's
-`laneIndex` property was referenced UNQUALIFIED from its child
-MouseArea's onPositionChanged/onExited handlers -- QML does not resolve
-a parent item's custom properties by bare name from a nested child's
-scope, only via the parent's own `id` (here: `laneCanvas.laneIndex`).
+Real-interaction tests for src/gui/qml/screens/TimelineScreen.qml, using a
+single shared Main.qml load for the whole module (see TestTimelineHover's
+own docstring for why: a second independent QQmlApplicationEngine loading
+Main.qml later in the same process was found, empirically, to corrupt Qt
+Quick Controls' component resolution under this offscreen QPA platform --
+not specific to any one control type, confirmed by reproducing it with two
+unrelated components (Fusion style's ToolButton/ButtonPanel, then Basic
+style's StatCard) depending on which style got resolved first. All Timeline
+QML-interaction coverage therefore lives in ONE test class/engine here,
+not split across files the way tests/test_gui_*.py otherwise are.
+
+Originally just the hover regression below. Root cause of THAT bug: the
+per-lane Canvas's `laneIndex` property was referenced UNQUALIFIED from its
+child MouseArea's onPositionChanged/onExited handlers -- QML does not
+resolve a parent item's custom properties by bare name from a nested
+child's scope, only via the parent's own `id` (here: `laneCanvas.laneIndex`).
 The bare reference threw a JS ReferenceError on every single hover move,
 reported only via engine.warnings (which nothing at runtime was
 watching), so it was completely silent: no crash, no visible error, the
@@ -34,8 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QUrl, QObject, QPoint, Property
-    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtCore import QUrl, QObject, QPoint, QPointF, Property, Qt
+    from PySide6.QtGui import QGuiApplication, QWheelEvent
     from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
     from PySide6.QtQuick import QQuickWindow, QQuickItem
     from PySide6.QtTest import QTest
@@ -70,12 +79,20 @@ def _build_trace() -> "Trace":
     # Two lanes, one span each, each spanning the ENTIRE trace duration --
     # at the default zoom (1.0x) each covers the full canvas width, so any
     # x position within a lane's row reliably hits its span. No fragile
-    # pixel-perfect math needed to pick a hover point.
+    # pixel-perfect math needed to pick a hover point. (Scaled up from the
+    # original 1000ns to 1_000_000ns, still fully covering the trace
+    # either way -- purely to give the nav tests below a large enough
+    # range to fit a distinctly-short "target_event" span, see tid=3.)
     trace = Trace(TraceMetadata(command="a.out", args=[]))
     trace.add(SpanEvent(name="fn_on_thread_1", category=Category.CPU,
-                         start_ns=0, duration_ns=1000, pid=1, tid=1))
+                         start_ns=0, duration_ns=1_000_000, pid=1, tid=1))
     trace.add(SpanEvent(name="fn_on_thread_2", category=Category.CPU,
-                         start_ns=0, duration_ns=1000, pid=1, tid=2))
+                         start_ns=0, duration_ns=1_000_000, pid=1, tid=2))
+    # A short, distinct span for the double-click-to-zoom-to-event tests --
+    # its own lane so it doesn't interfere with the two full-width hover
+    # lanes above.
+    trace.add(SpanEvent(name="target_event", category=Category.CPU,
+                         start_ns=490_000, duration_ns=20_000, pid=1, tid=3))
     return trace
 
 
@@ -148,8 +165,26 @@ class TestTimelineHover(unittest.TestCase):
                 break
         assert cls._timeline_root is not None, "could not locate TimelineScreen's root item"
 
+        cls._flick = cls._root.findChild(QObject, "timelineFlick")
+        assert cls._flick is not None
+
     def setUp(self):
         self._warnings.clear()
+        # Nav tests mutate zoom/viewStartNs/contentY/hover state -- start
+        # every test from the same known view state regardless of
+        # execution order (unittest runs a class's tests alphabetically by
+        # default, and e.g. test_double_click_on_span_zooms_to_it leaves
+        # the synthesized cursor sitting on target_event's span, which
+        # would otherwise leak a nonzero hoverLane into whatever test
+        # happens to sort right after it).
+        self._timeline_root.setProperty("zoom", 1.0)
+        self._timeline_root.setProperty("viewStartNs", self._timeline_model.viewStartNs)
+        self._flick.setProperty("contentY", 0)
+        self._timeline_root.setProperty("hoverLane", -1)
+        self._timeline_root.setProperty("hoverSpanIdx", -1)
+        self._timeline_root.setProperty("hoverText", "")
+        for _ in range(3):
+            self._app.processEvents()
 
     def _move_to(self, point: QPoint) -> None:
         QTest.mouseMove(self._window, point)
@@ -195,6 +230,175 @@ class TestTimelineHover(unittest.TestCase):
         self.assertEqual(self._warnings, [])
         self.assertEqual(self._timeline_root.property("hoverLane"), -1)
         self.assertEqual(self._timeline_root.property("hoverText"), "")
+
+    # ── Navigation overhaul: call-graph panel removal, zoom-to-cursor,
+    #    keyboard controls, double-click-to-event, vertical-scroll
+    #    preservation. Same shared engine/window as the hover tests above
+    #    (see module docstring for why this can't be a separate file's
+    #    own QQmlApplicationEngine). ──────────────────────────────────────
+
+    def _give_keyboard_focus(self):
+        self._timeline_root.forceActiveFocus()
+        for _ in range(3):
+            self._app.processEvents()
+
+    def test_call_graph_panel_is_gone(self):
+        self.assertIsNone(self._root.findChild(QObject, "callGraphCanvas"))
+
+    def test_wheel_zoom_keeps_timestamp_under_cursor_fixed(self):
+        # A real synthesized QWheelEvent, not a property write -- proves
+        # the actual event wiring (MouseArea.onWheel -> zoomAtFraction),
+        # not just the math function in isolation.
+        view_start_before = self._timeline_root.property("viewStartNs")
+        visible_ns_before = self._timeline_root.property("visibleNs")
+        cursor = QPointF(300, 100)
+        canvas_w = self._window.width() - 130 - 13
+        ns_under_cursor_before = view_start_before + (cursor.x() - 130) / canvas_w * visible_ns_before
+
+        ev = QWheelEvent(cursor, cursor, QPoint(0, 0), QPoint(0, 120),
+                          Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+        QGuiApplication.sendEvent(self._window, ev)
+        for _ in range(5):
+            self._app.processEvents()
+
+        zoom_after = self._timeline_root.property("zoom")
+        self.assertGreater(zoom_after, 1.0, "wheel-up should have zoomed in")
+
+        view_start_after = self._timeline_root.property("viewStartNs")
+        visible_ns_after = self._timeline_root.property("visibleNs")
+        ns_under_cursor_after = view_start_after + (cursor.x() - 130) / canvas_w * visible_ns_after
+        # The timestamp under the cursor before the zoom should still be
+        # (approximately) under the cursor after it -- the whole point of
+        # zoom-to-cursor, unlike the old center-anchored behavior.
+        self.assertAlmostEqual(ns_under_cursor_before, ns_under_cursor_after, delta=visible_ns_before * 0.02)
+        self.assertEqual(self._warnings, [])
+
+    def test_keyboard_right_then_left_pans(self):
+        # At zoom 1.0 the whole trace is already visible, so
+        # clampViewStart() pins any pan attempt right back -- zoom in
+        # first so there's actually room to pan.
+        self._timeline_root.setProperty("zoom", 4.0)
+        self._app.processEvents()
+        self._give_keyboard_focus()
+        start0 = self._timeline_root.property("viewStartNs")
+        QTest.keyClick(self._window, Qt.Key_Right)
+        self._app.processEvents()
+        start1 = self._timeline_root.property("viewStartNs")
+        self.assertGreater(start1, start0)
+
+        QTest.keyClick(self._window, Qt.Key_Left)
+        self._app.processEvents()
+        start2 = self._timeline_root.property("viewStartNs")
+        self.assertAlmostEqual(start2, start0, delta=1.0)
+        self.assertEqual(self._warnings, [])
+
+    def test_keyboard_plus_zooms_in_centered(self):
+        self._give_keyboard_focus()
+        zoom0 = self._timeline_root.property("zoom")
+        QTest.keyClick(self._window, Qt.Key_Plus)
+        self._app.processEvents()
+        self.assertGreater(self._timeline_root.property("zoom"), zoom0)
+        self.assertEqual(self._warnings, [])
+
+    def test_keyboard_0_resets_view_and_vertical_scroll(self):
+        self._give_keyboard_focus()
+        QTest.keyClick(self._window, Qt.Key_Plus)
+        self._flick.setProperty("contentY", 5)
+        self._app.processEvents()
+
+        QTest.keyClick(self._window, Qt.Key_0)
+        self._app.processEvents()
+
+        self.assertEqual(self._timeline_root.property("zoom"), 1.0)
+        self.assertEqual(self._flick.property("contentY"), 0)
+
+    def test_keyboard_home_end_jump_to_trace_bounds(self):
+        self._give_keyboard_focus()
+        QTest.keyClick(self._window, Qt.Key_Plus)  # zoom in first so Home/End are meaningful
+        self._app.processEvents()
+
+        QTest.keyClick(self._window, Qt.Key_End)
+        self._app.processEvents()
+        visible_ns = self._timeline_root.property("visibleNs")
+        expected_end_start = self._timeline_model.viewStartNs + self._timeline_model.traceDurationNs - visible_ns
+        self.assertAlmostEqual(self._timeline_root.property("viewStartNs"), expected_end_start, delta=1.0)
+
+        QTest.keyClick(self._window, Qt.Key_Home)
+        self._app.processEvents()
+        self.assertAlmostEqual(
+            self._timeline_root.property("viewStartNs"), self._timeline_model.viewStartNs, delta=1.0)
+        self.assertEqual(self._warnings, [])
+
+    def test_zoom_buttons_present_and_work(self):
+        # QML Controls types get a synthesized metaobject class name (e.g.
+        # "ToolButton_QMLTYPE_12", confirmed empirically -- NOT the C++
+        # base class name "QQuickToolButton") with a numeric suffix that
+        # isn't stable across runs/Qt versions, hence startswith().
+        buttons = [c for c in self._root.findChildren(QObject)
+                   if c.metaObject().className().startswith("ToolButton")]
+        texts = {b.property("text") for b in buttons}
+        self.assertIn("+", texts)
+        self.assertIn("−", texts)  # "−"
+        self.assertIn("Fit", texts)
+        self.assertIn("Reset", texts)
+
+        zoom0 = self._timeline_root.property("zoom")
+        plus_btn = next(b for b in buttons if b.property("text") == "+")
+        center = plus_btn.mapToScene(QPointF(plus_btn.property("width") / 2, plus_btn.property("height") / 2))
+        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, center.toPoint())
+        self._app.processEvents()
+        self.assertGreater(self._timeline_root.property("zoom"), zoom0)
+
+    def test_double_click_on_empty_area_resets(self):
+        # 25% across: clearly inside the [1_000_000, 490_000) gap before
+        # target_event's lane even starts to matter -- reset baseline is
+        # zoom 1.0, so this only needs to avoid the OTHER two lanes' full-
+        # width spans, which it does since it targets the SAME x fraction
+        # each lane shares (the two full-width spans would be hit too,
+        # but this point is deliberately below both lane rows: y=400 is
+        # well past the 3-lane block near the top of the canvas).
+        empty_point = QPoint(int(130 + (self._window.width() - 130 - 13) * 0.25), 400)
+        QTest.mouseDClick(self._window, Qt.LeftButton, Qt.NoModifier, empty_point)
+        self._app.processEvents()
+        self.assertEqual(self._timeline_root.property("zoom"), 1.0)
+
+    def test_double_click_on_span_zooms_to_it(self):
+        # Sweep for the short "target_event" span the same way
+        # _find_hover_point sweeps for the hover tests above -- robust to
+        # exact label/margin/row-position pixel sizing. Wider y range
+        # than _find_hover_point's since target_event is the 3rd lane row.
+        found = None
+        for y in range(70, 260, 10):
+            for x in range(140, int(self._window.width() * 0.9), 20):
+                self._move_to(QPoint(x, y))
+                if self._timeline_root.property("hoverText").startswith("target_event"):
+                    found = QPoint(x, y)
+                    break
+            if found:
+                break
+        self.assertIsNotNone(found, "could not hover the target_event span to set up the double-click test")
+
+        zoom_before = self._timeline_root.property("zoom")
+        QTest.mouseDClick(self._window, Qt.LeftButton, Qt.NoModifier, found)
+        self._app.processEvents()
+        self.assertGreater(self._timeline_root.property("zoom"), zoom_before)
+        # Centered roughly on the span: its midpoint (500_000ns) should
+        # now be within the new (much narrower) visible window.
+        view_start = self._timeline_root.property("viewStartNs")
+        visible_ns = self._timeline_root.property("visibleNs")
+        self.assertTrue(view_start <= 500_000 <= view_start + visible_ns)
+        self.assertEqual(self._warnings, [])
+
+    def test_vertical_scroll_preserved_across_zoom_and_pan(self):
+        self._flick.setProperty("contentY", 7)
+        self._app.processEvents()
+
+        self._give_keyboard_focus()
+        QTest.keyClick(self._window, Qt.Key_Plus)
+        QTest.keyClick(self._window, Qt.Key_Right)
+        self._app.processEvents()
+
+        self.assertEqual(self._flick.property("contentY"), 7)
 
 
 if __name__ == "__main__":

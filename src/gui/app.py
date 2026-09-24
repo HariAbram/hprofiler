@@ -54,8 +54,8 @@ def main() -> int:
     from src.output.chrome_trace import load_trace_from_json
     from src.gui.theme import Theme
     from src.gui.bridge import (
-        DashboardBridge, KernelsBridge, CallTreeBridge, RooflineBridge, SourceBridge,
-        SystemBridge, ProfileBridge,
+        DashboardBridge, KernelsBridge, CallTreeBridge, FlameGraphBridge, RooflineBridge,
+        SourceBridge, SystemBridge, ProfileBridge,
     )
     from src.gui.models import TimelineModel
 
@@ -70,6 +70,7 @@ def main() -> int:
     timeline = TimelineModel(trace, theme)
     kernels = KernelsBridge(trace, theme)
     call_tree = CallTreeBridge(trace, theme)
+    flame_graph = FlameGraphBridge(trace, theme)
     roofline = RooflineBridge(trace)
     source = SourceBridge(trace)
     system = SystemBridge(trace)
@@ -95,6 +96,7 @@ def main() -> int:
     qmlRegisterSingletonInstance(TimelineModel, "Hprofiler", 1, 0, "TimelineModel", timeline)
     qmlRegisterSingletonInstance(KernelsBridge, "Hprofiler", 1, 0, "Kernels", kernels)
     qmlRegisterSingletonInstance(CallTreeBridge, "Hprofiler", 1, 0, "CallTree", call_tree)
+    qmlRegisterSingletonInstance(FlameGraphBridge, "Hprofiler", 1, 0, "FlameGraph", flame_graph)
     qmlRegisterSingletonInstance(RooflineBridge, "Hprofiler", 1, 0, "Roofline", roofline)
     qmlRegisterSingletonInstance(SourceBridge, "Hprofiler", 1, 0, "Source", source)
     qmlRegisterSingletonInstance(SystemBridge, "Hprofiler", 1, 0, "System", system)

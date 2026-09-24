@@ -103,45 +103,5 @@ class TestLaunchGuiFallback(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 2)
 
 
-class TestLaunchFlamegraphGui(unittest.TestCase):
-    """launch_flamegraph_gui() -- the standalone `hprofiler flamegraph
-    --gui` popup's own launch path, sharing _run_gui_tiers() with
-    launch_gui() but pointed at flamegraph_app.py instead of app.py, and
-    taking a folded-stacks file path + title instead of a trace path."""
-
-    def test_argv_points_at_flamegraph_app_with_path_and_title(self):
-        from src.gui.launch import launch_flamegraph_gui
-        with patch("src.gui.launch.check_x11", return_value=_available()), \
-             patch("src.gui.launch.subprocess.run") as mock_run, \
-             patch.dict("sys.modules", {"PySide6": MagicMock()}):
-            mock_run.return_value = MagicMock(returncode=0)
-            shown = launch_flamegraph_gui("/tmp/stacks.txt", "myprog — flame graph (fp)",
-                                          verbose=False)
-        self.assertTrue(shown)
-        argv = mock_run.call_args.args[0]
-        self.assertIn("flamegraph_app.py", argv[1])
-        self.assertIn("/tmp/stacks.txt", argv)
-        self.assertIn("myprog — flame graph (fp)", argv)
-
-    def test_no_x11_skips_subprocess_entirely(self):
-        from src.gui.launch import launch_flamegraph_gui
-        with patch("src.gui.launch.check_x11",
-                    return_value=X11Status(False, "$DISPLAY is not set", "")), \
-             patch("src.gui.launch.subprocess.run") as mock_run:
-            shown = launch_flamegraph_gui("/tmp/stacks.txt", "title", verbose=False)
-        self.assertFalse(shown)
-        mock_run.assert_not_called()
-
-    def test_both_tiers_failing_falls_back_to_tui(self):
-        from src.gui.launch import launch_flamegraph_gui
-        with patch("src.gui.launch.check_x11", return_value=_available()), \
-             patch("src.gui.launch.subprocess.run") as mock_run, \
-             patch.dict("sys.modules", {"PySide6": MagicMock()}):
-            mock_run.return_value = MagicMock(returncode=1)
-            shown = launch_flamegraph_gui("/tmp/stacks.txt", "title", verbose=False)
-        self.assertFalse(shown)
-        self.assertEqual(mock_run.call_count, 2)
-
-
 if __name__ == "__main__":
     unittest.main()

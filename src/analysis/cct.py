@@ -106,17 +106,17 @@ class CCT:
     @classmethod
     def build(cls, trace: "Trace") -> "CCT":
         """
-        Build a CCT from all spans that carry call-stack information.
-
-        GPU spans (CUDA/ROCm/OpenCL) use the stack_frames attached by
-        callstack.h.  CPU perf-sample spans use the 'stack' tag written by
-        the perf-script parser in runner.py.
+        Build a CCT from all spans that carry call-stack information --
+        span.stack_frames, whether attached by a hook (callstack.h) or by
+        runner.py's perf-script parser for a --perf-callgraph run (one
+        span per sample, leaf as span.name, ancestors as stack_frames --
+        same shape and convention either way, so no per-source-specific
+        handling is needed here).
         """
         cct = cls()
-        seen_perf: set[tuple] = set()   # dedup perf samples by (pid,tid,ts)
 
         for span in trace.spans:
-            frames = _extract_frames(span, seen_perf)
+            frames = _extract_frames(span)
             if not frames:
                 continue
 
@@ -345,33 +345,15 @@ def annotate_stack_frames(trace: "Trace") -> int:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _extract_frames(span: "SpanEvent", seen_perf: set) -> list[str]:
+def _extract_frames(span: "SpanEvent") -> list[str]:
     """
-    Extract call-stack frames from a span.
-
-    Returns frames in innermost-first order, or [] if no stack info.
-    Deduplicates perf CPU samples using seen_perf (mutated in place).
+    Extract call-stack frames (ancestors, innermost-first) from a span,
+    or [] if it carries no stack info -- span.stack_frames already uses
+    this convention regardless of source (hook-captured or a
+    --perf-callgraph CPU sample), so no per-category special-casing is
+    needed.
     """
-    from ..core.events import Category
-
-    # GPU spans: frames from callstack.h attached by runner.py
-    if span.stack_frames:
-        return list(span.stack_frames)
-
-    # CPU perf samples: reconstruct from the folded stack tag
-    if span.category == Category.CPU and span.duration_ns == 0:
-        key = (span.pid, span.tid, span.start_ns)
-        if key in seen_perf:
-            return []
-        stack_str = span.tags.get("stack", "")
-        if not stack_str:
-            return []
-        seen_perf.add(key)
-        # stack tag is outermost-first; return innermost-first
-        frames = [f for f in stack_str.split(";") if f and f != "[cpu]"]
-        return list(reversed(frames))
-
-    return []
+    return list(span.stack_frames) if span.stack_frames else []
 
 
 def _merge_intervals(intervals: list[tuple[int, int]]) -> int:

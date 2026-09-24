@@ -298,6 +298,52 @@ class CallTreeBridge(QObject):
         return self._roots
 
 
+def _flame_node_with_color(node: dict[str, Any], theme) -> dict[str, Any]:
+    """analysis/flamegraph_tree.py's build_flame_tree() already returns
+    the exact {name, value, category, children} shape the Flame Graph
+    screen needs -- this just adds a theme-resolved "color" field
+    (recursively), the same pattern _ct_node_to_dict above uses for Call
+    Tree, so the two tabs share one color language (category -> hex)
+    instead of the flame graph introducing its own separate per-function
+    hash-coloring scheme the way the now-removed standalone
+    `hprofiler flamegraph --gui` popup did in isolation."""
+    return {
+        "name": node["name"],
+        "value": node["value"],
+        "category": node["category"],
+        "color": theme.categoryColor(node["category"]),
+        "children": [_flame_node_with_color(c, theme) for c in node["children"]],
+    }
+
+
+class FlameGraphBridge(QObject):
+    """Backs the Flame Graph screen. Reuses analysis/flamegraph_tree.py's
+    build_flame_tree() (itself a thin wrapper over the SAME _ct_build
+    CallTreeBridge above uses), so the two tabs can never disagree about
+    the underlying call structure -- only the rendering differs
+    (indented list there, proportional icicle here)."""
+
+    def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        from ..analysis.flamegraph_tree import build_flame_tree
+        spans = [s for s in trace.spans if s.duration_ns > 0]
+        tree = build_flame_tree(spans)
+        self._tree = _flame_node_with_color(tree, theme)
+
+    @Property('QVariant', constant=True)
+    def tree(self) -> dict[str, Any]:
+        return self._tree
+
+    @Property(int, constant=True)
+    def totalNs(self) -> int:
+        """Inclusive nanoseconds at the tree's root -- NOT a raw sample
+        count (unlike the removed standalone popup's own totalSamples,
+        which counted perf-collected folded-stack samples directly; this
+        tree's "value" is real time, from build_flame_tree()'s reuse of
+        _ct_build's inclusive-time accumulation)."""
+        return self._tree.get("value", 0)
+
+
 class RooflineBridge(QObject):
     """Backs the Roofline screen -- reuses analysis/roofline.py's
     analyze_trace() exactly like the TUI's RooflineWidget does (see

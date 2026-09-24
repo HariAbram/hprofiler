@@ -1,23 +1,27 @@
 """
 Profiler TUI — card-based dashboard layout, inspired by Paraver and VTune.
 
-Tabs (numbered 1..N in the tab strip; Call Tree/Roofline/Source only
-appear when the trace actually has the data behind them):
-  Overview   — dashboard: diagnosis, headline stats, condensed timeline
-               preview, top findings, hot kernels, source correlation
-  Timeline   — Paraver-style Gantt: one row per (category, thread), zoomable,
-               hover a span to reveal MPI/NCCL communication connector lines
-  Kernels    — VTune-style: function table with bar visualization, sortable
-  Call Tree  — hierarchical call tree (only when stack traces were captured)
-  Roofline   — log-log arithmetic-intensity/TFLOP-s scatter (only when
-               hardware-counter or disassembly-estimated kernel metrics exist)
-  Source     — annotated disassembly with instruction-mix breakdown
-               (only when --disasm was passed or the trace already has it)
-  System     — device specs, GPU utilisation, CPU microarch counters
-  Profile    — per-backend activity, time breakdown, hotspots, insight tips
+Tabs (numbered 1..N in the tab strip; Call Tree/Flame Graph/Roofline/
+Source only appear when the trace actually has the data behind them):
+  Overview    — dashboard: diagnosis, headline stats, condensed timeline
+                preview, top findings, hot kernels, source correlation
+  Timeline    — Paraver-style Gantt: one row per (category, thread), zoomable,
+                hover a span to reveal MPI/NCCL communication connector lines
+  Kernels     — VTune-style: function table with bar visualization, sortable
+  Call Tree   — hierarchical call tree (only when stack traces were captured)
+  Flame Graph — proportional icicle chart of the same call-stack data Call
+                Tree shows (same visibility condition; --perf-callgraph
+                fp|dwarf|lbr on `hprofiler run` populates it from CPU
+                sampling, --call-tree from hook-captured API calls, or both)
+  Roofline    — log-log arithmetic-intensity/TFLOP-s scatter (only when
+                hardware-counter or disassembly-estimated kernel metrics exist)
+  Source      — annotated disassembly with instruction-mix breakdown
+                (only when --disasm was passed or the trace already has it)
+  System      — device specs, GPU utilisation, CPU microarch counters
+  Profile     — per-backend activity, time breakdown, hotspots, insight tips
 
 Keyboard shortcuts:
-  1-7              jump directly to a tab
+  1-9              jump directly to a tab (however many actually exist)
   Tab / Shift+Tab  cycle tabs
   ← →              scroll timeline
   + / -            zoom timeline
@@ -25,6 +29,8 @@ Keyboard shortcuts:
   j/k or ↑ ↓       navigate kernel/call-tree rows
   s                cycle sort column (kernels)
   /                focus name filter (kernels)
+  click            zoom into a frame (flame graph)
+  right-click/bksp zoom out one level (flame graph)
   ?                toggle help overlay
   q                quit
 """
@@ -32,6 +38,7 @@ Keyboard shortcuts:
 from __future__ import annotations
 import json
 import math
+import re
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -46,7 +53,7 @@ from rich.panel import Panel
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import ScrollableContainer, Horizontal, Vertical, Grid
-from textual.events import MouseMove
+from textual.events import MouseMove, Click, Key
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
@@ -1723,52 +1730,194 @@ class RooflineWidget(Widget):
 
 # ── Flame graph widget ────────────────────────────────────────────────────────
 
-class FlameGraphWidget(Static):
-    """ASCII proportional flame graph of CPU samples."""
+class _FlameCanvas(Widget):
+    """The icicle-chart rendering surface for FlameGraphWidget -- split
+    out from it so this can implement render() directly (Textual calls
+    render() only after layout has settled, so self.size is reliable
+    there; the old dead FlameGraphWidget's replacement needed exactly
+    this, not an early .update() call from on_mount() before the
+    widget's real size is known). Root ("all") is pinned to the bottom
+    row; shallower trees get blank padding rows ABOVE the frames, not
+    below -- the same bottom-anchoring fix the GUI's own flame graph
+    needed (see FlameGraphWindow.qml's canvas.y binding) applies equally
+    here: without it, a shallow tree would render stuck at the TOP of
+    the widget with dead space below instead of the root sitting at the
+    bottom where "the ground" is expected to be."""
+
+    can_focus = True
+
+    def __init__(self, tree: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._tree = tree
+        self.zoom_stack: list[dict[str, Any]] = [tree]
+        self.search = ""
+        self._built: list[dict[str, Any]] = []  # hit-test cache from the last render
+
+    @property
+    def current_root(self) -> dict[str, Any]:
+        return self.zoom_stack[-1]
+
+    @staticmethod
+    def _depth(node: dict[str, Any]) -> int:
+        if not node["children"]:
+            return 0
+        return 1 + max(_FlameCanvas._depth(c) for c in node["children"])
+
+    def zoom_into(self, node: dict[str, Any]) -> None:
+        if node is not self.current_root:
+            self.zoom_stack.append(node)
+            self.refresh()
+
+    def zoom_up(self) -> None:
+        if len(self.zoom_stack) > 1:
+            self.zoom_stack.pop()
+            self.refresh()
+
+    def reset_zoom(self) -> None:
+        self.zoom_stack = [self._tree]
+        self.refresh()
+
+    def set_search(self, text: str) -> None:
+        self.search = text
+        self.refresh()
+
+    def render(self) -> Any:  # noqa: ANN401
+        if not self._tree or self._tree.get("value", 0) == 0:
+            self._built = []
+            return Text(
+                "No call-stack data captured.\n"
+                "Run with --perf-callgraph fp|dwarf|lbr (or --call-tree) to enable it.",
+                style="dim",
+            )
+
+        width = max(10, self.size.width)
+        height_avail = max(1, self.size.height)
+        root = self.current_root
+        n_rows = self._depth(root) + 1
+
+        search_re = None
+        if self.search:
+            try:
+                search_re = re.compile(self.search, re.IGNORECASE)
+            except re.error:
+                search_re = None
+
+        rows: list[list[tuple[int, int, dict]]] = [[] for _ in range(n_rows)]
+
+        def walk(node: dict[str, Any], x0: int, w: int, depth: int) -> None:
+            if w < 1:
+                return
+            rows[depth].append((x0, w, node))
+            cx = x0
+            for child in node["children"]:
+                cw = int(w * child["value"] / node["value"]) if node["value"] > 0 else 0
+                walk(child, cx, cw, depth + 1)
+                cx += cw
+
+        walk(root, 0, width, 0)
+
+        text = Text()
+        # Blank rows above the frames, not below -- see class docstring.
+        for _ in range(max(0, height_avail - n_rows)):
+            text.append(" " * width + "\n")
+
+        built: list[dict[str, Any]] = []
+        for depth in range(n_rows - 1, -1, -1):
+            line = Text()
+            cursor = 0
+            for x0, w, node in sorted(rows[depth], key=lambda t: t[0]):
+                if x0 > cursor:
+                    line.append(" " * (x0 - cursor))
+                color = _cat_color(node["category"])
+                matched = (search_re.search(node["name"]) is not None) if search_re else True
+                style = f"bold black on {color}" if matched else "grey42 on grey19"
+                label = node["name"]
+                if len(label) < w:
+                    label = label.ljust(w)
+                elif len(label) > w:
+                    label = (label[: w - 1] + "…") if w > 1 else label[:w]
+                line.append(label, style=style)
+                built.append({"x0": x0, "w": w, "depth": depth, "node": node})
+                cursor = x0 + w
+            if cursor < width:
+                line.append(" " * (width - cursor))
+            text.append(line)
+            if depth > 0:
+                text.append("\n")
+        self._built = built
+        return text
+
+    def _hit_test(self, x: int, y: int) -> dict[str, Any] | None:
+        n_rows = self._depth(self.current_root) + 1
+        pad_rows = max(0, self.size.height - n_rows)
+        row_from_top = y - pad_rows
+        if row_from_top < 0:
+            return None
+        depth = (n_rows - 1) - row_from_top
+        for f in self._built:
+            if f["depth"] == depth and f["x0"] <= x < f["x0"] + f["w"]:
+                return f["node"]
+        return None
+
+    def on_click(self, event: Click) -> None:
+        node = self._hit_test(event.x, event.y)
+        if node is None:
+            return
+        if event.button == 3:
+            self.zoom_up()
+        else:
+            self.zoom_into(node)
+        event.stop()
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "escape":
+            self.reset_zoom()
+            event.stop()
+        elif event.key == "backspace":
+            self.zoom_up()
+            event.stop()
+
+
+class FlameGraphWidget(Widget):
+    """
+    Proportional-width flame graph (icicle chart), root ("all") at the
+    bottom row, callees stacked upward -- built from
+    analysis/flamegraph_tree.py's build_flame_tree(), the SAME
+    underlying _ct_build tree the Call Tree tab uses (same data,
+    complementary rendering: indented list there, proportional icicle
+    here -- reuses rather than re-derives, so the two tabs can never
+    disagree about the call structure).
+    Keys: click zoom in · right-click/backspace zoom out · esc reset
+    """
+
+    DEFAULT_CSS = """
+    FlameGraphWidget { height: 1fr; layout: vertical; border: round $primary; padding: 0 1; }
+    #fg-search  { height: 3; dock: top; }
+    #fg-canvas  { height: 1fr; }
+    #fg-hint    { height: 1; dock: bottom; color: $text-muted; }
+    """
 
     def __init__(self, trace: Trace, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._trace = trace
+        self.border_title = "Flame Graph"
+        from ..analysis.flamegraph_tree import build_flame_tree
+        spans = [s for s in trace.spans if s.duration_ns > 0]
+        self._tree = build_flame_tree(spans)
 
-    def render(self) -> Any:  # noqa: ANN401
-        cpu_spans = [s for s in self._trace.spans if s.category == Category.CPU]
-        if not cpu_spans:
-            return Panel(
-                "[dim]No CPU samples captured.\n\n"
-                "Run with [bold]--backend cpu[/bold] to enable CPU profiling.[/dim]",
-                title="[bold]CPU Flame Graph[/bold]",
-                border_style="dim",
-            )
-
-        totals: dict[str, int] = defaultdict(int)
-        for s in cpu_spans:
-            totals[s.name] += max(s.duration_ns, 1)
-
-        sorted_items = sorted(totals.items(), key=lambda kv: -kv[1])
-        grand_total  = sum(totals.values()) or 1
-        width        = 72
-
-        lines: list[str] = []
-        lines.append(
-            f"[bold cyan]CPU Flame Graph[/bold cyan]  "
-            f"[dim]samples: {len(cpu_spans)}   total: {_fmt_ns(grand_total)}[/dim]\n"
+    def compose(self) -> ComposeResult:
+        yield Input(placeholder="  search (regex)…", id="fg-search")
+        yield _FlameCanvas(self._tree, id="fg-canvas")
+        # NOTE: literal brackets must be escaped (\[) -- see HotspotsWidget's
+        # #hs-sort-hint for why an unescaped bracketed hint collides with
+        # Rich markup and silently vanishes from the rendered text.
+        yield Static(
+            "  [dim]click zoom in  ·  right-click/\\[backspace] zoom out  ·  \\[esc] reset[/dim]",
+            id="fg-hint",
         )
 
-        for name, dur in sorted_items[:30]:
-            bar_w = max(1, int(dur / grand_total * width))
-            pct   = 100.0 * dur / grand_total
-            lines.append(
-                f"[cyan]{'█' * bar_w:<{width}}[/cyan]  "
-                f"[bold]{name[:36]:<36}[/bold]  "
-                f"[yellow]{_fmt_ns(dur):>10}[/yellow]  "
-                f"[dim]{pct:5.1f}%[/dim]"
-            )
-
-        lines.append(
-            f"\n[dim]Showing top {min(30, len(sorted_items))} of "
-            f"{len(sorted_items)} functions[/dim]"
-        )
-        return "\n".join(lines)
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "fg-search":
+            self.query_one("#fg-canvas", _FlameCanvas).set_search(event.value)
 
 
 # ── Call tree widget ─────────────────────────────────────────────────────────
@@ -2425,6 +2574,7 @@ _TAB_HINTS: dict[str, list[tuple[str, str]]] = {
     "tab-timeline": [],
     "tab-kernels":  [("j/k", "navigate"), ("s", "sort"), ("/", "filter")],
     "tab-calltree": [("↑↓", "navigate"), ("enter", "expand")],
+    "tab-flamegraph": [("click", "zoom in"), ("bksp", "zoom out"), ("esc", "reset")],
     "tab-roofline": [],
     "tab-source":   [("j/k", "select kernel")],
     "tab-system":   [("↑↓", "scroll")],
@@ -2458,6 +2608,14 @@ class ProfilerApp(App):
         Binding("5", "goto_tab(5)", "5", show=False),
         Binding("6", "goto_tab(6)", "6", show=False),
         Binding("7", "goto_tab(7)", "7", show=False),
+        # 8/9, not just up to 7: up to 3 conditional tabs (Call Tree,
+        # Flame Graph, Roofline) can now all be present alongside Source
+        # plus the 5 always-present ones, so as many as 9 tabs can exist
+        # at once -- 7 bindings already under-covered the pre-existing
+        # maximum of 8 (Call Tree+Roofline+Source all present together),
+        # a real pre-existing gap this just happened to make one worse.
+        Binding("8", "goto_tab(8)", "8", show=False),
+        Binding("9", "goto_tab(9)", "9", show=False),
     ]
 
     TITLE = "hprofiler"
@@ -2494,6 +2652,17 @@ class ProfilerApp(App):
                 with TabPane(f"{n} Call Tree", id="tab-calltree"):
                     yield CallTreeWidget(self.trace)
                 self._tab_ids.append("tab-calltree")
+
+                # Same visibility condition as Call Tree -- deliberately:
+                # this tab shows the SAME underlying data (whatever spans
+                # carry stack_frames, from --perf-callgraph and/or
+                # --call-tree), just as a proportional icicle instead of
+                # an indented list, so the two should appear/disappear
+                # together, never one without the other.
+                n += 1
+                with TabPane(f"{n} Flame Graph", id="tab-flamegraph"):
+                    yield FlameGraphWidget(self.trace)
+                self._tab_ids.append("tab-flamegraph")
 
             if _has_roofline_data(self.trace):
                 n += 1

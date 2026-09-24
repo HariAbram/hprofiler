@@ -100,9 +100,8 @@ python3 hprofiler roofline --backend cuda -- ./my_cuda_app
 python3 hprofiler roofline --backend openmp -- ./my_omp_program
 python3 hprofiler roofline --html --backend cuda -- ./my_cuda_app  # browser instead
 
-# Flame graph — TUI viewer by default (requires plotly + kaleido)
-python3 hprofiler flamegraph -- ./my_program
-python3 hprofiler flamegraph --html -- ./my_program                # browser instead
+# Flame graph — populates the Flame Graph tab (TUI and GUI both)
+python3 hprofiler run --perf-callgraph dwarf -- ./my_program
 
 # Profile a ROCm/HIP program
 python3 hprofiler run --backend rocm -- ./my_hip_app
@@ -156,7 +155,7 @@ python3 hprofiler run --no-ui -- ./my_program
 
 ```bash
 pip install click textual rich capstone
-pip install plotly "kaleido==0.2.1"   # required for TUI flamegraph/roofline viewers
+pip install plotly "kaleido==0.2.1"   # required for the TUI roofline viewer (Flame Graph tab needs neither)
 # kaleido 0.2.1 specifically — 0.3+ requires an external Chrome install and breaks on clusters
 
 pip install "hprofiler[gui]"          # optional: popup Qt/QML viewer instead of the TUI
@@ -519,79 +518,25 @@ Available backends:
 
 ---
 
-### `hprofiler flamegraph`
+### Flame graphs
 
-Generate an interactive flame graph by profiling COMMAND with Linux `perf record`.
-
-By default a **native TUI viewer** is opened inline in the terminal using the
-Kitty graphics protocol (or Sixel/iTerm2 as fallback). Pass `--html` to skip
-the TUI and open the HTML file in a browser instead.
-
-Requires: `pip install plotly "kaleido==0.2.1"`
-
-```
-hprofiler flamegraph [OPTIONS] -- COMMAND [ARGS...]
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--backend`, `-b` | — | Inject backend hooks so GPU/MPI API overhead appears in CPU stacks |
-| `--output`, `-o` | `<prog>.flamegraph.html` | Output HTML file (always written) |
-| `--callgraph` | `fp` | Call-graph method: `fp` (frame-pointer), `dwarf`, or `lbr` |
-| `--freq`, `-F` | `99` | perf sampling frequency in Hz |
-| `--html` | off | Open browser instead of TUI viewer |
-| `--gui` | off | Open the flame graph in the native Qt/QML GUI instead of the terminal TUI. Takes priority over `--html` when both are given. Same click/right-click/search interaction as the TUI viewer below, no terminal-graphics-protocol requirement. Falls back to the TUI if PySide6/X11 aren't available. |
+There is no separate `hprofiler flamegraph` command — flame-graph data is
+collected as part of a normal `hprofiler run` (pass `--perf-callgraph
+fp|dwarf|lbr` to capture CPU call stacks; `--call-tree` for hook-captured
+GPU/MPI/OpenMP API call stacks works too, and both can be combined) and
+viewed live in the **Flame Graph tab**, alongside every other tab, in
+both the TUI and the GUI — no second profiling run, no separate output
+file. See §5 (TUI) and §21 (GUI) for the tab itself, and `hprofiler run`
+above for `--perf-callgraph`/`--call-tree`.
 
 ```bash
-hprofiler flamegraph --gui -- ./my_program
+# CPU flame graph (dwarf unwinding -- no -fno-omit-frame-pointer needed)
+hprofiler run --perf-callgraph dwarf -- ./my_program
+
+# CUDA program -- GPU API overhead in the flame graph too (--call-tree
+# captures the hook-intercepted CUDA calls, combined with the CPU stacks)
+hprofiler run --backend cuda --perf-callgraph dwarf --call-tree -- ./cuda_app
 ```
-
-**TUI keyboard controls:**
-
-| Key | Action |
-|-----|--------|
-| click | Zoom into that frame |
-| `u` / Esc | Zoom out one level |
-| `r` | Reset to full view |
-| `/` | Search — highlight frames matching substring |
-| `w` | Open HTML version in browser |
-| `q` | Quit |
-
-**Terminal requirements:** kitty, WezTerm, Ghostty (Kitty graphics protocol),
-iTerm2, or xterm/mlterm (Sixel). Falls back to browser-open when no inline-image
-protocol is detected.
-
-**HTML output:** A single self-contained HTML file (Plotly-based icicle chart).
-Open in any browser — no server or internet connection required.
-
-**Orientation:** Root frame at top, leaf frames at bottom (icicle / top-down convention).
-
-**With `--backend`:** Backend hooks are injected via `LD_PRELOAD` so the CPU
-stacks captured by `perf` include time spent inside GPU API calls:
-
-- `cudaLaunchKernel` / `clEnqueueNDRangeKernel` — kernel launch overhead
-- `cudaDeviceSynchronize` / `clFinish` — CPU blocking while GPU runs
-- `MPI_Allreduce` / `MPI_Barrier` — collective synchronisation wait
-- `hipLaunchKernel` — ROCm launch overhead
-
-```bash
-# CPU-only flame graph
-hprofiler flamegraph -- ./my_program
-
-# CUDA program — shows GPU API overhead in CPU stacks
-hprofiler flamegraph --backend cuda -- ./cuda_app
-
-# For binaries compiled without -fno-omit-frame-pointer use dwarf unwinding
-hprofiler flamegraph --callgraph dwarf --backend cuda -- ./cuda_app
-
-# ACPP SYCL targeting CUDA
-ACPP_VISIBILITY_MASK=cuda hprofiler flamegraph --backend cuda -- ./sycl_app
-```
-
-**Requirements:**
-- `perf` installed (`apt install linux-tools-$(uname -r)`)
-- `perf_event_paranoid` ≤ 1 for user-space sampling: `sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'`
-- Compile with `-fno-omit-frame-pointer` for the `fp` call-graph method (default); otherwise use `--callgraph dwarf`
 
 ---
 
@@ -1242,7 +1187,7 @@ being profiled (left) and whatever run context actually applies — rank
 count, device, wall time — omitting anything that doesn't apply to this
 trace (right), and a bottom bar shows plain "key  description" hints for
 whichever tab is active instead of Textual's default reverse-video key
-chips. Tabs are numbered (`1 Overview`, `2 Timeline`, …) and `1`-`7` jump
+chips. Tabs are numbered (`1 Overview`, `2 Timeline`, …) and `1`-`9` jump
 straight to a tab from anywhere. Three tabs are always present; the rest
 appear conditionally based on recorded data:
 
@@ -1251,17 +1196,16 @@ appear conditionally based on recorded data:
 | 1 | Overview | Always |
 | 2 | Timeline | Always |
 | 3 | Kernels | Always |
-| — | Call Tree | Only when `--call-tree` was passed during `hprofiler run` |
+| — | Call Tree | Only when the trace has captured call-stack data (`--call-tree` and/or `--perf-callgraph fp\|dwarf\|lbr` on `hprofiler run`) |
+| — | Flame Graph | Same condition as Call Tree — same underlying data (analysis/call_tree.py's `_ct_build`), rendered as a proportional icicle chart instead of an indented list |
 | — | Roofline | Only when hardware-counter or disassembly-estimated kernel metrics exist |
 | — | Source | Only when `--disasm` is passed to `run` or `view` |
 | — | System | Always (positioned after the conditional tabs) |
 | — | Profile | Always (positioned after the conditional tabs) |
 
 Tab numbers shift to stay contiguous depending on which conditional tabs
-are actually present for a given trace — Call Tree/Roofline/Source are
-never shown as a numbered gap. CPU flame graphs are a separate,
-dedicated view (`hprofiler flamegraph`, native TUI or `--html` export),
-not a tab inside this main viewer.
+are actually present for a given trace — none of the conditional tabs are
+ever shown as a numbered gap.
 
 ### Overview Tab
 
@@ -1425,25 +1369,35 @@ category. Type to filter by name; press `s` to cycle the sort column;
 | Total / Avg / Min / Max | Duration statistics |
 | % | Fraction of total profiled time |
 
-### Call Tree Tab *(only shown when `--call-tree` was used)*
+### Call Tree Tab *(only shown when call-stack data was captured)*
 
-A from-main call tree built from CPU call stacks captured at every intercepted
-API call. Only shown when the trace was recorded with `--call-tree`.
+A from-main call tree built from captured call stacks. Shown when the
+trace has stack data from either (or both) of two independent sources:
+
+- **`--call-tree`** — CPU call stacks captured via `backtrace()` at every
+  hook-intercepted API call (CUDA/ROCm/OpenCL/OpenMP/MPI).
+- **`--perf-callgraph fp|dwarf|lbr`** — CPU stacks from `perf`'s own
+  sampling, unwound with the chosen method. One `SpanEvent` per sample
+  (leaf = the sampled frame, ancestors = the call stack), so this
+  populates the SAME tree the hook-based path does, not a separate view.
 
 **Two tree-building modes:**
 
-- **Stack-based** (default when `--call-tree` is active): Each API span's full
-  call stack is captured via `backtrace()` at interception time. Frames are
-  reversed (innermost-first → root-first) and merged into a trie rooted at
-  `_start` / `main`. This gives accurate from-main call paths.
+- **Stack-based** (used whenever either source above provided stack
+  data): frames are reversed (innermost-first → root-first) and merged
+  into a trie rooted at `_start` / `main`. This gives accurate from-main
+  call paths.
 
-- **Temporal containment** (fallback): When no stack data is present, the tree
-  is inferred from span start/end nesting on a per-thread basis. Less accurate
-  than stack-based but works without `--call-tree`.
+- **Temporal containment** (fallback): When no stack data is present at
+  all, the tree is inferred from span start/end nesting on a per-thread
+  basis. Less accurate than stack-based but works without either flag.
 
-**Requirements for stack-based mode:** The profiled binary must be compiled with
-`-fno-omit-frame-pointer -rdynamic`. Without `-rdynamic`, symbol names resolve
-via `dladdr` (works for shared-library symbols but not static functions).
+**Requirements for stack-based mode:** `--call-tree` needs the profiled
+binary compiled with `-fno-omit-frame-pointer -rdynamic` (without
+`-rdynamic`, symbol names resolve via `dladdr`, which works for shared-
+library symbols but not static functions). `--perf-callgraph dwarf`
+needs no special compilation; `--perf-callgraph fp` needs
+`-fno-omit-frame-pointer` the same way `--call-tree` does.
 
 **Keyboard controls:**
 
@@ -1458,6 +1412,30 @@ via `dladdr` (works for shared-library symbols but not static functions).
 do not include `main` even with `--call-tree`. Only `task_create` and
 `parallel_begin` callbacks fire from user-code context and show the full call
 path from `main`.
+
+### Flame Graph Tab *(same visibility condition as Call Tree)*
+
+A proportional-width icicle chart of the same call-tree data the Call
+Tree tab shows — reuses `analysis/call_tree.py`'s `_ct_build` directly
+(via `analysis/flamegraph_tree.py`'s `build_flame_tree()`), so the two
+tabs can never disagree about the call structure; only the rendering
+differs (indented list there, icicle here). The root (`all`) is the
+bottom row; each frame's width is proportional to its inclusive time
+(its own + every descendant's), colored by category (same
+category→color mapping every other tab uses, not a separate per-function
+palette).
+
+| Action | Control |
+|--------|---------|
+| Click a frame | Zoom into it (that frame becomes the new bottom row) |
+| Right-click | Zoom out one level |
+| `Escape` | Reset to full view |
+| Type in the search box | Regex-highlight matching frames, dim the rest |
+
+Combine `--backend cuda --perf-callgraph dwarf --call-tree` to see GPU
+API overhead (`cudaLaunchKernel`, `cudaDeviceSynchronize`, …) alongside
+CPU-sampled time in one flame graph — the hook-captured and perf-sampled
+spans merge into one tree, same as the Call Tree tab.
 
 ### Roofline Tab *(only shown when kernel metrics are available)*
 
@@ -1575,20 +1553,6 @@ It can be opened in **[ui.perfetto.dev](https://ui.perfetto.dev)** or
 `ts` and `dur` fields are in **microseconds**. The `metadata` block records the
 command, backends, hostname, and `cwd` (used to resolve relative binary paths
 when reloading).
-
-### Flame Graph HTML
-
-`hprofiler flamegraph` writes a self-contained interactive HTML file.
-
-The flame graph data is embedded as a JSON tree in a `<script>` tag and
-rendered at load time onto a `<canvas>` element. No external dependencies,
-no server, no internet connection required — open the file directly in any
-browser. The canvas renderer re-draws on every zoom/search/resize event;
-performance is proportional to the number of visible frames, not the total
-frame count.
-
-**File size:** typically 10–50 KB for a 60-second profile of a moderate
-workload (a few thousand unique stacks).
 
 ### Roofline HTML
 
@@ -2126,8 +2090,7 @@ flowchart TB
             direction LR
             J["Chrome Trace JSON\nPerfetto / chrome://tracing"]
             S["Text\nSummary"]
-            T["TUI Viewer\nOverview · Timeline · Kernels\n[Call Tree — --call-tree]\n[Roofline — kernel metrics]\n[Source — --disasm]\nSystem · Profile"]
-            FG["Flame Graph HTML\ncanvas · zoom · search\nhprofiler flamegraph"]
+            T["TUI/GUI Viewer\nOverview · Timeline · Kernels\n[Call Tree / Flame Graph — stack data]\n[Roofline — kernel metrics]\n[Source — --disasm]\nSystem · Profile"]
         end
 
         TRACE --> J & S & T
@@ -2400,11 +2363,14 @@ conditional tabs exist. `TopBar`/`BottomBar` replace Textual's default
 tab (Timeline) that already shows its own live keybinding footer inside
 the widget itself, to avoid showing the same hints twice.
 
-`FlameGraphWidget` is defined in this file but was never wired into
-`ProfilerApp.compose()` — dead code, superseded by the separate
-`hprofiler flamegraph` command (native TUI or `--html` export, see
-`src/output/flamegraph.py`), not a bug introduced by the dashboard
-redesign.
+`FlameGraphWidget` backs the Flame Graph tab: a container (`compose()`)
+around a search `Input` and `_FlameCanvas`, the actual rendering surface
+-- split into its own `Widget` subclass specifically so it can implement
+`render()` directly (Textual only guarantees `self.size` is accurate
+once layout has settled, which `render()` is called after; an earlier,
+now-superseded version of this widget was a flat, never-wired dead bar
+chart with no ancestor/child structure at all, replaced along with the
+standalone `hprofiler flamegraph` command's removal).
 
 `CallTreeWidget` uses Textual's `Tree` widget. It calls `_ct_build()` which
 selects between two tree-building strategies:
@@ -3849,7 +3815,7 @@ profiling process down with it.
 hprofiler run --gui --backend cuda -- ./app     # profile, then open the GUI
 hprofiler gui trace.hprofiler.json              # open a previously saved trace
 hprofiler gui --disasm trace.hprofiler.json      # + background disassembly collection
-hprofiler flamegraph --gui -- ./my_program       # standalone flame graph popup (see below)
+hprofiler run --gui --perf-callgraph dwarf -- ./app  # + populate the Flame Graph tab
 ```
 
 ### Three-tier fallback
@@ -3888,8 +3854,14 @@ for machines where installing it isn't an option at all.
 
 ### Tabs
 
-Mirrors the TUI's tab set (§5) exactly, same conditional-visibility rules
-(Call Tree only with `--call-tree`, Source only with `--disasm`):
+Mirrors the TUI's tab set (§5) closely, but with one real difference in
+how conditional tabs are handled: the TUI hides a tab entirely when its
+data isn't present, while the GUI's `TabBar` always shows all 9 tabs and
+each screen renders its own empty-state message instead (e.g. Call Tree/
+Flame Graph both show "No call-stack data..." pointing at `--call-tree`/
+`--perf-callgraph` rather than disappearing) — always-visible tabs with
+inline empty states, not conditional visibility, is the deliberate GUI
+convention throughout.
 
 | # | Tab | Notes vs. the TUI equivalent |
 |---|-----|-------------------------------|
@@ -3897,10 +3869,11 @@ Mirrors the TUI's tab set (§5) exactly, same conditional-visibility rules
 | 2 | Timeline | Real vector Gantt view, not character cells — see below for GUI-specific additions |
 | 3 | Kernels | Same aggregated-stats table |
 | 4 | Call Tree | Same stack-frame tree, proportional-width tree rows instead of ASCII indentation |
-| 5 | Roofline | Canvas-drawn scatter instead of a Plotly-rendered static image |
-| 6 | Source | Same per-kernel disassembly, plus a third panel (see below) not present in the TUI |
-| 7 | System | Same hardware info |
-| 8 | Profile | Same activity breakdown |
+| 5 | Flame Graph | Same tree as Call Tree (same `_ct_build` call, via `analysis/flamegraph_tree.py`), rendered as a Canvas-drawn proportional icicle chart instead of character-cell blocks — see §5's own Flame Graph Tab section, same tab, same interaction model, just vector-rendered |
+| 6 | Roofline | Canvas-drawn scatter instead of a Plotly-rendered static image |
+| 7 | Source | Same per-kernel disassembly, plus a third panel (see below) not present in the TUI |
+| 8 | System | Same hardware info |
+| 9 | Profile | Same activity breakdown |
 
 **Timeline tab, GUI-specific additions beyond the TUI's equivalent:**
 
@@ -3942,35 +3915,11 @@ threshold-based advisor described in §8, not an LLM call) rendered
 side-by-side with the assembly instead of requiring a separate summary
 view.
 
-### Standalone flame graph popup (`hprofiler flamegraph --gui`)
-
-A separate window (`src/gui/qml/FlameGraphWindow.qml`), not a tab inside
-the main 8-tab viewer — same relationship the TUI's own flame graph
-viewer has to the main TUI (§5's closing note). Reads the same
-`perf record`-collected folded-stacks data the `--html`/native-TUI paths
-use (`output/flamegraph.py`'s `collect_folded_stacks()`); the rendering
-algorithm, warm hash-based color function, and interaction model were
-ported near-verbatim from the existing HTML/JS flame graph's own
-JavaScript, so this window behaves identically to `--html` mode, just
-natively and without a browser.
-
-| Action | Control |
-|--------|---------|
-| Zoom into a frame | Click |
-| Zoom out one level | Right-click |
-| Reset to full view | `Esc` or the Reset button |
-| Search — highlight matching frames | Type in the search box (regex) |
-| Hover | Tooltip with full name + time |
-
-Goes through the same launch mechanism and three-tier fallback as the
-main GUI (falls back to the existing TUI flame graph viewer, §5's Flame
-Graph controls, if PySide6/X11 aren't available).
-
 ### Verification status
 
 Built and verified via real `grabWindow()` screenshots against a real X
 server (`DISPLAY=:1`) for every tab and feature above, and via the real
-CLI entry points (`hprofiler gui`/`run --gui`/`flamegraph --gui`), not
+CLI entry points (`hprofiler gui`/`run --gui`), not
 bypass scripts — confirmed via `xwininfo`/`ps aux` that the expected
 window/process architecture (parent CLI process, separate child GUI
 subprocess) actually appears on a live X display. Subsequently confirmed

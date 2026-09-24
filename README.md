@@ -1,12 +1,12 @@
 # hprofiler — Heterogeneous Profiler
 
-Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI simultaneously — with a terminal UI (and an optional native Qt GUI, see [GUI Viewer](#gui-viewer) below), native TUI viewers for flame graphs and roofline charts, and cross-layer causal attribution: one dependency graph over every backend active in a run, with a confidence-graded, formally-computed critical path instead of a single-runtime or heuristic one (see [Cross-Layer Causal Attribution](#cross-layer-causal-attribution) below). CPU sampling is provided via Linux `perf`.
+Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI simultaneously — with a terminal UI (and an optional native Qt GUI, see [GUI Viewer](#gui-viewer) below), a live Flame Graph tab and a native TUI roofline viewer, and cross-layer causal attribution: one dependency graph over every backend active in a run, with a confidence-graded, formally-computed critical path instead of a single-runtime or heuristic one (see [Cross-Layer Causal Attribution](#cross-layer-causal-attribution) below). CPU sampling is provided via Linux `perf`.
 
 ## Requirements
 
 - Python 3.10+, CMake 3.16+, GCC/Clang
 - `pip install click textual rich capstone`
-- TUI flamegraph/roofline viewers: `pip install plotly "kaleido==0.2.1"` (0.2.1 specifically — later versions require Chrome and break on clusters)
+- TUI roofline viewer: `pip install plotly "kaleido==0.2.1"` (0.2.1 specifically — later versions require Chrome and break on clusters); the Flame Graph tab needs neither
 - Backend-specific: CUDA toolkit, a `libamdhip64` (ROCm/HIP) runtime, LLVM `libomp`, an MPI implementation (`mpicc`, or a Cray Programming Environment `cc` wrapper), or `perf` — see [DOCUMENTATION.md](DOCUMENTATION.md#requirements) for exact search paths
 
 ## Build
@@ -57,12 +57,9 @@ python3 hprofiler summary trace.json
 python3 hprofiler run --gui --backend cuda -- ./cuda_app
 python3 hprofiler gui trace.json
 
-# Flame graph — opens TUI viewer by default (requires plotly + kaleido)
-python3 hprofiler flamegraph -- ./my_program
-python3 hprofiler flamegraph --backend cuda -- ./cuda_app
-python3 hprofiler flamegraph --callgraph dwarf -- ./my_program  # no frame-pointer binary
-python3 hprofiler flamegraph --html -- ./my_program             # write HTML + open browser
-python3 hprofiler flamegraph --gui -- ./my_program               # native GUI popup instead
+# Flame graph — populates the Flame Graph tab in both the TUI and the GUI
+python3 hprofiler run --perf-callgraph dwarf -- ./my_program
+python3 hprofiler run --backend cuda --perf-callgraph dwarf --call-tree -- ./cuda_app  # + GPU API overhead
 
 # Roofline chart — opens TUI viewer by default (requires plotly + kaleido)
 python3 hprofiler roofline --backend cuda    -- ./cuda_app
@@ -102,33 +99,32 @@ Opens automatically after `hprofiler run`. Tabs:
 | Profile | Always | GPU activity%, time breakdown by category, top hotspots, bottleneck advisor |
 | Timeline | Always | Gantt view with per-stream CUDA/ROCm lanes |
 | Hotspots | Always | Filterable/sortable function table |
-| Call Tree | Only with `--call-tree` | Stack-frame tree from captured call graphs |
+| Call Tree | Only with `--call-tree` and/or `--perf-callgraph fp\|dwarf\|lbr` | Stack-frame tree from captured call graphs |
+| Flame Graph | Same condition as Call Tree | Proportional icicle chart of the same call-stack data — see [Flame Graph Tab Controls](#flame-graph-tab-controls) |
 | Disasm | Only with `--disasm` | Per-kernel assembly with instruction-type color coding, runtime heat % and stall columns (CPU via perf, CUDA via `--gpu-pc-sampling`), and static optimization hints |
 
 ## GUI Viewer
 
-An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI, plus a few GUI-specific additions: smooth wheel-zoom/drag-pan on the Timeline, a scrollable node-and-edge call-graph panel showing which functions call which for whatever's currently visible, an idle-time overlay, so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy, and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
+An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI (including Flame Graph), plus a few GUI-specific additions: smooth wheel-zoom/drag-pan on the Timeline, a scrollable node-and-edge call-graph panel showing which functions call which for whatever's currently visible, an idle-time overlay, so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy, and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
 
 ```bash
 hprofiler run --gui --backend cuda -- ./cuda_app
 hprofiler gui trace.hprofiler.json
-hprofiler flamegraph --gui -- ./my_program   # standalone flame graph popup
+hprofiler run --gui --perf-callgraph dwarf -- ./app   # + populate the Flame Graph tab
 ```
 
 Falls back to the TUI automatically — no error shown — if PySide6 isn't installed, X11 isn't reachable, or GPU-rendered Qt Quick fails over indirect/forwarded X11 (retried once with software rendering first). See [DOCUMENTATION.md](DOCUMENTATION.md) §21 for the full tab reference and §2 for install/troubleshooting (including the `libxcb-cursor0` system-library requirement and a VNC fallback for machines where installing it isn't an option).
 
-## Flamegraph TUI Controls
+## Flame Graph Tab Controls
 
-Requires an inline-image terminal: kitty, WezTerm, Ghostty (Kitty protocol), iTerm2, or xterm/mlterm (Sixel). Falls back to browser if no protocol is detected.
+Works in any terminal — plain character-cell rendering, no inline-image protocol required (unlike the roofline viewer below). Same controls in the GUI's Flame Graph tab, mouse-driven there too.
 
-| Key | Action |
-|-----|--------|
-| click | Zoom into that frame |
-| `u` / Esc | Zoom out one level |
-| `r` | Reset to full view |
-| `/` | Search — highlight frames by name substring |
-| `w` | Open HTML version in browser |
-| `q` | Quit |
+| Action | TUI | GUI |
+|--------|-----|-----|
+| Zoom into a frame | Click | Click |
+| Zoom out one level | Right-click or Backspace | Right-click |
+| Reset to full view | Escape | Escape / Reset button |
+| Search — regex-highlight matching frames | Type in the search box | Type in the search box |
 
 ## Roofline TUI Controls
 
@@ -148,7 +144,6 @@ Requires an inline-image terminal: kitty, WezTerm, Ghostty (Kitty protocol), iTe
 | File | Viewer |
 |------|--------|
 | `<prog>.hprofiler.json` | [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` |
-| `<prog>.flamegraph.html` | Any browser — click to zoom, search |
 | `<prog>.roofline.html` | Any browser (self-contained) |
 
 ## OpenTelemetry Export

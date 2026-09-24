@@ -245,6 +245,61 @@ class TestGuiBridge(unittest.TestCase):
         self.assertEqual(len(root["children"]), 1)
         self.assertEqual(root["children"][0]["name"], "work")
 
+    # ── FlameGraphBridge ─────────────────────────────────────────────────
+    # Moved here (from the now-removed standalone `hprofiler flamegraph
+    # --gui` popup's own tests/test_flamegraph_gui.py) since the bridge
+    # itself moved into bridge.py alongside CallTreeBridge -- same trace-
+    # sourced data now (analysis/flamegraph_tree.py's build_flame_tree(),
+    # itself built on the same _ct_build CallTreeBridge uses), not a
+    # folded-stacks-text constructor argument the way the popup's version was.
+
+    def test_flame_graph_bridge_empty_trace(self):
+        from src.gui.bridge import FlameGraphBridge
+        trace = _mk_trace([])
+        fgb = FlameGraphBridge(trace, self._theme())
+        self.assertEqual(fgb.totalNs, 0)
+        self.assertEqual(fgb.tree["children"], [])
+
+    def test_flame_graph_bridge_tree_shape_and_color(self):
+        from src.gui.bridge import FlameGraphBridge
+        span = SpanEvent(name="work", category=Category.CPU, start_ns=0, duration_ns=100,
+                         pid=1, tid=1, tags={}, stack_frames=["main"])
+        trace = _mk_trace([span], backends=["cpu"])
+        fgb = FlameGraphBridge(trace, self._theme())
+        self.assertEqual(fgb.totalNs, 100)
+        tree = fgb.tree
+        self.assertEqual(tree["name"], "all")
+        self.assertEqual(tree["value"], 100)
+        self.assertTrue(tree["color"].startswith("#"))
+        main = tree["children"][0]
+        self.assertEqual(main["name"], "main")
+        self.assertTrue(main["color"].startswith("#"))
+        work = main["children"][0]
+        self.assertEqual(work["name"], "work")
+        self.assertEqual(work["value"], 100)
+
+    def test_flame_graph_bridge_matches_call_tree_bridge_structure(self):
+        # Same underlying spans, same _ct_build call -- CallTreeBridge and
+        # FlameGraphBridge must agree on names/values, just reshaped
+        # differently (totalNs/value vs totalNs-per-node/children).
+        from src.gui.bridge import CallTreeBridge, FlameGraphBridge
+        spans = [
+            SpanEvent(name="leaf_a", category=Category.CPU, start_ns=0, duration_ns=70,
+                      pid=1, tid=1, stack_frames=["main"]),
+            SpanEvent(name="leaf_b", category=Category.CPU, start_ns=70, duration_ns=30,
+                      pid=1, tid=1, stack_frames=["main"]),
+        ]
+        trace = _mk_trace(spans, backends=["cpu"])
+        theme = self._theme()
+        ctb = CallTreeBridge(trace, theme)
+        fgb = FlameGraphBridge(trace, theme)
+        ct_main = ctb.roots[0]
+        fg_main = fgb.tree["children"][0]
+        self.assertEqual(ct_main["name"], fg_main["name"])
+        self.assertEqual(ct_main["totalNs"], fg_main["value"])
+        self.assertEqual({c["name"] for c in ct_main["children"]},
+                         {c["name"] for c in fg_main["children"]})
+
     # ── RooflineBridge ───────────────────────────────────────────────────
 
     def test_roofline_bridge_unavailable_without_gpu_metrics(self):

@@ -162,7 +162,7 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
             )
     if samples:
         top_s = sorted(samples, key=lambda r: -r["count"])[:10]
-        print(f"\n  Top CPU sample functions (use `hprofiler flamegraph` for full view):")
+        print(f"\n  Top CPU sample functions (see the Flame Graph tab for the full view):")
         print(f"  {'Function':<50} {'Samples':>8}")
         print(f"  {'-'*60}")
         for row in top_s:

@@ -81,6 +81,46 @@ class TestTimelineModel(unittest.TestCase):
         self.assertEqual(m.visibleSpans(99, 0, 1000, 100), [])
         self.assertEqual(m.visibleSpans(-1, 0, 1000, 100), [])
 
+    def test_visible_spans_lo_bound_uses_per_span_duration_not_lane_span(self):
+        # Regression test for a real bug: _max_dur used to be the lane's
+        # FULL first-to-last time range (ends.max()-starts.min()), not the
+        # longest INDIVIDUAL span's own duration -- so searchsorted's
+        # look-back margin was wildly oversized for any lane whose spans
+        # spread across most of the trace, pinning `lo` near index 0
+        # regardless of how far into the trace the query window actually
+        # was. One long early span (duration 1000) followed by a cluster
+        # of short spans far later -- querying a window that starts well
+        # after the early span's TRUE end (but still within the old,
+        # bogus, whole-lane-range look-back) must not resurrect it.
+        early = _span(1, 1, Category.OPENMP, 0, 1000, "early_long_span")
+        late = [_span(1, 1, Category.OPENMP, 10_000_000 + i * 100, 50, f"late{i}")
+                for i in range(5)]
+        m = self._model(_mk_trace([early] + late))
+        lane_idx = 0
+        result = m.visibleSpans(lane_idx, 9_000_000, 9_500_000, 2000)
+        self.assertEqual(result, [])
+        names = {r["name"] for r in m.visibleSpans(lane_idx, 10_000_000, 10_001_000, 2000)}
+        self.assertNotIn("early_long_span", names)
+        self.assertTrue(any(n.startswith("late") for n in names))
+
+    def test_visible_spans_preserves_idle_gap_between_two_clusters(self):
+        # Two clusters of spans with a genuine, deliberate idle gap
+        # between them (no span at all covers that time) -- querying
+        # squarely inside the gap must return nothing, not spans smeared
+        # in from either cluster.
+        cluster_a = [_span(1, 1, Category.OPENMP, i * 1000, 500, f"a{i}") for i in range(20)]
+        cluster_b = [_span(1, 1, Category.OPENMP, 100_000 + i * 1000, 500, f"b{i}") for i in range(20)]
+        m = self._model(_mk_trace(cluster_a + cluster_b))
+        lane_idx = 0
+        gap = m.visibleSpans(lane_idx, 40_000, 60_000, 2000)
+        self.assertEqual(gap, [])
+
+    def test_visible_spans_max_dur_is_longest_single_span_not_lane_range(self):
+        a = _span(1, 1, Category.CPU, 0, 500, "a")
+        b = _span(1, 1, Category.CPU, 1_000_000, 30, "b")
+        m = self._model(_mk_trace([a, b]))
+        self.assertEqual(m._max_dur["cpu/thread-1"], 500)
+
     def test_visible_spans_respects_max_spans_cap(self):
         spans = [_span(1, 1, Category.CPU, i * 100, 50, f"s{i}") for i in range(500)]
         m = self._model(_mk_trace(spans))

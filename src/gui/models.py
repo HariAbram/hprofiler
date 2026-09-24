@@ -131,7 +131,16 @@ class TimelineModel(QObject):
             if slist:
                 self._starts[lane] = np.array([s.start_ns for s in slist], dtype=np.int64)
                 self._ends[lane] = np.array([s.end_ns for s in slist], dtype=np.int64)
-                self._max_dur[lane] = int(self._ends[lane].max() - self._starts[lane].min())
+                # Longest INDIVIDUAL span in this lane -- the look-back margin
+                # visibleSpans() needs so a span starting just before the
+                # viewport but extending into it isn't missed. NOT the lane's
+                # overall first-to-last time range (ends.max()-starts.min()),
+                # which for a lane whose spans are spread across most of the
+                # trace pins searchsorted's lower bound near index 0
+                # regardless of how far into the trace the viewport actually
+                # is -- flooding candidates with spans nowhere near the
+                # visible window (see visibleSpans()'s docstring).
+                self._max_dur[lane] = int((self._ends[lane] - self._starts[lane]).max())
             else:
                 self._starts[lane] = np.empty(0, dtype=np.int64)
                 self._ends[lane] = np.empty(0, dtype=np.int64)
@@ -206,15 +215,26 @@ class TimelineModel(QObject):
     @Slot(int, float, float, int, result='QVariantList')
     def visibleSpans(self, lane_index: int, view_start_ns: float, view_end_ns: float,
                      max_spans: int = 2000) -> list[dict[str, Any]]:
-        """Spans in `lane_index` overlapping [view_start_ns, view_end_ns),
-        via the same numpy searchsorted spatial-index trick
+        """Spans in `lane_index` truly overlapping [view_start_ns,
+        view_end_ns), via the same numpy searchsorted spatial-index trick
         TimelineWidget._density_row uses (src/ui/app.py) -- cheap even
         for a lane with tens of thousands of spans, since only the
         visible slice is ever materialized into Python dicts. Capped at
         `max_spans`: past that, the caller is zoomed out far enough that
         individual rectangles would be sub-pixel anyway (a coarse
         bucketed fallback, like the Overview preview's, is a possible
-        future improvement, not implemented for this first pass)."""
+        future improvement, not implemented for this first pass).
+
+        `lo` uses `max_dur` (the longest INDIVIDUAL span in this lane, not
+        the lane's overall time range -- see its computation in __init__)
+        as a look-back margin, then `mask` narrows the [lo:hi) candidate
+        window down to spans that genuinely END after view_start_ns --
+        without this, a span starting well before the window but NOT
+        actually reaching into it (there can be many between `lo` and the
+        first truly-visible span, once `lo` only needs to look back one
+        span's worth of margin rather than the whole lane) would still be
+        returned, and at high zoom/deep offsets could dominate decimation's
+        `max_spans` budget with spans nowhere near the viewport."""
         if lane_index < 0 or lane_index >= len(self._lane_names):
             return []
         lane = self._lane_names[lane_index]
@@ -226,20 +246,22 @@ class TimelineModel(QObject):
         hi = int(np.searchsorted(starts, view_end_ns, side="right"))
         if lo >= hi:
             return []
+        ends = self._ends[lane]
+        mask = ends[lo:hi] > view_start_ns
+        overlap_idx = (np.nonzero(mask)[0] + lo).tolist()
+        if len(overlap_idx) > max_spans:
+            step = len(overlap_idx) // max_spans + 1
+            overlap_idx = overlap_idx[::step]
         slist = self._sorted_spans[lane]
-        candidates = slist[lo:hi]
-        if len(candidates) > max_spans:
-            step = len(candidates) // max_spans + 1
-            candidates = candidates[::step]
         return [
             {
-                "startNs": float(s.start_ns),
-                "durNs": float(max(s.duration_ns, 1)),
-                "name": s.name,
-                "color": self._func_colors.get(s.name, "#9ca3af"),
-                "spanIdx": lo + i * (step if len(slist[lo:hi]) > max_spans else 1),
+                "startNs": float(slist[i].start_ns),
+                "durNs": float(max(slist[i].duration_ns, 1)),
+                "name": slist[i].name,
+                "color": self._func_colors.get(slist[i].name, "#9ca3af"),
+                "spanIdx": i,
             }
-            for i, s in enumerate(candidates)
+            for i in overlap_idx
         ]
 
     @Slot(int, int, result='QVariantMap')

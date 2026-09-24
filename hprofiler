@@ -89,9 +89,9 @@ def cli():
       hprofiler run -- ./app                           # auto-detect all backends
       hprofiler run --backend cuda,nccl -- ./app       # multiple backends
       hprofiler run --call-tree --backend cuda -- ./app  # + call tree from main
+      hprofiler run --perf-callgraph dwarf -- ./app    # + flame graph (Flame Graph tab)
       hprofiler run --gui -- ./app                     # pop up the Qt GUI (falls back to TUI)
       hprofiler roofline --backend cuda -- ./app       # hardware roofline chart
-      hprofiler flamegraph -- ./app                    # CPU flame graph SVG
       hprofiler view app.hprofiler.json                # reopen a saved trace in the TUI
       hprofiler gui app.hprofiler.json                 # reopen a saved trace in the Qt GUI
 
@@ -128,7 +128,9 @@ def cli():
               help="perf sampling frequency (Hz)")
 @click.option("--perf-callgraph", default=None,
               type=click.Choice(["fp", "dwarf", "lbr"]),
-              help="perf call-graph method (disabled by default — use fp/dwarf/lbr for stacks)")
+              help="perf call-graph method (disabled by default — use fp/dwarf/lbr to capture "
+                   "CPU call stacks, which populates the Call Tree and Flame Graph tabs; "
+                   "dwarf works without frame pointers, fp needs -fno-omit-frame-pointer)")
 @click.option("--disasm/--no-disasm", default=False,
               help="Collect per-kernel disassembly after profiling  [default: no]")
 @click.option("--call-tree/--no-call-tree", default=False,
@@ -793,178 +795,6 @@ def roofline(backend, output, use_html, target):
         click.echo("[hprofiler] Opening TUI roofline  (q to quit, w to open HTML) ...",
                    err=True)
         _rl_tui(dev, mets, trace_name=Path(trace_file).stem, html_path=out)
-
-
-@cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.option("--backend", "-b", default=None,
-              help="Inject backend hooks (cuda, opencl, rocm, openmp, mpi, …) so their "
-                   "API call overhead appears in the CPU flame graph.  "
-                   "Comma-separated; same names as 'hprofiler run --backend'.")
-@click.option("--output", "-o", default=None,
-              help="Output HTML file path  (only used with --html)")
-@click.option("--html", "use_html", is_flag=True, default=False,
-              help="Write an HTML flamegraph and open in the browser instead of the TUI")
-@click.option("--gui", is_flag=True, default=False,
-              help="Pop up the Qt/QML flame graph GUI (X11-forwarding-aware, falls back "
-                   "to the TUI automatically if unavailable). Takes priority over --html.")
-@click.option("--callgraph", default="fp", show_default=True,
-              type=click.Choice(["fp", "dwarf", "lbr"]),
-              help="perf call-graph method.  fp = frame-pointer (fast, needs "
-                   "-fno-omit-frame-pointer).  dwarf = DWARF CFI (slower, "
-                   "works with any binary).")
-@click.option("--freq", "-F", default=99, show_default=True,
-              help="perf sampling frequency (Hz)")
-@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
-def flamegraph(backend, output, use_html, gui, callgraph, freq, command):
-    """Profile COMMAND and show an interactive flame graph in the terminal.
-
-    By default opens a native TUI flamegraph (works on HPC clusters without a
-    browser).  Pass --html to write an HTML file and open it in the browser,
-    or --gui to pop up the Qt/QML GUI (falls back to the TUI automatically
-    over a plain SSH session with no X11 forwarding).
-
-    Runs COMMAND under 'perf record --call-graph' to collect CPU stack samples,
-    then renders the call tree interactively.
-
-    \b
-    TUI controls:
-      click / Enter    zoom into frame (fills full width)
-      Esc / u          zoom out one level
-      r                reset to full view
-      /                search / highlight frames by name
-      w                write HTML and open in browser
-      q                quit
-
-    \b
-    GUI controls (--gui):
-      click            zoom into frame
-      right-click / Up button   zoom out one level
-      Esc / Reset button        reset to full view
-      search field (regex)      highlight matching frames
-
-    Use --backend to inject GPU/MPI/OpenMP hooks alongside perf so the flame
-    graph shows time spent inside CUDA, OpenCL, ROCm, MPI, etc. API calls
-    (kernel launches, synchronisation waits, collectives).
-
-    \b
-    Examples:
-      hprofiler flamegraph -- ./my_program
-      hprofiler flamegraph --backend cuda -- ./cuda_app
-      hprofiler flamegraph --html -- ./my_program        (browser mode)
-      hprofiler flamegraph --gui -- ./my_program          (popup GUI mode)
-      hprofiler flamegraph --callgraph dwarf -- ./my_program
-    """
-    import os, shutil as _shutil
-
-    if not _shutil.which("perf"):
-        click.echo("[hprofiler] ✗  perf not found — install linux-tools-$(uname -r)",
-                   err=True)
-        raise SystemExit(1)
-
-    cmd = [a for a in command if a != "--"]
-    if not cmd:
-        raise click.UsageError("Specify a command after --:\n  hprofiler flamegraph -- ./app")
-
-    env = dict(os.environ)
-
-    # ── Inject backend hooks into the environment ─────────────────────────────
-    if backend:
-        backends = _resolve_backends(backend)
-        if backends:
-            from src.backends import ALL_BACKENDS
-            from pathlib import Path as _Path
-            preload_libs: list[str] = []
-            for bname in backends:
-                bcls = ALL_BACKENDS.get(bname)
-                if bcls is None:
-                    continue
-                try:
-                    b = bcls()
-                    for lib in b.preload_libs():
-                        if lib and _Path(lib).exists():
-                            preload_libs.append(lib)
-                    for k, v in b.env_vars().items():
-                        if k == "OMP_TOOL_LIBRARIES":
-                            existing = env.get(k, "")
-                            env[k] = ":".join(filter(None, [existing, v]))
-                        else:
-                            env.setdefault(k, v)
-                except Exception:
-                    pass
-            if preload_libs:
-                existing = env.get("LD_PRELOAD", "")
-                env["LD_PRELOAD"] = ":".join(filter(None, [existing] + preload_libs))
-            click.echo(
-                f"[hprofiler] Backends: {', '.join(backends)}",
-                err=True,
-            )
-
-    click.echo(
-        f"[hprofiler] Recording CPU stacks (--call-graph={callgraph}, -F{freq}) ...",
-        err=True,
-    )
-    click.echo(f"[hprofiler] Command: {' '.join(cmd)}", err=True)
-
-    from src.output.flamegraph import collect_folded_stacks, save as fg_save
-
-    folded = collect_folded_stacks(cmd, env, callgraph=callgraph, freq=freq)
-
-    if not folded.strip():
-        click.echo(
-            "[hprofiler] ✗  No CPU stacks collected.\n"
-            "  Tips:\n"
-            "    • Use --callgraph dwarf if the binary lacks frame pointers\n"
-            "    • Lower perf_event_paranoid: "
-            "sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'\n"
-            "    • Make sure the program runs long enough to collect samples",
-            err=True,
-        )
-        raise SystemExit(1)
-
-    total = sum(
-        int(ln.rsplit(" ", 1)[1])
-        for ln in folded.splitlines()
-        if ln.strip() and ln.rsplit(" ", 1)[-1].isdigit()
-    )
-    click.echo(f"[hprofiler] Collected {total:,} samples.", err=True)
-
-    title = f"{Path(cmd[0]).name} — flame graph ({callgraph})"
-
-    out = output or (Path(cmd[0]).name + ".flamegraph.html")
-    try:
-        fg_save(folded, out, title)
-    except ValueError as e:
-        click.echo(f"[hprofiler] ✗  {e}", err=True)
-        raise SystemExit(1)
-    click.echo(f"[hprofiler] Flame graph → {out}  (open in any browser)", err=True)
-
-    if gui:
-        import tempfile as _tempfile
-        from src.gui.launch import launch_flamegraph_gui
-        fd, folded_path = _tempfile.mkstemp(suffix=".folded.txt", prefix="hprofiler_fg_")
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(folded)
-            shown = launch_flamegraph_gui(folded_path, title)
-        finally:
-            try:
-                os.unlink(folded_path)
-            except OSError:
-                pass
-        if shown:
-            return
-
-    if use_html:
-        _open_browser(out)
-    else:
-        from src.output.flamegraph_tui import show as _fg_tui
-        click.echo("[hprofiler] Opening TUI flamegraph  (q to quit, w to open HTML) ...",
-                   err=True)
-        try:
-            _fg_tui(folded, title=title, html_path=out)
-        except ValueError as e:
-            click.echo(f"[hprofiler] ✗  {e}", err=True)
-            raise SystemExit(1)
 
 
 @cli.command()

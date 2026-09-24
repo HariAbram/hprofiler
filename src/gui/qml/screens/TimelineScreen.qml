@@ -15,6 +15,15 @@ Item {
     readonly property real rowHeight: 26
     readonly property real labelWidth: 130
 
+    // Keyboard needs a real focused Item -- Keys only attaches to Item,
+    // not Window -- and this screen is one of several StackLayout pages
+    // in Main.qml that get shown/hidden (not destroyed/recreated) as the
+    // user switches tabs, so focus has to be actively reclaimed every
+    // time this page becomes the visible one, not just set once at
+    // startup.
+    focus: true
+    onVisibleChanged: if (visible) forceActiveFocus()
+
     property real zoom: 1.0
     property real viewStartNs: TimelineModel.viewStartNs
     readonly property real visibleNs: TimelineModel.traceDurationNs / zoom
@@ -43,6 +52,7 @@ Item {
     function resetView() {
         zoom = 1.0
         viewStartNs = TimelineModel.viewStartNs
+        flick.contentY = 0
     }
 
     function clampViewStart() {
@@ -57,6 +67,73 @@ Item {
         if (ns >= 1e6) return (ns / 1e6).toFixed(2) + "ms"
         if (ns >= 1e3) return (ns / 1e3).toFixed(1) + "µs"
         return ns.toFixed(0) + "ns"
+    }
+
+    // Zooms by `factor` (>1 in, <1 out) while keeping the timestamp at
+    // horizontal fraction `xFrac` (0=left edge of the lanes area, 1=right
+    // edge) fixed under that same fraction afterward -- i.e. zoom toward
+    // the cursor (wheel/double-click) or the canvas center (keyboard/
+    // buttons, xFrac=0.5), not always toward the trace start. Captures
+    // the anchor timestamp BEFORE mutating zoom, and computes the new
+    // visibleNs by direct division rather than reading root.visibleNs
+    // back after the write, to not depend on binding-reevaluation order.
+    function zoomAtFraction(factor, xFrac) {
+        var newZoom = Math.max(1.0, Math.min(256.0, zoom * factor))
+        if (newZoom === zoom) return
+        var nsAtAnchor = viewStartNs + xFrac * visibleNs
+        var newVisibleNs = TimelineModel.traceDurationNs / newZoom
+        zoom = newZoom
+        viewStartNs = nsAtAnchor - xFrac * newVisibleNs
+        clampViewStart()
+    }
+
+    // Zooms to and centers a specific span (double-click target) -- the
+    // span fills ~20% of the new window (clamped to the normal 1-256x
+    // zoom range, so a very short span just zooms as far as allowed
+    // rather than producing an absurd zoom value).
+    //
+    // NOTE: TimelineModel.spanAt() returns startNs RELATIVE to
+    // TimelineModel.viewStartNs (the hover tooltip already relies on
+    // this), unlike visibleSpans()'s ABSOLUTE startNs -- the offset has
+    // to be re-added here, this isn't a bug to "fix" in the model.
+    function zoomToSpan(laneIndex, spanIdx) {
+        var d = TimelineModel.spanAt(laneIndex, spanIdx)
+        if (!d.name) return
+        var absStart = TimelineModel.viewStartNs + d.startNs
+        var centerNs = absStart + d.durNs / 2.0
+        var targetVisibleNs = Math.max(d.durNs / 0.2, 1)
+        zoom = Math.max(1.0, Math.min(256.0, TimelineModel.traceDurationNs / targetVisibleNs))
+        viewStartNs = centerNs - (TimelineModel.traceDurationNs / zoom) / 2.0
+        clampViewStart()
+    }
+
+    Keys.onPressed: (event) => {
+        switch (event.key) {
+        case Qt.Key_Left:  viewStartNs -= visibleNs * 0.1; clampViewStart(); break
+        case Qt.Key_Right: viewStartNs += visibleNs * 0.1; clampViewStart(); break
+        case Qt.Key_Up:
+            flick.contentY = Math.max(0, flick.contentY - rowHeight * 3)
+            break
+        case Qt.Key_Down:
+            flick.contentY = Math.min(Math.max(0, flick.contentHeight - flick.height),
+                                       flick.contentY + rowHeight * 3)
+            break
+        case Qt.Key_Plus: case Qt.Key_Equal:
+            zoomAtFraction(1.25, 0.5); break
+        case Qt.Key_Minus: case Qt.Key_Underscore:
+            zoomAtFraction(0.8, 0.5); break
+        case Qt.Key_Home:
+            viewStartNs = TimelineModel.viewStartNs; clampViewStart(); break
+        case Qt.Key_End:
+            viewStartNs = TimelineModel.viewStartNs + TimelineModel.traceDurationNs - visibleNs
+            clampViewStart()
+            break
+        case Qt.Key_0:
+            resetView(); break
+        default:
+            return
+        }
+        event.accepted = true
     }
 
     ColumnLayout {
@@ -102,8 +179,41 @@ Item {
                     font.pixelSize: 10
                 }
             }
+            RowLayout {
+                spacing: 2
+                ToolButton {
+                    text: "−"
+                    implicitWidth: 26
+                    implicitHeight: 22
+                    onClicked: { root.zoomAtFraction(0.8, 0.5); root.forceActiveFocus() }
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Zoom out (-)"
+                }
+                ToolButton {
+                    text: "+"
+                    implicitWidth: 26
+                    implicitHeight: 22
+                    onClicked: { root.zoomAtFraction(1.25, 0.5); root.forceActiveFocus() }
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Zoom in (+)"
+                }
+                ToolButton {
+                    text: "Fit"
+                    implicitHeight: 22
+                    onClicked: { root.resetView(); root.forceActiveFocus() }
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Fit entire trace"
+                }
+                ToolButton {
+                    text: "Reset"
+                    implicitHeight: 22
+                    onClicked: { root.resetView(); root.forceActiveFocus() }
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Reset view (0)"
+                }
+            }
             Text {
-                text: "wheel: zoom · drag: pan · double-click: reset"
+                text: "wheel: zoom@cursor · drag: pan · dbl-click event: zoom to it · arrows/+/-/Home/End/0: keyboard"
                 color: AppTheme.textMuted
                 font.pixelSize: 10
             }
@@ -233,8 +343,19 @@ Item {
                                 // before the next span in the SAME list.
                                 function _paintSpans(ctx, spans, scale, colorOf, alpha) {
                                     ctx.globalAlpha = alpha
+                                    var viewEndNs = root.viewStartNs + root.visibleNs
                                     for (var i = 0; i < spans.length; i++) {
                                         var sp = spans[i]
+                                        // Defense-in-depth: never paint a span that
+                                        // doesn't truly overlap the visible window,
+                                        // regardless of what the model handed back --
+                                        // guarantees this class of bug (an incorrectly
+                                        // windowed Python query smearing off-screen
+                                        // spans across the canvas) can't resurface here
+                                        // even if visibleSpans()'s own windowing ever
+                                        // regresses.
+                                        if (sp.startNs + sp.durNs <= root.viewStartNs || sp.startNs >= viewEndNs)
+                                            continue
                                         var x0 = (sp.startNs - root.viewStartNs) * scale
                                         var wReal = sp.durNs * scale
                                         var w = Math.max(1, wReal)
@@ -410,11 +531,20 @@ Item {
                         root.clampViewStart()
                     }
                 }
-                onDoubleClicked: root.resetView()
+                // Double-click ON a span (root.hoverSpanIdx is kept live by
+                // each lane's own hover MouseArea, which passes clicks
+                // through via acceptedButtons: Qt.NoButton) zooms to and
+                // centers that event; double-click on empty canvas falls
+                // back to the original reset-view behavior.
+                onDoubleClicked: {
+                    if (root.hoverSpanIdx >= 0)
+                        root.zoomToSpan(root.hoverLane, root.hoverSpanIdx)
+                    else
+                        root.resetView()
+                }
                 onWheel: (wheel) => {
                     var factor = wheel.angleDelta.y > 0 ? 1.25 : 0.8
-                    root.zoom = Math.max(1.0, Math.min(256.0, root.zoom * factor))
-                    root.clampViewStart()
+                    root.zoomAtFraction(factor, wheel.x / width)
                 }
             }
 
@@ -481,298 +611,6 @@ Item {
                         var deltaFrac = (mouse.x - dragStartX) / trackSpan
                         root.viewStartNs = dragStartViewNs + deltaFrac * hScrollThumb.scrollRangeNs
                         root.clampViewStart()
-                    }
-                }
-            }
-        }
-
-        // ── Call graph: who-calls-whom for whatever's currently visible ────
-        // A node-and-edge diagram (analysis/call_graph.py), NOT the same
-        // thing as the Call Tree tab: that shows time breakdown down each
-        // specific call PATH (the same function under two different
-        // callers is two separate rows there, by design); this merges
-        // every occurrence of a function into ONE box regardless of
-        // caller, with edges showing the distinct call relationships --
-        // answering "which functions call which, overall" for the
-        // CURRENT TIME WINDOW, not "how expensive is this specific path"
-        // for the whole trace.
-        //
-        // The canvas is wrapped in a Flickable and sized from the
-        // layout's raw numLayers/maxLayerSize (fixed per-node pixel
-        // pitch, not "squeeze everything into 210px") so nodes never
-        // visually overlap regardless of how wide/tall the graph is --
-        // a real crowding bug seen on a live GROMACS trace where a
-        // layer of ~8-10 nodes packed into one fixed-height column made
-        // labels overlap and become unreadable. Scrolling (not just a
-        // bigger fixed canvas) is what makes raising max_nodes from 30
-        // to 60 in TimelineModel.callGraph() viable instead of just
-        // moving the crowding problem to a bigger box.
-        Rectangle {
-            id: callGraphPanel
-            Layout.fillWidth: true
-            Layout.preferredHeight: 210
-            Layout.maximumHeight: 210
-            color: AppTheme.surface
-            border.color: AppTheme.panelBorder
-            border.width: 1
-            radius: 6
-            clip: true
-
-            readonly property real boxW: 130
-            readonly property real boxH: 32
-            readonly property real colGap: 46
-            readonly property real rowGap: 14
-
-            property var graphData: ({nodes: [], edges: [], numLayers: 0, maxLayerSize: 0, truncated: 0})
-            property var hoveredNode: null
-            property real hoverViewX: 0
-            property real hoverViewY: 0
-
-            function refresh() {
-                graphData = TimelineModel.callGraph(root.viewStartNs, root.viewStartNs + root.visibleNs)
-                graphCanvas.requestPaint()
-            }
-
-            // Rebuilding the graph is a real Python round-trip over
-            // every visible span (twice: once to aggregate, once to
-            // lay out) -- much heavier than a single lane's
-            // visibleSpans() call, so this uses a slower, separate
-            // throttle (~4/sec) rather than the lane canvases' ~60fps
-            // one; still feels live while panning/zooming without
-            // costing a rebuild on every single pixel of drag.
-            Timer {
-                id: graphRefreshThrottle
-                interval: 250
-                repeat: false
-                onTriggered: callGraphPanel.refresh()
-            }
-            // NOTE: zoom/viewStartNs are root's properties, not this
-            // item's -- bare onZoomChanged/onViewStartNsChanged handlers
-            // declared directly here would silently never fire (exactly
-            // the class of bug already found once this session in the
-            // per-lane hover handlers: an unqualified reference to an
-            // ancestor's property). Connections{target: root} is the
-            // correct way to listen to a DIFFERENT item's property
-            // changes from here.
-            Connections {
-                target: root
-                function onViewStartNsChanged() {
-                    if (!graphRefreshThrottle.running) graphRefreshThrottle.start()
-                }
-                function onZoomChanged() {
-                    if (!graphRefreshThrottle.running) graphRefreshThrottle.start()
-                }
-            }
-            Component.onCompleted: refresh()
-
-            Text {
-                id: graphTitle
-                anchors.top: parent.top
-                anchors.left: parent.left
-                anchors.margins: 6
-                text: "Call graph (visible window)" +
-                      (callGraphPanel.graphData.truncated > 0
-                       ? "  ·  +" + callGraphPanel.graphData.truncated + " more not shown"
-                       : "")
-                color: AppTheme.textMuted
-                font.pixelSize: 10
-                z: 5
-            }
-
-            Text {
-                anchors.centerIn: parent
-                visible: callGraphPanel.graphData.nodes.length === 0
-                text: "No call-stack data for the current view.\nRun with --call-tree to capture it."
-                horizontalAlignment: Text.AlignHCenter
-                color: AppTheme.textMuted
-                font.pixelSize: 12
-            }
-
-            Flickable {
-                id: graphFlick
-                anchors.top: graphTitle.bottom
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.margins: 4
-                contentWidth: graphCanvas.width
-                contentHeight: graphCanvas.height
-                clip: true
-                boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.horizontal: ScrollBar {
-                    policy: graphFlick.contentWidth > graphFlick.width ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
-                }
-                ScrollBar.vertical: ScrollBar {
-                    policy: graphFlick.contentHeight > graphFlick.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
-                }
-
-                Canvas {
-                    id: graphCanvas
-                    objectName: "callGraphCanvas"
-
-                    // NOT named "data" -- that's QtQuick's built-in
-                    // Item.data default property (holds child objects);
-                    // shadowing it with a custom property of the same
-                    // name is a real footgun, not just a style nit.
-                    readonly property var layoutData: callGraphPanel.graphData
-                    width: Math.max(layoutData.numLayers * (callGraphPanel.boxW + callGraphPanel.colGap) + callGraphPanel.colGap,
-                                     graphFlick.width)
-                    height: Math.max(layoutData.maxLayerSize * (callGraphPanel.boxH + callGraphPanel.rowGap) + callGraphPanel.rowGap,
-                                      graphFlick.height)
-
-                    // Raw layer/layerIndex (not the normalized x/y) give
-                    // every node the SAME pixel size/spacing no matter
-                    // how many layers/nodes exist -- this is what
-                    // actually fixes the overlap, not just a bigger canvas.
-                    function px(n) { return colGapHalf + n.layer * (callGraphPanel.boxW + callGraphPanel.colGap) + callGraphPanel.boxW / 2 }
-                    function py(n) { return rowGapHalf + n.layerIndex * (callGraphPanel.boxH + callGraphPanel.rowGap) + callGraphPanel.boxH / 2 }
-                    readonly property real colGapHalf: callGraphPanel.colGap / 2
-                    readonly property real rowGapHalf: callGraphPanel.rowGap / 2
-
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.reset()
-                        var nodes = layoutData.nodes
-                        var edges = layoutData.edges
-                        if (nodes.length === 0) return
-
-                        // Edges first (under the node boxes), thickness/alpha
-                        // scaled by relative time weight so hot call paths
-                        // visually stand out.
-                        var maxEdgeNs = 1
-                        for (var i = 0; i < edges.length; i++)
-                            maxEdgeNs = Math.max(maxEdgeNs, edges[i].totalNs)
-                        for (i = 0; i < edges.length; i++) {
-                            var e = edges[i]
-                            var a = nodes[e.callerIdx], b = nodes[e.calleeIdx]
-                            var x0 = px(a), y0 = py(a), x1 = px(b), y1 = py(b)
-                            var weight = e.totalNs / maxEdgeNs
-                            ctx.strokeStyle = AppTheme.dark
-                                ? "rgba(139,148,158," + (0.3 + 0.6 * weight) + ")"
-                                : "rgba(101,109,118," + (0.3 + 0.6 * weight) + ")"
-                            ctx.lineWidth = 1 + 2 * weight
-                            ctx.beginPath()
-                            ctx.moveTo(x0, y0)
-                            ctx.lineTo(x1, y1)
-                            ctx.stroke()
-                            // Arrowhead at the callee end
-                            var ang = Math.atan2(y1 - y0, x1 - x0)
-                            var ah = 6
-                            var tx = x1 - Math.cos(ang) * (callGraphPanel.boxW / 2)
-                            var ty = y1 - Math.sin(ang) * (callGraphPanel.boxH / 2)
-                            ctx.beginPath()
-                            ctx.moveTo(tx, ty)
-                            ctx.lineTo(tx - ah * Math.cos(ang - Math.PI / 6), ty - ah * Math.sin(ang - Math.PI / 6))
-                            ctx.lineTo(tx - ah * Math.cos(ang + Math.PI / 6), ty - ah * Math.sin(ang + Math.PI / 6))
-                            ctx.closePath()
-                            ctx.fill()
-                        }
-
-                        // Nodes on top.
-                        for (i = 0; i < nodes.length; i++) {
-                            var n = nodes[i]
-                            var cx = px(n), cy = py(n)
-                            var hovered = callGraphPanel.hoveredNode === n
-                            ctx.fillStyle = n.color
-                            ctx.globalAlpha = hovered ? 1.0 : 0.85
-                            ctx.beginPath()
-                            // Plain rect, not roundedRect -- QML's Canvas 2D
-                            // context doesn't implement that method (a
-                            // relatively recent addition to the HTML5 Canvas
-                            // spec); calling it threw and silently aborted
-                            // the rest of this paint (everything after the
-                            // FIRST node in the loop), which is why edges
-                            // rendered correctly but no node boxes ever did.
-                            ctx.rect(cx - callGraphPanel.boxW / 2, cy - callGraphPanel.boxH / 2,
-                                     callGraphPanel.boxW, callGraphPanel.boxH)
-                            ctx.fill()
-                            ctx.globalAlpha = 1.0
-                            if (hovered) {
-                                ctx.strokeStyle = AppTheme.text
-                                ctx.lineWidth = 2
-                                ctx.stroke()
-                            }
-                            ctx.fillStyle = "#111111"
-                            ctx.font = "11px sans-serif"
-                            ctx.textAlign = "center"
-                            var label = n.name
-                            var maxCh = Math.floor(callGraphPanel.boxW / 6.5)
-                            if (label.length > maxCh) label = label.slice(0, maxCh - 1) + "…"
-                            ctx.fillText(label, cx, cy + 4)
-                        }
-                        ctx.textAlign = "left"
-                    }
-
-                    function hitTest(mx, my) {
-                        var nodes = layoutData.nodes
-                        for (var i = nodes.length - 1; i >= 0; i--) {
-                            var n = nodes[i]
-                            var cx = px(n), cy = py(n)
-                            if (Math.abs(mx - cx) <= callGraphPanel.boxW / 2 && Math.abs(my - cy) <= callGraphPanel.boxH / 2)
-                                return n
-                        }
-                        return null
-                    }
-
-                    Connections {
-                        target: callGraphPanel
-                        function onGraphDataChanged() { graphCanvas.requestPaint() }
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        onPositionChanged: (mouse) => {
-                            var hit = graphCanvas.hitTest(mouse.x, mouse.y)
-                            callGraphPanel.hoverViewX = mouse.x - graphFlick.contentX
-                            callGraphPanel.hoverViewY = mouse.y - graphFlick.contentY
-                            if (hit === callGraphPanel.hoveredNode) return
-                            callGraphPanel.hoveredNode = hit
-                            graphCanvas.requestPaint()
-                        }
-                        onExited: {
-                            callGraphPanel.hoveredNode = null
-                            graphCanvas.requestPaint()
-                        }
-                    }
-                }
-            }
-
-            // Tooltip for the hovered node -- follows the cursor, clamped
-            // to stay within the panel (not the scrollable canvas, which
-            // can be much bigger than the visible viewport).
-            Rectangle {
-                visible: !!callGraphPanel.hoveredNode
-                color: "#000000"
-                opacity: 0.92
-                radius: 5
-                border.color: "#444444"
-                border.width: 1
-                width: tipCol.width + 18
-                height: tipCol.height + 12
-                x: Math.min(callGraphPanel.hoverViewX + 14, callGraphPanel.width - width - 6)
-                y: Math.min(graphTitle.height + callGraphPanel.hoverViewY + 8, callGraphPanel.height - height - 6)
-                z: 20
-
-                ColumnLayout {
-                    id: tipCol
-                    anchors.centerIn: parent
-                    spacing: 2
-                    Text {
-                        text: callGraphPanel.hoveredNode ? callGraphPanel.hoveredNode.name : ""
-                        color: "#eeeeee"
-                        font.bold: true
-                        font.pixelSize: 11
-                    }
-                    Text {
-                        text: callGraphPanel.hoveredNode
-                              ? (callGraphPanel.hoveredNode.count > 0
-                                 ? root.fmtNs(callGraphPanel.hoveredNode.totalNs) + " · " +
-                                   callGraphPanel.hoveredNode.count + " calls"
-                                 : "(ancestor frame only -- not directly measured)")
-                              : ""
-                        color: "#cccccc"
-                        font.pixelSize: 10
                     }
                 }
             }

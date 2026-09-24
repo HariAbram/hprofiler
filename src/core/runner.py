@@ -535,7 +535,7 @@ class Runner:
 
         # ── Parse perf record output ──────────────────────────────────────────
         if perf_data and Path(perf_data).exists():
-            _parse_perf_script(perf_data, trace)
+            _parse_perf_script(perf_data, trace, self.perf_freq)
             # Do NOT delete perf_data yet — _collect_disasm needs it for
             # perf annotate instruction-level heat.  It is deleted there.
 
@@ -1163,13 +1163,29 @@ def _resolve_jit_sym(addr: int, so_path: str) -> str:
     return name
 
 
-def _parse_perf_script(perf_data: str, trace: Trace) -> None:
+def _parse_perf_script(perf_data: str, trace: Trace, freq: int = 99) -> None:
     """
     Parse perf script output into SpanEvents.
 
     Handles both formats:
       Flat:  comm pid ts: period event: addr sym (dso)
       Stack: same header followed by indented frame lines, blank-line separated.
+
+    In stack mode (--perf-callgraph was passed), each SAMPLE becomes ONE
+    SpanEvent -- name=the leaf/currently-executing frame, stack_frames=the
+    ancestor chain (innermost-first, same convention hook-captured spans
+    already use) -- not one span per frame per sample the way this used
+    to work. That old shape (N spans per sample, duration_ns=0,
+    stack_frames never set, the whole stack redundantly duplicated as a
+    string in tags["stack"]) was invisible to analysis/call_tree.py's
+    _ct_build (requires duration_ns>0 AND stack_frames truthy) and only
+    ever got consumed by analysis/cct.py's own separate tag-string
+    re-parser -- which already prefers span.stack_frames when present
+    (cct.py's _extract_frames, checked first), so this needs no matching
+    change there. `duration_ns` is a nominal per-sample weight
+    (1e9/freq ns, i.e. "this sample represents one sampling interval"),
+    the same assumption perf's own report/annotate percentages already
+    make -- there's no real "duration" for a single sampled instant.
     """
     try:
         result = subprocess.run(
@@ -1220,30 +1236,39 @@ def _parse_perf_script(perf_data: str, trace: Trace) -> None:
     cur_ts: int = 0
     cur_top_sym = ""
     cur_stack: list[str] = []
+    # Nominal per-sample weight: each sample stands in for one sampling
+    # interval's worth of wall time. Only used in stack mode -- the flat
+    # (no --perf-callgraph) path below is intentionally left at
+    # duration_ns=0, unchanged, out of scope for this fix.
+    sample_weight_ns = max(1, round(1_000_000_000 / freq)) if freq > 0 else 1
 
     def _flush():
         if not cur_ts:
             return
         rel_ts = cur_ts
         if cur_stack:
-            # cur_stack is built with append() so it's innermost-first;
-            # reverse once to get outermost-first (flamegraph.pl convention).
-            outer_first = list(reversed(cur_stack))
-            folded = ";".join(outer_first)
-            for depth, sym in enumerate(outer_first):
-                if sym:
-                    trace.add(SpanEvent(
-                        name=sym, category=Category.CPU,
-                        start_ns=rel_ts, duration_ns=0,
-                        pid=cur_pid, tid=cur_tid,
-                        tags={"depth": str(depth), "stack": folded},
-                    ))
+            # cur_stack is innermost-first (backtrace order) exactly as
+            # appended -- cur_stack[0] is the leaf/currently-executing
+            # frame, cur_stack[1:] is its ancestor chain, already in the
+            # same innermost-first order SpanEvent.stack_frames expects
+            # (see core/events.py's field comment) -- no reversal needed.
+            leaf = cur_stack[0]
+            trace.add(SpanEvent(
+                name=leaf, category=Category.CPU,
+                start_ns=rel_ts, duration_ns=sample_weight_ns,
+                pid=cur_pid, tid=cur_tid,
+                stack_frames=cur_stack[1:],
+            ))
         else:
+            # Call-graph was requested but unwinding failed for this one
+            # sample -- still a real sample, gets the same nominal
+            # weight as every other one in this run so it doesn't bias
+            # aggregate percentages downward.
             name = cur_top_sym or "[cpu]"
             if name:
                 trace.add(SpanEvent(
                     name=name, category=Category.CPU,
-                    start_ns=rel_ts, duration_ns=0,
+                    start_ns=rel_ts, duration_ns=sample_weight_ns,
                     pid=cur_pid, tid=cur_tid,
                 ))
 
