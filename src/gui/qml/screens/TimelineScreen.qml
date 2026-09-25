@@ -22,7 +22,26 @@ Item {
     // time this page becomes the visible one, not just set once at
     // startup.
     focus: true
-    onVisibleChanged: if (visible) forceActiveFocus()
+    // Covers the FIRST ever visit to this tab: an item born already-
+    // visible (the current StackLayout page at the moment its Loader
+    // first instantiates it) never actually transitions false->true, so
+    // onVisibleChanged below -- which fires correctly on every SUBSEQUENT
+    // tab switch -- can't be relied on for that initial activation.
+    Component.onCompleted: jumpToSelectionIfNew()
+    onVisibleChanged: {
+        if (!visible) return
+        forceActiveFocus()
+        // Catches the common real path a Loader-based tab otherwise
+        // misses entirely: select a kernel in Kernels, THEN switch to
+        // Timeline (e.g. via the Inspector's "Open in Timeline" action,
+        // which only calls Nav.navigateTo -- it does not re-fire
+        // selectFunction, since the selection itself didn't change).
+        // Connections.onSelectionChanged below can't see that jump: this
+        // screen's Loader isn't even active yet while the click happens
+        // on a different, already-visible tab, so nothing here is alive
+        // to receive the signal.
+        jumpToSelectionIfNew()
+    }
 
     property real zoom: 1.0
     property real viewStartNs: TimelineModel.viewStartNs
@@ -31,6 +50,39 @@ Item {
     property int hoverLane: -1
     property int hoverSpanIdx: -1
     property string hoverText: ""
+    // How many spans share the currently cross-tab-selected (category,
+    // name) -- 0 when nothing's selected or it has no occurrences here.
+    property int matchCount: 0
+    // (category,name) key last auto-jumped to, so revisiting this tab
+    // with the SAME selection (e.g. after manually panning elsewhere and
+    // tabbing back) doesn't yank the view back every time -- only an
+    // actual selection change re-triggers the jump.
+    property string lastJumpedKey: ""
+
+    function jumpToSelectionIfNew() {
+        if (Nav.selectedName.length === 0) { root.matchCount = 0; return }
+        var key = Nav.selectedCategory + "::" + Nav.selectedName
+        var matches = TimelineModel.findByName(Nav.selectedCategory, Nav.selectedName, 50)
+        root.matchCount = matches.length
+        if (matches.length === 0) return
+        if (key === root.lastJumpedKey) return
+        // Skip the auto-jump when the selection just came from clicking
+        // a span on THIS screen (see the pan/zoom MouseArea's onClicked
+        // below) -- root.hoverLane/hoverSpanIdx already point at it, so
+        // re-jumping to the first same-named match could yank the view
+        // away from the exact span the user just clicked whenever it
+        // isn't chronologically first. Still records the key so a later
+        // revisit doesn't jump either.
+        if (root.hoverLane >= 0 && root.hoverSpanIdx >= 0) {
+            var hovered = TimelineModel.spanAt(root.hoverLane, root.hoverSpanIdx)
+            if (hovered.category === Nav.selectedCategory && hovered.name === Nav.selectedName) {
+                root.lastJumpedKey = key
+                return
+            }
+        }
+        root.lastJumpedKey = key
+        root.zoomToSpan(matches[0].laneIndex, matches[0].spanIdx)
+    }
 
     // True when at least one lane pairs with a "sync" lane on the same
     // thread (see each lane Canvas's syncOverlayLaneIndex) -- gates the
@@ -107,6 +159,17 @@ Item {
         clampViewStart()
     }
 
+    // Covers a selection click ON this screen itself (see the pan/zoom
+    // MouseArea's onClicked below, which calls Nav.selectFunction) --
+    // onVisibleChanged above handles the "selected elsewhere, THEN
+    // switched to Timeline" path; this handles "already on Timeline,
+    // selection changes right here" so matchCount/lastJumpedKey stay
+    // correct without needing a tab switch to refresh them.
+    Connections {
+        target: Nav
+        function onSelectionChanged() { root.jumpToSelectionIfNew() }
+    }
+
     Keys.onPressed: (event) => {
         switch (event.key) {
         case Qt.Key_Left:  viewStartNs -= visibleNs * 0.1; clampViewStart(); break
@@ -138,75 +201,81 @@ Item {
 
     ColumnLayout {
         anchors.fill: parent
-        spacing: 4
+        spacing: AppTheme.spacingXs
 
         // ── Status / controls row ───────────────────────────────────────
         RowLayout {
             Layout.fillWidth: true
             Layout.preferredHeight: 24
             Layout.maximumHeight: 24
-            spacing: 12
+            spacing: AppTheme.spacingMd
 
             Text {
                 text: "zoom " + root.zoom.toFixed(1) + "×   offset " +
                       root.fmtNs(root.viewStartNs - TimelineModel.viewStartNs) +
                       "   window " + root.fmtNs(root.visibleNs)
                 color: AppTheme.textMuted
-                font.pixelSize: 11
+                font.pixelSize: AppTheme.typeLabel
             }
             Item { Layout.fillWidth: true }
             Text {
                 visible: root.hoverText.length > 0
                 text: root.hoverText
                 color: AppTheme.text
-                font.pixelSize: 11
+                font.pixelSize: AppTheme.typeLabel
                 font.bold: true
+            }
+            Text {
+                visible: root.matchCount > 1
+                text: root.matchCount + (root.matchCount >= 50 ? "+" : "") + " matches"
+                color: AppTheme.accent
+                font.pixelSize: AppTheme.typeLabel
             }
             Item { Layout.fillWidth: true }
             RowLayout {
                 visible: root.hasSyncOverlay
-                spacing: 4
+                spacing: AppTheme.spacingXs
                 Rectangle {
                     width: 10
                     height: 10
-                    radius: 2
+                    radius: AppTheme.radiusSmall / 2
                     color: AppTheme.categoryColor("sync")
                     opacity: 0.8
                 }
                 Text {
                     text: "= blocked at a nested sync event"
                     color: AppTheme.textMuted
-                    font.pixelSize: 10
+                    font.pixelSize: AppTheme.typeCaption
                 }
             }
             RowLayout {
                 spacing: 2
                 ToolButton {
                     text: "−"
-                    implicitWidth: 26
-                    implicitHeight: 22
+                    implicitWidth: AppTheme.iconButtonWidth
+                    implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.zoomAtFraction(0.8, 0.5); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Zoom out (-)"
                 }
                 ToolButton {
                     text: "+"
-                    implicitWidth: 26
-                    implicitHeight: 22
+                    implicitWidth: AppTheme.iconButtonWidth
+                    implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.zoomAtFraction(1.25, 0.5); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Zoom in (+)"
                 }
                 ToolButton {
                     text: "Fit"
-                    implicitHeight: 22
+                    implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.resetView(); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Fit entire trace"
                 }
                 ToolButton {
                     text: "Reset"
-                    implicitHeight: 22
+                    implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.resetView(); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Reset view (0)"
@@ -215,7 +284,7 @@ Item {
             Text {
                 text: "wheel: zoom@cursor · drag: pan · dbl-click event: zoom to it · arrows/+/-/Home/End/0: keyboard"
                 color: AppTheme.textMuted
-                font.pixelSize: 10
+                font.pixelSize: AppTheme.typeCaption
             }
         }
 
@@ -226,7 +295,7 @@ Item {
             color: AppTheme.surface
             border.color: AppTheme.panelBorder
             border.width: 1
-            radius: 6
+            radius: AppTheme.radiusPanel
             clip: true
 
             Flickable {
@@ -272,9 +341,9 @@ Item {
                                 text: modelData.label + "  (" + modelData.count + ")"
                                 color: modelData.color
                                 font.bold: true
-                                font.pixelSize: 11
+                                font.pixelSize: AppTheme.typeLabel
                                 elide: Text.ElideRight
-                                leftPadding: 6
+                                leftPadding: AppTheme.spacingSm
                             }
 
                             Canvas {
@@ -531,6 +600,24 @@ Item {
                         root.clampViewStart()
                     }
                 }
+                // Single click ON a span selects it for cross-tab
+                // navigation (Nav.selectFunction/selectThread), distinct
+                // from the drag-to-pan handled above and the
+                // double-click-to-zoom handled below -- guarded by the
+                // same movement threshold pan itself doesn't use, since a
+                // plain click-release fires `clicked` in Qt Quick
+                // regardless of how far the mouse moved in between
+                // (MouseArea.clicked isn't drag-aware unless drag.target
+                // is set, which this pan implementation deliberately
+                // doesn't use -- see onPositionChanged above).
+                onClicked: (mouse) => {
+                    if (Math.abs(mouse.x - dragStartX) > 4) return
+                    if (root.hoverSpanIdx < 0) return
+                    var d = TimelineModel.spanAt(root.hoverLane, root.hoverSpanIdx)
+                    if (!d.name) return
+                    Nav.selectFunction(d.category, d.name)
+                    Nav.selectThread(d.pid, d.tid)
+                }
                 // Double-click ON a span (root.hoverSpanIdx is kept live by
                 // each lane's own hover MouseArea, which passes clicks
                 // through via acceptedButtons: Qt.NoButton) zooms to and
@@ -566,7 +653,7 @@ Item {
                 anchors.rightMargin: 14
                 anchors.bottomMargin: 1
                 height: 12
-                radius: 4
+                radius: AppTheme.radiusSmall
                 color: AppTheme.background
                 visible: root.visibleNs < TimelineModel.traceDurationNs
 
@@ -584,7 +671,7 @@ Item {
                     x: (hScrollTrack.width - width) * scrollFrac
                     width: Math.max(20, hScrollTrack.width * thumbFrac)
                     height: parent.height
-                    radius: 4
+                    radius: AppTheme.radiusSmall
                     color: hDrag.pressed ? AppTheme.accent : AppTheme.panelBorder
                 }
 

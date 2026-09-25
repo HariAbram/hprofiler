@@ -4,28 +4,17 @@ import Hprofiler 1.0
 import "../components"
 
 ColumnLayout {
-    spacing: 6
+    spacing: AppTheme.spacingSm
 
-    Text {
-        text: "Call Tree"
-        color: AppTheme.accent
-        font.bold: true
-        font.pixelSize: 13
-    }
-
-    Rectangle {
+    Panel {
         Layout.fillWidth: true
         Layout.fillHeight: true
-        color: AppTheme.surface
-        border.color: AppTheme.panelBorder
-        border.width: 1
-        radius: 6
+        title: "Call Tree"
         clip: true
 
         Flickable {
             id: flick
             anchors.fill: parent
-            anchors.margins: 8
             contentHeight: col.height
             boundsBehavior: Flickable.StopAtBounds
 
@@ -50,12 +39,10 @@ ColumnLayout {
             }
         }
 
-        Text {
-            anchors.centerIn: parent
+        EmptyState {
+            centered: true
             visible: CallTree.roots.length === 0
-            text: "No call-stack data in this trace.\nRun with --call-tree to capture it."
-            horizontalAlignment: Text.AlignHCenter
-            color: AppTheme.textMuted
+            message: "No call-stack data in this trace.\nRun with --call-tree to capture it."
         }
     }
 }

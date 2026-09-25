@@ -1,20 +1,15 @@
 import QtQuick
 import QtQuick.Layouts
 import Hprofiler 1.0
+import "../components"
 
 ColumnLayout {
-    spacing: 6
+    spacing: AppTheme.spacingSm
 
-    RowLayout {
-        Layout.fillWidth: true
-        Text { text: "Roofline"; color: AppTheme.accent; font.bold: true; font.pixelSize: 13 }
-        Item { Layout.fillWidth: true }
-        Text {
-            visible: Roofline.available
-            text: Roofline.aiRangeLabel + "   " + Roofline.tflopsRangeLabel
-            color: AppTheme.textMuted
-            font.pixelSize: 11
-        }
+    Toolbar {
+        title: "Roofline"
+        statusText: Roofline.available
+            ? (Roofline.aiRangeLabel + "   " + Roofline.tflopsRangeLabel) : ""
     }
 
     Rectangle {
@@ -23,19 +18,16 @@ ColumnLayout {
         color: AppTheme.surface
         border.color: AppTheme.panelBorder
         border.width: 1
-        radius: 6
+        radius: AppTheme.radiusPanel
         clip: true
 
-        Text {
-            anchors.centerIn: parent
+        EmptyState {
+            centered: true
+            monospace: true
             visible: !Roofline.available
-            horizontalAlignment: Text.AlignHCenter
-            text: "No roofline data for this trace -- needs GPU hardware-counter\n" +
-                  "or disassembly-estimated kernel metrics. Try:\n\n" +
-                  "  hprofiler roofline --backend <backend> -- ./app"
-            color: AppTheme.textMuted
-            font.family: "monospace"
-            font.pixelSize: 12
+            message: "No roofline data for this trace -- needs GPU hardware-counter\n" +
+                     "or disassembly-estimated kernel metrics. Try:\n\n" +
+                     "  hprofiler roofline --backend <backend> -- ./app"
         }
 
         Item {
@@ -85,6 +77,7 @@ ColumnLayout {
             }
 
             MouseArea {
+                id: hoverArea
                 anchors.fill: parent
                 hoverEnabled: true
                 property string hoverText: ""
@@ -106,20 +99,13 @@ ColumnLayout {
                                         found.bound + "-bound)") : ""
                 }
 
-                Rectangle {
-                    visible: parent.hoverText.length > 0
-                    color: AppTheme.background
-                    border.color: AppTheme.panelBorder
-                    radius: 4
-                    width: hoverLabel.width + 12
-                    height: hoverLabel.height + 8
-                    x: 8; y: 8
+                Tooltip {
+                    visible: hoverArea.hoverText.length > 0
+                    followCursor: false
                     Text {
-                        id: hoverLabel
-                        anchors.centerIn: parent
-                        text: parent.parent.hoverText
+                        text: hoverArea.hoverText
                         color: AppTheme.text
-                        font.pixelSize: 11
+                        font.pixelSize: AppTheme.typeLabel
                     }
                 }
             }
@@ -129,11 +115,16 @@ ColumnLayout {
     RowLayout {
         Layout.fillWidth: true
         visible: Roofline.available
-        spacing: 16
-        Rectangle { width: 10; height: 10; radius: 5; color: "#22d3ee" }
-        Text { text: "compute-bound"; color: AppTheme.textMuted; font.pixelSize: 11 }
-        Rectangle { width: 10; height: 10; radius: 5; color: "#e879f9" }
-        Text { text: "memory-bound"; color: AppTheme.textMuted; font.pixelSize: 11 }
+        spacing: AppTheme.spacingXl
+        // Coincidentally reuses the cpu/rocm category hexes (the values
+        // already matched before this fix) -- the roofline chart's own
+        // scatter points are colored server-side (bridge.py's
+        // RooflineBridge._BOUND_COLOR), independently of AppTheme, and
+        // stay that way after this change (a real, disclosed, deeper
+        // fix would need threading `theme` into that bridge's
+        // constructor -- out of scope for a QML-only pass).
+        LegendSwatch { swatchColor: AppTheme.categoryColor("cpu"); label: "compute-bound" }
+        LegendSwatch { swatchColor: AppTheme.categoryColor("rocm"); label: "memory-bound" }
         Item { Layout.fillWidth: true }
     }
 }

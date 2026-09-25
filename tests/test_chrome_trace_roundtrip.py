@@ -91,5 +91,39 @@ class TestDisasmJsonRoundtrip(unittest.TestCase):
         self.assertEqual(ln.stall_cycles, -1)
 
 
+class TestCaptureTimeRoundtrip(unittest.TestCase):
+    """TraceMetadata.capture_time_iso -- new, additive field for the GUI
+    Overview tab's "Captured" summary field (see src/gui/bridge.py's
+    DashboardBridge.captureTime). Populated in runner.py at profile time,
+    serialized as chrome_trace.py's "captureTime" metadata key. Checks
+    the round-trip explicitly since every OTHER metadata field it sits
+    next to (command/args/hostname/backends_used) already round-trips
+    implicitly through the other tests in this file -- this is the one
+    new key that could silently regress without its own coverage."""
+
+    def _roundtrip(self, meta: TraceMetadata) -> TraceMetadata:
+        trace = Trace(meta)
+        trace.add(SpanEvent(name="fn", category=Category.CPU, start_ns=0, duration_ns=100, pid=1, tid=1))
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            chrome_trace.write(trace, path)
+            loaded = chrome_trace.load_trace_from_json(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        return loaded.metadata
+
+    def test_capture_time_survives_roundtrip(self):
+        meta = TraceMetadata(command="a.out", args=[], capture_time_iso="2026-09-25T10:00:00")
+        self.assertEqual(self._roundtrip(meta).capture_time_iso, "2026-09-25T10:00:00")
+
+    def test_defaults_to_empty_when_absent_from_json(self):
+        # A trace saved by a build before this field existed has no
+        # "captureTime" key at all -- must default to "", which the GUI
+        # renders as "unavailable", not a crash or a fabricated time.
+        meta = TraceMetadata(command="a.out", args=[])  # capture_time_iso="" by default
+        self.assertEqual(self._roundtrip(meta).capture_time_iso, "")
+
+
 if __name__ == "__main__":
     unittest.main()

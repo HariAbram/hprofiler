@@ -75,15 +75,19 @@ class DashboardBridge(QObject):
         self._diagnosis_severity = diag_severity
         self._wall_time = dash.fmt_ns(wall_ns)
 
-        gpu_pct: float | None = None
+        # Kept as the full dict (not just gpu_active_pct) -- the new
+        # time-breakdown/investigate-next logic below reuses
+        # launch_gap_pct/sync_stall_pct from the SAME gpu_starvation()
+        # call rather than invoking it a second time.
+        gpu_stats: dict[str, float] | None = None
         if any(b in dash._GPU_CATS for b in (meta.backends_used or [])):
             try:
                 from ..analysis.cct import gpu_starvation
-                gpu_pct = gpu_starvation(trace)["gpu_active_pct"]
+                gpu_stats = gpu_starvation(trace)
             except Exception:
-                gpu_pct = None
-        self._gpu_active_available = gpu_pct is not None
-        self._gpu_active_pct = gpu_pct or 0.0
+                gpu_stats = None
+        self._gpu_active_available = gpu_stats is not None
+        self._gpu_active_pct = gpu_stats["gpu_active_pct"] if gpu_stats else 0.0
 
         mpi_present = any(s.category.value == "mpi" for s in trace.spans)
         if mpi_present:
@@ -154,6 +158,84 @@ class DashboardBridge(QObject):
             self._source_hot_line = -1
             self._source_lines = []
 
+        # ── Overview redesign: run summary, breakdown, "investigate next" ──
+        self._executable = meta.command
+        self._host = meta.hostname or "—"
+        self._backends = list(meta.backends_used or [])
+        self._devices: list[str] = [f"{d.name} ({d.backend})" for d in trace.devices]
+        self._process_count = len({s.pid for s in trace.spans})
+        self._thread_count = len({(s.pid, s.tid) for s in trace.spans})
+        self._profiling_duration = self._wall_time
+        self._capture_time = meta.capture_time_iso
+
+        # Same merged-interval technique as waitPct/gpuActivePct above --
+        # a plain sum would double-count overlapping spans on different
+        # CPU threads and could read well over 100%.
+        cpu_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "cpu"])
+        self._cpu_util_pct = 100.0 * cpu_ns / wall_ns if wall_ns else 0.0
+
+        _bucket_of = {
+            "cpu": "Computation", "cuda": "Computation", "rocm": "Computation",
+            "opencl": "Computation", "openmp": "Computation",
+            "mpi": "Communication", "nccl": "Communication",
+            "sync": "Synchronization", "memory": "Memory transfer",
+        }
+        buckets: dict[str, int] = {}
+        for s in trace.spans:
+            label = _bucket_of.get(s.category.value, "Other")
+            buckets[label] = buckets.get(label, 0) + max(s.duration_ns, 0)
+        if gpu_stats is not None:
+            idle_ns = int(gpu_stats["launch_gap_pct"] / 100.0 * wall_ns)
+            buckets["Idle"] = buckets.get("Idle", 0) + max(idle_ns, 0)
+        grand = sum(buckets.values()) or 1
+        _order = ["Computation", "Communication", "Synchronization", "Memory transfer", "Idle", "Other"]
+        self._time_breakdown: list[dict[str, Any]] = [
+            {"label": label, "pct": buckets[label] / grand * 100, "ns": buckets[label], "kind": "derived"}
+            for label in _order if buckets.get(label, 0) > 0
+        ]
+
+        # No overhead-measurement instrumentation exists anywhere in this
+        # codebase (confirmed during design) -- reported honestly as
+        # unavailable rather than invented from an unrelated proxy number.
+        self._profiling_overhead = {
+            "label": "Profiling overhead", "value": "", "kind": "unavailable",
+            "reason": "not measured by this build -- no overhead-instrumentation exists yet",
+        }
+
+        self._top_bottlenecks: list[dict[str, Any]] = [
+            {"label": title, "value": metric, "kind": "measured", "reason": "",
+             "icon": icon, "color": self._theme.severityColor(severity)}
+            for icon, severity, title, metric in dash.top_findings(trace)
+        ]
+
+        # Tab indices match Main.qml's TabBar order (Overview=0 .. Profile=8).
+        _TAB = {"timeline": 1, "kernels": 2, "call_tree": 3, "roofline": 5, "source": 6}
+        actions: list[dict[str, Any]] = []
+        if gpu_stats is not None:
+            if gpu_stats["launch_gap_pct"] > 30:
+                actions.append({"label": "Find idle GPU gaps on the Timeline",
+                                 "tab": _TAB["timeline"], "category": "", "name": ""})
+                actions.append({"label": "Check compute intensity on the Roofline",
+                                 "tab": _TAB["roofline"], "category": "", "name": ""})
+            if gpu_stats["sync_stall_pct"] > 20:
+                actions.append({"label": "Find synchronization hotspots in the Call Tree",
+                                 "tab": _TAB["call_tree"], "category": "", "name": ""})
+        if self._wait_pct > 20 and not actions:
+            actions.append({"label": "Find synchronization hotspots in the Call Tree",
+                             "tab": _TAB["call_tree"], "category": "", "name": ""})
+        if stats and stats[0]["pct"] > 30:
+            top_cat, top_name = stats[0]["category"], stats[0]["name"]
+            short = dash.fmt_kernel_name(top_name)[:30]
+            actions.append({"label": f"Investigate dominant kernel '{short}' in Kernels",
+                             "tab": _TAB["kernels"], "category": top_cat, "name": top_name})
+            if self._has_source:
+                actions.append({"label": f"View source for '{short}'",
+                                 "tab": _TAB["source"], "category": top_cat, "name": top_name})
+        if not actions and stats:
+            actions.append({"label": "Browse hot functions in Kernels", "tab": _TAB["kernels"],
+                             "category": stats[0]["category"], "name": stats[0]["name"]})
+        self._investigate_next = actions[:5]
+
     # ── Stat cards ───────────────────────────────────────────────────────
     @Property(str, constant=True)
     def diagnosisLabel(self) -> str:
@@ -220,6 +302,59 @@ class DashboardBridge(QObject):
     def sourceLines(self) -> list[dict[str, Any]]:
         return self._source_lines
 
+    # ── Overview redesign: run summary, breakdown, "investigate next" ──────
+    @Property(str, constant=True)
+    def executable(self) -> str:
+        return self._executable
+
+    @Property(str, constant=True)
+    def host(self) -> str:
+        return self._host
+
+    @Property(str, constant=True)
+    def backends(self) -> str:
+        return "  ".join(self._backends) or "none"
+
+    @Property('QVariantList', constant=True)
+    def devices(self) -> list[str]:
+        return self._devices
+
+    @Property(int, constant=True)
+    def processCount(self) -> int:
+        return self._process_count
+
+    @Property(int, constant=True)
+    def threadCount(self) -> int:
+        return self._thread_count
+
+    @Property(str, constant=True)
+    def profilingDuration(self) -> str:
+        return self._profiling_duration
+
+    @Property(str, constant=True)
+    def captureTime(self) -> str:
+        return self._capture_time
+
+    @Property(float, constant=True)
+    def cpuUtilPct(self) -> float:
+        return self._cpu_util_pct
+
+    @Property('QVariantList', constant=True)
+    def timeBreakdown(self) -> list[dict[str, Any]]:
+        return self._time_breakdown
+
+    @Property('QVariantMap', constant=True)
+    def profilingOverhead(self) -> dict[str, str]:
+        return self._profiling_overhead
+
+    @Property('QVariantList', constant=True)
+    def topBottlenecks(self) -> list[dict[str, Any]]:
+        return self._top_bottlenecks
+
+    @Property('QVariantList', constant=True)
+    def investigateNext(self) -> list[dict[str, Any]]:
+        return self._investigate_next
+
 
 class KernelsBridge(QObject):
     """Backs the Kernels screen -- the GUI's equivalent of the TUI's
@@ -235,6 +370,11 @@ class KernelsBridge(QObject):
         self._rows: list[dict[str, Any]] = [
             {
                 "name": dash.fmt_kernel_name(r["name"]),
+                # Untruncated -- the correlation key cross-tab navigation
+                # uses (see src/gui/nav.py), never the display name,
+                # which fmt_kernel_name() can truncate/reformat. Same
+                # raw/display split SourceBridge.kernels already uses.
+                "rawName": r["name"],
                 "category": r["category"],
                 "color": theme.categoryColor(r["category"]),
                 "count": r["count"],

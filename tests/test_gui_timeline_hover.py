@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 try:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtCore import QUrl, QObject, QPoint, QPointF, Property, Qt
-    from PySide6.QtGui import QGuiApplication, QWheelEvent
+    from PySide6.QtGui import QGuiApplication, QWheelEvent, QColor
     from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
     from PySide6.QtQuick import QQuickWindow, QQuickItem
     from PySide6.QtTest import QTest
@@ -59,8 +59,10 @@ if _PYSIDE6_AVAILABLE:
     from src.gui.models import TimelineModel
     from src.gui.bridge import (
         DashboardBridge, KernelsBridge, CallTreeBridge, RooflineBridge, SourceBridge,
-        SystemBridge, ProfileBridge,
+        SystemBridge, ProfileBridge, FlameGraphBridge,
     )
+    from src.gui.nav import Selection
+    from src.gui.inspector import InspectorBridge
 
     class _AppInfo(QObject):
         @Property(str, constant=True)
@@ -93,6 +95,12 @@ def _build_trace() -> "Trace":
     # lanes above.
     trace.add(SpanEvent(name="target_event", category=Category.CPU,
                          start_ns=490_000, duration_ns=20_000, pid=1, tid=3))
+    # stack_frames so FlameGraphBridge/CallTreeBridge build a real
+    # (non-empty) tree -- needed for the FlameGraph theme-toggle
+    # regression test, which has to hover an actual frame.
+    trace.add(SpanEvent(name="flame_leaf", category=Category.CPU,
+                         start_ns=0, duration_ns=1_000_000, pid=1, tid=4,
+                         stack_frames=["flame_root"]))
     return trace
 
 
@@ -127,6 +135,12 @@ class TestTimelineHover(unittest.TestCase):
         cls._source = SourceBridge(cls._trace)
         cls._system = SystemBridge(cls._trace)
         cls._profile = ProfileBridge(cls._trace, cls._theme)
+        cls._flame_graph = FlameGraphBridge(cls._trace, cls._theme)
+        cls._selection = Selection()
+        cls._inspector = InspectorBridge(
+            cls._trace, cls._selection, cls._kernels, cls._call_tree,
+            cls._roofline, cls._source, cls._timeline_model,
+        )
 
         qmlRegisterSingletonInstance(Theme, "Hprofiler", 1, 0, "AppTheme", cls._theme)
         qmlRegisterSingletonInstance(_AppInfo, "Hprofiler", 1, 0, "AppInfo", cls._app_info)
@@ -138,6 +152,9 @@ class TestTimelineHover(unittest.TestCase):
         qmlRegisterSingletonInstance(SourceBridge, "Hprofiler", 1, 0, "Source", cls._source)
         qmlRegisterSingletonInstance(SystemBridge, "Hprofiler", 1, 0, "System", cls._system)
         qmlRegisterSingletonInstance(ProfileBridge, "Hprofiler", 1, 0, "Profile", cls._profile)
+        qmlRegisterSingletonInstance(FlameGraphBridge, "Hprofiler", 1, 0, "FlameGraph", cls._flame_graph)
+        qmlRegisterSingletonInstance(Selection, "Hprofiler", 1, 0, "Nav", cls._selection)
+        qmlRegisterSingletonInstance(InspectorBridge, "Hprofiler", 1, 0, "Inspector", cls._inspector)
 
         cls._engine = QQmlApplicationEngine()
         cls._warnings: list[str] = []
@@ -153,8 +170,8 @@ class TestTimelineHover(unittest.TestCase):
                 break
         assert cls._window is not None
 
-        tab_bar = cls._root.findChild(QObject, "tabBar")
-        tab_bar.setProperty("currentIndex", 1)  # "2 Timeline"
+        cls._tab_bar = cls._root.findChild(QObject, "tabBar")
+        cls._tab_bar.setProperty("currentIndex", 1)  # "2 Timeline"
         for _ in range(5):
             cls._app.processEvents()
 
@@ -170,6 +187,15 @@ class TestTimelineHover(unittest.TestCase):
 
     def setUp(self):
         self._warnings.clear()
+        # Some tests (e.g. the tab-cycling and FlameGraph theme-toggle
+        # checks below) switch tabs away from Timeline -- restore it
+        # first so every OTHER test's real QTest mouse/keyboard events
+        # (which only hit whatever StackLayout page is actually visible)
+        # land on TimelineScreen regardless of what a previous test left
+        # active. Cheap even when already on Timeline.
+        self._tab_bar.setProperty("currentIndex", 1)
+        for _ in range(3):
+            self._app.processEvents()
         # Nav tests mutate zoom/viewStartNs/contentY/hover state -- start
         # every test from the same known view state regardless of
         # execution order (unittest runs a class's tests alphabetically by
@@ -183,6 +209,20 @@ class TestTimelineHover(unittest.TestCase):
         self._timeline_root.setProperty("hoverLane", -1)
         self._timeline_root.setProperty("hoverSpanIdx", -1)
         self._timeline_root.setProperty("hoverText", "")
+        # Nav/Inspector are the SAME kind of shared, class-level state as
+        # the Timeline view properties above -- cross-tab-navigation tests
+        # mutate selection/breadcrumbs/inspectorOpen, so those need
+        # resetting between tests too, or execution order would leak
+        # state (e.g. a leftover breadcrumb from one test changing
+        # goBack()'s behavior in the next). clearSelection() covers
+        # selection/call-path/time-range/thread; breadcrumbs has no public
+        # reset (Selection never needs one outside tests), so it's reset
+        # directly here.
+        self._selection.clearSelection()
+        self._selection._breadcrumbs = []
+        self._selection.breadcrumbsChanged.emit()
+        if not self._selection.inspectorOpen:
+            self._selection.toggleInspector()
         for _ in range(3):
             self._app.processEvents()
 
@@ -399,6 +439,317 @@ class TestTimelineHover(unittest.TestCase):
         self._app.processEvents()
 
         self.assertEqual(self._flick.property("contentY"), 7)
+
+    # ── Visual-consistency audit: cross-screen smoke test + the
+    #    FlameGraph theme-toggle regression, direct not just visual ────
+
+    def test_every_tab_loads_without_warnings(self):
+        # Cheap, catches a broken "../components" import or missing
+        # property across every migrated screen at once -- each of the
+        # 9 tabs' Loader activates for the first time here (most were
+        # never visited by any other test in this class).
+        for i in range(9):
+            self._warnings.clear()
+            self._tab_bar.setProperty("currentIndex", i)
+            for _ in range(8):
+                self._app.processEvents()
+            self.assertEqual(self._warnings, [], f"tab {i} produced QML warnings: {self._warnings}")
+
+    def test_flame_graph_tooltip_repaints_on_theme_toggle(self):
+        # Direct regression test for the audit's headline bug:
+        # FlameGraphScreen's tooltip used to be built from 8 hardcoded
+        # hex literals that never repainted on the light/dark toggle.
+        # Checks the actual bound QColor property, not a screenshot --
+        # screenshots of this exact tooltip were visually misjudged
+        # (misread as "still dark") during this fix's own verification,
+        # while property introspection was unambiguous; this test uses
+        # the reliable method.
+        self._tab_bar.setProperty("currentIndex", 4)  # Flame Graph
+        for _ in range(10):
+            self._app.processEvents()
+
+        canvas = self._root.findChild(QQuickItem, "flameGraphCanvas")
+        self.assertIsNotNone(canvas, "flameGraphCanvas not found")
+        fg_root = None
+        for child in self._root.findChildren(QQuickItem):
+            if child.property("zoomStack") is not None:
+                fg_root = child
+                break
+        self.assertIsNotNone(fg_root, "FlameGraphScreen root (zoomStack) not found")
+
+        tooltip = None
+        for child in self._root.findChildren(QQuickItem):
+            if child.property("followCursor") is not None:
+                tooltip = child
+                break
+        self.assertIsNotNone(tooltip, "Tooltip instance not found")
+
+        # Bottom row, well inside the canvas -- the root frame spans the
+        # full width at any zoom, so this reliably hits something.
+        target_local = QPoint(int(canvas.width() * 0.3), int(canvas.height() - 8))
+        # A SINGLE mouseMove teleporting straight to the target does not
+        # reliably register Qt Quick hover-enter as the first-ever
+        # synthetic mouse event in the process -- confirmed real and
+        # reproducible (not a one-off), and NOT fixed by more
+        # processEvents() alone, explicit window activation, or a
+        # trajectory through unrelated screen regions; only a trajectory
+        # that stays within the target item's own area reliably worked,
+        # and even that was not 100% deterministic across repeated runs
+        # under the offscreen QPA platform. Retrying the sweep a few
+        # times (cheap, and this loop exits the instant a real hover
+        # registers) makes this robust without weakening what's actually
+        # asserted -- it still requires a real, successful hover.
+        for attempt in range(5):
+            for step in range(1, 6):
+                local = QPoint(target_local.x(), int(target_local.y() * step / 5))
+                self._move_to(canvas.mapToScene(local).toPoint())
+            if tooltip.property("visible"):
+                break
+        self.assertTrue(tooltip.property("visible"),
+                         "tooltip never became visible after repeated hover attempts")
+
+        dark_color = tooltip.property("color")
+        self._theme.toggle()
+        for _ in range(10):
+            self._app.processEvents()
+        light_color = tooltip.property("color")
+
+        self.assertNotEqual(dark_color, light_color)
+        self.assertEqual(light_color, QColor(self._theme.background))
+        self._theme.toggle()  # back to dark for whatever test runs next
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertEqual(self._warnings, [])
+
+    # ── Cross-tab navigation: shared selection, inspector, breadcrumbs ──
+    #    Same shared engine/window as every test above -- see module
+    #    docstring for why. Nav/Inspector state is reset in setUp().
+
+    def test_kernel_click_updates_nav_selection(self):
+        self._tab_bar.setProperty("currentIndex", 2)  # Kernels
+        for _ in range(5):
+            self._app.processEvents()
+
+        # Scope to tabLoader2's OWN loaded item, not the whole root tree:
+        # a bare root.findChildren(QQuickListView) match TabBar's own
+        # internal ListView first under the Basic style (its contentItem
+        # is a ListView of TabButtons) -- a real false positive that's
+        # visible and populated (count=9) just like Kernels' actual data
+        # list, found the hard way while building this test.
+        kernels_loader = self._root.findChild(QObject, "tabLoader2")
+        self.assertIsNotNone(kernels_loader)
+        kernels_screen = kernels_loader.property("item")
+        self.assertIsNotNone(kernels_screen)
+        lists = [c for c in kernels_screen.findChildren(QQuickItem)
+                 if c.metaObject().className().startswith("QQuickListView")
+                 and c.property("visible") and (c.property("count") or 0) > 0]
+        self.assertTrue(lists, "could not find Kernels' populated ListView")
+        kernels_list = lists[0]
+
+        top_left = kernels_list.mapToScene(kernels_list.boundingRect().topLeft()).toPoint()
+        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, top_left + QPoint(60, 14))
+        for _ in range(5):
+            self._app.processEvents()
+
+        self.assertNotEqual(self._selection.selectedName, "")
+        self.assertEqual(self._warnings, [])
+        # Inspector reacts to the same selection -- Summary always has at
+        # least Name/Category, confirming the signal chain (QML click ->
+        # Nav.selectFunction -> InspectorBridge._recompute) fired for real,
+        # not just that the Python-level Selection object changed.
+        self.assertTrue(len(self._inspector.content["summary"]) >= 2)
+
+    def test_navigateTo_pushes_breadcrumb_and_goBack_restores(self):
+        self._selection.selectFunction("cpu", "fn_on_thread_1")
+        self.assertEqual(self._selection.breadcrumbs, [])
+
+        self._selection.navigateTo(7)  # System
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertEqual(self._selection.currentTab, 7)
+        self.assertEqual(len(self._selection.breadcrumbs), 1)
+        self.assertEqual(self._tab_bar.property("currentIndex"), 7,
+                          "TabBar didn't follow Nav.currentTab after navigateTo()")
+
+        back_btn = None
+        for c in self._root.findChildren(QObject):
+            if c.metaObject().className().startswith("ToolButton") and c.property("text") == "← Back":
+                back_btn = c
+                break
+        self.assertIsNotNone(back_btn, "Inspector's Back button not found")
+        self.assertTrue(back_btn.property("visible"))
+
+        self._selection.goBack()
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertEqual(self._selection.currentTab, 1)
+        self.assertEqual(self._selection.selectedName, "fn_on_thread_1")
+        self.assertEqual(self._selection.breadcrumbs, [])
+        self.assertEqual(self._tab_bar.property("currentIndex"), 1)
+        self.assertEqual(self._warnings, [])
+
+    def test_plain_tab_click_does_not_push_breadcrumb(self):
+        # The established rule (see src/gui/nav.py's Selection.navigateTo
+        # docstring): only an explicit navigateTo() call records a
+        # breadcrumb. Ordinary browsing -- a direct TabBar click, wired
+        # as a plain currentIndex write, not routed through navigateTo --
+        # must not.
+        self._tab_bar.setProperty("currentIndex", 3)
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertEqual(self._selection.currentTab, 3)
+        self.assertEqual(self._selection.breadcrumbs, [])
+
+    def test_calltree_node_click_selects_and_keeps_expand_working(self):
+        self._tab_bar.setProperty("currentIndex", 3)  # Call Tree
+        for _ in range(5):
+            self._app.processEvents()
+
+        ct_loader = self._root.findChild(QObject, "tabLoader3")
+        self.assertIsNotNone(ct_loader)
+        ct_screen = ct_loader.property("item")
+        self.assertIsNotNone(ct_screen)
+
+        # Repeater-created TreeNode delegates are QObject-parented to the
+        # Repeater itself for lifecycle management, not to their visual
+        # parent Item (QQuickItem::parentItem() and QObject::parent() are
+        # separate trees in Qt Quick) -- findChildren() walks the QOBJECT
+        # tree and structurally cannot reach them, confirmed by direct
+        # comparison against a real screenshot showing fully-rendered rows
+        # while findChildren() returned none. A coordinate sweep (the same
+        # technique _find_hover_point already uses for Timeline) sidesteps
+        # this rather than hunting for an Item handle that can't be found
+        # this way.
+        #
+        # Priming mouseMoves stepping up to the point, THEN an explicit
+        # mousePress + processEvents + mouseRelease -- confirmed by direct
+        # repro that a bare QTest.mouseClick (and even mousePress/
+        # mouseRelease with no priming move) unreliably fails to register
+        # on this Flickable-wrapped, Loader/Repeater-recursed row, while
+        # this exact combination (the same family as this file's
+        # documented first-mouseMove hover lesson, extended here to click
+        # delivery) registers reliably across repeated attempts.
+        def _click(pt: QPoint) -> None:
+            start = pt - QPoint(0, 20)
+            for step in range(1, 5):
+                self._move_to(start + (pt - start) * step / 4)
+            QTest.mousePress(self._window, Qt.LeftButton, Qt.NoModifier, pt)
+            self._app.processEvents()
+            QTest.mouseRelease(self._window, Qt.LeftButton, Qt.NoModifier, pt)
+
+        panel_top_left = ct_screen.mapToScene(QPointF(0, 0)).toPoint()
+        hit = False
+        # Outer retry around the whole sweep, same rationale as the
+        # FlameGraph tooltip test's repeated hover attempts: this specific
+        # synthetic-event path was observed to succeed reliably in an
+        # interactive repro but still occasionally miss every point on a
+        # single pass under the offscreen QPA platform when run through
+        # the full unittest harness -- cheap, and exits the instant a
+        # click actually registers.
+        for _attempt in range(3):
+            for y_off in range(30, 140, 6):
+                self._selection.clearSelection()
+                for _ in range(2):
+                    self._app.processEvents()
+                _click(panel_top_left + QPoint(80, y_off))
+                for _ in range(3):
+                    self._app.processEvents()
+                if self._selection.selectedName != "":
+                    hit = True
+                    break
+            if hit:
+                break
+        self.assertTrue(hit, "clicking never selected a call-tree row anywhere in the swept area")
+        self.assertEqual(self._warnings, [])
+
+        # Root-level call-tree data built from a single-frame stack (see
+        # _build_trace's flame_leaf span): the outermost row is the
+        # synthetic frame name, not the span's own name/category.
+        selected_before = (self._selection.selectedCategory, self._selection.selectedName)
+
+        # Clicking the SAME point again toggles expand/collapse (existing
+        # behavior, unchanged) while re-selecting the same node -- proves
+        # the new Nav.selectFunction() call didn't replace the old
+        # root.expanded = !root.expanded toggle, both still fire together.
+        _click(panel_top_left + QPoint(80, y_off))
+        for _ in range(3):
+            self._app.processEvents()
+        self.assertEqual((self._selection.selectedCategory, self._selection.selectedName), selected_before)
+        self.assertEqual(self._warnings, [])
+
+    def test_timeline_click_selects_and_double_click_still_zooms(self):
+        # Reuses the same target_event sweep as
+        # test_double_click_on_span_zooms_to_it.
+        found = None
+        for y in range(70, 260, 10):
+            for x in range(140, int(self._window.width() * 0.9), 20):
+                self._move_to(QPoint(x, y))
+                if self._timeline_root.property("hoverText").startswith("target_event"):
+                    found = QPoint(x, y)
+                    break
+            if found:
+                break
+        self.assertIsNotNone(found, "could not hover target_event to set up this test")
+
+        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, found)
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertEqual(self._selection.selectedName, "target_event")
+        self.assertEqual(self._selection.selectedThread.get("tid"), 3)
+
+        zoom_before = self._timeline_root.property("zoom")
+        QTest.mouseDClick(self._window, Qt.LeftButton, Qt.NoModifier, found)
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertGreater(self._timeline_root.property("zoom"), zoom_before,
+                            "double-click-to-zoom should still work after adding click-to-select")
+        self.assertEqual(self._warnings, [])
+
+    def test_inspector_panel_toggles(self):
+        panel = self._root.findChild(QObject, "inspectorPanel")
+        self.assertIsNotNone(panel)
+        reopen_btn = None
+        for c in panel.findChildren(QObject):
+            if c.metaObject().className().startswith("ToolButton") and c.property("text") == "◀":
+                reopen_btn = c
+                break
+        self.assertIsNotNone(reopen_btn, "collapsed-state reopen button not found")
+
+        self.assertTrue(self._selection.inspectorOpen)
+        self.assertFalse(reopen_btn.property("visible"))
+
+        self._selection.toggleInspector()
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertFalse(self._selection.inspectorOpen)
+        self.assertTrue(reopen_btn.property("visible"))
+
+        self._selection.toggleInspector()
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertTrue(self._selection.inspectorOpen)
+        self.assertFalse(reopen_btn.property("visible"))
+        self.assertEqual(self._warnings, [])
+
+    def test_uncorrelated_selection_reports_unavailable_gracefully(self):
+        # A (category,name) guaranteed to match nothing in the fixture
+        # trace -- every section should degrade to an honest
+        # "unavailable" with a specific reason, never a crash/warning or
+        # a silently blank field.
+        self._selection.selectFunction("other", "totally_fake_uncorrelated_name")
+        for _ in range(5):
+            self._app.processEvents()
+        self.assertEqual(self._warnings, [])
+
+        content = self._inspector.content
+        summary_kinds = {f["label"]: f["kind"] for f in content["summary"]}
+        self.assertEqual(summary_kinds.get("Total time"), "unavailable")
+
+        for section in ("context", "relationships", "recommendations"):
+            for field in content[section]:
+                self.assertIn(field["kind"], ("measured", "derived", "estimated", "unavailable"))
+                if field["kind"] == "unavailable":
+                    self.assertTrue(field["reason"], f"{section}.{field['label']} unavailable with no reason given")
 
 
 if __name__ == "__main__":

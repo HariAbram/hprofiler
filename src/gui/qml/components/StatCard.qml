@@ -12,25 +12,25 @@ Rectangle {
     color: AppTheme.surface
     border.color: AppTheme.panelBorder
     border.width: 1
-    radius: 6
+    radius: AppTheme.radiusPanel
 
     Column {
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        anchors.margins: 12
-        spacing: 4
+        anchors.margins: AppTheme.spacingLg
+        spacing: AppTheme.spacingXs
 
         Text {
             text: label
             color: AppTheme.textMuted
-            font.pixelSize: 11
+            font.pixelSize: AppTheme.typeLabel
             font.letterSpacing: 1
         }
         Text {
             text: value
             color: valueColor
-            font.pixelSize: 20
+            font.pixelSize: AppTheme.typeValue
             font.bold: true
             elide: Text.ElideRight
             width: parent.width

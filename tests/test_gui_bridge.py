@@ -106,6 +106,113 @@ class TestGuiBridge(unittest.TestCase):
         light_color = theme.categoryColor("cuda")
         self.assertNotEqual(dark_color, light_color)
 
+    # ── Layout tokens (visual-consistency audit) ────────────────────────
+    # spacing/radius/typography/row/button scales added so screens stop
+    # each picking their own ad hoc numbers -- see theme.py's module
+    # docstring. constant=True (not notify=themeChanged): these never
+    # vary with the dark/light toggle, only colors do.
+
+    def test_spacing_scale_is_ascending_ints(self):
+        theme = self._theme()
+        values = [theme.spacingXs, theme.spacingSm, theme.spacingMd,
+                  theme.spacingLg, theme.spacingXl]
+        self.assertEqual(values, sorted(values))
+        self.assertTrue(all(isinstance(v, int) for v in values))
+        # spacingMd is the specific value the audit found already
+        # dominant (most common ad hoc panel-padding number) -- the
+        # token was chosen to match it, not invent a new one.
+        self.assertEqual(theme.spacingMd, 8)
+
+    def test_radius_scale(self):
+        theme = self._theme()
+        self.assertLess(theme.radiusSmall, theme.radiusPanel)
+        # radiusPanel matches the value that already dominated every
+        # panel block across the GUI before this token existed.
+        self.assertEqual(theme.radiusPanel, 6)
+
+    def test_typography_scale_is_ascending_by_role(self):
+        theme = self._theme()
+        # caption < label < body < title < heading -- typeValue
+        # (StatCard's headline numbers) is deliberately the largest and
+        # not part of this ascending body-text progression.
+        values = [theme.typeCaption, theme.typeLabel, theme.typeBody,
+                  theme.typeTitle, theme.typeHeading]
+        self.assertEqual(values, sorted(values))
+        self.assertGreater(theme.typeValue, theme.typeHeading)
+
+    def test_row_and_button_and_field_tokens_exist(self):
+        theme = self._theme()
+        self.assertLess(theme.rowCompact, theme.rowComfortable)
+        self.assertGreater(theme.statRowHeight, theme.rowComfortable)
+        self.assertGreater(theme.buttonHeight, 0)
+        self.assertGreater(theme.iconButtonWidth, 0)
+        self.assertGreater(theme.fieldWidth, 0)
+
+    def test_semantic_severity_aliases_match_underlying_family(self):
+        # Additive, not a replacement -- severityColor()'s "red"/"yellow"/
+        # "green"/"cyan" family-name contract (depended on by
+        # analysis/dashboard.py's diagnose() and 9 bridge.py call sites)
+        # is untouched; these are just clearer names for exactly the same
+        # colors, in both theme states.
+        theme = self._theme()
+        for dark in (True, False):
+            theme.dark = dark
+            self.assertEqual(theme.errorColor, theme.severityColor("red"))
+            self.assertEqual(theme.warningColor, theme.severityColor("yellow"))
+            self.assertEqual(theme.successColor, theme.severityColor("green"))
+            self.assertEqual(theme.infoColor, theme.severityColor("cyan"))
+
+    def test_revised_category_colors_for_colorblind_safety(self):
+        # mpi/memory/jit/nvtx were changed after a quantitative
+        # deuteranopia/protanopia/tritanopia simulation found them
+        # confusable with other categories (worst: mpi/memory confusable
+        # under both common red-green CVD forms). Exact values pinned so
+        # a future edit can't silently drift back to the old, confusable
+        # ones -- the other 8 categories are deliberately NOT asserted
+        # here since they were untouched by this fix.
+        theme = self._theme()
+        theme.dark = True
+        self.assertEqual(theme.categoryColor("mpi"), "#2563eb")
+        self.assertEqual(theme.categoryColor("memory"), "#a78bfa")
+        self.assertEqual(theme.categoryColor("jit"), "#8b5cf6")
+        self.assertEqual(theme.categoryColor("nvtx"), "#ea580c")
+        theme.dark = False
+        self.assertEqual(theme.categoryColor("mpi"), "#1d4ed8")
+        self.assertEqual(theme.categoryColor("memory"), "#7c3aed")
+        self.assertEqual(theme.categoryColor("jit"), "#581c87")
+        self.assertEqual(theme.categoryColor("nvtx"), "#9a3412")
+
+    def test_no_raw_hex_colors_outside_theme_py(self):
+        # Regression guard for the visual-consistency audit's core
+        # finding: FlameGraphScreen.qml alone had 8 raw hex literals that
+        # silently stopped repainting on the light/dark toggle (color
+        # bindings to a literal string aren't reactive the way
+        # AppTheme.* bindings are) -- this single grep-based check would
+        # have caught all 12 hits (3 files) across the whole GUI
+        # instantly, before it shipped. Any legitimate new raw color
+        # belongs in theme.py as a named token, not inline in a screen.
+        import re
+        qml_dir = Path(__file__).resolve().parent.parent / "src" / "gui" / "qml"
+        hex_re = re.compile(r'#[0-9a-fA-F]{3,8}\b')
+        offenders = []
+        for qml_file in qml_dir.rglob("*.qml"):
+            text = qml_file.read_text()
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if hex_re.search(line):
+                    offenders.append(f"{qml_file.relative_to(qml_dir)}:{lineno}: {line.strip()}")
+        self.assertEqual(offenders, [], "raw hex color literal(s) found outside theme.py:\n" + "\n".join(offenders))
+
+    def test_light_mpi_no_longer_collides_with_old_dark_mpi(self):
+        # The exact regression this fix closes: mpi's dark value used to
+        # be #60a5fa and its light value #2563eb -- distinct at the time,
+        # but #2563eb is mpi's NEW dark value, so a naive fix that only
+        # changed the dark side would have made light-mode mpi equal the
+        # OLD dark-mode mpi, not a real fix. Confirms both sides moved.
+        theme = self._theme()
+        theme.dark = False
+        self.assertNotEqual(theme.categoryColor("mpi"), "#60a5fa")
+        self.assertEqual(theme.categoryColor("mpi"), "#1d4ed8")
+
     # ── DashboardBridge ──────────────────────────────────────────────────
 
     def _bridge(self, trace):
@@ -544,6 +651,145 @@ class TestGuiBridge(unittest.TestCase):
     def test_profile_bridge_minimal_trace_does_not_crash(self):
         from src.gui.bridge import ProfileBridge
         ProfileBridge(_mk_trace([_span(1, 1, Category.CPU, 0, 10, "x")]), self._theme())
+
+    # ── DashboardBridge: Overview redesign (cross-tab-navigation round) ──
+
+    def test_dashboard_bridge_run_summary_fields(self):
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "x"), _span(1, 2, Category.CPU, 0, 100, "y")],
+                          backends=["cpu"], command="./a.out")
+        trace.metadata.hostname = "node01"
+        trace.metadata.capture_time_iso = "2026-09-25T10:00:00"
+        bridge = self._bridge(trace)
+        self.assertEqual(bridge.executable, "./a.out")
+        self.assertEqual(bridge.host, "node01")
+        self.assertEqual(bridge.captureTime, "2026-09-25T10:00:00")
+        self.assertEqual(bridge.processCount, 1)
+        self.assertEqual(bridge.threadCount, 2)
+
+    def test_dashboard_bridge_capture_time_empty_when_unset(self):
+        # "" (TraceMetadata.capture_time_iso's own default) -- the GUI
+        # renders this as "unavailable", not a fabricated time.
+        bridge = self._bridge(_mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")]))
+        self.assertEqual(bridge.captureTime, "")
+
+    def test_dashboard_bridge_time_breakdown_sums_to_100_pct(self):
+        spans = [_span(1, 1, Category.CPU, 0, 100, "cpu_work"),
+                _span(1, 1, Category.MPI, 100, 50, "MPI_Send"),
+                _span(1, 1, Category.SYNC, 150, 20, "sync"),
+                _span(1, 1, Category.MEMORY, 170, 10, "memcpy")]
+        trace = _mk_trace(spans, backends=["cpu", "mpi"])
+        breakdown = self._bridge(trace).timeBreakdown
+        self.assertTrue(breakdown)
+        self.assertAlmostEqual(sum(b["pct"] for b in breakdown), 100.0, delta=0.5)
+        self.assertTrue(all(b["kind"] == "derived" for b in breakdown))
+
+    def test_dashboard_bridge_profiling_overhead_always_unavailable(self):
+        # No overhead-measurement instrumentation exists anywhere in this
+        # codebase -- reported honestly, not invented from a proxy number.
+        overhead = self._bridge(_mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")])).profilingOverhead
+        self.assertEqual(overhead["kind"], "unavailable")
+        self.assertTrue(overhead["reason"])
+
+    def test_dashboard_bridge_investigate_next_targets_dominant_kernel(self):
+        spans = [_span(1, 1, Category.CPU, i, 100, "dominant_fn") for i in range(20)]
+        spans += [_span(1, 1, Category.CPU, 3000 + i, 5, "minor_fn") for i in range(2)]
+        actions = self._bridge(_mk_trace(spans, backends=["cpu"])).investigateNext
+        self.assertTrue(actions)
+        self.assertTrue(any(a["name"] == "dominant_fn" and a["category"] == "cpu" for a in actions))
+
+    def test_dashboard_bridge_top_bottlenecks_reshapes_top_findings(self):
+        from src.analysis import dashboard as dash
+        spans = [_span(1, 1, Category.GPU_CUDA, i * 1_000_000, 50_000, "k",
+                       tags={"type": "kernel"}) for i in range(5)]
+        trace = _mk_trace(spans, backends=["cuda"])
+        bottlenecks = self._bridge(trace).topBottlenecks
+        findings = dash.top_findings(trace)
+        self.assertEqual(len(bottlenecks), len(findings))
+        for field, (_icon, _severity, title, metric) in zip(bottlenecks, findings):
+            self.assertEqual(field["label"], title)
+            self.assertEqual(field["value"], metric)
+            self.assertEqual(field["kind"], "measured")
+
+    # ── InspectorBridge ──────────────────────────────────────────────────
+    # Field shape/kind-tagging is what makes "clearly distinguish
+    # measured, derived, estimated, and unavailable values" a concrete
+    # contract rather than an aspiration -- see src/gui/inspector.py.
+
+    def _inspector(self, trace):
+        from src.gui.bridge import KernelsBridge, CallTreeBridge, RooflineBridge, SourceBridge
+        from src.gui.models import TimelineModel
+        from src.gui.nav import Selection
+        from src.gui.inspector import InspectorBridge
+        theme = self._theme()
+        kernels = KernelsBridge(trace, theme)
+        call_tree = CallTreeBridge(trace, theme)
+        roofline = RooflineBridge(trace)
+        source = SourceBridge(trace)
+        timeline = TimelineModel(trace, theme)
+        selection = Selection()
+        inspector = InspectorBridge(trace, selection, kernels, call_tree, roofline, source, timeline)
+        return selection, inspector
+
+    def test_inspector_empty_selection_yields_empty_content(self):
+        _selection, inspector = self._inspector(_mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")]))
+        for section in ("summary", "context", "metrics", "relationships", "recommendations"):
+            self.assertEqual(inspector.content[section], [])
+
+    def test_inspector_matched_selection_has_measured_and_derived_fields(self):
+        spans = [_span(1, 1, Category.CPU, i * 100, 50, "hot_fn") for i in range(5)]
+        selection, inspector = self._inspector(_mk_trace(spans, backends=["cpu"]))
+
+        selection.selectFunction("cpu", "hot_fn")
+        content = inspector.content
+
+        self.assertTrue(content["summary"])
+        kinds = {f["label"]: f["kind"] for f in content["summary"]}
+        self.assertEqual(kinds["Name"], "measured")
+        self.assertEqual(kinds["Share of total"], "derived")
+        self.assertTrue(content["metrics"])
+        self.assertTrue(all(f["kind"] in ("measured", "derived") for f in content["metrics"]))
+
+    def test_inspector_unmatched_selection_reports_unavailable_with_reasons(self):
+        selection, inspector = self._inspector(_mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")]))
+
+        selection.selectFunction("other", "nothing_matches_this")
+        content = inspector.content
+
+        summary_kinds = {f["label"]: f["kind"] for f in content["summary"]}
+        self.assertEqual(summary_kinds["Total time"], "unavailable")
+        for section in ("context", "relationships", "recommendations"):
+            for field in content[section]:
+                if field["kind"] == "unavailable":
+                    self.assertTrue(field["reason"], f"{section}.{field['label']} unavailable with no reason")
+
+    def test_inspector_every_field_has_the_full_field_shape(self):
+        spans = [_span(1, 1, Category.CPU, i * 100, 50, "hot_fn") for i in range(3)]
+        selection, inspector = self._inspector(_mk_trace(spans, backends=["cpu"]))
+        selection.selectFunction("cpu", "hot_fn")
+
+        for section_fields in inspector.content.values():
+            for field in section_fields:
+                self.assertEqual(set(field.keys()), {"label", "value", "kind", "reason"})
+                self.assertIn(field["kind"], ("measured", "derived", "estimated", "unavailable"))
+
+    def test_inspector_copy_and_export(self):
+        import json
+        import tempfile
+        selection, inspector = self._inspector(_mk_trace(
+            [_span(1, 1, Category.CPU, 0, 100, "hot_fn")], backends=["cpu"]))
+        selection.selectFunction("cpu", "hot_fn")
+
+        inspector.copyToClipboard(json.dumps(inspector.content))  # must not raise
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            self.assertTrue(inspector.exportTo(path))
+            with open(path) as fh:
+                exported = json.load(fh)
+            self.assertEqual(exported, inspector.content)
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
 def DashboardBridgeBuckets() -> int:

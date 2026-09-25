@@ -14,18 +14,18 @@ Rectangle {
     color: AppTheme.surface
     border.color: AppTheme.panelBorder
     border.width: 1
-    radius: 6
+    radius: AppTheme.radiusPanel
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 10
-        spacing: 6
+        anchors.margins: AppTheme.spacingMd
+        spacing: AppTheme.spacingSm
 
         Text {
             visible: root.title.length > 0
             text: root.title
             color: AppTheme.accent
-            font.pixelSize: 13
+            font.pixelSize: AppTheme.typeTitle
             font.bold: true
         }
 

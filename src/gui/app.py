@@ -58,6 +58,8 @@ def main() -> int:
         SourceBridge, SystemBridge, ProfileBridge,
     )
     from src.gui.models import TimelineModel
+    from src.gui.nav import Selection
+    from src.gui.inspector import InspectorBridge
 
     trace = load_trace_from_json(trace_path, collect_disasm=disasm)
 
@@ -75,6 +77,8 @@ def main() -> int:
     source = SourceBridge(trace)
     system = SystemBridge(trace)
     profile = ProfileBridge(trace, theme)
+    selection = Selection()
+    inspector = InspectorBridge(trace, selection, kernels, call_tree, roofline, source, timeline)
 
     meta = trace.metadata
     cmd_line = f"{meta.command} {' '.join(meta.args[:4])}".strip() or "(no command)"
@@ -101,6 +105,8 @@ def main() -> int:
     qmlRegisterSingletonInstance(SourceBridge, "Hprofiler", 1, 0, "Source", source)
     qmlRegisterSingletonInstance(SystemBridge, "Hprofiler", 1, 0, "System", system)
     qmlRegisterSingletonInstance(ProfileBridge, "Hprofiler", 1, 0, "Profile", profile)
+    qmlRegisterSingletonInstance(Selection, "Hprofiler", 1, 0, "Nav", selection)
+    qmlRegisterSingletonInstance(InspectorBridge, "Hprofiler", 1, 0, "Inspector", inspector)
 
     engine = QQmlApplicationEngine()
     errors: list[str] = []

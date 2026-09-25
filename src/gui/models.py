@@ -282,7 +282,41 @@ class TimelineModel(QObject):
             "startNs": float(s.start_ns - self._view_start),
             "durNs": float(s.duration_ns),
             "tags": dict(s.tags),
+            # pid/tid: additive, for cross-tab navigation's
+            # Nav.selectThread() (see src/gui/nav.py) -- SpanEvent carries
+            # these as real dataclass fields, not tags entries, so they
+            # weren't reachable from a click handler without this.
+            "pid": s.pid,
+            "tid": s.tid,
         }
+
+    @Slot(str, str, int, result='QVariantList')
+    def findByName(self, category: str, name: str, max_results: int = 50) -> list[dict[str, Any]]:
+        """All spans matching (category, name) across every lane --
+        "occurrences of this kernel/function" for cross-tab navigation
+        (see src/gui/nav.py's docstring for why (category,name) is the
+        correlation key rather than a true per-instance id). No name
+        index is precomputed (this is the first caller that needs one),
+        so this is a real O(total spans) scan across every lane -- capped
+        at `max_results` like visibleSpans() already caps its own
+        per-lane results, so a name appearing thousands of times (a
+        worker-thread loop body, say) doesn't build a huge QML list.
+        startNs is ABSOLUTE (matching visibleSpans()'s convention), NOT
+        relative to viewStartNs the way spanAt()'s own startNs field is
+        -- a real, deliberate asymmetry between these two methods (see
+        spanAt()'s docstring); callers jumping the view to a match need
+        an absolute timestamp to assign directly to viewStartNs."""
+        out: list[dict[str, Any]] = []
+        for lane_idx, lane in enumerate(self._lane_names):
+            if lane.split("/")[0] != category:
+                continue
+            for span_idx, s in enumerate(self._sorted_spans[lane]):
+                if s.name != name:
+                    continue
+                out.append({"laneIndex": lane_idx, "spanIdx": span_idx, "startNs": float(s.start_ns)})
+                if len(out) >= max_results:
+                    return out
+        return out
 
     @Slot(float, float, result='QVariantMap')
     def callGraph(self, view_start_ns: float, view_end_ns: float) -> dict[str, Any]:

@@ -22,6 +22,13 @@ class TraceMetadata:
     backends_used: list[str] = field(default_factory=list)
     hostname: str = ""
     cwd: str = ""
+    # Wall-clock ISO timestamp of when profiling started -- unlike
+    # start_time_ns (monotonic, unrecoverable as a real timestamp after
+    # the fact), this is for DISPLAY ("capture time" in the GUI's
+    # Overview tab), not timing math. "" (not populated) for any trace
+    # captured before this field existed, or built by hand in a test --
+    # the GUI renders that as "unavailable", not a fake/guessed time.
+    capture_time_iso: str = ""
 
 
 class Trace:

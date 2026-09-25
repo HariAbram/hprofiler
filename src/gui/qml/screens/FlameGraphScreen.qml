@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Hprofiler 1.0
+import "../components"
 
 // Flame Graph tab -- proportional-width icicle chart of FlameGraph.tree
 // (src/gui/bridge.py's FlameGraphBridge, itself analysis/
@@ -61,31 +62,34 @@ ColumnLayout {
         return ns.toFixed(0) + "ns"
     }
 
-    RowLayout {
-        Layout.fillWidth: true
-        spacing: 8
-        Text {
-            text: "Flame Graph"
-            color: AppTheme.accent
-            font.bold: true
-            font.pixelSize: 13
-        }
-        Item { Layout.fillWidth: true }
+    Toolbar {
+        title: "Flame Graph"
+
         TextField {
-            Layout.preferredWidth: 220
+            Layout.preferredWidth: AppTheme.fieldWidth
             placeholderText: "search (regex)…"
-            font.pixelSize: 11
+            font.pixelSize: AppTheme.typeLabel
+            color: AppTheme.text
             onTextChanged: root.searchText = text
+            // Focus-visible border -- panelBorderFocus existed as a token
+            // already but had zero call sites anywhere in the GUI before
+            // this; filter/search fields had no focus affordance at all.
+            background: Rectangle {
+                color: AppTheme.background
+                border.color: parent.activeFocus ? AppTheme.panelBorderFocus : AppTheme.panelBorder
+                border.width: 1
+                radius: AppTheme.radiusSmall
+            }
         }
         Button {
             text: "↑ Up"
-            font.pixelSize: 11
+            font.pixelSize: AppTheme.typeLabel
             enabled: root.zoomStack.length > 1
             onClicked: root.zoomUp()
         }
         Button {
             text: "⟲ Reset"
-            font.pixelSize: 11
+            font.pixelSize: AppTheme.typeLabel
             onClicked: root.resetZoom()
         }
         Text {
@@ -94,7 +98,7 @@ ColumnLayout {
                      "  (" + root.pctTotal(root.hoveredFrame.node) + "% of total)")
                   : root.fmtNs(FlameGraph.totalNs) + " total"
             color: AppTheme.textMuted
-            font.pixelSize: 11
+            font.pixelSize: AppTheme.typeLabel
             elide: Text.ElideLeft
             Layout.maximumWidth: 320
         }
@@ -106,22 +110,20 @@ ColumnLayout {
         color: AppTheme.surface
         border.color: AppTheme.panelBorder
         border.width: 1
-        radius: 6
+        radius: AppTheme.radiusPanel
         clip: true
 
-        Text {
-            anchors.centerIn: parent
+        EmptyState {
+            centered: true
             visible: FlameGraph.totalNs === 0
-            text: "No call-stack data in this trace.\nRun with --perf-callgraph fp|dwarf|lbr (or --call-tree) to capture it."
-            horizontalAlignment: Text.AlignHCenter
-            color: AppTheme.textMuted
+            message: "No call-stack data in this trace.\nRun with --perf-callgraph fp|dwarf|lbr (or --call-tree) to capture it."
             z: 5
         }
 
         Flickable {
             id: flick
             anchors.fill: parent
-            anchors.margins: 4
+            anchors.margins: AppTheme.spacingXs
             contentWidth: canvas.width
             contentHeight: canvas.height
             clip: true
@@ -176,8 +178,15 @@ ColumnLayout {
                         var y = H - (f.depth + 1) * root.frameH
                         f.y = y
 
+                        // AppTheme.* is readable live inside Canvas.onPaint
+                        // (confirmed working elsewhere, e.g. Roofline's
+                        // ctx.strokeStyle = AppTheme.textMuted) -- these
+                        // used to be hardcoded hex instead, which meant
+                        // this whole canvas silently stopped repainting
+                        // correctly on the light/dark toggle while every
+                        // other element on this screen kept working.
                         var matched = !searchRe || searchRe.test(f.node.name)
-                        ctx.fillStyle = matched ? f.node.color : "#2a2a2a"
+                        ctx.fillStyle = matched ? f.node.color : AppTheme.panelBorder
                         // Plain fillRect, not roundedRect -- QML's Canvas
                         // 2D context doesn't implement that method
                         // (throws and silently aborts the rest of the
@@ -186,7 +195,7 @@ ColumnLayout {
                         ctx.fillRect(f.x, f.y, Math.max(f.w - 0.5, 0), root.frameH - 1)
 
                         if (f.w > 32) {
-                            ctx.fillStyle = matched ? "#111111" : "#888888"
+                            ctx.fillStyle = matched ? AppTheme.background : AppTheme.textMuted
                             var maxCh = Math.floor((f.w - 6) / 6.5)
                             var lbl = f.node.name
                             if (lbl.length > maxCh) lbl = lbl.slice(0, Math.max(maxCh - 1, 0)) + "…"
@@ -235,46 +244,39 @@ ColumnLayout {
         }
 
         // Tooltip -- follows the cursor, clamped to stay within the panel.
-        Rectangle {
+        // Shared Tooltip component handles the background/border/radius/
+        // positioning math -- always AppTheme-driven internally, which is
+        // itself the fix for this tooltip's old bug (hardcoded hex that
+        // never repainted on the light/dark toggle, unlike everything
+        // else on this screen).
+        Tooltip {
             visible: !!root.hoveredFrame
-            color: "#000000"
-            opacity: 0.92
-            radius: 5
-            border.color: "#444444"
-            border.width: 1
-            width: tooltipCol.width + 22
-            height: tooltipCol.height + 14
-            x: Math.min(root.hoverViewX + 14, parent.width - width - 10)
-            y: Math.max(root.hoverViewY - height - 10, 0)
-            z: 100
+            followCursor: true
+            anchorX: root.hoverViewX
+            anchorY: root.hoverViewY
 
-            ColumnLayout {
-                id: tooltipCol
-                anchors.centerIn: parent
-                spacing: 3
-                Text {
-                    // Bounded width + wrap so a long (C++ template) name
-                    // can't balloon this tooltip past the panel's own
-                    // width -- see this file's header comment.
-                    Layout.maximumWidth: 420
-                    text: root.hoveredFrame ? root.hoveredFrame.node.name : ""
-                    color: "#eeeeee"
-                    font.family: "monospace"
-                    font.pixelSize: 12
-                    font.bold: true
-                    wrapMode: Text.WrapAnywhere
-                }
-                Text {
-                    text: root.hoveredFrame ? root.fmtNs(root.hoveredFrame.node.value) : ""
-                    color: "#cccccc"
-                    font.family: "monospace"
-                    font.pixelSize: 11
-                }
-                Text {
-                    text: root.hoveredFrame ? (root.pctTotal(root.hoveredFrame.node) + "% of total") : ""
-                    color: "#cccccc"
-                    font.pixelSize: 11
-                }
+            Text {
+                // Bounded width + wrap so a long (C++ template) name
+                // can't balloon this tooltip past the panel's own
+                // width -- see this file's header comment.
+                Layout.maximumWidth: 420
+                text: root.hoveredFrame ? root.hoveredFrame.node.name : ""
+                color: AppTheme.text
+                font.family: "monospace"
+                font.pixelSize: AppTheme.typeBody
+                font.bold: true
+                wrapMode: Text.WrapAnywhere
+            }
+            Text {
+                text: root.hoveredFrame ? root.fmtNs(root.hoveredFrame.node.value) : ""
+                color: AppTheme.textMuted
+                font.family: "monospace"
+                font.pixelSize: AppTheme.typeLabel
+            }
+            Text {
+                text: root.hoveredFrame ? (root.pctTotal(root.hoveredFrame.node) + "% of total") : ""
+                color: AppTheme.textMuted
+                font.pixelSize: AppTheme.typeLabel
             }
         }
     }

@@ -14,6 +14,7 @@ until the process exits.
 """
 
 from __future__ import annotations
+import datetime
 import os
 import re
 import resource
@@ -322,6 +323,7 @@ class Runner:
             backends_used=list(self.backends),
             hostname=platform.node(),
             cwd=os.getcwd(),
+            capture_time_iso=datetime.datetime.now().isoformat(timespec="seconds"),
         )
         trace = Trace(metadata)
         self._trace = trace

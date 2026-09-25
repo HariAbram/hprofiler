@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Hprofiler 1.0
+import "../components"
 
 // GUI equivalent of the TUI's DisasmWidget -- split-pane disassembly
 // viewer. Left: kernel list. Middle: annotated assembly (instruction
@@ -11,7 +12,7 @@ import Hprofiler 1.0
 // TUI (_show_mix/_show_hints); this screen just never called them.
 RowLayout {
     id: root
-    spacing: 8
+    spacing: AppTheme.spacingMd
 
     property int selectedIndex: 0
     readonly property var selectedKernel: Source.kernels.length > selectedIndex
@@ -22,35 +23,32 @@ RowLayout {
     readonly property var mixData: hasSelection ? Source.instructionMix(selectedKernel.rawName) : []
     readonly property var hintsData: hasSelection ? Source.advisorHints(selectedKernel.rawName) : []
 
-    Rectangle {
+    Panel {
         Layout.preferredWidth: 260
         Layout.fillHeight: true
-        color: AppTheme.surface
-        border.color: AppTheme.panelBorder
-        border.width: 1
-        radius: 6
         clip: true
 
         ListView {
             anchors.fill: parent
-            anchors.margins: 4
             model: Source.kernels
             clip: true
             delegate: Rectangle {
                 width: ListView.view.width
+                // 40, not the shared row-height scale -- genuine 2-line
+                // content (name + arch/total sub-line), not drift.
                 height: 40
                 color: root.selectedIndex === index ? AppTheme.panelBorder : "transparent"
-                radius: 4
+                radius: AppTheme.radiusSmall
 
                 ColumnLayout {
                     anchors.fill: parent
-                    anchors.margins: 6
-                    spacing: 1
+                    anchors.margins: AppTheme.spacingSm
+                    spacing: AppTheme.spacingXs
                     RowLayout {
                         Text {
                             text: (modelData.hasDisasm ? "✓ " : "  ") + modelData.name
                             color: AppTheme.text
-                            font.pixelSize: 12
+                            font.pixelSize: AppTheme.typeBody
                             elide: Text.ElideRight
                             Layout.fillWidth: true
                         }
@@ -58,7 +56,7 @@ RowLayout {
                     Text {
                         text: modelData.arch + "  ·  " + modelData.total
                         color: AppTheme.textMuted
-                        font.pixelSize: 10
+                        font.pixelSize: AppTheme.typeCaption
                     }
                 }
 
@@ -68,28 +66,22 @@ RowLayout {
                 }
             }
 
-            Text {
-                anchors.centerIn: parent
+            EmptyState {
+                centered: true
                 visible: Source.kernels.length === 0
-                text: "No kernels profiled."
-                color: AppTheme.textMuted
+                message: "No kernels profiled."
             }
         }
     }
 
-    Rectangle {
+    Panel {
         Layout.fillWidth: true
         Layout.fillHeight: true
-        color: AppTheme.surface
-        border.color: AppTheme.panelBorder
-        border.width: 1
-        radius: 6
         clip: true
 
         ColumnLayout {
             anchors.fill: parent
-            anchors.margins: 8
-            spacing: 4
+            spacing: AppTheme.spacingXs
             visible: root.selectedKernel && root.selectedKernel.hasDisasm
 
             // What function this actually is: the span list on the left
@@ -106,18 +98,18 @@ RowLayout {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 18
                 Layout.maximumHeight: 18
-                spacing: 8
+                spacing: AppTheme.spacingMd
                 visible: !!(root.selectedKernel && root.selectedKernel.symbol)
                 Text {
                     text: "call site:"
                     color: AppTheme.textMuted
-                    font.pixelSize: 11
+                    font.pixelSize: AppTheme.typeLabel
                 }
                 Text {
                     text: root.selectedKernel ? root.selectedKernel.symbol : ""
                     color: AppTheme.text
                     font.bold: true
-                    font.pixelSize: 11
+                    font.pixelSize: AppTheme.typeLabel
                     elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
@@ -146,8 +138,8 @@ RowLayout {
                         color: AppTheme.textMuted
                         font.family: "monospace"
                         font.italic: true
-                        font.pixelSize: 10
-                        Layout.topMargin: 4
+                        font.pixelSize: AppTheme.typeCaption
+                        Layout.topMargin: AppTheme.spacingXs
                         elide: Text.ElideLeft
                         Layout.fillWidth: true
                     }
@@ -156,12 +148,12 @@ RowLayout {
                         Layout.fillWidth: true
                         Layout.preferredHeight: 18
                         Layout.maximumHeight: 18
-                        spacing: 8
+                        spacing: AppTheme.spacingMd
                         Text {
                             text: modelData.addr
                             color: AppTheme.textMuted
                             font.family: "monospace"
-                            font.pixelSize: 11
+                            font.pixelSize: AppTheme.typeLabel
                             Layout.preferredWidth: 60
                         }
                         Text {
@@ -169,22 +161,29 @@ RowLayout {
                             color: modelData.color
                             font.family: "monospace"
                             font.bold: true
-                            font.pixelSize: 11
+                            font.pixelSize: AppTheme.typeLabel
                             Layout.preferredWidth: 90
                         }
                         Text {
                             text: modelData.operands
                             color: AppTheme.text
                             font.family: "monospace"
-                            font.pixelSize: 11
+                            font.pixelSize: AppTheme.typeLabel
                             Layout.fillWidth: true
                             elide: Text.ElideRight
                         }
                         Text {
                             visible: modelData.samplePct > 0
                             text: modelData.samplePct.toFixed(1) + "%"
-                            color: modelData.samplePct >= 10 ? "#f87171" : (modelData.samplePct >= 1 ? "#fbbf24" : AppTheme.textMuted)
-                            font.pixelSize: 10
+                            // >=10% "hot": error-family red: this is a
+                            // severity/attention signal (heavily sampled
+                            // instruction), not literally an error, but
+                            // reuses the same red/yellow "how much should
+                            // this worry you" scale as everywhere else.
+                            color: modelData.samplePct >= 10 ? AppTheme.errorColor
+                                   : modelData.samplePct >= 1 ? AppTheme.warningColor
+                                   : AppTheme.textMuted
+                            font.pixelSize: AppTheme.typeCaption
                             Layout.preferredWidth: 40
                         }
                     }
@@ -195,39 +194,31 @@ RowLayout {
         ColumnLayout {
             anchors.centerIn: parent
             visible: !root.selectedKernel || !root.selectedKernel.hasDisasm
-            spacing: 8
+            spacing: AppTheme.spacingMd
             Text {
                 Layout.alignment: Qt.AlignHCenter
                 text: root.selectedKernel ? root.selectedKernel.name : ""
                 color: AppTheme.text
                 font.bold: true
             }
-            Text {
+            EmptyState {
                 Layout.maximumWidth: 500
-                wrapMode: Text.WordWrap
-                horizontalAlignment: Text.AlignHCenter
-                text: root.selectedKernel ? Source.noDisasmReason(root.selectedKernel.rawName) : ""
-                color: AppTheme.textMuted
-                font.pixelSize: 12
+                Layout.alignment: Qt.AlignHCenter
+                message: root.selectedKernel ? Source.noDisasmReason(root.selectedKernel.rawName) : ""
             }
         }
     }
 
     // ── Analysis panel: instruction mix + static advisor hints ─────────────
-    Rectangle {
+    Panel {
         Layout.preferredWidth: 300
         Layout.fillHeight: true
-        color: AppTheme.surface
-        border.color: AppTheme.panelBorder
-        border.width: 1
-        radius: 6
         clip: true
         visible: root.hasSelection
 
         ScrollView {
             id: analysisScroll
             anchors.fill: parent
-            anchors.margins: 8
             clip: true
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
@@ -243,13 +234,13 @@ RowLayout {
                 // ScrollView's own documented "content area, viewport-
                 // bounded" property, made for exactly this.
                 width: analysisScroll.availableWidth
-                spacing: 10
+                spacing: AppTheme.spacingLg
 
                 Text {
                     text: "Instruction mix"
                     color: AppTheme.text
                     font.bold: true
-                    font.pixelSize: 12
+                    font.pixelSize: AppTheme.typeBody
                 }
                 Text {
                     text: {
@@ -258,54 +249,45 @@ RowLayout {
                         return total + " instructions"
                     }
                     color: AppTheme.textMuted
-                    font.pixelSize: 10
+                    font.pixelSize: AppTheme.typeCaption
                     Layout.bottomMargin: 2
                 }
                 Repeater {
                     model: root.mixData
                     delegate: ColumnLayout {
                         Layout.fillWidth: true
-                        spacing: 1
+                        spacing: AppTheme.spacingXs
                         RowLayout {
                             Layout.fillWidth: true
                             Text {
                                 text: modelData.label
                                 color: modelData.color
-                                font.pixelSize: 11
+                                font.pixelSize: AppTheme.typeLabel
                                 Layout.fillWidth: true
                             }
                             Text {
                                 text: modelData.count
                                 color: AppTheme.text
-                                font.pixelSize: 11
+                                font.pixelSize: AppTheme.typeLabel
                             }
                             Text {
                                 text: modelData.pct.toFixed(0) + "%"
                                 color: AppTheme.textMuted
-                                font.pixelSize: 10
+                                font.pixelSize: AppTheme.typeCaption
                                 Layout.preferredWidth: 30
                                 horizontalAlignment: Text.AlignRight
                             }
                         }
-                        Rectangle {
+                        ProgressBar {
                             Layout.fillWidth: true
-                            height: 5
-                            radius: 2
-                            color: AppTheme.background
-                            Rectangle {
-                                width: parent.width * modelData.pct / 100
-                                height: parent.height
-                                radius: 2
-                                color: modelData.color
-                            }
+                            pct: modelData.pct
+                            barColor: modelData.color
                         }
                     }
                 }
-                Text {
+                EmptyState {
                     visible: root.mixData.length === 0
-                    text: "No instruction data."
-                    color: AppTheme.textMuted
-                    font.pixelSize: 11
+                    message: "No instruction data."
                 }
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: AppTheme.panelBorder; Layout.topMargin: 4; Layout.bottomMargin: 4 }
@@ -314,23 +296,23 @@ RowLayout {
                     text: "Analysis"
                     color: AppTheme.text
                     font.bold: true
-                    font.pixelSize: 12
+                    font.pixelSize: AppTheme.typeBody
                 }
                 Repeater {
                     model: root.hintsData
                     delegate: ColumnLayout {
                         Layout.fillWidth: true
-                        Layout.bottomMargin: 6
-                        spacing: 2
+                        Layout.bottomMargin: AppTheme.spacingSm
+                        spacing: AppTheme.spacingXs
                         RowLayout {
-                            spacing: 6
-                            Text { text: modelData.icon; color: modelData.color; font.pixelSize: 11; font.bold: true }
-                            Text { text: modelData.category; color: AppTheme.textMuted; font.pixelSize: 10 }
+                            spacing: AppTheme.spacingSm
+                            Text { text: modelData.icon; color: modelData.color; font.pixelSize: AppTheme.typeLabel; font.bold: true }
+                            Text { text: modelData.category; color: AppTheme.textMuted; font.pixelSize: AppTheme.typeCaption }
                         }
                         Text {
                             text: modelData.message
                             color: modelData.color
-                            font.pixelSize: 11
+                            font.pixelSize: AppTheme.typeLabel
                             font.bold: true
                             wrapMode: Text.WordWrap
                             Layout.fillWidth: true
@@ -339,19 +321,16 @@ RowLayout {
                             visible: modelData.detail.length > 0
                             text: modelData.detail
                             color: AppTheme.textMuted
-                            font.pixelSize: 10
+                            font.pixelSize: AppTheme.typeCaption
                             wrapMode: Text.WordWrap
                             Layout.fillWidth: true
                         }
                     }
                 }
-                Text {
-                    visible: root.hasSelection && root.hintsData.length === 0
-                    text: "No notable issues found in this function's assembly."
-                    color: AppTheme.textMuted
-                    font.pixelSize: 11
-                    wrapMode: Text.WordWrap
+                EmptyState {
                     Layout.fillWidth: true
+                    visible: root.hasSelection && root.hintsData.length === 0
+                    message: "No notable issues found in this function's assembly."
                 }
             }
         }

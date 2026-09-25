@@ -126,6 +126,7 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             "cwd": meta.cwd,
             "duration_ms": trace.duration_ns / 1_000_000,
             "devices": [d.to_dict() for d in trace.devices],
+            "captureTime": meta.capture_time_iso,
         },
     }
 
@@ -181,6 +182,9 @@ def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trac
         backends_used=meta_raw.get("backends", []),
         hostname=meta_raw.get("hostname", ""),
         cwd=meta_raw.get("cwd", ""),
+        # "" for any trace saved before this field existed -- the GUI
+        # renders that as "unavailable", not a guessed/fake time.
+        capture_time_iso=meta_raw.get("captureTime", ""),
     )
     trace = Trace(metadata)
 

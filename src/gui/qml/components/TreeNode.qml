@@ -17,47 +17,47 @@ Column {
 
     Rectangle {
         width: root.width
-        height: 24
+        height: AppTheme.rowCompact
         color: rowMouse.containsMouse ? AppTheme.panelBorder : "transparent"
 
         RowLayout {
             anchors.fill: parent
             anchors.leftMargin: root.depth * 18
-            anchors.rightMargin: 8
-            spacing: 6
+            anchors.rightMargin: AppTheme.spacingMd
+            spacing: AppTheme.spacingSm
 
             Text {
                 text: root.node.children.length > 0 ? (root.expanded ? "▾" : "▸") : " "
                 color: AppTheme.textMuted
-                font.pixelSize: 11
+                font.pixelSize: AppTheme.typeLabel
                 Layout.preferredWidth: 14
             }
             Rectangle { width: 8; height: 8; radius: 4; color: root.node.color }
             Text {
                 text: root.node.name
                 color: AppTheme.text
-                font.pixelSize: 12
+                font.pixelSize: AppTheme.typeBody
                 elide: Text.ElideRight
                 Layout.fillWidth: true
             }
             Text {
                 text: (root.wallNs > 0 ? (100.0 * root.node.totalNs / root.wallNs).toFixed(1) : "0.0") + "%"
                 color: AppTheme.textMuted
-                font.pixelSize: 11
+                font.pixelSize: AppTheme.typeLabel
                 Layout.preferredWidth: 50
                 horizontalAlignment: Text.AlignRight
             }
             Text {
                 text: root.node.total
                 color: AppTheme.text
-                font.pixelSize: 12
+                font.pixelSize: AppTheme.typeBody
                 Layout.preferredWidth: 70
                 horizontalAlignment: Text.AlignRight
             }
             Text {
                 text: root.node.count + "×"
                 color: AppTheme.textMuted
-                font.pixelSize: 11
+                font.pixelSize: AppTheme.typeLabel
                 Layout.preferredWidth: 50
                 horizontalAlignment: Text.AlignRight
             }
@@ -67,7 +67,13 @@ Column {
             id: rowMouse
             anchors.fill: parent
             hoverEnabled: true
-            onClicked: root.expanded = !root.expanded
+            onClicked: {
+                root.expanded = !root.expanded
+                // Reachable regardless of recursion depth -- Nav is a
+                // singleton (import Hprofiler 1.0), not resolved through
+                // the visual parent chain the way an ordinary id is.
+                Nav.selectFunction(root.node.category, root.node.name)
+            }
         }
     }
 

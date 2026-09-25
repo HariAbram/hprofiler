@@ -4,15 +4,15 @@ import Hprofiler 1.0
 import "../components"
 
 ColumnLayout {
-    spacing: 10
+    spacing: AppTheme.spacingLg
 
     RowLayout {
         Layout.fillWidth: true
         Layout.fillHeight: false
-        Layout.preferredHeight: 90
-        Layout.maximumHeight: 90
+        Layout.preferredHeight: AppTheme.statRowHeight
+        Layout.maximumHeight: AppTheme.statRowHeight
         visible: Profile.gpuActivity.length > 0
-        spacing: 10
+        spacing: AppTheme.spacingLg
         Repeater {
             model: Profile.gpuActivity
             delegate: Panel {
@@ -21,18 +21,18 @@ ColumnLayout {
                 title: modelData.label + " Activity"
                 ColumnLayout {
                     anchors.fill: parent
-                    spacing: 2
+                    spacing: AppTheme.spacingXs
                     Text {
                         text: modelData.activePct.toFixed(1) + "% active   " +
                               modelData.syncPct.toFixed(1) + "% sync   eff " + modelData.efficiency.toFixed(0) + "%"
                         color: modelData.color
                         font.bold: true
-                        font.pixelSize: 12
+                        font.pixelSize: AppTheme.typeBody
                     }
                     Text {
                         text: modelData.launches + " launches  ·  " + modelData.total + " total"
                         color: AppTheme.textMuted
-                        font.pixelSize: 11
+                        font.pixelSize: AppTheme.typeLabel
                     }
                 }
             }
@@ -42,7 +42,7 @@ ColumnLayout {
     RowLayout {
         Layout.fillWidth: true
         Layout.fillHeight: true
-        spacing: 10
+        spacing: AppTheme.spacingLg
 
         Panel {
             Layout.fillWidth: true
@@ -50,28 +50,21 @@ ColumnLayout {
             title: "Time breakdown"
             ColumnLayout {
                 anchors.fill: parent
-                spacing: 6
+                spacing: AppTheme.spacingSm
                 Repeater {
                     model: Profile.breakdown
                     delegate: ColumnLayout {
                         Layout.fillWidth: true
-                        spacing: 1
+                        spacing: AppTheme.spacingXs
                         RowLayout {
-                            Text { text: modelData.category; color: modelData.color; font.bold: true; font.pixelSize: 12; Layout.preferredWidth: 80 }
-                            Text { text: modelData.pct.toFixed(1) + "%"; color: AppTheme.text; font.pixelSize: 12; Layout.preferredWidth: 50 }
-                            Text { text: modelData.total; color: AppTheme.textMuted; font.pixelSize: 11 }
+                            Text { text: modelData.category; color: modelData.color; font.bold: true; font.pixelSize: AppTheme.typeBody; Layout.preferredWidth: 80 }
+                            Text { text: modelData.pct.toFixed(1) + "%"; color: AppTheme.text; font.pixelSize: AppTheme.typeBody; Layout.preferredWidth: 50 }
+                            Text { text: modelData.total; color: AppTheme.textMuted; font.pixelSize: AppTheme.typeLabel }
                         }
-                        Rectangle {
+                        ProgressBar {
                             Layout.fillWidth: true
-                            height: 6
-                            radius: 3
-                            color: AppTheme.background
-                            Rectangle {
-                                width: parent.width * modelData.pct / 100
-                                height: parent.height
-                                radius: 3
-                                color: modelData.color
-                            }
+                            pct: modelData.pct
+                            barColor: modelData.color
                         }
                     }
                 }
@@ -85,7 +78,7 @@ ColumnLayout {
             title: "Insight"
             ColumnLayout {
                 anchors.fill: parent
-                spacing: 8
+                spacing: AppTheme.spacingMd
                 Repeater {
                     model: Profile.insight
                     delegate: RowLayout {
@@ -94,17 +87,15 @@ ColumnLayout {
                         Text {
                             text: modelData.text
                             color: AppTheme.text
-                            font.pixelSize: 12
+                            font.pixelSize: AppTheme.typeBody
                             wrapMode: Text.WordWrap
                             Layout.fillWidth: true
                         }
                     }
                 }
-                Text {
+                EmptyState {
                     visible: Profile.insight.length === 0
-                    text: "No actionable insight — looks balanced."
-                    color: AppTheme.textMuted
-                    font.pixelSize: 12
+                    message: "No actionable insight — looks balanced."
                 }
                 Item { Layout.fillHeight: true }
             }
