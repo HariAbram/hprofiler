@@ -10,9 +10,9 @@ intercepted without requiring libnvToolsExt.
 Its core contribution is **cross-layer causal attribution**: one dependency
 graph built directly over every backend active in a single run — not a
 separate per-runtime trace merged after the fact — with each edge tagged by
-how directly the data proves it (§18), a formally-computed (not heuristic)
+how directly the data proves it (§17), a formally-computed (not heuristic)
 critical path, and a collection/observability design aimed at low
-perturbation and full-stack visibility (§13, §19). See "Implementation
+perturbation and full-stack visibility (§13, §18). See "Implementation
 Status" immediately below for what's verified end-to-end vs. what remains
 unverified on this development machine's specific hardware, and why.
 
@@ -37,12 +37,12 @@ confirm here, so nothing is implicitly overstated.
 | # | Piece | Status | Verified how | Docs |
 |---|---|---|---|---|
 | 1 | MPI protocol semantics (resolved wildcard matching, `Waitany`/`Waitsome`/`Test*`/`Cancel`, communicator identity) | ✅ **Verified end-to-end** | Real hook built + `LD_PRELOAD`ed into a fixture; actual wire-protocol bytes captured over a real `AF_UNIX` socket and parsed with the production parser (`tests/integration/test_mpi_protocol.py`, 8 tests) | §4 `mpi`, §12 |
-| 2 | Typed causal DAG: edge confidence tiers + formal DAG longest-path DP (replaces the old greedy walk) | ✅ **Verified end-to-end** | 27 hand-computed unit tests (`tests/test_criticalpath.py`), including a constructed case proving the DP finds a materially better (650ns vs. 60ns) answer than the old algorithm on the same graph | §18 |
-| 3 | GPU lifecycle split: real exec-start via reference-event calibration (`xs=` tag) | ⚠️ **Compile-verified only** | Clean `gcc -Wall -Wextra` compile of `cuda_hook.c`/`rocm_hook.c`, clean rebuild via the real CMake path, integrated into the DP (unit-tested against synthetic `xs=` tags) — **never run against a real GPU** (this machine's NVIDIA driver is broken, no AMD GPU present) | §4 `cuda`, §18, §13 |
+| 2 | Typed causal DAG: edge confidence tiers + formal DAG longest-path DP (replaces the old greedy walk) | ✅ **Verified end-to-end** | 27 hand-computed unit tests (`tests/test_criticalpath.py`), including a constructed case proving the DP finds a materially better (650ns vs. 60ns) answer than the old algorithm on the same graph | §17 |
+| 3 | GPU lifecycle split: real exec-start via reference-event calibration (`xs=` tag) | ⚠️ **Compile-verified only** | Clean `gcc -Wall -Wextra` compile of `cuda_hook.c`/`rocm_hook.c`, clean rebuild via the real CMake path, integrated into the DP (unit-tested against synthetic `xs=` tags) — **never run against a real GPU** (this machine's NVIDIA driver is broken, no AMD GPU present) | §4 `cuda`, §17, §13 |
 | 4 | Collection-path redesign: lock-free per-thread ring buffer (removes mutex+socket from the hot path) | ✅ **Primitive verified in isolation**; ⚠️ **not wired into any hook** | Concurrent correctness stress test, exact drop-counter accounting, FIFO-under-wraparound, ThreadSanitizer-clean, and real measured overhead (1.5–58x faster than today's mutex+`send()` pattern, depending on thread count) — deliberately not integrated into any hook's actual `emit_span()` this pass (see §13 for why) | §13 |
-| 5 | eBPF OS-level scheduler tracer (off-CPU/wakeup/migrate visibility) | ⚠️ **Compiled, linked, and run to the exact expected privilege wall — never loaded into a kernel** | `bpftool gen skeleton` independently confirms the compiled object's structure (fully offline check); running it reaches libbpf's internal probe-load self-test and fails with `EPERM`, precisely the error `kernel.unprivileged_bpf_disabled=2` should produce, handled gracefully — the kernel BPF verifier itself has never run against it | §19 |
-| 6 | Multi-node design: clock-offset estimation (Cristian's algorithm) + trace merging | ✅ **Python side (merge, validation, offset arithmetic) verified end-to-end**; ⚠️ **C-side round-trip capture compile-verified only** | 14 unit tests including an asymmetric-latency case proving the error bound brackets the real error, plus a real CLI run merging two actual traces (confirmed correct pid remapping) — the C-side round-trip exchange itself has never executed a real 2+-rank exchange (same MPI multi-rank limitation as #1's cross-process piece) | §20 |
-| 7 | Validation suite: aggregate precision/recall + determinism checks (vs. crash-only testing) | ✅ **Verified** | 100%/100% precision/recall across 22 hand-constructed ground-truth edges spanning all three confidence tiers; 35 determinism trials (7 scenarios × 5 random reorderings) with byte-identical results | §18, `tests/validation/` |
+| 5 | eBPF OS-level scheduler tracer (off-CPU/wakeup/migrate visibility) | ⚠️ **Compiled, linked, and run to the exact expected privilege wall — never loaded into a kernel** | `bpftool gen skeleton` independently confirms the compiled object's structure (fully offline check); running it reaches libbpf's internal probe-load self-test and fails with `EPERM`, precisely the error `kernel.unprivileged_bpf_disabled=2` should produce, handled gracefully — the kernel BPF verifier itself has never run against it | §18 |
+| 6 | Multi-node design: clock-offset estimation (Cristian's algorithm) + trace merging | ✅ **Python side (merge, validation, offset arithmetic) verified end-to-end**; ⚠️ **C-side round-trip capture compile-verified only** | 14 unit tests including an asymmetric-latency case proving the error bound brackets the real error, plus a real CLI run merging two actual traces (confirmed correct pid remapping) — the C-side round-trip exchange itself has never executed a real 2+-rank exchange (same MPI multi-rank limitation as #1's cross-process piece) | §19 |
+| 7 | Validation suite: aggregate precision/recall + determinism checks (vs. crash-only testing) | ✅ **Verified** | 100%/100% precision/recall across 22 hand-constructed ground-truth edges spanning all three confidence tiers; 35 determinism trials (7 scenarios × 5 random reorderings) with byte-identical results | §17, `tests/validation/` |
 
 Every ⚠️ item is re-stated with full detail, including the exact command
 and error that was reached, in its own section and in §13's Known
@@ -67,13 +67,12 @@ hunted for, not to replace it.
 12. [Wire Protocol](#12-wire-protocol)
 13. [Performance Overhead](#13-performance-overhead)
 14. [Extending the Profiler](#14-extending-the-profiler)
-15. [AI Performance Analysis](#15-ai-performance-analysis)
-16. [Call-Path Analysis, CCT, and GPU Starvation](#16-call-path-analysis-cct-and-gpu-starvation)
-17. [POP-Style Efficiency Analysis](#17-pop-style-efficiency-analysis)
-18. [Critical Path and Cross-Runtime Blame Attribution](#18-critical-path-and-cross-runtime-blame-attribution)
-19. [OS-Level Observability (eBPF Scheduler Tracer)](#19-os-level-observability-ebpf-scheduler-tracer)
-20. [Multi-Node Trace Merging and Clock Synchronization](#20-multi-node-trace-merging-and-clock-synchronization)
-21. [GUI Viewer](#21-gui-viewer)
+15. [Call-Path Analysis, CCT, and GPU Starvation](#15-call-path-analysis-cct-and-gpu-starvation)
+16. [POP-Style Efficiency Analysis](#16-pop-style-efficiency-analysis)
+17. [Critical Path and Cross-Runtime Blame Attribution](#17-critical-path-and-cross-runtime-blame-attribution)
+18. [OS-Level Observability (eBPF Scheduler Tracer)](#18-os-level-observability-ebpf-scheduler-tracer)
+19. [Multi-Node Trace Merging and Clock Synchronization](#19-multi-node-trace-merging-and-clock-synchronization)
+20. [GUI Viewer](#20-gui-viewer)
 
 ---
 
@@ -235,7 +234,7 @@ hprofiler run [OPTIONS] -- COMMAND [ARGS...]
 | `--disasm / --no-disasm` | `--no-disasm` | Collect per-kernel disassembly after the run; adds the Disasm tab to the TUI |
 | `--gpu-pc-sampling` | off | Enable CUPTI PC sampling for per-instruction GPU heat and stall annotation (CUDA only; **AoT-compiled kernels only** — see note). `libcupti.so` is loaded at runtime via `dlopen` — no recompile or CUPTI headers needed. Adds **Heat %** and **Stall** columns to the Disasm tab. Requires `--disasm`. |
 | `--call-tree / --no-call-tree` | `--no-call-tree` | Capture C++ call stacks at every API interception point; adds the Call Tree tab to the TUI and a CCT hotspot section to the text summary. When libunwind is available (detected at build time), unwinding is accurate without requiring `-fno-omit-frame-pointer`. Source file:line annotations are resolved automatically via `addr2line` / `llvm-symbolizer` when available. Adds ~5–50 µs per intercepted call — do not use during benchmarking. |
-| `--gui` | off | Open the native Qt/QML GUI instead of the TUI after profiling (falls back to the TUI automatically if PySide6/X11 aren't available). See §21. |
+| `--gui` | off | Open the native Qt/QML GUI instead of the TUI after profiling (falls back to the TUI automatically if PySide6/X11 aren't available). See §20. |
 
 Always separate the profiler's options from the target program with `--`:
 
@@ -297,7 +296,7 @@ hprofiler gui [OPTIONS] TRACE_FILE
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--disasm / --no-disasm` | `--no-disasm` | Collect disassembly in the background; populates the Source tab |
-| `--compare TRACE_B` | — | Open a second trace as a comparison run (populates the Compare tab); see §21's Comparison mode |
+| `--compare TRACE_B` | — | Open a second trace as a comparison run (populates the Compare tab); see §20's Comparison mode |
 | `--verbose / --no-verbose` | `--no-verbose` | Print which rendering tier was used (GPU-rendered Qt Quick, software-rendered, or TUI fallback) and why |
 
 ```bash
@@ -306,10 +305,17 @@ hprofiler gui --disasm my_program.hprofiler.json
 hprofiler gui after.hprofiler.json --compare before.hprofiler.json
 ```
 
+The trace is parsed and analysed on a background thread before the window
+opens; progress (current stage and percentage) is printed to the terminal,
+and **Ctrl+C cancels the load** (exit code 130). A trace that can't be
+loaded prints a short classified message (invalid input, unsupported data,
+missing dependency, permission denied, …), the underlying detail, and the
+path of the GUI log, then exits with code 1 instead of a Python traceback.
+
 Falls back to the TUI automatically — with no error — if PySide6 isn't
 installed, X11 isn't reachable (e.g. no `ssh -X`/`-Y`), or GPU-rendered Qt
 Quick fails to start over indirect/forwarded X11 (retried once with
-software rendering before giving up). See §21 for the full tab reference,
+software rendering before giving up). See §20 for the full tab reference,
 and §2's Requirements/troubleshooting for the PySide6 + `libxcb-cursor0`
 install and the VNC fallback for machines where installing that system
 library isn't possible.
@@ -434,7 +440,7 @@ hprofiler summary --top 10 my_program.hprofiler.json
 
 ### `hprofiler efficiency`
 
-Print a POP-style parallel efficiency breakdown for a saved trace. See §17
+Print a POP-style parallel efficiency breakdown for a saved trace. See §16
 for the full formula tree and what's exact vs. approximate.
 
 ```
@@ -457,7 +463,7 @@ hprofiler efficiency trace.json --baseline trace_1rank.json --interconnect-bw 30
 ### `hprofiler critical-path`
 
 Compute and print the N-way cross-runtime critical path for a saved trace.
-See §18 for the dependency model, its scope, and the single-node limitation.
+See §17 for the dependency model, its scope, and the single-node limitation.
 
 ```
 hprofiler critical-path [OPTIONS] TRACE_FILE
@@ -478,7 +484,7 @@ hprofiler critical-path trace.json --export trace.critpath.json
 ### `hprofiler merge-nodes`
 
 Merge multiple per-node traces from a multi-node run onto one timeline. See
-§20 for the clock-offset model and what's verified vs. not.
+§19 for the clock-offset model and what's verified vs. not.
 
 ```
 hprofiler merge-nodes [OPTIONS] TRACE_FILES...
@@ -528,7 +534,7 @@ fp|dwarf|lbr` to capture CPU call stacks; `--call-tree` for hook-captured
 GPU/MPI/OpenMP API call stacks works too, and both can be combined) and
 viewed live in the **Flame Graph tab**, alongside every other tab, in
 both the TUI and the GUI — no second profiling run, no separate output
-file. See §5 (TUI) and §21 (GUI) for the tab itself, and `hprofiler run`
+file. See §5 (TUI) and §20 (GUI) for the tab itself, and `hprofiler run`
 above for `--perf-callgraph`/`--call-tree`.
 
 ```bash
@@ -631,7 +637,7 @@ that point in the stream's FIFO queue, and this holds across streams since
 CUDA events mark points on one single per-device timeline). Purely
 additive — never changes what `start_ns`/`duration_ns` mean, so anything
 reading spans without knowing about `xs=` is unaffected.
-`src/analysis/criticalpath.py`'s dependency-graph DP (§18) prefers `xs=`
+`src/analysis/criticalpath.py`'s dependency-graph DP (§17) prefers `xs=`
 over `start_ns` when computing causal gate/gap times for GPU spans, so idle-
 time attribution around a queued kernel is accurate even though the
 Timeline/roofline/CCT views still show `start_ns` (deliberately — "when I
@@ -946,7 +952,7 @@ Up to 512 streams are tracked; beyond that, spans are tagged `stream=-1`.
 the outermost pair emits a `ncclGroup` span covering the full group
 duration. That span's [start, end] interval structurally contains every
 individual op called inside the group, each of which is *also* its own
-separate span — `hprofiler efficiency`'s Serialization Efficiency (§17)
+separate span — `hprofiler efficiency`'s Serialization Efficiency (§16)
 excludes the `ncclGroup` wrapper span itself from its "total communication
 time" sum for exactly this reason (it would otherwise double-count every
 grouped operation's duration); nothing else needs to, since no other
@@ -1134,7 +1140,7 @@ closing so no queued events are lost at program exit.
 **Multi-node clock synchronization:** set `HPROFILER_CLOCK_SYNC=1` (off by
 default) to have each rank estimate its clock offset relative to rank 0
 during `MPI_Init`, for aligning multiple nodes' traces via `hprofiler
-merge-nodes` — see §20 for the full protocol and verification status.
+merge-nodes` — see §19 for the full protocol and verification status.
 
 ---
 
@@ -1334,10 +1340,10 @@ communication pattern instead of just isolated per-rank bars. The status bar
 shows a `⇄N` hint when the hovered span has N such links, so the feature is
 discoverable without needing to already know which spans have edges. Reuses
 `criticalpath.py`'s already-resolved dependency-graph edges (resolved
-wildcard matching, `commid=`-scoped rendezvous, confidence tiers — see §18)
+wildcard matching, `commid=`-scoped rendezvous, confidence tiers — see §17)
 rather than re-deriving matching logic in the UI, so the same edges
 `hprofiler critical-path` reports are what gets drawn here. Line color
-signals confidence, the same tiers §18's "Path evidence strength" uses:
+signals confidence, the same tiers §17's "Path evidence strength" uses:
 bright white = `certain`, bright cyan = `high`, grey = `medium`.
 
 Only the *hovered* span's own edges are drawn, not every edge in the trace at
@@ -2090,6 +2096,7 @@ flowchart TB
             R1["CUDA Runtime\nDriver API · NVTX"]
             R2["OpenCL\nICD Loader"]
             R3["OpenMP\nlibomp"]
+            R7["OpenMP\nGNU libgomp"]
             R4["ROCm / HIP"]
             R5["NCCL\nlibnccl"]
             R6["MPI\nOpenMPI / MPICH"]
@@ -2103,6 +2110,7 @@ flowchart TB
             H4["libhprofiler_rocm\n─────────────\nGPU event timing\nstream ID tagging\nmemory counters\nJIT binary capture"]
             H5["libhprofiler_nccl\n─────────────\nGPU event timing\ncollective type + bytes\nstream ID tagging\ngroup boundaries"]
             H6["libhprofiler_mpi\n─────────────\nPMPI wrappers\nwall-clock timing\nbytes · rank · peer\ncollectives + p2p"]
+            H7["libhprofiler_gomp\n─────────────\nGOMP_* interposition\nper-thread region timing\nbarriers · loops · critical"]
         end
 
         R1 -->|LD_PRELOAD| H1
@@ -2111,11 +2119,12 @@ flowchart TB
         R4 -->|LD_PRELOAD| H4
         R5 -->|LD_PRELOAD| H5
         R6 -->|PMPI link| H6
+        R7 -->|LD_PRELOAD| H7
     end
 
     WIRE(["🔌  Unix domain socket\nspan: · ctr: · inst: · stk: · pcsa:\nnewline-delimited ASCII"])
 
-    H1 & H2 & H3 & H4 & H5 & H6 --> WIRE
+    H1 & H2 & H3 & H4 & H5 & H6 & H7 --> WIRE
 
     subgraph PY["  🐍  Profiler — Python  "]
         direction TB
@@ -2156,8 +2165,8 @@ flowchart TB
     classDef output   fill:#0c1a3d,stroke:#60a5fa,stroke-width:2px,color:#bfdbfe
     classDef engine   fill:#1c1917,stroke:#a8a29e,stroke-width:2px,color:#e7e5e4
 
-    class R1,R2,R3,R4,R5,R6 runtime
-    class H1,H2,H3,H4,H5,H6 hook
+    class R1,R2,R3,R4,R5,R6,R7 runtime
+    class H1,H2,H3,H4,H5,H6,H7 hook
     class WIRE wire
     class TRACE store
     class J,S,T,RF output
@@ -2167,11 +2176,16 @@ flowchart TB
 ### Data flow summary
 
 1. `hprofiler run` creates a Unix domain socket and sets `HPROFILER_SOCKET`.
-2. C hook libraries are injected via `LD_PRELOAD` (CUDA, OpenCL, ROCm, NCCL), the OMPT tool via `OMP_TOOL_LIBRARIES`, and the MPI hook via PMPI link-time interposition.
+2. C hook libraries are injected via `LD_PRELOAD` (CUDA, OpenCL, ROCm, NCCL, GNU libgomp), the OMPT tool via `OMP_TOOL_LIBRARIES`, and the MPI hook via PMPI link-time interposition.
 3. Each hook streams newline-delimited `span:` / `ctr:` / `stk:` records as API calls are intercepted. `stk:` records are emitted only when `HPROFILER_CALLSTACK=1` (set by `--call-tree`).
 4. The Python receiver matches `stk:` records to their preceding `span:` by `(pid, tid, start_ns)` and attaches the call stack to the `SpanEvent`.
-5. After the process exits, the `Trace` is serialized to Chrome Trace JSON.
-5. When `--disasm` is passed, a background thread starts `_collect_disasm`:
+5. After the process exits, the `Trace` is serialized to Chrome Trace JSON —
+   losslessly (span/request ids, real GPU thread ids, the profiling window;
+   see §6), because the GUI and every command other than `run` (`view`,
+   `summary`, `efficiency`, `critical-path`, `merge-nodes`) work from that
+   file, not from the in-memory trace. The GUI runs in its own process and
+   loads the file on a background thread (§20).
+6. When `--disasm` is passed, a background thread starts `_collect_disasm`:
    - CUDA: parses PTX/cubin blobs from `/tmp/hprofiler_cubin_<pid>_*.bin`
    - ROCm: parses AMDGCN blobs from `/tmp/hprofiler_rocm_<pid>_*.bin`
    - OpenCL SSCP: disassembles ACPP `.jit.so` files
@@ -2181,17 +2195,17 @@ flowchart TB
      x86-64, AArch64, or RISC-V from `e_machine`; uses capstone (fast) or objdump
    - All `/tmp/hprofiler_*_<pid>_*` scratch files are deleted after processing;
      any left over from a crashed run are cleaned up at the end of the next run
-6. After disassembly, `_collect_disasm` runs annotation passes:
+7. After disassembly, `_collect_disasm` runs annotation passes:
    - CPU/OpenCL-CPU kernels: `annotate_with_perf(kd, perf_data)` — runs `perf annotate`
      and sets `DisasmLine.sample_pct` from the `perf.data` recording (then deletes it).
    - CUDA kernels (when `--gpu-pc-sampling`): `annotate_with_cupti(kd, samples)` — matches
      accumulated `pcsa:` records to `DisasmLine.addr`, setting `sample_pct`,
      `stall_cycles`, and `stall_reason`.
    Each annotation increments `trace._disasm_version` so the TUI can detect the change.
-7. The TUI's Disasm tab (shown only when `--disasm`) polls `trace._disasm_version` every
+8. The TUI's Disasm tab (shown only when `--disasm`) polls `trace._disasm_version` every
    0.5 s. A version change clears the render cache and refreshes heat/stall columns and
    the optimization hints panel without requiring user interaction.
-8. `profiler roofline` is a separate pass that re-runs the application under
+9. `profiler roofline` is a separate pass that re-runs the application under
    `ncu` / `rocprof` / `perf stat` to collect exact hardware counter measurements.
 
 ---
@@ -2853,12 +2867,12 @@ Known measurement artifacts:
 | **Static CUDA runtime** | Binaries linked with `libcudart_static.a` (nvcc default) show 0 events because LD_PRELOAD cannot intercept compile-time-resolved `cudaXxx` symbols. `--gpu-pc-sampling` has the same requirement. | Rebuild with `-cudart shared` (no runtime-performance impact). |
 | **Device bandwidth estimates** | The roofline `device.py` memory-bandwidth formula under-reports peak bandwidth by ~2× for HBM-based cards (A100, H100, MI300). | Treat bandwidth peaks in the System tab as conservative estimates; check vendor datasheets for exact numbers. |
 | **ROCm PC sampling** | `--gpu-pc-sampling` is silently ignored for ROCm runs. Instruction-level heat annotation requires `librocprofiler-sdk.so` integration (not yet implemented). | Use CUDA backend for instruction-level GPU heat. |
-| **Multi-node critical-path needs a merge step first, and its clock-offset mechanism is unverified** | A single trace is still inherently single-node (the collector's `AF_UNIX` socket is only reachable within one node/filesystem) — `hprofiler merge-nodes` (§20) combines several nodes' traces first, using clock offsets from `mpi_hook.c`'s opt-in `HPROFILER_CLOCK_SYNC` round-trip exchange. The Python-side offset arithmetic and merge logic are fully unit-tested; the C-side round-trip *capture* has never executed against a real multi-node job (this machine can't form a real multi-rank `MPI_COMM_WORLD` at all, see below). | Run `merge-nodes` before `critical-path` for a multi-node trace; treat the resulting cross-node edges as unverified until `HPROFILER_CLOCK_SYNC` has been confirmed on a real cluster — `validate_causality()` (also run automatically by the `merge-nodes` CLI command) flags any resulting send-after-receive violation rather than silently trusting the offset. |
-| **POP efficiency's Serialization/Transfer split is approximate** | `hprofiler efficiency` (§17) fits latency/bandwidth from the trace's own messages instead of a Dimemas network replay. | Treat Transfer Efficiency as a proxy; check `EfficiencyReport.notes` for when it was too under-determined to compute at all. |
+| **Multi-node critical-path needs a merge step first, and its clock-offset mechanism is unverified** | A single trace is still inherently single-node (the collector's `AF_UNIX` socket is only reachable within one node/filesystem) — `hprofiler merge-nodes` (§19) combines several nodes' traces first, using clock offsets from `mpi_hook.c`'s opt-in `HPROFILER_CLOCK_SYNC` round-trip exchange. The Python-side offset arithmetic and merge logic are fully unit-tested; the C-side round-trip *capture* has never executed against a real multi-node job (this machine can't form a real multi-rank `MPI_COMM_WORLD` at all, see below). | Run `merge-nodes` before `critical-path` for a multi-node trace; treat the resulting cross-node edges as unverified until `HPROFILER_CLOCK_SYNC` has been confirmed on a real cluster — `validate_causality()` (also run automatically by the `merge-nodes` CLI command) flags any resulting send-after-receive violation rather than silently trusting the offset. |
+| **POP efficiency's Serialization/Transfer split is approximate** | `hprofiler efficiency` (§16) fits latency/bandwidth from the trace's own messages instead of a Dimemas network replay. | Treat Transfer Efficiency as a proxy; check `EfficiencyReport.notes` for when it was too under-determined to compute at all. |
 | **Cross-process `commid=` agreement untested on this dev machine** | `MPI_Comm_dup`/`split`/`create`'s bootstrap `Bcast` (§4 `mpi`) is only meaningfully exercised at 2+ real ranks; this development machine's MPICH/Hydra cannot form a multi-rank `MPI_COMM_WORLD` at all (every rank under `mpirun -np N`, N>1, independently sees size 1 — a PMI/KVS rank-discovery failure in this machine's MPICH/UCX/PMIx setup, reproducible with the pre-existing unmodified `mpi_mini.c` fixture, unrelated to hprofiler). | Verified here only via a self-communicating fixture (real completion semantics, no real second rank) plus compile-checked multi-rank code (`tests/fixtures/mpi_proto.c`); needs a real multi-rank run (e.g. on Dardel) to confirm cross-process agreement. |
 | **`xs=` exec-start calibration unverified on real GPU hardware** | `cuda_hook.c`/`rocm_hook.c`'s reference-event calibration (§4 `cuda`) has no working GPU to run against on this development machine (broken NVIDIA driver, no AMD GPU) — only compile-checked (`gcc -Wall -Wextra` clean, and via `./hprofiler build`), and `src/analysis/criticalpath.py`'s consumption of it (`_effective_start_ns`/`_edge_gap_and_gate`) is only unit-tested against hand-constructed synthetic spans with a fake `xs=` tag, never a real captured trace. | Treat `xs=`-derived gap/idle-time numbers as unverified until confirmed on a working CUDA/ROCm GPU; the underlying technique mirrors `opencl_hook.c`'s calibration, which *is* hardware-verified. |
 | **Lock-free ring buffer (`hooks/common/ringbuffer.h`) not wired into any hook** | Built and verified in isolation (stress-tested, ThreadSanitizer-clean, benchmarked — see §13 "Reducing collection-path overhead"), but no hook's `emit_span()` actually uses it yet; today's real collection path is still the mutex+`send()` pattern for every hook. | The measured 1.5–58x overhead reduction is real for the primitive itself, not yet realized end-to-end in a profiling run; treat it as available infrastructure for a future integration pass, not a shipped speedup. |
-| **eBPF OS tracer (`hooks/os_tracer/`) never loaded into a kernel** | `kernel.unprivileged_bpf_disabled=2` on this development machine blocks BPF loading for non-root — see §19. Compiled, linked, and run up to `EPERM` at the exact expected privilege wall; the kernel BPF verifier (a distinct pass beyond compilation) has never actually run against it. | Needs root/`CAP_BPF` on a machine where that's authorized to confirm the tracepoint handlers pass kernel verification and emit semantically correct events under real scheduler activity. |
+| **eBPF OS tracer (`hooks/os_tracer/`) never loaded into a kernel** | `kernel.unprivileged_bpf_disabled=2` on this development machine blocks BPF loading for non-root — see §18. Compiled, linked, and run up to `EPERM` at the exact expected privilege wall; the kernel BPF verifier (a distinct pass beyond compilation) has never actually run against it. | Needs root/`CAP_BPF` on a machine where that's authorized to confirm the tracepoint handlers pass kernel verification and emit semantically correct events under real scheduler activity. |
 | **`gomp_hook.c` (direct `GOMP_*` interception) — now confirmed on the real cluster that motivated it** | Built in response to a real user run on the Dardel HPC cluster (`ldd gmx_mpi` showed `libgomp.so.1`, confirming OMPT alone would never capture events there); fully verified end-to-end on this development machine, and subsequently confirmed working on Dardel itself via a real GROMACS run's Timeline screenshots (populated `omp`/`sync`/`mpi` lanes with real per-thread/per-rank span counts) — see §4 `openmp`. | None currently open for event capture itself. The GCC/`cpeGNU` toolchain-version specifics of what was actually exercised on Dardel beyond what this development machine's `gcc` produces are still not independently confirmed. |
 | **Call-site disassembly (`sym=`/`lib=` codeptr tags) doesn't cover every construct yet** | `ompt_tool.c` always resolved this; `gomp_hook.c` (`omp_parallel_region`, `omp_barrier`, `omp_critical_wait`/`_name_wait`, work-sharing loops) and `mpi_hook.c` (the collectives + `MPI_Barrier`) were fixed to do the same, via the shared `hooks/common/codeptr_resolve.h` helper, after a real Dardel run showed the Source tab's "No disassembly available" for every OpenMP/MPI construct — not an `objdump`-availability problem, but that `gomp_hook.c` never resolved/emitted the tag at all, and `src/core/runner.py`'s `_collect_disasm` unconditionally excluded category `"mpi"` from even looking for one. A SECOND, separate bug surfaced immediately after: a genuinely-resolved `sym=` still produced "No disassembly available" because `collect_disasm` always disassembled `command[0]`, but the profiled command is routinely a launcher (`srun`/`mpirun`) wrapping the real binary — fixed via a new `symfile=` tag carrying `dladdr()`'s own `dli_fname` (see §12's Span record tag table). Verified end-to-end (hook → wire protocol → real disassembly attached to the trace, including a real reproduction of the launcher-wrapped case) on this development machine. | Point-to-point MPI calls (`MPI_Send`/`Recv`/`Isend`/`Irecv`/`Wait*`) and `gomp_hook.c`'s `omp_critical_hold` span don't capture a call-site tag yet — those still show "No disassembly available" regardless of `objdump`/`nm` availability. `ompt_tool.c`'s own `sym=` tags don't carry `symfile=` yet, so the same launcher-wrapped-binary problem this fix solved for `gomp_hook.c`/`mpi_hook.c` could still affect a pure-OMPT (LLVM libomp) profiling run of a launcher-wrapped command — not confirmed broken, just not yet fixed the same way. |
 | **Zero-event runs via a job launcher can be intermittent, and hprofiler can't fix it from inside the profiled process** | A real user's `srun`-launched GROMACS run completed normally but captured zero events across every active backend, then the IDENTICAL command captured 60381 events on the next invocation with no code change in between — consistent with `srun` not propagating `HPROFILER_SOCKET`/`LD_PRELOAD` to the spawned job step on that particular invocation (every hook's `ensure_connected()` retries on every emit call, so a total loss across a multi-second run rules out a simple startup race). `src/core/runner.py` now has a `_total_zero_event_warning` check (see §4) that fires when EVERY active backend captured zero events and gives launcher-specific advice (e.g. `srun --export=ALL`) when the command is a recognized launcher (`srun`/`mpirun`/`mpiexec`/`aprun`/`jsrun`/`ibrun`). | This is a launcher/site environment-export configuration issue, not something fixable from inside the already-spawned profiled process — if the warning fires, check your site's launcher environment-export defaults, or just re-run (the user's own report suggests it may not reproduce every time). |
@@ -2904,6 +2918,32 @@ class MyBackend(Backend):
 4. Add `e_machine` detection in `_elf_arch()` and `_disasm_elf_capstone()`
    in `extractor.py`.
 
+### Running the tests
+
+```bash
+# Unit tests (pure Python + headless Qt; ~12 s)
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p 'test_*.py'
+
+# Integration tests -- build and run real programs through the hooks.
+# tests/integration/ has no __init__.py, so discovery skips it: run the
+# modules by name. Each skips (not fails) when its toolchain is missing.
+python3 -m unittest tests.integration.test_profiling_accuracy \
+    tests.integration.test_gomp_hook tests.integration.test_mpi_protocol \
+    tests.integration.test_mpi_rma tests.integration.test_gui_cancel
+
+# End-to-end CLI matrix (run/summary/efficiency/critical-path per backend)
+bash tests/integration/run_matrix.sh
+
+# Repeated-trial accuracy statistics (overhead, timestamp error, ...)
+python3 tests/integration/accuracy_report.py --trials 10
+```
+
+Any analysis that reads span fields should be tested on a trace that has
+been through `chrome_trace.write` → `load_trace_from_json`: the GUI and
+every command except `run` only ever see the reloaded trace, and
+in-memory-only tests are exactly how a lossy round trip once went
+unnoticed (see §6).
+
 ### Consuming the trace programmatically
 
 ```python
@@ -2938,265 +2978,7 @@ for name, kd in trace.disasm.items():
           f"mem={mix.get(InsnType.MEMORY, 0):.0f}%")
 ```
 
-## 15. AI Performance Analysis
-
-The `analyze` command and `--analyze` flag on `run` drive an agentic LLM workflow that reads profiling data, calls analysis tools to drill into bottlenecks, and writes a structured performance report.
-
----
-
-### 15.1 CLI Reference
-
-#### `hprofiler analyze`
-
-```
-hprofiler analyze [OPTIONS] [TRACE_FILE | -- COMMAND...]
-
-Two modes:
-  1. Existing trace:  hprofiler analyze trace.hprofiler.json
-  2. Profile first:   hprofiler analyze --backend cuda -- ./app
-```
-
-| Option | Description |
-|--------|-------------|
-| `--llm PROVIDER` | `anthropic` \| `openai` \| `ollama` \| `openai-compat`  (default: auto-detect) |
-| `--llm-model MODEL` | Model name accepted by the provider (see §15.2) |
-| `--llm-endpoint URL` | Base URL for `openai-compat` or custom Ollama host |
-| `--llm-api-key KEY` | API key (overrides env-var defaults) |
-| `--output-report PATH` | Save Markdown report to file |
-| `--compare TRACE_B` | Compare two traces — report improvements and regressions |
-| `--backend BACKENDS` | Backends when profiling a new command (same as `run`) |
-| `--output PATH` | Trace file path when profiling a new command |
-
-#### `hprofiler run --analyze`
-
-```
-hprofiler run --analyze [--llm ...] [--llm-model ...] ... -- COMMAND
-```
-
-Runs the profiler normally, then immediately analyses the captured trace. All `analyze` LLM options are available:
-
-| Option | Description |
-|--------|-------------|
-| `--analyze` | Enable AI analysis after profiling |
-| `--llm PROVIDER` | Provider (same as `analyze` command) |
-| `--llm-model MODEL` | Model name |
-| `--llm-endpoint URL` | Base URL override |
-| `--llm-api-key KEY` | API key override |
-| `--analysis-report PATH` | Save report to Markdown file |
-
----
-
-### 15.2 Provider and Model Selection
-
-#### Auto-detection order
-
-When `--llm` is not set, hprofiler detects the provider from the environment in this order:
-
-1. `ANTHROPIC_API_KEY` is set → use Anthropic (`claude-sonnet-4-6` default)
-2. `OPENAI_API_KEY` is set → use OpenAI (`gpt-4o` default)
-3. Ollama responds at `http://localhost:11434` → use Ollama (`llama3.1:8b` default)
-4. None found → error with setup instructions
-
-#### Supported providers and models
-
-| Provider | `--llm` value | Default model | Notes |
-|----------|--------------|---------------|-------|
-| Anthropic | `anthropic` | `claude-sonnet-4-6` | Best tool-use quality |
-| OpenAI | `openai` | `gpt-4o` | Standard function calling |
-| Ollama | `ollama` | `llama3.1:8b` | Local, free, private |
-| Any OpenAI-compat | `openai-compat` | (required) | vLLM, LM Studio, Groq, Together.ai, … |
-
-**Using any model:** pass any model string the provider accepts via `--llm-model`:
-
-```bash
-# Anthropic
-hprofiler analyze --llm anthropic --llm-model claude-opus-4-8 trace.json
-hprofiler analyze --llm anthropic --llm-model claude-haiku-4-5-20251001 trace.json
-
-# OpenAI
-hprofiler analyze --llm openai --llm-model o1 trace.json
-hprofiler analyze --llm openai --llm-model gpt-4o-mini trace.json
-
-# Ollama — any locally pulled model
-ollama pull qwen2.5:32b
-hprofiler analyze --llm ollama --llm-model qwen2.5:32b trace.json
-
-ollama pull deepseek-r1:7b
-hprofiler analyze --llm ollama --llm-model deepseek-r1:7b trace.json
-
-# Custom endpoint (vLLM, Groq, Together.ai, …)
-hprofiler analyze \
-  --llm openai-compat \
-  --llm-endpoint https://api.groq.com/openai/v1 \
-  --llm-api-key gsk_... \
-  --llm-model llama-3.1-70b-versatile \
-  trace.json
-```
-
-#### Persistent configuration via environment variables
-
-```bash
-export HPROFILER_LLM_PROVIDER=ollama
-export HPROFILER_LLM_MODEL=qwen2.5:32b
-# HPROFILER_LLM_API_KEY  — use instead of / alongside ANTHROPIC_API_KEY / OPENAI_API_KEY
-# HPROFILER_LLM_ENDPOINT — base URL for openai-compat or custom Ollama host
-# OLLAMA_HOST            — Ollama server URL (default: http://localhost:11434)
-```
-
-Command-line flags take priority over environment variables.
-
----
-
-### 15.3 How the Agent Works
-
-The analysis runs as a multi-turn agentic loop:
-
-```
-1. Build Tier-1 context (always included):
-   run metadata, hardware caps, time breakdown by category, top-15 hotspots,
-   GPU utilisation, memory transfer summary, hardware counters, roofline data,
-   and parent→child span hierarchy sample
-
-2. Send context + system prompt to LLM with tool definitions
-
-3. LLM reasons about the data and may call tools:
-   - get_hotspots        — top N spans, filtered by category or minimum duration
-   - get_kernel_details  — p50/p90 latency, tag details for a named kernel
-   - get_memory_profile  — H2D/D2H/D2D breakdown with effective bandwidth
-   - get_timeline_phases — per-bucket activity % (finds idle gaps and bubbles)
-   - get_sync_analysis   — synchronisation overhead with parent-link attribution
-   - get_mpi_communication — MPI operation breakdown, bytes, send-wait pairs
-   - query_spans         — flexible filter/sort query across all spans
-
-4. Tool results are fed back as the next turn
-
-5. Loop runs for up to 8 turns (configurable), then the LLM writes its report
-
-6. Report is rendered to the terminal via Rich markdown
-```
-
-**Graceful degradation:** if the model does not support tool use (some base models, very small quantised models), the agent automatically falls back to a single-shot analysis with the full Tier-1 context in the prompt — no tools are called, but the report is still produced.
-
-**No new dependencies:** all HTTP calls use Python's standard-library `urllib.request`. The `rich` library (already a hprofiler dependency) renders the report.
-
----
-
-### 15.4 Report Format
-
-The LLM is instructed to produce a structured Markdown report:
-
-```markdown
-## Executive Summary
-2–3 sentences on the biggest bottleneck and root cause.
-
-## Top Bottlenecks (ranked by impact)
-### 1. [Name] — [Root Cause Category]
-- **Evidence:** specific timing and percentage
-- **Root cause:** WHY it is slow
-- **Fix:** specific code change or configuration
-- **Estimated impact:** rough speedup or saved time
-
-## Secondary Observations
-Brief bullets on other issues worth addressing.
-
-## Optimization Roadmap
-[HIGH] most impactful change
-[MED]  moderate impact
-[LOW]  low-effort cleanup
-```
-
----
-
-### 15.5 Trace Comparison
-
-```bash
-# Profile two variants and compare
-hprofiler run --no-ui -o before.json -- ./app --naive
-hprofiler run --no-ui -o after.json  -- ./app --optimised
-hprofiler analyze --compare before.json after.json
-```
-
-The comparison context includes:
-- Wall time delta (absolute and %)
-- Per-category time deltas
-- Hotspot-level before/after table
-
-The LLM reports on: improvements, regressions, unchanged areas, and likely causes.
-
----
-
-### 15.6 Code Structure
-
-```
-src/analysis/
-  llm/
-    __init__.py          factory + auto-detection (create_provider, auto_detect)
-    base.py              LLMProvider ABC, ToolCall, ChatResponse dataclasses
-    anthropic.py         Anthropic Messages API via urllib.request
-    openai_compat.py     OpenAI / Ollama / vLLM / any compatible endpoint
-  context.py             Trace → structured profile dict (Tier-1 context)
-  agent_tools.py         Tool definitions (OpenAI format) + implementations
-  agent.py               Multi-turn agentic loop + compare_traces
-  report.py              Rich terminal output + Markdown file writer
-```
-
-#### Adding a new tool
-
-1. Add a tool definition to `TOOL_DEFINITIONS` in `agent_tools.py` (OpenAI function-calling format)
-2. Add a handler function `_my_tool(trace, **kwargs) -> str` (returns JSON string)
-3. Register it in the `_handlers` dict inside `execute_tool`
-
-The handler receives the `Trace` object and any arguments the LLM passes. Return a compact JSON string (the LLM reads it as a tool result).
-
-#### Adding a new LLM provider
-
-Subclass `LLMProvider` from `src/analysis/llm/base.py` and implement `chat()`. The method receives messages in OpenAI internal format; translate to your provider's wire format and back. Register the new provider name in `create_provider()` in `src/analysis/llm/__init__.py`.
-
----
-
-### 15.7 Planned: LLM-Triggered Re-Profiling
-
-**Current limitation:** the agent only has access to data already captured in the loaded trace. If it identifies a bottleneck that requires a different profiling strategy — e.g., "I need roofline data for this kernel" or "re-run with `--backend mpi` to see communication breakdown" — it cannot act on that insight; it can only describe what additional profiling *would* show.
-
-**Planned feature:** expose a `run_profile` tool that lets the agent trigger a new profiling run during the analysis loop.
-
-```
-run_profile(command, backends, extra_env) → trace_id
-```
-
-The agent would be able to:
-- Re-run with a different backend combination (e.g., add `cpu` to an existing `rocm` run)
-- Re-run with `--backend likwid` to collect hardware counters it's missing
-- Re-run with `HPROFILER_LIKWID_GROUP=MEM` to measure DRAM bandwidth specifically
-- Launch a roofline pass (`ncu`/`rocprof`) on a suspected compute-bound kernel
-
-Results from the new run would be loaded into a secondary `Trace` and made available to subsequent tool calls. The agent would then compare the original and follow-up traces to build a more complete picture.
-
-**Design considerations:**
-- Re-running is destructive for benchmarks (warm caches, GPU state, MPI startup cost) — the tool needs a `dry_run` preview mode so the agent can show the user what it intends to run before executing
-- Some profiling passes (e.g., `ncu`) require elevated permissions or add significant overhead — the agent must surface this as a warning
-- The loop turn limit (`max_turns`) would need to account for the latency of re-runs (could be seconds to minutes)
-
----
-
-### 15.9 Privacy Considerations
-
-All profiling data sent to the LLM includes:
-
-- Kernel/function names from the profiled binary
-- Timing and counter data
-- Hostname, command-line arguments, and backends used
-
-**Ollama is fully local** — no data leaves your machine. For cloud providers
-(Anthropic, OpenAI, any openai-compat endpoint), review the provider's data
-handling policy before profiling sensitive workloads.
-
-To avoid sending sensitive argument values, use `--no-summary` and review what
-`context_to_str()` would include for your trace before enabling cloud analysis.
-
----
-
-## 16. Call-Path Analysis, CCT, and GPU Starvation
+## 15. Call-Path Analysis, CCT, and GPU Starvation
 
 This section covers the three analysis features added for C/C++ HPC workloads:
 accurate C++ call paths via libunwind, the Calling Context Tree (CCT), and
@@ -3204,7 +2986,7 @@ GPU starvation detection.
 
 ---
 
-### 16.1 C++ Call Path via libunwind
+### 15.1 C++ Call Path via libunwind
 
 hprofiler can capture the full C++ call stack at every API interception point
 (kernel launches, memory transfers, MPI collectives, etc.) and attribute time
@@ -3269,7 +3051,7 @@ appear in call paths.
 
 ---
 
-### 16.2 Calling Context Tree (CCT)
+### 15.2 Calling Context Tree (CCT)
 
 The CCT aggregates profiling events by their full call path, collapsing
 repeated invocations from the same source location into a single node. This
@@ -3332,7 +3114,7 @@ for node in cct.top_incl(n=5):
 
 ---
 
-### 16.3 GPU Starvation Detection
+### 15.3 GPU Starvation Detection
 
 The GPU starvation analysis identifies time the GPU spent idle while the CPU
 was doing work, and separates it into two root causes:
@@ -3392,7 +3174,7 @@ a candidate for prefetching or restructuring data layout.
 
 ---
 
-### 16.4 Recommended workflow for HPC C++ programs
+### 15.4 Recommended workflow for HPC C++ programs
 
 ```bash
 # Step 1: baseline run without call trees (low overhead)
@@ -3412,7 +3194,7 @@ hprofiler run --backend cuda --call-tree -- ./sim --steps 10
 
 ---
 
-## 17. POP-Style Efficiency Analysis
+## 16. POP-Style Efficiency Analysis
 
 ```bash
 hprofiler efficiency trace.json
@@ -3443,7 +3225,7 @@ Communication Efficiency = Serialization Efficiency × Transfer Efficiency
 | Load Balance | avg(useful time per rank) / max(useful time per rank) | **Exact** — "useful time" is the merged (overlap-deduplicated) wall-clock interval covered by `cpu`/`cuda`/`rocm`/`opencl`/`openmp` category spans on that rank/process |
 | Communication Efficiency | max(useful time per rank) / wall time | **Exact** |
 | Transfer Efficiency | ideal message time (self-fitted α+bytes/β model) / actual message time | **Approximate** — see below |
-| Serialization Efficiency | (communication time that is actually on the critical path) / (total communication time) | **Approximate**, and only computed when critical-path analysis (§18) is available — `--no-critical-path` disables it |
+| Serialization Efficiency | (communication time that is actually on the critical path) / (total communication time) | **Approximate**, and only computed when critical-path analysis (§17) is available — `--no-critical-path` disables it |
 | Computational Scaling | mean IPC(this trace) / mean IPC(`--baseline` trace), capped at 1.0 | **Approximate proxy** — POP's stricter definition also scales instruction count, not just IPC; requires a `--baseline` trace at a lower rank/thread count (inherent to the metric itself, not a limitation of this implementation — POP's own methodology needs a reference case too) |
 | GPU Efficiency | duration-weighted mean of the existing disassembly-based roofline `flops_pct` | Requires the trace to have been recorded/viewed with `--disasm` |
 | NCCL Efficiency | achieved bus bandwidth (standard ring-allreduce formula, same metric `nccl-tests` reports) / `--interconnect-bw` | Achieved bus bandwidth is exact; the efficiency **percentage** requires `--interconnect-bw` (no reliable auto-detection of NVLink/PCIe/Slingshot peak across all platforms) |
@@ -3474,7 +3256,7 @@ exactly why.
 
 ---
 
-## 18. Critical Path and Cross-Runtime Blame Attribution
+## 17. Critical Path and Cross-Runtime Blame Attribution
 
 ```bash
 hprofiler critical-path trace.json
@@ -3503,7 +3285,7 @@ synchronization semantics:
 | Program order | Sequential spans on the same OS thread | Timestamps only |
 | Stream order | Sequential CUDA/ROCm spans on the same `stream=N` | `stream=` tag |
 | Device sync | `cudaDeviceSynchronize`/`hipDeviceSynchronize` depends on every GPU span since the last device sync on that process | Category/name matching |
-| Point-to-point | The Nth send-side event pairs with the Nth matching receive-side event for a given `(rank, peer, tag)` key, in each side's own post/arrival order — **not** "whichever send had already started" (MPI guarantees FIFO delivery per ordered pair+tag, so this holds regardless of which span starts first; a recv is commonly posted well before its matching send, to overlap communication setup with compute). Covers both blocking `MPI_Send`/`MPI_Recv` and non-blocking `MPI_Isend`/`MPI_Irecv` — for the latter, the edge lands on whichever call actually observes completion (`MPI_Wait`/`Waitall`/`Waitany`/`Waitsome`), not the `Irecv` itself, which returns almost instantly and isn't what blocks. A receive posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG` is matched using the *resolved* real peer/tag mpi_hook.c reports (§4 `mpi`), not a sentinel. Gated by the send's **start**, evaluated against the completing event's **end**. `Isend`/`Irecv` → their own `Wait`/`Waitall`/`Waitany`/`Waitsome` additionally get a same-rank `explicit_span_id` edge via `sid=`/`psid=` (§12/§16.1), including through a `;`-separated multi-request `psid=` on `Waitall`/`Waitsome` | `rank=`/`peer=`/`tag=`/`wildcard=`/`rpeer=`/`rtag=` tags, `span_id`/`parent_span_id` |
+| Point-to-point | The Nth send-side event pairs with the Nth matching receive-side event for a given `(rank, peer, tag)` key, in each side's own post/arrival order — **not** "whichever send had already started" (MPI guarantees FIFO delivery per ordered pair+tag, so this holds regardless of which span starts first; a recv is commonly posted well before its matching send, to overlap communication setup with compute). Covers both blocking `MPI_Send`/`MPI_Recv` and non-blocking `MPI_Isend`/`MPI_Irecv` — for the latter, the edge lands on whichever call actually observes completion (`MPI_Wait`/`Waitall`/`Waitany`/`Waitsome`), not the `Irecv` itself, which returns almost instantly and isn't what blocks. A receive posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG` is matched using the *resolved* real peer/tag mpi_hook.c reports (§4 `mpi`), not a sentinel. Gated by the send's **start**, evaluated against the completing event's **end**. `Isend`/`Irecv` → their own `Wait`/`Waitall`/`Waitany`/`Waitsome` additionally get a same-rank `explicit_span_id` edge via `sid=`/`psid=` (§12/§15.1), including through a `;`-separated multi-request `psid=` on `Waitall`/`Waitsome` | `rank=`/`peer=`/`tag=`/`wildcard=`/`rpeer=`/`rtag=` tags, `span_id`/`parent_span_id` |
 | Collective / barrier rendezvous | Every participant depends on the single **last-arriving** participant (by `start_ns`) — not a full mutual clique between all participants, which would let the walk keep chaining through arrival edges after the last arriver is already found. Gated the same way as point-to-point: by the last arriver's **start**, against the waiting participant's **end**. MPI collectives cluster per `(type, commid)` when a real communicator id is available (§4 `mpi`), not just per `(type)` — closes a real false-positive case where two *unrelated* communicators doing the same collective type at overlapping wall-clock times used to be merged into one bogus rendezvous group | Overlapping-interval clustering per `(type, commid)` for MPI (falls back to `(type)` only when `commid` is unavailable), per `(type)` for NCCL (no communicator-identity mechanism yet), per `(pid, barrier name)` for OpenMP |
 
 This does **not** attempt arbitrary data-flow analysis (e.g. "this kernel
@@ -3673,11 +3455,11 @@ can filter/color on in [Perfetto](https://ui.perfetto.dev) or
 
 ---
 
-## 19. OS-Level Observability (eBPF Scheduler Tracer)
+## 18. OS-Level Observability (eBPF Scheduler Tracer)
 
 `hooks/os_tracer/` answers a question none of the LD_PRELOAD/OMPT/PMPI
 hooks can: when a thread's span shows an idle gap, was that gap actually
-caused by the dependency the causal-path graph (§18) thinks it was waiting
+caused by the dependency the causal-path graph (§17) thinks it was waiting
 on, or was the OS scheduler simply not running that thread on a CPU during
 that window — preempted by another process, waiting for a free core,
 migrated across NUMA nodes? That's invisible below the userspace boundary
@@ -3785,7 +3567,7 @@ compile-only (phases 3/4 of this redesign), but still short of a live run.
 
 ---
 
-## 20. Multi-Node Trace Merging and Clock Synchronization
+## 19. Multi-Node Trace Merging and Clock Synchronization
 
 hprofiler's collector is a local `AF_UNIX` socket (§12), so a single trace
 is inherently single-node regardless of clock synchronization — a
@@ -3882,7 +3664,7 @@ ordering.
 
 ---
 
-## 21. GUI Viewer
+## 20. GUI Viewer
 
 A native Qt/QML desktop GUI (`src/gui/`, PySide6), built as an alternative
 to the Textual TUI for the same trace data — same underlying `Trace`
@@ -3937,6 +3719,49 @@ Requirements table and troubleshooting subsection for root and root-free
 (conda-forge/Spack) install paths, and the VNC platform-plugin fallback
 for machines where installing it isn't an option at all.
 
+### Loading, errors and cancellation
+
+- **Off the GUI thread.** `src/gui/loader.py` parses the JSON and computes
+  the Overview, Call Tree and Flame Graph data on a `QThread`
+  (`src/gui/controller.py`'s `LoadController` owns its lifecycle); only the
+  finished, internally consistent result is handed to the UI — there is no
+  partially-loaded state to see. The window itself only opens once loading
+  has finished: a second Qt Quick engine in one process corrupts Qt Quick
+  Controls in this PySide6 build (even after a controls-free splash
+  engine is torn down — tested), so progress goes to the terminal instead:
+  `[hprofiler][gui] Parsing trace events…`, `  42%`, …
+- **Cancellation.** Ctrl+C in that terminal cancels the load within about
+  a quarter of a second mid-parse (checked every 5 000 events and between
+  stages) and exits with code 130. The one exception is Python's initial
+  `json.load` of the file, which can't be interrupted. Once the window is
+  open, Ctrl+C closes it normally.
+- **Errors.** Load failures are classified (`src/gui/errors.py`): invalid
+  input (missing file, not JSON, a directory), unsupported data (valid JSON
+  that isn't an hprofiler trace), missing dependency, permission denied,
+  metric unavailable, internal error. The message is short; the detail,
+  failing stage, file and traceback go to the rotating GUI log at
+  `~/.local/share/hprofiler/hprofiler/hprofiler-gui.log` (**Help → Open Log
+  File**). Inside the GUI, error panels have **Show technical details**,
+  **Copy diagnostics** and **Open log** buttons.
+- **Opening another profile** (**File → Open Profile…**, Ctrl+O, or the
+  command palette). The chosen file is checked first (exists, readable,
+  looks like JSON); if that fails the error is shown in the current window
+  and nothing else happens. Otherwise a **new GUI process** loads it while
+  the current window stays open and usable, showing an "Opening new
+  profile…" overlay. The current window closes only once the new one has
+  actually opened (a ready-marker handshake). If the new process fails,
+  its error is shown with the same diagnostics and the current workspace
+  is untouched — the two processes share nothing. A new process is used
+  deliberately: reloading Qt Quick in the same process is not safe (see
+  above). After 30 s without a response the current window stops waiting
+  and says so, without killing the new process.
+- **Per-tab states.** Tabs whose data doesn't exist for this trace show an
+  explicit state instead of a blank panel: Roofline shows *unsupported*
+  (with the command to collect roofline data), Compare shows *empty*
+  (with the `--compare` syntax), Source shows *empty* when no kernels were
+  profiled. The shared component (`ScreenState.qml`) also has loading,
+  cancelled and error states.
+
 ### Tabs
 
 Mirrors the TUI's tab set (§5) closely, but with one real difference in
@@ -3981,7 +3806,7 @@ assembly+source | mix+analysis) beyond what the TUI's Disasm tab shows —
 instruction-type mix breakdown (vector/memory/branch/etc. percentages,
 `KernelDisasm.itype_pcts()`) and static optimization hints
 (`analysis/asm_advisor.py`'s `advise()` — the same deterministic,
-threshold-based advisor described in §8, not an LLM call) rendered
+threshold-based advisor described in §8) rendered
 side-by-side with the assembly instead of requiring a separate summary
 view.
 
@@ -4042,7 +3867,8 @@ collapsed state and the Timeline first-use tip's dismissal. `settings.py`
 also implements per-profile state and per-table column configuration
 (`save_profile_state`/`save_table_config`), but nothing calls them yet, so
 filters, zoom/position, grouping, selection, bookmarks and column layouts
-are not restored. The profiled program's command line and environment are
+are not restored — and **File → Reset Current View**, which clears that
+per-profile state, currently has nothing to clear. The profiled program's command line and environment are
 never written to the settings file.
 
 ### Tables
@@ -4089,13 +3915,13 @@ parameter is additive, and a directly-asserted test confirms calling it
 the old way produces identical output to before this parameter existed.
 
 - **Matching** (`src/analysis/compare.py`): kernels/functions are matched
-  by `(category, name)` — the same stable identifier Round 16 already
-  established for cross-tab navigation (`span_id` is real but never
-  serialized to JSON). A `name` that doesn't match exactly falls back to
-  a *normalized* match via the existing `fmt_kernel_name()` JIT-hash
-  shortener (already used for display); each row's `matchKind` — exact/
-  normalized/baseline_only/comparison_only — is a visible, filterable
-  column, not hidden bookkeeping.
+  by `(category, name)` — the same identifier cross-tab navigation uses
+  (span ids are per-run, so they can't match anything across two runs).
+  All exact matches are claimed first; a `name` with no exact match then
+  falls back to a *normalized* match via the existing `fmt_kernel_name()`
+  JIT-hash shortener, and a comparison row is never matched twice. Each
+  row's `matchKind` — exact/normalized/baseline_only/comparison_only — is
+  a visible, filterable column, not hidden bookkeeping.
 - **Classification**: improved/regressed requires a delta to clear
   *both* a minimum percentage (default 5%) *and* a minimum absolute time
   (default 1ms) — adjustable in the Compare tab's own threshold fields.
@@ -4106,7 +3932,11 @@ the old way produces identical output to before this parameter existed.
   here. True-zero (both sides genuinely 0ns) is kept distinct from
   unavailable (no data on one or both sides); new/removed rows (present
   on only one side) are their own statuses, not folded into improved/
-  regressed.
+  regressed. A side with no value shows **—** (not 0), as does the
+  percentage change of a new/removed row; such rows sort below every real
+  value and never pass a numeric range filter. Changing the thresholds
+  re-classifies the table, the top-changes panels, the bucket deltas and
+  the exported report together.
 - **What's compared**: the function/kernel table above; activity-bucket
   deltas (Computation/Communication/Synchronization/Memory transfer/
   Runtime overhead/Idle — the same taxonomy Overview's own "Time
@@ -4126,6 +3956,53 @@ the old way produces identical output to before this parameter existed.
 - **Export**: "Export report" (JSON — the full comparison, noise-floor
   disclosure included) and "Export CSV" (the function/kernel table),
   both on the Compare tab's own toolbar.
+
+### Menus, command palette and keyboard shortcuts
+
+| Menu | Items |
+|------|-------|
+| File | Open Profile… (Ctrl+O), Reset Current View, Reset All UI Settings… (asks for confirmation; clears window geometry, theme and dismissed tips) |
+| View | Command Palette (Ctrl+K) |
+| Help | Keyboard Shortcuts (F1), Open Log File |
+
+**Command palette (Ctrl+K)** — one filtered list for: jumping to any of
+the 10 tabs; running a command (toggle light/dark theme, reset view,
+reset all settings, open the log, open another profile, show shortcuts);
+and finding a function/kernel by name (type at least two characters —
+choosing one selects it and opens the Kernels tab, the same selection the
+Inspector and other tabs follow). ↑/↓ to move, Enter to run, Esc to close.
+
+**Keyboard shortcuts** (Help → Keyboard Shortcuts / F1 lists them all;
+the list is generated from `src/gui/shortcuts.py`, the same table the real
+key bindings read, so the two can't disagree):
+
+| Keys | Where | Action |
+|------|-------|--------|
+| Ctrl+K | anywhere | Command palette |
+| Ctrl+O | anywhere | Open a different profile |
+| F1 | anywhere | Keyboard shortcuts reference |
+| ← / → | Timeline | Pan backward / forward |
+| ↑ / ↓ | Timeline | Scroll lanes |
+| + / − | Timeline | Zoom in / out around the view centre |
+| Home / End | Timeline | Jump to the start / end of the trace |
+| 0 | Timeline | Reset zoom and pan to the whole trace |
+| Shift + drag | Timeline | Select a time range |
+| Double-click a span | Timeline | Zoom to that span |
+
+**Guidance and accessibility.** The first visit to the Timeline shows a
+small, dismissible tip (zoom, pan, filter, select, reset) that stays
+dismissed across relaunches. The activity-colour legend (Timeline, colour
+mode "Activity") can be collapsed, and remembers it. Every icon-only
+control (zoom ±, inspector ◀/▶, search ◂/▸/✕, …) has a tooltip and an
+accessible name; clickable rows that aren't real buttons (call-tree
+nodes, table rows and headers, column resize handles, group headers,
+bookmarks, "investigate next" items) expose the Button accessibility role
+with a name and description, so screen readers and keyboard-accessibility
+tools can see them.
+
+**What persists between sessions** — see the note at the end of Timeline
+exploration above: window geometry, theme, legend state and dismissed
+tips only; Timeline view state and table layouts are not restored.
 
 ### Verification status
 
@@ -4158,3 +4035,17 @@ fixed one real, previously-latent rendering bug: a comparison row's
 status text (e.g. "regressed") overlapped its own colored status dot,
 confirmed via a direct before/after screenshot comparison, not caught by
 any property-level check.
+
+Loading, errors, Open Profile, menus and the command palette are covered
+the same way: unit tests for the loader, error classification, settings
+(including malformed/obsolete settings files and a check that the
+profiled command line never reaches the settings file) and the Open
+Profile validation/spawn/watch logic; real-QML interaction tests for the
+command palette (Ctrl+K, filter, Enter), F1, the confirmation dialog, the
+Open Profile overlay, the first-use tip, the legend and accessible names;
+a real `QThread` cancellation test; and `tests/integration/test_gui_cancel.py`,
+which sends SIGINT to a real GUI process mid-load and expects exit code
+130. The Open Profile handshake was also exercised with a real (not
+mocked) child process. **Not tested:** the platform file-picker dialog
+itself and clicking through menus with the mouse (menu actions are tested
+by invoking them directly and through their shortcuts).

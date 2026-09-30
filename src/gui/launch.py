@@ -104,8 +104,7 @@ def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False,
     -- a real bug, not by design.
 
     `compare_path`: a second trace JSON to load as the Compare tab's
-    comparison run (mirrors the existing `hprofiler analyze --compare`
-    option's naming). Appended as `--compare <path>` BEFORE `--disasm`,
+    comparison run. Appended as `--compare <path>` BEFORE `--disasm`,
     not after -- tests/test_gui_launch.py hard-asserts `argv[-1] ==
     "--disasm"` when disasm is set, and this keeps that true regardless
     of whether compare_path is also given.

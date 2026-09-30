@@ -9,7 +9,7 @@ The `tags["type"]` sub-tag (e.g. "type=kernel,grid=...", set by the C hooks
 right next to the span's name/duration -- see hooks/*/*.c's `emit_span`
 calls) is already this codebase's established compute-vs-overhead
 discriminator: `tags.get("type") == "kernel"` is used identically in
-bridge.py, output/summary.py, and analysis/context.py to separate a GPU
+bridge.py and output/summary.py to separate a GPU
 kernel's actual execution from the API calls (alloc/free/launch) around it,
 and analysis/pop_efficiency.py's `_DATA_MOVEMENT_TYPES` already excludes
 memcpy/alloc/free from "useful compute" for the same reason. This module

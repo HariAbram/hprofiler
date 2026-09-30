@@ -141,23 +141,9 @@ def cli():
               help="Export to OTLP HTTP collector, e.g. http://localhost:4318")
 @click.option("--otlp-file", default=None, metavar="PATH",
               help="Write OTLP JSON to file (e.g. trace.otlp.json)")
-@click.option("--analyze", "do_analyze", is_flag=True, default=False,
-              help="Run AI analysis after profiling and print a performance report")
-@click.option("--llm", "llm_provider", default=None, metavar="PROVIDER",
-              help="LLM provider: anthropic | openai | ollama | openai-compat  [default: auto]")
-@click.option("--llm-model", default=None, metavar="MODEL",
-              help="Model name (e.g. claude-sonnet-4-6, gpt-4o, llama3.1:8b)")
-@click.option("--llm-endpoint", default=None, metavar="URL",
-              help="Base URL for openai-compat / custom Ollama host")
-@click.option("--llm-api-key", default=None, metavar="KEY",
-              help="API key (overrides env vars ANTHROPIC_API_KEY / OPENAI_API_KEY)")
-@click.option("--analysis-report", default=None, metavar="PATH",
-              help="Save AI analysis report to a Markdown file")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, call_tree,
-        gpu_pc_sampling,
-        otlp_endpoint, otlp_file, do_analyze, llm_provider, llm_model,
-        llm_endpoint, llm_api_key, analysis_report, command):
+        gpu_pc_sampling, otlp_endpoint, otlp_file, command):
     """Profile COMMAND with the selected backends.
 
     Backends are injected via LD_PRELOAD (CUDA, OpenCL, ROCm, NCCL, MPI) or
@@ -241,16 +227,6 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
         from src.output.summary import print_summary
         print_summary(trace)
 
-    if do_analyze:
-        _run_ai_analysis(
-            trace,
-            provider=llm_provider,
-            model=llm_model,
-            endpoint=llm_endpoint,
-            api_key=llm_api_key,
-            report_path=analysis_report,
-        )
-
     # Wait for disasm to finish before opening TUI so it is available immediately.
     # Cap at 60 s so we never block indefinitely for huge binaries; the poller
     # inside the TUI will pick up any results that finish later.
@@ -274,187 +250,6 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
         if trace.disasm:
             chrome_trace.write(trace, out_path)
             click.echo(f"[hprofiler] Disasm added to: {out_path}", err=True)
-
-
-# ── AI analysis helper ────────────────────────────────────────────────────────
-
-def _run_ai_analysis(
-    trace,
-    provider: str | None,
-    model: str | None,
-    endpoint: str | None,
-    api_key: str | None,
-    report_path: str | None,
-) -> None:
-    """Create an LLM provider and run the agentic analysis loop."""
-    from src.analysis.llm import create_provider
-    from src.analysis.agent import analyze, AnalysisConfig
-    from src.analysis.report import print_report, save_report
-
-    click.echo("[hprofiler] Running AI analysis …", err=True)
-
-    try:
-        llm = create_provider(
-            provider=provider, model=model, endpoint=endpoint, api_key=api_key
-        )
-    except RuntimeError as exc:
-        click.echo(f"[hprofiler] AI analysis skipped: {exc}", err=True)
-        return
-
-    def _progress(msg: str) -> None:
-        click.echo(f"[hprofiler] {msg}", err=True)
-
-    try:
-        report = analyze(
-            trace, llm,
-            config=AnalysisConfig(),
-            on_progress=_progress,
-        )
-    except Exception as exc:
-        click.echo(f"[hprofiler] Analysis failed: {exc}", err=True)
-        return
-
-    print_report(report)
-    if report_path:
-        save_report(report, report_path)
-
-
-# ── analyze command ───────────────────────────────────────────────────────────
-
-@cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-@click.option("--backend", "-b", default="auto",
-              help="Backends to use when profiling (ignored when analysing a saved trace)")
-@click.option("--llm", "llm_provider", default=None, metavar="PROVIDER",
-              help="LLM provider: anthropic | openai | ollama | openai-compat  [default: auto]")
-@click.option("--llm-model", default=None, metavar="MODEL",
-              help="Model name (e.g. claude-sonnet-4-6, gpt-4o, llama3.1:8b)")
-@click.option("--llm-endpoint", default=None, metavar="URL",
-              help="Base URL for openai-compat or a custom Ollama host")
-@click.option("--llm-api-key", default=None, metavar="KEY",
-              help="API key (overrides ANTHROPIC_API_KEY / OPENAI_API_KEY)")
-@click.option("--output-report", default=None, metavar="PATH",
-              help="Save analysis report to a Markdown file")
-@click.option("--compare", default=None, type=click.Path(exists=True), metavar="TRACE_B",
-              help="Compare TRACE_A against TRACE_B and report changes")
-@click.option("--perf-freq", default=9999, show_default=True,
-              help="perf sampling frequency (Hz) — only used when running a new profile")
-@click.option("--output", "-o", default=None,
-              help="Trace output file when profiling a new command")
-@click.option("--max-turns", default=8, show_default=True,
-              help="Maximum agentic turns (reduce to 1-2 for slow local models)")
-def analyze(args, backend, llm_provider, llm_model, llm_endpoint, llm_api_key,
-            output_report, compare, perf_freq, output, max_turns):
-    """Analyse a saved trace or profile + analyse a new command.
-
-    Two modes:
-
-    \b
-    1. Analyse a saved trace file:
-         hprofiler analyze trace.hprofiler.json
-         hprofiler analyze --compare before.json after.json
-
-    \b
-    2. Profile a command and immediately analyse it:
-         hprofiler analyze --backend cuda -- ./app
-
-    \b
-    LLM provider is auto-detected from environment:
-      ANTHROPIC_API_KEY  →  Claude (claude-sonnet-4-6)
-      OPENAI_API_KEY     →  OpenAI (gpt-4o)
-      Ollama running     →  local model (llama3.1:8b)
-
-    Override with --llm, --llm-model, --llm-api-key, --llm-endpoint:
-
-    \b
-      hprofiler analyze --llm anthropic --llm-model claude-opus-4-8 trace.json
-      hprofiler analyze --llm ollama --llm-model qwen2.5:32b -- ./app
-      hprofiler analyze --llm openai-compat --llm-endpoint http://myserver:8080 -- ./app
-
-    Set HPROFILER_LLM_PROVIDER, HPROFILER_LLM_MODEL, HPROFILER_LLM_API_KEY,
-    HPROFILER_LLM_ENDPOINT for persistent configuration.
-    """
-    from src.analysis.llm import create_provider
-    from src.analysis.agent import analyze as _analyze, compare_traces, AnalysisConfig
-    from src.analysis.report import print_report, save_report
-
-    # Detect mode: if first arg is an existing .json file → analyse it
-    clean_args = [a for a in args if a != "--"]
-
-    trace_a = None
-    profile_cmd: list[str] = []
-
-    if clean_args and Path(clean_args[0]).suffix in (".json",) and Path(clean_args[0]).exists():
-        # Analyse existing trace
-        trace_file = clean_args[0]
-        click.echo(f"[hprofiler] Loading {trace_file} …", err=True)
-        from src.ui.app import load_trace_from_json
-        trace_a = load_trace_from_json(trace_file)
-        click.echo(f"[hprofiler] {len(trace_a.spans)} spans loaded", err=True)
-    elif clean_args:
-        # Profile the given command first
-        profile_cmd = clean_args
-        click.echo(f"[hprofiler] Profiling: {' '.join(profile_cmd)}", err=True)
-        from src.core.runner import Runner
-        backends = _resolve_backends(backend)
-        click.echo(f"[hprofiler] Backends: {', '.join(backends)}", err=True)
-        runner = Runner(
-            command=profile_cmd,
-            backends=backends,
-            perf_freq=perf_freq,
-        )
-        trace_a = runner.run()
-        click.echo(
-            f"[hprofiler] Run complete — {len(trace_a.spans)} events captured", err=True
-        )
-        if output:
-            from src.output import chrome_trace
-            chrome_trace.write(trace_a, output)
-            click.echo(f"[hprofiler] Trace written to: {output}", err=True)
-    else:
-        raise click.UsageError(
-            "Provide a trace file (.json) or a command to profile:\n"
-            "  hprofiler analyze trace.json\n"
-            "  hprofiler analyze --backend cuda -- ./app"
-        )
-
-    # Create LLM provider
-    try:
-        llm = create_provider(
-            provider=llm_provider, model=llm_model,
-            endpoint=llm_endpoint, api_key=llm_api_key,
-        )
-    except RuntimeError as exc:
-        raise click.ClickException(str(exc))
-
-    def _progress(msg: str) -> None:
-        click.echo(f"[hprofiler] {msg}", err=True)
-
-    # Compare mode
-    if compare:
-        click.echo(f"[hprofiler] Loading comparison trace {compare} …", err=True)
-        from src.ui.app import load_trace_from_json
-        trace_b = load_trace_from_json(compare)
-        click.echo(f"[hprofiler] Comparing traces …", err=True)
-        report = compare_traces(
-            trace_a, trace_b,
-            label_a=Path(clean_args[0]).stem if clean_args else "baseline",
-            label_b=Path(compare).stem,
-            provider=llm,
-            config=AnalysisConfig(max_turns=max_turns),
-            on_progress=_progress,
-        )
-    else:
-        click.echo("[hprofiler] Running AI analysis …", err=True)
-        report = _analyze(
-            trace_a, llm,
-            config=AnalysisConfig(max_turns=max_turns),
-            on_progress=_progress,
-        )
-
-    print_report(report)
-    if output_report:
-        save_report(report, output_report)
 
 
 @cli.command()
@@ -541,12 +336,11 @@ def gui(trace_file, disasm, compare):
         trace = load_trace_from_json(trace_file, collect_disasm=disasm)
         click.echo(f"[hprofiler] {len(trace.spans)} spans loaded", err=True)
         if compare:
-            # The TUI has no Compare-mode view of its own -- pointed at
-            # the existing `analyze --compare` command instead of either
-            # silently ignoring --compare or trying to half-implement
-            # comparison in the TUI fallback.
-            click.echo(f"[hprofiler] Note: the TUI has no comparison view. "
-                       f"Try: hprofiler analyze --compare {trace_file} {compare}", err=True)
+            # The TUI has no Compare-mode view; say so rather than
+            # silently ignoring --compare.
+            click.echo("[hprofiler] Note: the TUI has no comparison view -- --compare "
+                       "needs the GUI (PySide6 + a reachable X11 display). Showing "
+                       f"{trace_file} only.", err=True)
         launch_viewer(trace, collect_disasm=disasm)
 
 

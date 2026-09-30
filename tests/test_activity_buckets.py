@@ -51,7 +51,7 @@ class TestBucketOf(unittest.TestCase):
 
     def test_kernel_is_computation_matching_established_discriminator(self):
         # type=="kernel" is already the compute-vs-overhead split used in
-        # bridge.py/output/summary.py/analysis/context.py -- must agree.
+        # bridge.py/output/summary.py -- must agree.
         self.assertEqual(ab.bucket_of("cuda", "kernel"), "Computation")
         self.assertEqual(ab.bucket_of("rocm", "kernel"), "Computation")
         self.assertEqual(ab.bucket_of("opencl", "kernel"), "Computation")
