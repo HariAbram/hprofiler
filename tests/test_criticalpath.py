@@ -572,3 +572,43 @@ class TestExecStartCalibration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProgramOrderWithNesting(unittest.TestCase):
+    """Same-thread spans that NEST (an OpenMP barrier inside a parallel
+    region/implicit task) used to break the program-order chain: each span
+    was linked to the previous span by START, i.e. to its own enclosing
+    span, whose end gate it can never meet -- the edge was dropped and
+    nothing later connected back. On a real, continuously-busy OpenMP
+    program the path explained 28% of wall time."""
+
+    def _regions(self, n):
+        spans = []
+        for r in range(n):
+            base = r * 110
+            spans.append(_span(1, 1, Category.OPENMP, base, 100, "omp_implicit_task", {"type": "implicit_task"}))
+            spans.append(_span(1, 1, Category.SYNC, base + 60, 40, "omp_barrier", {"type": "sync"}))
+        return spans
+
+    def test_chain_continues_past_nested_spans(self):
+        spans = self._regions(5)
+        trace = _mk_trace(spans)
+        _, preds = cp.build_dependency_graph(trace)
+        names = [(s.name, s.start_ns) for s in trace.spans]
+        # region r's task must be preceded by an r-1 span that completed
+        for r in range(1, 5):
+            v = names.index(("omp_implicit_task", r * 110))
+            ps = [trace.spans[u] for (u, k, _c) in preds.get(v, []) if k == "sequential"]
+            self.assertTrue(ps)
+            self.assertTrue(all(p.end_ns <= r * 110 for p in ps))
+
+    def test_path_covers_the_busy_timeline(self):
+        report = cp.analyze(_mk_trace(self._regions(5)))
+        self.assertGreaterEqual(report.total_path_ns, 0.95 * report.wall_ns)
+
+    def test_non_nested_sequence_unchanged(self):
+        spans = [_span(1, 1, Category.CPU, i * 10, 5, f"f{i}") for i in range(4)]
+        trace = _mk_trace(spans)
+        _, preds = cp.build_dependency_graph(trace)
+        for i in range(1, 4):
+            self.assertEqual([(u, k) for (u, k, _c) in preds[i] if k == "sequential"], [(i - 1, "sequential")])

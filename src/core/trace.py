@@ -9,6 +9,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import Any
 from .events import SpanEvent, InstantEvent, CounterEvent, Category, AnyEvent
 
 
@@ -167,19 +168,67 @@ class Trace:
         return CCT.build(self)
 
     def lanes(self) -> dict[str, list[SpanEvent]]:
-        """Return spans grouped into display lanes.
+        """Return spans grouped into display lanes (parse names with
+        parse_lane_name()).
 
-        CUDA spans with a 'stream' tag get a per-stream lane (cuda/stream-N)
-        so the Timeline can show kernel/memcpy overlap across streams.
-        All other spans keep the existing (category/thread-TID) grouping.
+        CUDA/ROCm spans with a 'stream' tag -- and event-timed async copies
+        (type=memcpy_async) -- get a per-stream lane (cuda/stream-N) so the
+        Timeline shows kernel/memcpy overlap across streams. Device-timed
+        spans with no stream (OpenCL side=gpu, *_gpu transfers) get a
+        category/device lane: their tid is whichever driver callback thread
+        fired, which would otherwise scatter them into (and overlap with)
+        unrelated host-thread lanes. Everything else is category/thread-TID.
+
+        A key shared by several processes is suffixed with @PID. Stream ids
+        repeat across processes (the default stream is 0 in every rank, and
+        same-binary processes hash identical stream pointers), and tids
+        repeat across nodes after merge-nodes -- without the suffix, every
+        rank's kernels were drawn in ONE lane. Single-process traces keep
+        the unsuffixed names.
         """
+        def base(s: SpanEvent) -> tuple[str, str, Any]:
+            cat = s.category.value
+            if "stream" in s.tags and (cat in ("cuda", "rocm") or s.tags.get("type") == "memcpy_async"):
+                return (cat, "stream", s.tags["stream"])
+            if s.tags.get("side") == "gpu" or s.name.endswith("_gpu"):
+                return (cat, "device", "")
+            if s.tid:
+                return (cat, "thread", s.tid)
+            return (cat, "", "")
+
+        spans = self.spans
+        bases = [base(s) for s in spans]
+        pids: dict[tuple[str, str, Any], set[int]] = defaultdict(set)
+        for b, s in zip(bases, spans):
+            pids[b].add(s.pid)
+
         lanes: dict[str, list[SpanEvent]] = defaultdict(list)
-        for s in self.spans:
-            if s.category.value in ("cuda", "rocm") and "stream" in s.tags:
-                key = f"{s.category.value}/stream-{s.tags['stream']}"
-            elif s.tid:
-                key = f"{s.category.value}/thread-{s.tid}"
-            else:
-                key = s.category.value
+        for (cat, kind, ident), s in zip(bases, spans):
+            key = f"{cat}/{kind}-{ident}" if kind in ("stream", "thread") else (
+                f"{cat}/device" if kind == "device" else cat)
+            if len(pids[(cat, kind, ident)]) > 1:
+                key += f"@{s.pid}"
             lanes[key].append(s)
         return dict(lanes)
+
+
+def parse_lane_name(name: str) -> tuple[str, str, str, int | None]:
+    """Inverse of Trace.lanes()'s naming: (category, kind, ident, pid).
+    kind is "thread", "stream", "device" or "" (bare category); ident is
+    the tid/stream id as a string ("" when kind has none); pid is set only
+    for @PID-disambiguated lanes."""
+    pid: int | None = None
+    body = name
+    if "@" in body:
+        body, _, p = body.rpartition("@")
+        try:
+            pid = int(p)
+        except ValueError:
+            body, pid = name, None
+    cat, _, suffix = body.partition("/")
+    for kind in ("thread", "stream"):
+        if suffix.startswith(kind + "-"):
+            return cat, kind, suffix[len(kind) + 1:], pid
+    if suffix == "device":
+        return cat, "device", "", pid
+    return cat, "", suffix, pid

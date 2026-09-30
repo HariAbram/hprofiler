@@ -219,3 +219,21 @@ class TestReportDict(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMatchRowsNeverDoubleMatches(unittest.TestCase):
+    def test_exact_match_is_claimed_before_normalized_fallback(self):
+        # Both baseline JIT names normalize to the same display name; the
+        # comparison run only has the SECOND one. The first baseline row
+        # used to grab it via its normalized name, then the second matched
+        # it exactly again -- one comparison row counted twice.
+        from src.analysis.compare import match_rows
+        a = [{"category": "cuda", "name": "1111111.2222.jit.so", "total_ns": 5},
+             {"category": "cuda", "name": "9111111.2222.jit.so", "total_ns": 7}]
+        b = [{"category": "cuda", "name": "9111111.2222.jit.so", "total_ns": 9}]
+        rows = match_rows(a, b)
+        used = [m["comp"]["name"] for m in rows if m["comp"] is not None]
+        self.assertEqual(len(used), len(set(used)))
+        by_name = {m["name"]: m for m in rows}
+        self.assertEqual(by_name["9111111.2222.jit.so"]["matchKind"], "exact")
+        self.assertEqual(by_name["1111111.2222.jit.so"]["matchKind"], "baseline_only")

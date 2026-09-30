@@ -131,13 +131,28 @@ def main() -> int:
             last_progress_pct[0] = pct
             print(f"[hprofiler][gui]   {pct}%", file=sys.stderr)
 
+    import signal
+    from PySide6.QtCore import QTimer
+
+    # Python runs signal handlers only when the main thread executes Python
+    # bytecode, which barely happens inside Qt's event loop -- Ctrl+C was
+    # ignored for the whole load (and then the window opened anyway). A
+    # cheap periodic no-op slot gives the handler a chance to run.
+    py_tick = QTimer()
+    py_tick.timeout.connect(lambda: None)
+    py_tick.start(100)
+
     loader = LoadController(trace_path, compare_path=compare_path, disasm=disasm, dark=dark)
+
+    def _cancel_on_sigint(_signum, _frame):
+        log.info("load interrupted (Ctrl+C) -- cancelling")
+        loader.cancel()   # plain flag write; the worker polls it
+
+    prev_sigint = signal.signal(signal.SIGINT, _cancel_on_sigint)
     try:
         outcome, value = run_load_blocking(loader, on_stage=_on_stage, on_progress=_on_progress)
-    except KeyboardInterrupt:
-        log.info("load interrupted (Ctrl+C) -- cancelling")
-        loader.cancel()
-        outcome, value = "cancelled", None
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
 
     if outcome == "cancelled":
         print("[hprofiler][gui] cancelled", file=sys.stderr)
@@ -253,6 +268,9 @@ def main() -> int:
         }))
         return 0
 
+    # Ctrl+C in the launching terminal closes the window normally (same
+    # path as closing it) instead of being ignored by the event loop.
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
     return app.exec()
 
 

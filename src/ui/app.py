@@ -444,10 +444,15 @@ class ProfileWidget(Static):
             )
 
         # ── Time breakdown ────────────────────────────────────────────────
+        # Exclusive (innermost-span) time per category, same attribution
+        # as the GUI's breakdown -- raw sums counted nested spans (a
+        # barrier inside a parallel region) twice.
+        from ..analysis.activity_buckets import exclusive_totals
         by_cat: dict[str, dict] = defaultdict(lambda: {"ns": 0, "n": 0})
+        for cat, ns in exclusive_totals(spans, lambda s: s.category.value).items():
+            by_cat[cat]["ns"] = ns
         for s in spans:
-            by_cat[s.category.value]["ns"] += s.duration_ns
-            by_cat[s.category.value]["n"]  += 1
+            by_cat[s.category.value]["n"] += 1
         grand = sum(v["ns"] for v in by_cat.values()) or 1
 
         _sep("TIME BREAKDOWN")
@@ -668,14 +673,8 @@ class DashboardWidget(Widget):
             gpu_text = "[dim]GPU ACTIVE[/dim]\n[dim]n/a[/dim]"
         self.query_one("#stat-gpu", Static).update(Text.from_markup(gpu_text))
 
-        mpi_present = any(s.category.value == "mpi" for s in trace.spans)
-        if mpi_present:
-            wait_ns    = _merged_ns([s for s in trace.spans if s.category.value == "mpi"])
-            wait_label = "MPI WAIT"
-        else:
-            wait_ns    = _merged_ns([s for s in trace.spans if s.category.value == "sync"])
-            wait_label = "SYNC WAIT"
-        wait_pct = 100.0 * wait_ns / wall_ns
+        from ..analysis.dashboard import wait_fraction
+        wait_label, wait_pct = wait_fraction(trace)
         wcol = "red" if wait_pct >= 40 else ("yellow" if wait_pct >= 20 else "bright_green")
         self.query_one("#stat-wait", Static).update(Text.from_markup(
             f"[dim]{wait_label}[/dim]\n[bold {wcol}]{wait_pct:.0f}%[/bold {wcol}]"))
@@ -825,21 +824,17 @@ class TimelineWidget(Widget):
         self._lanes       = trace.lanes()
         self._lane_counts = {k: len(v) for k, v in self._lanes.items()}
 
-        # Assign stable sequential numbers T1, T2, … to each unique TID
-        all_tids = sorted({
-            int(ln.split("/thread-")[1])
-            for ln in self._lanes
-            if "/thread-" in ln
-        })
-        self._tid_seq: dict[int, int] = {tid: i + 1 for i, tid in enumerate(all_tids)}
+        from ..core.trace import parse_lane_name
+        self._parsed_lanes = {ln: parse_lane_name(ln) for ln in self._lanes}
 
-        # Assign stable sequential numbers S0, S1, … to each unique CUDA stream ID
-        all_sids = sorted({
-            int(ln.split("/stream-")[1])
-            for ln in self._lanes
-            if "/stream-" in ln
+        # Assign stable sequential numbers T1, T2, … per (pid, tid): the
+        # same tid in two processes (merge-nodes) is two different threads.
+        all_tids = sorted({
+            (pid if pid is not None else -1, int(ident))
+            for (_c, kind, ident, pid) in self._parsed_lanes.values()
+            if kind == "thread" and ident.lstrip("-").isdigit()
         })
-        self._stream_seq: dict[int, int] = {sid: sid for sid in all_sids}
+        self._tid_seq: dict[tuple[int, int], int] = {k: i + 1 for i, k in enumerate(all_tids)}
 
         # MPI lane -> that rank's own rank= tag value, when known -- "mpi
         # rank2" reads far more meaningfully than a generic "mpi T3"
@@ -870,24 +865,18 @@ class TimelineWidget(Widget):
 
         # Sort: group by thread first, then by category within the thread.
         # CUDA stream lanes are sorted together by stream ID.
-        def _sort_key(name: str) -> tuple[int, str]:
-            parts = name.split("/", 1)
-            cat   = parts[0]
-            if len(parts) > 1:
-                suffix = parts[1]
-                if suffix.startswith("thread-"):
-                    try:
-                        tid = int(suffix.removeprefix("thread-"))
-                        return (self._tid_seq.get(tid, 9999), cat)
-                    except ValueError:
-                        pass
-                elif suffix.startswith("stream-"):
-                    try:
-                        sid = int(suffix.removeprefix("stream-"))
-                        return (10000 + sid, cat)
-                    except ValueError:
-                        pass
-            return (0, cat)
+        def _sort_key(name: str) -> tuple[int, int, str]:
+            cat, kind, ident, pid = self._parsed_lanes[name]
+            try:
+                if kind == "thread":
+                    return (self._tid_seq.get((pid if pid is not None else -1, int(ident)), 9999), 0, cat)
+                if kind == "stream":
+                    return (10000 + int(ident), pid or 0, cat)
+            except ValueError:
+                pass
+            if kind == "device":
+                return (20000, pid or 0, cat)
+            return (0, pid or 0, cat)
 
         self._lane_names = sorted(self._lanes.keys(), key=_sort_key)
 
@@ -1029,37 +1018,33 @@ class TimelineWidget(Widget):
             self._connector_count[succ_sid] += 1
 
     def _lane_label(self, lane_name: str) -> str:
-        parts = lane_name.split("/", 1)
-        cat   = parts[0]
+        cat, kind, ident, pid = self._parsed_lanes.get(lane_name) or ("", "", "", None)
         abbr  = self._CAT_ABBREV.get(cat, cat[:4])
         count = self._lane_counts.get(lane_name, 0)
 
-        if len(parts) > 1:
-            suffix = parts[1]
-            if suffix.startswith("thread-"):
-                rank = self._lane_rank.get(lane_name)
-                if rank is not None:
-                    # "mpi rank2" reads far more meaningfully than a
-                    # generic sequential "mpi T3" -- rank is what a user
-                    # actually thinks in terms of for an MPI trace.
-                    core = f"{abbr:<5} rank{rank}"
-                else:
-                    try:
-                        tid = int(suffix.removeprefix("thread-"))
-                        seq = self._tid_seq.get(tid, tid)
-                        core = f"{abbr:<5} T{seq}"
-                    except ValueError:
-                        core = abbr
-            elif suffix.startswith("stream-"):
+        if kind == "thread":
+            rank = self._lane_rank.get(lane_name)
+            if rank is not None:
+                # "mpi rank2" reads far more meaningfully than a
+                # generic sequential "mpi T3" -- rank is what a user
+                # actually thinks in terms of for an MPI trace.
+                core = f"{abbr:<5} rank{rank}"
+            else:
                 try:
-                    sid = int(suffix.removeprefix("stream-"))
-                    core = f"{abbr:<5} S{sid}"   # e.g. "cuda  S0", "cuda  S1"
+                    seq = self._tid_seq.get((pid if pid is not None else -1, int(ident)), ident)
+                    core = f"{abbr:<5} T{seq}"
                 except ValueError:
                     core = abbr
-            else:
-                core = abbr
+        elif kind == "stream":
+            core = f"{abbr:<5} S{ident}"   # e.g. "cuda  S0", "cuda  S1"
+        elif kind == "device":
+            core = f"{abbr:<5} dev"
         else:
             core = abbr
+        # Lanes disambiguated per process (several processes shared this
+        # stream/thread id) carry that process's pid.
+        if pid is not None and self._lane_rank.get(lane_name) is None:
+            core = f"{core} p{pid}"
 
         # Reserve 4 chars for "  (N)" count suffix; truncate core to fit _LABEL_W.
         count_str  = f"({count})"
@@ -1290,7 +1275,7 @@ class TimelineWidget(Widget):
         span  = min(containing, key=lambda s: s.duration_ns)
         dur   = _fmt_ns(span.duration_ns)
         start = _fmt_ns(span.start_ns - self._view_start)
-        cat   = lane_name.split("/")[0]
+        cat   = self._parsed_lanes.get(lane_name, (lane_name.split("/")[0],))[0]
         hover = f"{span.name}  [{cat}]  @{start}  dur {dur}"
         if span.parent_span_id:
             parent_name = self._sid_name.get(span.parent_span_id, span.parent_span_id[:8])
@@ -1401,7 +1386,7 @@ class TimelineWidget(Widget):
                 canvas.line(x1, pred_spacer_y, x1, succ_data_y, style=style)
 
         for row_idx, lane_name in enumerate(visible_lanes):
-            cat   = lane_name.split("/")[0]
+            cat   = self._parsed_lanes.get(lane_name, (lane_name.split("/")[0],))[0]
             color = _cat_color(cat)
 
             # Data row

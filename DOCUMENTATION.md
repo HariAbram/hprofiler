@@ -773,7 +773,8 @@ exported at all on Ubuntu 24.04/GCC 13). Registered callbacks:
 
 | Callback | Category | What it captures |
 |----------|---------|-----------------|
-| `ompt_callback_parallel_begin/end` | `openmp` | `parallel_region` spans |
+| `ompt_callback_parallel_begin/end` | `openmp` | `parallel_region` spans (primary thread only) |
+| `ompt_callback_implicit_task` | `openmp` | `omp_implicit_task` spans — each thread's own share of a region (`type=implicit_task`, `index=`, `psid=` region id); the initial task is skipped. Without these, worker threads' compute was invisible under OMPT while the GOMP hook already reported it per thread |
 | `ompt_callback_work` | `openmp` | `omp_loop`, `omp_sections`, `omp_taskloop`, etc. |
 | `ompt_callback_task_create` | `openmp` | `omp_task_create` spans (one per `#pragma omp task`) |
 | `ompt_callback_task_schedule` | `openmp` | `omp_task` execution spans (start → complete/yield) |
@@ -1217,11 +1218,13 @@ screen rather than requiring a tour through every other tab first:
 - **Five headline stat cards** — Diagnosis (a one-line heuristic verdict:
   e.g. "GPU starvation", "Load imbalance", "cuda-bound", "Balanced"), Wall
   time, GPU Active % (merged kernel-active time; shows `n/a` when no GPU
-  backend was used), MPI Wait % (merged time at least one rank was inside
-  an MPI call — relabeled **Sync Wait %**, measuring `sync`-category spans
-  instead, when the trace has no MPI spans at all), and Peak Memory
-  (process RSS, falling back to summed GPU VRAM peak when RSS wasn't
-  captured).
+  backend was used), MPI Wait % (the **average over ranks** of each rank's
+  merged MPI time / wall — relabeled **Sync Wait %** when the trace has no
+  MPI spans, then the exclusive `sync` time summed over host threads /
+  (threads × wall)), and Peak Memory (process RSS, falling back to summed
+  GPU VRAM peak when RSS wasn't captured). Wait % used to be the *union*
+  across all threads ("some thread was waiting"), which read ~80% for a
+  4-thread program whose threads actually waited ~38% of the time.
 - **Execution timeline preview** — a condensed density row per the top 3
   categories by accumulated time (reusing the same category colors as the
   Timeline tab), with a legend.
@@ -1245,6 +1248,24 @@ screen rather than requiring a tour through every other tab first:
 Diagnosis, findings, and the Profile tab's "Insight" tips all share one
 `_bottleneck_analysis`/`_diagnose`/`_top_findings` implementation, so they
 never disagree with each other or with `hprofiler summary`'s text output.
+
+**How time is attributed in breakdowns and verdicts.** The Time breakdown
+(TUI by category, GUI by activity bucket), the "*X*-bound" diagnosis and
+the "*f* dominates" finding use **exclusive** time
+(`analysis/activity_buckets.ExclusiveTime`): on each host thread every
+instant belongs to the innermost instrumented span covering it, so a
+barrier nested in a parallel region counts once, as synchronization — not
+twice. Rules: device-timed spans (CUDA/ROCm kernels and async copies,
+OpenCL `side=gpu`, NCCL collectives) keep their full duration and are
+never nested under the thread that launched them; NVTX/ROCTX annotations
+contribute nothing; perf samples (`cpu` spans, a nominal one-interval
+weight each) are estimates that only count when their thread is *not*
+inside an instrumented call. Dominance shares are relative to available
+thread-time (host threads × wall), so a program that spends 2% of its run
+in MPI — the only instrumented thing — is not called "mpi-bound". The
+Hotspots/Kernels tables still show **inclusive** per-function totals.
+Before this, the same OpenMP program was diagnosed "sync-bound" under
+LLVM libomp and "openmp-bound" under GNU libgomp.
 
 ### System Tab
 
@@ -1285,6 +1306,15 @@ is visible. MPI lanes are labeled by the rank's own `rank=` tag (`mpi rank0`,
 what you actually think in terms of when reading an MPI trace; any lane
 without a resolvable rank (or a non-MPI lane) falls back to the sequential
 `T1`, `T2`, … numbering.
+
+Device-timed spans with no stream (OpenCL `side=gpu` kernels, `*_gpu`
+transfers) get a per-category `device` lane rather than the lane of whichever
+driver callback thread happened to report them. When a lane id is shared by
+several processes — the default CUDA stream is `stream-0` in every rank, and
+merged multi-node traces reuse tids — each process gets its own lane
+(`cuda/stream-0@<pid>`, labeled with the rank when known, e.g. `cuda S0 r2`);
+previously every rank's kernels were drawn overlapping in one lane.
+Single-process traces keep the plain names.
 
 **Keyboard controls:**
 
@@ -1554,7 +1584,19 @@ It can be opened in **[ui.perfetto.dev](https://ui.perfetto.dev)** or
 
 `ts` and `dur` fields are in **microseconds**. The `metadata` block records the
 command, backends, hostname, and `cwd` (used to resolve relative binary paths
-when reloading).
+when reloading), plus `startTimeNs`/`endTimeNs`/`pid` (the profiling window on
+the hooks' CLOCK_MONOTONIC) and `counterUnits`.
+
+Reloading must reproduce what `hprofiler run` held in memory, because every
+other entry point (GUI, `view`, `summary`, `critical-path`, `merge-nodes`)
+works from the file. Span `args` therefore also carry `sid`/`psid` (request
+and parent ids — critical-path request linking, MPI wildcard resolution and
+call-tree parent links depend on them) and, for GPU spans, `_tid` (the real
+launching thread; the event's own `tid` is a virtual per-stream track for
+Perfetto's layout). Instant events keep their tags in `args`. Timestamps are
+rounded, not truncated, back to integer ns. Files written before these fields
+existed load with ids absent and the profiling window taken from the event
+extent.
 
 ### Roofline HTML
 
@@ -2756,6 +2798,46 @@ The Timeline widget uses fully vectorised numpy rendering:
 
 The TUI remains responsive at 250k spans at all zoom levels.
 
+### Measured accuracy (ground-truth validation)
+
+`tests/fixtures/{omp,mpi,ocl}_truth.c` are small deterministic programs that
+log their own CLOCK_MONOTONIC stamps (the hooks' clock) around every
+operation. `tests/integration/test_profiling_accuracy.py` checks them
+end-to-end (hook → socket → Runner → JSON → reload → analysis) with
+explicit tolerances; `python3 tests/integration/accuracy_report.py
+--trials 10` prints the repeated-trial statistics. Results on the dev laptop
+(i7-1265U), 10 trials each:
+
+| Workload | Overhead on program's own elapsed time (median) | Missing events | Start error median / p95 | Duration error median | Aggregate error |
+|---|---|---|---|---|---|
+| OpenMP, LLVM libomp (OMPT), 4 thr | +0.2 % … +1.1 % | 0 / 240 | 1.9 µs / 4.7 µs | −12 µs (on ~6 ms waits) | −0.15 … −0.26 % |
+| OpenMP, GNU libgomp (GOMP hook), 4 thr | +0.08 % | 0 / 240 | 0.25 µs / 1.4 µs | −8 µs | −0.20 % |
+| MPI, 1 rank to itself | +1.2 % | 0 / 240 | 0.22 µs / 1.7 µs | −1.5 µs (on ~3 µs calls) | −1.65 µs per call |
+| OpenCL, Intel CPU device | within noise (CV 2–4 %) | 0 / 50 | — | kernel device time = CL_PROFILING exactly | — |
+
+Durations are slightly *shorter* than the program's own bracketing stamps
+because the hook's entry/exit cost falls outside the measured call. No
+per-thread ordering inversions were observed, and the program's own
+barrier-wait totals changed by < 1 % when profiled. Per-thread compute
+attributed by `ExclusiveTime` matches the known spin time within 5 %.
+
+Not validated here: CUDA/ROCm/NCCL (no working GPU runtime on this
+machine), real multi-rank MPI (this MPICH/Hydra cannot form a multi-process
+communicator), and perf sampling (`perf_event_paranoid=4`).
+
+Known measurement artifacts:
+- **LLVM libomp** reports a worker's implicit end-of-region barrier as
+  lasting until the *next* region's fork, so serial time between regions
+  shows up as synchronization on worker threads (≈ +40 ms sync on the
+  ground-truth program vs GNU libgomp). The first region's start also lags
+  by ~3 ms (runtime initialization precedes the first `parallel_begin`).
+- **CUDA/ROCm kernel spans start at the host launch time** with the GPU
+  duration. Kernels queued behind others therefore appear earlier than they
+  ran and can overlap within a stream lane, which under-counts GPU Active %
+  and over-counts launch gaps under queue backlog. The hooks also emit
+  `xs=` (a calibrated execution-start estimate), currently used only by the
+  critical path; switching other consumers to it is untested on hardware.
+
 ### Known limitations
 
 | Area | Limitation | Workaround |
@@ -3953,6 +4035,15 @@ All of the above is Timeline-local view state (filters/grouping/search/
 bookmarks/named ranges), not persisted across a relaunch — it lives in
 `TimelineModel` (`src/gui/models.py`) for the life of the window, same
 "session" scope as every other GUI screen's state.
+
+What *is* persisted (`~/.config/hprofiler/hprofiler.conf`, via
+`src/gui/settings.py`): window geometry, light/dark theme, the legend's
+collapsed state and the Timeline first-use tip's dismissal. `settings.py`
+also implements per-profile state and per-table column configuration
+(`save_profile_state`/`save_table_config`), but nothing calls them yet, so
+filters, zoom/position, grouping, selection, bookmarks and column layouts
+are not restored. The profiled program's command line and environment are
+never written to the settings file.
 
 ### Tables
 

@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 from PySide6.QtCore import QObject, Property, Signal, Slot
 
-from ..core.trace import Trace
+from ..core.trace import Trace, parse_lane_name
 from ..analysis import criticalpath as _cp
 from ..analysis import activity_buckets
 from ..analysis import dashboard as dash
@@ -84,11 +84,28 @@ class TimelineModel(QObject):
         self._trace = trace
         self._theme = theme
         self._lanes = trace.lanes()
+        parsed = {ln: parse_lane_name(ln) for ln in self._lanes}
 
-        all_tids = sorted({
-            int(ln.split("/thread-")[1]) for ln in self._lanes if "/thread-" in ln
-        })
-        tid_seq = {tid: i + 1 for i, tid in enumerate(all_tids)}
+        # T1, T2, ... numbering per (pid, tid) -- the same tid from two
+        # processes (merge-nodes) is two different threads.
+        def _thread_key(ln: str) -> tuple[int, int] | None:
+            cat, kind, ident, pid = parsed[ln]
+            if kind != "thread":
+                return None
+            try:
+                return (pid if pid is not None else -1, int(ident))
+            except ValueError:
+                return None
+        all_tids = sorted({k for ln in self._lanes if (k := _thread_key(ln)) is not None})
+        tid_seq = {k: i + 1 for i, k in enumerate(all_tids)}
+
+        # rank for any lane whose process made MPI calls -- labels
+        # pid-disambiguated GPU stream lanes ("cuda S0 r2") too.
+        pid_rank: dict[int, str] = {}
+        for spans in self._lanes.values():
+            for s in spans:
+                if s.category.value == "mpi" and s.pid not in pid_rank and s.tags.get("rank") is not None:
+                    pid_rank[s.pid] = s.tags["rank"]
 
         lane_rank: dict[str, str] = {}
         for lane_name, spans in self._lanes.items():
@@ -115,51 +132,53 @@ class TimelineModel(QObject):
         self._lane_stream: dict[str, str | None] = {}
         for lane_name, spans in self._lanes.items():
             self._lane_pid[lane_name] = spans[0].pid if spans else 0
-            suffix = lane_name.split("/", 1)[1] if "/" in lane_name else ""
+            _cat, kind, ident, _pid = parsed[lane_name]
             tid = None
             stream = None
-            if suffix.startswith("thread-"):
+            if kind == "thread":
                 try:
-                    tid = int(suffix.removeprefix("thread-"))
+                    tid = int(ident)
                 except ValueError:
                     tid = None
-            elif suffix.startswith("stream-"):
-                stream = suffix.removeprefix("stream-")
+            elif kind == "stream":
+                stream = ident
             self._lane_tid[lane_name] = tid
             self._lane_stream[lane_name] = stream
 
-        def _sort_key(name: str) -> tuple[int, str]:
-            cat, _, suffix = name.partition("/")
-            if suffix.startswith("thread-"):
+        def _sort_key(name: str) -> tuple[int, int, str]:
+            cat, kind, ident, pid = parsed[name]
+            if kind == "thread":
+                k = _thread_key(name)
+                if k is not None:
+                    return (tid_seq.get(k, 9999), 0, cat)
+            elif kind == "stream":
                 try:
-                    return (tid_seq.get(int(suffix.removeprefix("thread-")), 9999), cat)
+                    return (10000 + int(ident), pid or 0, cat)
                 except ValueError:
                     pass
-            elif suffix.startswith("stream-"):
-                try:
-                    return (10000 + int(suffix.removeprefix("stream-")), cat)
-                except ValueError:
-                    pass
-            return (0, cat)
+            elif kind == "device":
+                return (20000, pid or 0, cat)
+            return (0, pid or 0, cat)
 
         self._lane_names: list[str] = sorted(self._lanes.keys(), key=_sort_key)
         self._lane_index: dict[str, int] = {name: i for i, name in enumerate(self._lane_names)}
 
         self._lane_meta: list[dict[str, Any]] = []
         for lane_name in self._lane_names:
-            cat = lane_name.split("/")[0]
-            suffix = lane_name.split("/", 1)[1] if "/" in lane_name else ""
+            cat, kind, ident, pid = parsed[lane_name]
             if lane_name in lane_rank:
                 label = f"{cat} rank{lane_rank[lane_name]}"
-            elif suffix.startswith("thread-"):
-                try:
-                    label = f"{cat} T{tid_seq.get(int(suffix.removeprefix('thread-')), '?')}"
-                except ValueError:
-                    label = cat
-            elif suffix.startswith("stream-"):
-                label = f"{cat} {suffix.replace('stream-', 'S')}"
+            elif kind == "thread":
+                k = _thread_key(lane_name)
+                label = f"{cat} T{tid_seq.get(k, '?')}" if k is not None else cat
+            elif kind == "stream":
+                label = f"{cat} S{ident}"
+            elif kind == "device":
+                label = f"{cat} device"
             else:
                 label = cat
+            if pid is not None and lane_name not in lane_rank:
+                label += f" r{pid_rank[pid]}" if pid in pid_rank else f" p{pid}"
             self._lane_meta.append({
                 "name": lane_name,
                 "label": label,
@@ -347,7 +366,7 @@ class TimelineModel(QObject):
             return False
         if f.get("threads") and self._lane_tid.get(lane_name) not in f["threads"]:
             return False
-        if f.get("runtimes") and lane_name.split("/")[0] not in f["runtimes"]:
+        if f.get("runtimes") and parse_lane_name(lane_name)[0] not in f["runtimes"]:
             return False
         if f.get("streams") and self._lane_stream.get(lane_name) not in f["streams"]:
             return False
@@ -406,7 +425,7 @@ class TimelineModel(QObject):
         if grouping == "process":
             return self._lane_pid.get(lane_name)
         if grouping == "runtime":
-            return lane_name.split("/")[0]
+            return parse_lane_name(lane_name)[0]
         if grouping == "stream":
             return self._lane_stream.get(lane_name)
         if grouping == "thread":
@@ -502,7 +521,7 @@ class TimelineModel(QObject):
         ranks = sorted({r for r in self._lane_rank.values()}, key=str)
         processes = sorted({p for p in self._lane_pid.values()})
         threads = sorted({t for t in self._lane_tid.values() if t is not None})
-        runtimes = sorted({name.split("/")[0] for name in self._lane_names})
+        runtimes = sorted({parse_lane_name(name)[0] for name in self._lane_names})
         streams = sorted({s for s in self._lane_stream.values() if s is not None})
 
         def _dim(key: str, label: str, values: list, supported: bool = True, reason: str = "") -> dict[str, Any]:

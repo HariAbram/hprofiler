@@ -55,6 +55,12 @@ def demangle(name: str) -> str:
 # ── Formatting helpers ──────────────────────────────────────────────────────
 
 def fmt_ns(ns: float) -> str:
+    if ns != ns:  # NaN -- "no value", never render it as a number
+        return "—"
+    if ns < 0:
+        # Delta columns (Compare tab) go negative; without this -2.5ms
+        # rendered as "-2500000ns".
+        return "-" + fmt_ns(-ns)
     if ns >= 1_000_000_000:
         return f"{ns / 1e9:.3f}s"
     if ns >= 1_000_000:
@@ -93,6 +99,8 @@ def fmt_count(n: float) -> str:
 
 
 def fmt_pct(x: float, digits: int = 1) -> str:
+    if x != x:
+        return "—"
     return f"{x:.{digits}f}%"
 
 
@@ -180,6 +188,34 @@ def trace_wall_ns(trace: Any) -> int:
     return max(span_end - span_start, 1)
 
 
+def wait_fraction(trace: Any, et: Any = None) -> tuple[str, float]:
+    """(label, percent) for the headline WAIT stat, shared by the TUI and
+    GUI. Averaged per execution context, NOT the union of wait intervals
+    across every thread: with 4 OpenMP threads where thread 0 waits 12ms of
+    every 16ms region, "some thread is waiting" covers ~80% of wall time
+    while the threads actually spend ~38% of their time waiting (measured
+    against a ground-truth program). The union read as the latter.
+
+    MPI present: mean over ranks (pids with MPI spans) of that rank's
+    merged MPI time / wall. Otherwise: exclusive "sync" time summed over
+    host threads / (host threads x wall)."""
+    from .activity_buckets import ExclusiveTime
+    wall = trace_wall_ns(trace)
+    spans = et.spans if et is not None else trace.spans
+    by_pid: dict[int, list] = {}
+    for s in spans:
+        if s.category.value == "mpi":
+            by_pid.setdefault(s.pid, []).append(s)
+    if by_pid:
+        per_rank = [merged_ns(v) / wall for v in by_pid.values()]
+        return "MPI WAIT", 100.0 * sum(per_rank) / len(per_rank)
+    et = et or ExclusiveTime(spans)
+    if not et.threads:
+        return "SYNC WAIT", 0.0
+    sync_ns = sum(et.owned.get(id(s), 0) for s in spans if s.category.value == "sync")
+    return "SYNC WAIT", 100.0 * sync_ns / (len(et.threads) * wall)
+
+
 # ── Diagnosis / findings ─────────────────────────────────────────────────────
 
 def bottleneck_analysis(trace: Trace, ctrs: dict[str, float]) -> list[str]:
@@ -235,7 +271,7 @@ def bottleneck_analysis(trace: Trace, ctrs: dict[str, float]) -> list[str]:
     return tips
 
 
-def diagnose(trace: Trace) -> tuple[str, str]:
+def diagnose(trace: Trace, et: Any = None) -> tuple[str, str]:
     """One-line overall diagnosis + a severity level ("red"/"yellow"/
     "cyan"/"green" -- UI-agnostic; each UI maps this to its own actual
     color), for the headline DIAGNOSIS stat. Uses the same thresholds as
@@ -267,14 +303,40 @@ def diagnose(trace: Trace) -> tuple[str, str]:
         except Exception:
             pass
 
-    stats = trace.aggregated_stats()
-    if stats and stats[0]["pct"] > 40:
-        return f"{stats[0]['category']}-bound", "cyan"
+    cat, share = _top_exclusive_share(trace, lambda s: s.category.value, et)
+    if cat is None:
+        # Nothing with a duration was measured -- a verdict of "Balanced"
+        # (green) here would be a positive claim made from no data.
+        return "No timed events", "cyan"
+    if share > 40:
+        return f"{cat}-bound", "cyan"
 
     return "Balanced", "green"
 
 
-def top_findings(trace: Trace) -> list[tuple[str, str, str, str]]:
+def _top_exclusive_share(trace: Trace, key, et: Any = None) -> tuple[Any, float]:
+    """(key, % of attributed time) for the largest key by EXCLUSIVE time
+    (activity_buckets.exclusive_totals). aggregated_stats()'s pct is a
+    share of summed inclusive durations, so nested spans (a barrier inside
+    a parallel region) were counted twice and the verdict flipped between
+    OpenMP runtimes for the same program.
+
+    The denominator is the available host thread-time (threads x wall),
+    not just the instrumented time: an MPI program spending 2% of its run
+    in MPI calls -- the only thing instrumented -- was diagnosed
+    "mpi-bound" at 100% share (measured on a ground-truth program)."""
+    from .activity_buckets import ExclusiveTime
+    et = et or ExclusiveTime(trace.spans)
+    totals = et.totals(lambda i, s: key(s))
+    grand = sum(totals.values())
+    if not grand:
+        return None, 0.0
+    denom = max(grand, len(et.threads) * trace_wall_ns(trace))
+    top = max(totals, key=totals.get)
+    return top, 100.0 * totals[top] / denom
+
+
+def top_findings(trace: Trace, et: Any = None) -> list[tuple[str, str, str, str]]:
     """(icon, severity, title, metric) tuples for the "Top findings"
     panel, most-actionable first. `severity` is one of "red"/"yellow"/
     "cyan" (UI-agnostic; see diagnose()). Always tries one cheap,
@@ -305,12 +367,12 @@ def top_findings(trace: Trace) -> list[tuple[str, str, str, str]]:
     except Exception:
         pass
 
-    stats = trace.aggregated_stats()
-    if stats and stats[0]["pct"] > 30:
+    top, share = _top_exclusive_share(trace, lambda s: s.name, et)
+    if top is not None and share > 30:
         out.append((
             "◆", "cyan",
-            f"{fmt_kernel_name(stats[0]['name'])[:28]} dominates",
-            f"{stats[0]['pct']:.0f}% of total time",
+            f"{fmt_kernel_name(top)[:28]} dominates",
+            f"{share:.0f}% of total time",
         ))
 
     return out[:4]
@@ -337,12 +399,15 @@ def find_source_context(trace: Trace, context: int = 3) -> SourceContext | None:
     profile collected on a cluster and opened locally routinely hits the
     "file doesn't exist here" case — that's an expected, not exceptional,
     outcome, so callers should show an explanatory message, not blank."""
+    # One pass: first file-tagged span per name. The previous per-row scan
+    # re-copied trace.spans for every aggregated row (2.5s at 200k spans x
+    # 400 names, on the TUI's main thread).
+    first_loc: dict[str, tuple[str, Any]] = {}
+    for s in trace.spans:
+        if s.name not in first_loc and s.tags.get("file"):
+            first_loc[s.name] = (s.tags["file"], s.tags.get("line"))
     for row in trace.aggregated_stats():
-        file_tag = line_tag = None
-        for s in trace.spans:
-            if s.name == row["name"] and s.tags.get("file"):
-                file_tag, line_tag = s.tags["file"], s.tags.get("line")
-                break
+        file_tag, line_tag = first_loc.get(row["name"], (None, None))
         if not file_tag:
             continue
         try:

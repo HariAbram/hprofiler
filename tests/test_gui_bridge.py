@@ -1197,6 +1197,63 @@ class TestComparisonBridge(unittest.TestCase):
         self.assertEqual(bridge.newCount, 1)
         self.assertEqual(bridge.removedCount, 1)
 
+    def _pair(self):
+        trace_a = _mk_trace([
+            _span(1, 1, Category.GPU_CUDA, 0, 10_000_000, "matmul", tags={"type": "kernel"}),
+            _span(1, 1, Category.GPU_CUDA, 0, 5_000_000, "old_only", tags={"type": "kernel"}),
+        ])
+        trace_b = _mk_trace([
+            _span(1, 1, Category.GPU_CUDA, 0, 10_800_000, "matmul", tags={"type": "kernel"}),
+            _span(1, 1, Category.GPU_CUDA, 0, 3_000_000, "new_only", tags={"type": "kernel"}),
+        ])
+        return self._bridge(trace_a, trace_b)
+
+    def test_threshold_change_updates_every_derived_summary(self):
+        # +8% / +0.8ms on matmul: unchanged under the default 5%/1ms
+        # floor, regressed once the floor drops. The table used to flip
+        # while topRegressions, bucketDeltas and the export kept the old
+        # verdict next to it on the same screen.
+        import json, tempfile, os
+        bridge = self._pair()
+        self.assertNotIn("matmul", [r["name"] for r in bridge.topRegressions])
+        bridge.setChangeThresholds(100_000.0, 1.0)
+        self.assertEqual({r["name"]: r["status"] for r in bridge._rows}["matmul"], "regressed")
+        self.assertIn("matmul", [r["name"] for r in bridge.topRegressions])
+        fd, path = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        try:
+            self.assertTrue(bridge.exportReport(path))
+            exported = {r["name"]: r["status"] for r in json.loads(Path(path).read_text())["aggregates"]}
+        finally:
+            os.unlink(path)
+        self.assertEqual(exported["matmul"], "regressed")
+        comp = {b["bucket"]: b["status"] for b in bridge.bucketDeltas}
+        from src.analysis import compare as cmp
+        self.assertEqual(comp["Computation"], cmp.classify(15_000_000.0, 13_800_000.0,
+                                                            noise_pct=1.0, noise_ns=100_000.0)[0])
+
+    def test_missing_side_is_nan_not_zero(self):
+        import math
+        bridge = self._pair()
+        by_name = {r["name"]: r for r in bridge._rows}
+        self.assertTrue(math.isnan(by_name["new_only"]["baselineNs"]))
+        self.assertTrue(math.isnan(by_name["new_only"]["deltaPct"]))
+        self.assertTrue(math.isnan(by_name["old_only"]["comparisonNs"]))
+        from src.gui.tablemodel import FormatBridge
+        fmt = FormatBridge()
+        self.assertEqual(fmt.formatNumber("time_ns", by_name["new_only"]["baselineNs"]), "—")
+        self.assertEqual(fmt.formatNumber("pct", by_name["new_only"]["deltaPct"]), "—")
+
+    def test_missing_values_sort_consistently_and_fail_range_filters(self):
+        bridge = self._pair()
+        proxy = bridge.table.rows
+        proxy.toggleSort("baselineNs")  # ascending: missing first
+        names = [proxy.data(proxy.index(i, 0), proxy.sourceModel().roleForKey("name"))
+                 for i in range(proxy.rowCount())]
+        self.assertEqual(names[0], "new_only")
+        proxy.setMin("baselineNs", 1.0)
+        self.assertNotIn("new_only", [proxy.data(proxy.index(i, 0), proxy.sourceModel().roleForKey("name"))
+                                      for i in range(proxy.rowCount())])
+
     def test_noise_floor_note_present_and_not_a_statistical_claim(self):
         trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
         trace_b = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])

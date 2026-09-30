@@ -743,3 +743,62 @@ class TestTimelineModel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 not installed")
+class TestTimelineOperationsNeverMutateMeasurements(unittest.TestCase):
+    """Zoom/filter/group/hide/isolate/reorder/search/colour/bookmark are
+    view operations: the Trace's spans and every summary computed from
+    them must be byte-identical before and after."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = QGuiApplication.instance() or QGuiApplication([])
+
+    def test_view_operations_leave_trace_and_summaries_untouched(self):
+        import copy
+        from src.core.trace import Trace, TraceMetadata
+        from src.core.events import SpanEvent, Category
+        from src.gui.theme import Theme
+        from src.gui.models import TimelineModel
+        from src.analysis import activity_buckets as ab
+        t = Trace(TraceMetadata(command="a.out"))
+        for i in range(200):
+            cat = [Category.CPU, Category.MPI, Category.GPU_CUDA, Category.SYNC][i % 4]
+            tags = {"type": "kernel", "stream": str(i % 2)} if cat is Category.GPU_CUDA else {"rank": str(i % 2)}
+            t.add(SpanEvent(name=f"f{i % 7}", category=cat, start_ns=i * 1000, duration_ns=500 + i,
+                            pid=1 + i % 2, tid=10 + i % 3, tags=tags))
+        snapshot = lambda: [(s.name, s.category, s.start_ns, s.duration_ns, s.pid, s.tid,
+                             dict(s.tags), s.span_id, s.parent_span_id) for s in t.spans]
+        before = copy.deepcopy(snapshot())
+        stats_before = t.aggregated_stats()
+        buckets_before = ab.bucket_totals(t.spans)
+
+        m = TimelineModel(t, Theme(dark=True))
+        m.applyFilters({"runtimes": ["cpu", "mpi"], "minDurationNs": 550, "nameQuery": "f[0-3]",
+                        "nameIsRegex": True, "activeOnly": True})
+        for g in ("rank", "process", "runtime", "stream", "thread"):
+            m.setGrouping(g)
+            m.collapseAllGroups()
+            m.expandAllGroups()
+        m.setGrouping("none")
+        lanes = [lane["name"] for lane in m.lanes]
+        m.hideLane(lanes[0])
+        m.isolateLane(lanes[-1])
+        m.showAllLanes()
+        m.moveRow(lanes[0], len(lanes) - 1)
+        for mode in ("bucket", "category", "function"):
+            m.setColorMode(mode)
+        m.search("f2", False)
+        m.nextMatch()
+        m.previousMatch()
+        m.addBookmark(5_000.0, "b")
+        m.addNamedRange(1_000.0, 9_000.0, "r")
+        for i in range(len(lanes)):
+            m.visibleSpans(i, 0.0, 200_000.0, 800)
+        m.clearFilters()
+        m.clearSearch()
+
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(t.aggregated_stats(), stats_before)
+        self.assertEqual(ab.bucket_totals(t.spans), buckets_before)

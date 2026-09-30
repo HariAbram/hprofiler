@@ -94,25 +94,32 @@ class ComparisonBridge(QObject):
 
     def _recompute(self, trace_a: Trace, trace_b: Trace) -> None:
         rows = cmp.compare_aggregates(trace_a, trace_b, noise_pct=self._noise_pct, noise_ns=self._noise_ns)
+        # Missing sides/undefined percentages stay NaN ("—" in the table),
+        # never 0: a function absent from one run did not take 0ns there,
+        # and a new/removed row has no percentage change at all.
+        nan = float("nan")
         self._rows = [
             {
                 "name": dash.fmt_kernel_name(r["name"]), "category": r["category"], "status": r["status"],
-                "baselineNs": r["baseNs"] if r["baseNs"] is not None else 0.0,
-                "comparisonNs": r["compNs"] if r["compNs"] is not None else 0.0,
-                "deltaNs": r["deltaNs"] if r["deltaNs"] is not None else 0.0,
-                "deltaPct": r["deltaPct"] if r["deltaPct"] is not None else 0.0,
+                "baselineNs": r["baseNs"] if r["baseNs"] is not None else nan,
+                "comparisonNs": r["compNs"] if r["compNs"] is not None else nan,
+                "deltaNs": r["deltaNs"] if r["deltaNs"] is not None else nan,
+                "deltaPct": r["deltaPct"] if r["deltaPct"] is not None else nan,
                 "matchKind": r["matchKind"],
             }
             for r in rows
         ]
         self._bucket_rows = cmp.compare_buckets(trace_a, trace_b, noise_pct=self._noise_pct, noise_ns=self._noise_ns)
-        self._top_improvements = cmp.top_changes(rows, status=cmp.STATUS_IMPROVED, limit=10)
-        self._top_regressions = cmp.top_changes(rows, status=cmp.STATUS_REGRESSED, limit=10)
         self._baseline_coverage = cmp.normalized_coverage(trace_a, _COVERAGE_BUCKETS)
         self._comparison_coverage = cmp.normalized_coverage(trace_b, _COVERAGE_BUCKETS)
         self._new_count = sum(1 for r in rows if r["status"] == cmp.STATUS_NEW)
         self._removed_count = sum(1 for r in rows if r["status"] == cmp.STATUS_REMOVED)
         self._report_rows = rows   # raw (unformatted) rows, for exportReport/exportCsv
+        self._refresh_top_changes()
+
+    def _refresh_top_changes(self) -> None:
+        self._top_improvements = cmp.top_changes(self._report_rows, status=cmp.STATUS_IMPROVED, limit=10)
+        self._top_regressions = cmp.top_changes(self._report_rows, status=cmp.STATUS_REGRESSED, limit=10)
 
     # ── Properties ───────────────────────────────────────────────────
     @Property(bool, constant=True)
@@ -131,15 +138,15 @@ class ComparisonBridge(QObject):
     def table(self) -> TableBundle:
         return self._table
 
-    @Property('QVariantList', constant=True)
+    @Property('QVariantList', notify=thresholdsChanged)
     def bucketDeltas(self) -> list[dict[str, Any]]:
         return self._bucket_rows
 
-    @Property('QVariantList', constant=True)
+    @Property('QVariantList', notify=thresholdsChanged)
     def topImprovements(self) -> list[dict[str, Any]]:
         return self._top_improvements
 
-    @Property('QVariantList', constant=True)
+    @Property('QVariantList', notify=thresholdsChanged)
     def topRegressions(self) -> list[dict[str, Any]]:
         return self._top_regressions
 
@@ -189,9 +196,18 @@ class ComparisonBridge(QObject):
             return
         self._noise_ns = max(0.0, min_abs_ns)
         self._noise_pct = max(0.0, min_pct)
+        # Everything derived from a status must be re-derived together --
+        # previously only the table was, so the top-regressions/
+        # improvements panels, bucket deltas and the exported report kept
+        # the OLD thresholds' verdicts next to a table showing the new ones.
         for row, raw in zip(self._rows, self._report_rows):
             status, delta = cmp.classify(raw["baseNs"], raw["compNs"], noise_pct=self._noise_pct, noise_ns=self._noise_ns)
             row["status"] = status
+            raw["status"] = status
+            raw["deltaKind"], raw["deltaReason"] = delta["kind"], delta["reason"]
+        for b in self._bucket_rows:
+            b["status"] = cmp.classify(b["baseNs"], b["compNs"], noise_pct=self._noise_pct, noise_ns=self._noise_ns)[0]
+        self._refresh_top_changes()
         self._table.setRows(self._rows)
         self.thresholdsChanged.emit()
 

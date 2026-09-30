@@ -99,12 +99,16 @@ class TestBucketOfSpan(unittest.TestCase):
 
 class TestBucketTotals(unittest.TestCase):
     def test_sums_duration_per_bucket(self):
+        # Host spans laid out sequentially: bucket_totals attributes each
+        # instant of a thread to one span, so overlapping same-thread
+        # spans are no longer summed (see the nesting tests below).
         spans = [
             _span(Category.GPU_CUDA, 100, "kernel"),
             _span(Category.GPU_CUDA, 50, "kernel"),
             _span(Category.MPI, 30, "allreduce"),
             _span(Category.SYNC, 10, "barrier"),
         ]
+        spans[3].start_ns = spans[2].end_ns
         totals = ab.bucket_totals(spans)
         self.assertEqual(totals["Computation"], 150)
         self.assertEqual(totals["Communication"], 30)
@@ -137,3 +141,99 @@ class TestBucketTotals(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _hs(cat, name, start, dur, tid=1, pid=1, **tags):
+    return SpanEvent(name=name, category=cat, start_ns=start, duration_ns=dur,
+                     pid=pid, tid=tid, tags=dict(tags))
+
+
+def _omp_program(shape: str):
+    """One timeline, two OpenMP runtimes' span shapes. 4 threads, 3
+    regions of 16ns: thread t computes 4*(t+1)ns then waits at a barrier
+    until 16ns. Ground truth per region: compute 40, barrier wait 24."""
+    spans = []
+    for r in range(3):
+        base = r * 20
+        if shape == "ompt":
+            spans.append(_hs(Category.OPENMP, "parallel_region", base, 16, tid=0, type="parallel"))
+        for t in range(4):
+            work = 4 * (t + 1)
+            if shape == "gomp":
+                spans.append(_hs(Category.OPENMP, "omp_parallel_region", base, 16, tid=t, type="parallel_region"))
+            else:
+                spans.append(_hs(Category.OPENMP, "omp_implicit_task", base, 16, tid=t, type="implicit_task"))
+            if work < 16:
+                spans.append(_hs(Category.SYNC, "omp_barrier", base + work, 16 - work, tid=t, type="sync"))
+    return spans
+
+
+class TestExclusiveAttribution(unittest.TestCase):
+    """bucket_totals used to sum raw durations; nested host spans were
+    counted twice and the same OpenMP program was diagnosed differently
+    depending on which runtime it linked (measured: OMPT 'sync-bound'
+    66% sync, GOMP 'openmp-bound' 27.5% sync; truth 38%)."""
+
+    def test_nested_barrier_not_double_counted(self):
+        totals = ab.bucket_totals(_omp_program("gomp"))
+        self.assertEqual(totals["Computation"], 3 * 40)
+        self.assertEqual(totals["Synchronization"], 3 * 24)
+
+    def test_ompt_and_gomp_shapes_give_identical_breakdown(self):
+        self.assertEqual(ab.bucket_totals(_omp_program("ompt")), ab.bucket_totals(_omp_program("gomp")))
+
+    def test_device_kernel_not_nested_under_launching_thread(self):
+        # A kernel span carries its LAUNCHING thread's tid; it ran on the
+        # GPU while that thread blocked in cudaDeviceSynchronize.
+        spans = [_hs(Category.GPU_CUDA, "k", 0, 100, tid=1, type="kernel", stream="0"),
+                 _hs(Category.SYNC, "cudaDeviceSynchronize", 5, 95, tid=1, type="sync")]
+        totals = ab.bucket_totals(spans)
+        self.assertEqual(totals["Computation"], 100)
+        self.assertEqual(totals["Synchronization"], 95)
+
+    def test_opencl_cpu_side_enqueue_is_overhead_not_compute(self):
+        spans = [_hs(Category.GPU_OPENCL, "k", 0, 10, tid=1, type="kernel", side="cpu"),
+                 _hs(Category.GPU_OPENCL, "k", 20, 500, tid=9, type="kernel", side="gpu")]
+        totals = ab.bucket_totals(spans)
+        self.assertEqual(totals["Computation"], 500)
+        self.assertEqual(totals["Runtime overhead"], 10)
+
+    def test_annotation_does_not_steal_time_from_wrapped_host_work(self):
+        spans = [_hs(Category.NVTX, "range", 0, 100, type="nvtx_range"),
+                 _hs(Category.CPU, "f", 10, 50)]
+        self.assertEqual(ab.bucket_totals(spans), {"Computation": 50})
+
+    def test_per_thread_total_equals_union_of_coverage(self):
+        import random
+        from src.analysis.dashboard import merged_ns
+        rng = random.Random(3)
+        for _ in range(50):
+            # Instrumented categories only -- cpu spans are perf samples,
+            # which deliberately don't take part in the partition (see
+            # test_samples_inside_measured_calls_are_not_double_counted).
+            spans = [_hs(rng.choice([Category.SYNC, Category.MPI, Category.OPENMP, Category.MEMORY]), "x",
+                         rng.randint(0, 1000), rng.randint(1, 300), tid=rng.randint(1, 3))
+                     for _ in range(rng.randint(1, 40))]
+            owned = ab.exclusive_host_ns(spans)
+            for tid in {s.tid for s in spans}:
+                mine = [s for s in spans if s.tid == tid]
+                self.assertEqual(sum(owned.get(id(s), 0) for s in mine), merged_ns(mine))
+
+
+class TestSampledVsMeasured(unittest.TestCase):
+    """perf samples (cpu spans with a nominal one-interval weight) are
+    estimates; instrumented spans are measurements. A sample taken inside
+    an instrumented call on the same thread is already covered by it."""
+
+    def test_samples_inside_measured_calls_are_not_double_counted(self):
+        spans = [_hs(Category.MPI, "MPI_Allreduce", 0, 1000, type="allreduce")]
+        spans += [_hs(Category.CPU, "libmpi_progress", 100 * k, 100) for k in range(10)]   # inside the call
+        spans += [_hs(Category.CPU, "compute", 1000 + 100 * k, 100) for k in range(5)]     # after it
+        totals = ab.bucket_totals(spans)
+        self.assertEqual(totals["Communication"], 1000)   # measured call keeps all its time
+        self.assertEqual(totals["Computation"], 500)      # only samples outside it
+
+    def test_samples_on_another_thread_still_count(self):
+        spans = [_hs(Category.MPI, "MPI_Allreduce", 0, 1000, tid=1, type="allreduce"),
+                 _hs(Category.CPU, "compute", 100, 100, tid=2)]
+        self.assertEqual(ab.bucket_totals(spans)["Computation"], 100)

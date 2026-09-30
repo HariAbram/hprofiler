@@ -63,11 +63,23 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
 
     for span in trace.spans:
         cat = span.category.value
+        args = {**span.tags, **({"_stack": span.stack_frames} if span.stack_frames else {})}
         if cat in _GPU_CATS:
             stream = span.tags.get("stream", "")
             tid = _gpu_tid(cat, stream)
+            # The virtual tid only exists for Perfetto's track layout; the
+            # real launching/callback thread is what every hprofiler
+            # analysis keys on, so it must survive a save/reload.
+            args["_tid"] = span.tid
         else:
             tid = span.tid
+        # Same keys as the hook wire protocol (runner._parse_record pops
+        # them into these fields) -- critical-path request linking, MPI
+        # wildcard resolution and call-tree parent links all depend on them.
+        if span.span_id:
+            args["sid"] = span.span_id
+        if span.parent_span_id:
+            args["psid"] = span.parent_span_id
         events.append({
             "ph": "X",
             "name": span.name,
@@ -77,7 +89,7 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             "pid": span.pid or meta.pid,
             "tid": tid,
             "cname": _category_color(cat),
-            "args": {**span.tags, **({"_stack": span.stack_frames} if span.stack_frames else {})},
+            "args": args,
         })
 
     # Emit thread-name metadata for each virtual GPU track so Perfetto labels them.
@@ -89,7 +101,7 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
         })
 
     for inst in trace.instants:
-        events.append({
+        ev = {
             "ph": "i",
             "name": inst.name,
             "cat": inst.category.value,
@@ -97,11 +109,17 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             "pid": inst.pid or meta.pid,
             "tid": inst.tid,
             "s": "t",
-        })
+        }
+        if inst.tags:
+            ev["args"] = dict(inst.tags)
+        events.append(ev)
 
     counters_by_name: dict[str, list] = {}
+    counter_units: dict[str, str] = {}
     for ctr in trace.counters:
         counters_by_name.setdefault(ctr.name, []).append(ctr)
+        if ctr.unit:
+            counter_units[ctr.name] = ctr.unit
 
     for name, ctrs in counters_by_name.items():
         for ctr in sorted(ctrs, key=lambda c: c.timestamp_ns):
@@ -127,6 +145,15 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             "duration_ms": trace.duration_ns / 1_000_000,
             "devices": [d.to_dict() for d in trace.devices],
             "captureTime": meta.capture_time_iso,
+            # CLOCK_MONOTONIC ns, same domain as every event timestamp.
+            # Without these a reloaded trace's duration_ns was "time since
+            # the file was loaded" (TraceMetadata's default start).
+            "startTimeNs": meta.start_time_ns,
+            "endTimeNs": meta.end_time_ns,
+            "pid": meta.pid,
+            # A counter event's own args are its plotted series in
+            # Perfetto, so units live here instead of on each event.
+            "counterUnits": counter_units,
         },
     }
 
@@ -163,6 +190,13 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             json.dump(payload, f, indent=indent)
     else:
         json.dump(payload, out, indent=indent)
+
+
+def _us_to_ns(us: float) -> int:
+    """Rounded, not truncated: int(us * 1000) turned ~0.7% of realistic
+    CLOCK_MONOTONIC timestamps into value-1 ns (float products land just
+    under the integer), and could turn a 1 ns span into a 0 ns one."""
+    return int(round(us * 1_000))
 
 
 class LoadCancelled(Exception):
@@ -209,7 +243,9 @@ def load_trace_from_json(
         # "" for any trace saved before this field existed -- the GUI
         # renders that as "unavailable", not a guessed/fake time.
         capture_time_iso=meta_raw.get("captureTime", ""),
+        pid=meta_raw.get("pid", 0) or 0,
     )
+    counter_units: dict[str, str] = meta_raw.get("counterUnits") or {}
     trace = Trace(metadata)
 
     events = data.get("traceEvents", [])
@@ -237,35 +273,64 @@ def load_trace_from_json(
         if ph == "X":
             args = ev.get("args", {})
             stack = args.pop("_stack", [])
+            span_id = args.pop("sid", "")
+            parent_span_id = args.pop("psid", "")
+            tid = args.pop("_tid", ev.get("tid", 0))
+            start_ns = _us_to_ns(ev.get("ts", 0))
             trace.add(SpanEvent(
                 name=ev.get("name", ""),
                 category=cat,
-                start_ns=int(ev.get("ts", 0) * 1_000),
-                duration_ns=int(ev.get("dur", 0) * 1_000),
+                start_ns=start_ns,
+                # Derived from the rounded END, not rounded separately, so
+                # start+dur always lands on the originally-written end.
+                duration_ns=max(_us_to_ns(ev.get("ts", 0) + ev.get("dur", 0)) - start_ns, 0),
                 pid=ev.get("pid", 0),
-                tid=ev.get("tid", 0),
+                tid=tid,
                 tags=args,
                 stack_frames=stack if isinstance(stack, list) else [],
+                span_id=str(span_id),
+                parent_span_id=str(parent_span_id),
             ))
         elif ph == "i":
             trace.add(InstantEvent(
                 name=ev.get("name", ""),
                 category=cat,
-                timestamp_ns=int(ev.get("ts", 0) * 1_000),
+                timestamp_ns=_us_to_ns(ev.get("ts", 0)),
                 pid=ev.get("pid", 0),
                 tid=ev.get("tid", 0),
+                tags=dict(ev.get("args") or {}),
             ))
         elif ph == "C":
             args = ev.get("args", {})
             name = ev.get("name", "counter")
-            val  = list(args.values())[0] if args else 0
+            if not args:
+                # No sampled value at all -- skip rather than invent a 0.
+                continue
+            val = list(args.values())[0]
             trace.add(CounterEvent(
                 name=name,
                 category=cat,
-                timestamp_ns=int(ev.get("ts", 0) * 1_000),
+                timestamp_ns=_us_to_ns(ev.get("ts", 0)),
                 value=float(val),
+                unit=counter_units.get(name, ""),
                 pid=ev.get("pid", 0),
             ))
+
+    # Profiling window. Files written before startTimeNs/endTimeNs existed
+    # fall back to the event extent -- never TraceMetadata's default
+    # (monotonic time at LOAD), which made trace.duration_ns meaningless.
+    start_raw = meta_raw.get("startTimeNs")
+    end_raw = meta_raw.get("endTimeNs")
+    if isinstance(start_raw, int) and isinstance(end_raw, int) and end_raw > start_raw > 0:
+        metadata.start_time_ns = start_raw
+        metadata.end_time_ns = end_raw
+    else:
+        starts = [s.start_ns for s in trace.spans] + [i.timestamp_ns for i in trace.instants] \
+            + [c.timestamp_ns for c in trace.counters]
+        ends = [s.end_ns for s in trace.spans] + [i.timestamp_ns for i in trace.instants] \
+            + [c.timestamp_ns for c in trace.counters]
+        metadata.start_time_ns = min(starts) if starts else 0
+        metadata.end_time_ns = max(ends) if ends else 0
 
     # Restore device peaks saved at profile time
     for d in meta_raw.get("devices", []):

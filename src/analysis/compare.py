@@ -56,20 +56,24 @@ def match_rows(rows_a: list[dict], rows_b: list[dict]) -> list[dict[str, Any]]:
     index_b = {(r["category"], r["name"]): r for r in rows_b}
 
     out: list[dict[str, Any]] = []
-    used_b: set[tuple[str, str]] = set()
+    # Every exact match is claimed BEFORE any normalized fallback runs --
+    # otherwise an earlier baseline row could steal (via its normalized
+    # name) a comparison row that a later baseline row matches exactly,
+    # and that comparison row would then be matched twice.
+    used_b: set[tuple[str, str]] = {key for key in index_a if key in index_b}
+    norm_b: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for kb in index_b:
+        if kb not in used_b:
+            norm_b.setdefault((kb[0], dash.fmt_kernel_name(kb[1])), []).append(kb)
 
     for key, ra in index_a.items():
         if key in index_b:
             out.append({"category": key[0], "name": key[1], "base": ra, "comp": index_b[key], "matchKind": "exact"})
-            used_b.add(key)
             continue
-        norm_name = dash.fmt_kernel_name(key[1])
         match = None
-        for kb, rb in index_b.items():
-            if kb in used_b or kb[0] != key[0]:
-                continue
-            if dash.fmt_kernel_name(kb[1]) == norm_name:
-                match = (kb, rb)
+        for kb in norm_b.get((key[0], dash.fmt_kernel_name(key[1])), []):
+            if kb not in used_b:
+                match = (kb, index_b[kb])
                 break
         if match is not None:
             kb, rb = match

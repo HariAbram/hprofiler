@@ -99,6 +99,14 @@ class DictListTableModel(QAbstractListModel):
         return self._role_for_key.get(key, -1)
 
 
+def _sort_num(v: Any) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return float("-inf")
+    return f if f == f else float("-inf")
+
+
 class TableFilterProxy(QSortFilterProxyModel):
     """Sorting/filtering state for one table. All mutation goes through
     sort()/beginFilterChange()+endFilterChange() (incremental Qt operations) -- never touches
@@ -157,7 +165,10 @@ class TableFilterProxy(QSortFilterProxyModel):
         rv = model.data(right, role)
         spec = next((c for c in model.columnSpecs() if c.key == self._sort_key), None)
         if spec is not None and spec.numeric:
-            return float(lv or 0) < float(rv or 0)
+            # Missing (None/NaN) sorts below every real value, consistently:
+            # NaN compared false both ways, which is not a strict weak
+            # ordering and gave an arbitrary row order.
+            return _sort_num(lv) < _sort_num(rv)
         return str(lv or "").lower() < str(rv or "").lower()
 
     # ── filtering ────────────────────────────────────────────────────────
@@ -248,11 +259,15 @@ class TableFilterProxy(QSortFilterProxyModel):
             if not any(needle in str(row.get(k, "")).lower() for k in keys):
                 return False
 
+        # A missing value (None/NaN) can't satisfy a numeric range --
+        # NaN compares false both ways, so it used to pass every filter.
         for key, lo in self._min_values.items():
-            if float(row.get(key, 0) or 0) < lo:
+            v = _sort_num(row.get(key))
+            if v == float("-inf") or v < lo:
                 return False
         for key, hi in self._max_values.items():
-            if float(row.get(key, 0) or 0) > hi:
+            v = _sort_num(row.get(key))
+            if v == float("-inf") or v > hi:
                 return False
 
         if self._category_filter and row.get("category") not in self._category_filter:
@@ -358,7 +373,7 @@ class TableBundle(QObject):
         self._bar_maxima: dict[str, float] = {}
         for c in columns:
             if c.bar and c.numeric:
-                values = [float(r.get(c.key, 0) or 0) for r in rows]
+                values = [v for v in (float(r.get(c.key, 0) or 0) for r in rows) if v == v]
                 self._bar_maxima[c.key] = max(values) if values else 0.0
 
     @Property(QObject, constant=True)
@@ -389,7 +404,7 @@ class TableBundle(QObject):
         self._model.setRows(rows)
         for c in self._model.columnSpecs():
             if c.bar and c.numeric:
-                values = [float(r.get(c.key, 0) or 0) for r in rows]
+                values = [v for v in (float(r.get(c.key, 0) or 0) for r in rows) if v == v]
                 self._bar_maxima[c.key] = max(values) if values else 0.0
 
     def _visible_columns(self) -> list[ColumnSpec]:

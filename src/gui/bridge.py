@@ -55,8 +55,12 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     meta = trace.metadata
     wall_ns = dash.trace_wall_ns(trace)
     result: dict[str, Any] = {}
+    # One exclusive-time pass shared by diagnosis, findings, wait % and
+    # the time breakdown (each used to redo it: 2.8x slower at 1M spans).
+    et = activity_buckets.ExclusiveTime(trace.spans)
+    findings = dash.top_findings(trace, et)
 
-    diag_label, diag_severity = dash.diagnose(trace)
+    diag_label, diag_severity = dash.diagnose(trace, et)
     result["diagnosis_label"] = diag_label
     result["diagnosis_severity"] = diag_severity
     result["wall_time"] = dash.fmt_ns(wall_ns)
@@ -75,14 +79,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     result["gpu_active_available"] = gpu_stats is not None
     result["gpu_active_pct"] = gpu_stats["gpu_active_pct"] if gpu_stats else 0.0
 
-    mpi_present = any(s.category.value == "mpi" for s in trace.spans)
-    if mpi_present:
-        wait_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "mpi"])
-        result["wait_label"] = "MPI WAIT"
-    else:
-        wait_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "sync"])
-        result["wait_label"] = "SYNC WAIT"
-    result["wait_pct"] = 100.0 * wait_ns / wall_ns if wall_ns else 0.0
+    result["wait_label"], result["wait_pct"] = dash.wait_fraction(trace, et)
 
     ctrs = {c.name: c.value for c in trace.counters}
     rss = ctrs.get("process_max_rss_bytes", 0.0)
@@ -95,7 +92,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     result["findings"] = [
         {"icon": icon, "color": theme_mod.severity_color(severity, dark),
          "title": title, "metric": metric}
-        for icon, severity, title, metric in dash.top_findings(trace)
+        for icon, severity, title, metric in findings
     ]
 
     stats = trace.aggregated_stats()
@@ -169,7 +166,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     idle_ns = 0
     if gpu_stats is not None:
         idle_ns = max(int(gpu_stats["launch_gap_pct"] / 100.0 * wall_ns), 0)
-    buckets = activity_buckets.bucket_totals(trace.spans, idle_ns=idle_ns)
+    buckets = activity_buckets.bucket_totals(et.spans, idle_ns=idle_ns, et=et)
     grand = sum(buckets.values()) or 1
     _order = list(activity_buckets.BUCKETS)
     result["time_breakdown"] = [
@@ -188,7 +185,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     result["top_bottlenecks"] = [
         {"label": title, "value": metric, "kind": "measured", "reason": "",
          "icon": icon, "color": theme_mod.severity_color(severity, dark)}
-        for icon, severity, title, metric in dash.top_findings(trace)
+        for icon, severity, title, metric in findings
     ]
 
     # Tab indices match Main.qml's TabBar order (Overview=0 .. Compare=9).

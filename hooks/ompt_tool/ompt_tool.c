@@ -6,7 +6,8 @@
  *
  * Callbacks registered:
  *   thread_begin/end         → thread lifecycle
- *   parallel_begin/end       → parallel region spans
+ *   parallel_begin/end       → parallel region spans (primary thread only)
+ *   implicit_task begin/end  → per-thread share of a parallel region
  *   work (loop/sections)     → work-distribution spans
  *   sync_region (barriers)   → synchronization spans
  *   target begin/end         → GPU offload spans (OMP 5, ACPP)
@@ -183,6 +184,7 @@ typedef enum {
     ompt_callback_parallel_end   = 4,
     ompt_callback_task_create    = 5,
     ompt_callback_task_schedule  = 6,
+    ompt_callback_implicit_task  = 7,
     ompt_callback_target         = 8,
     ompt_callback_work           = 20,
     ompt_callback_sync_region    = 23,
@@ -303,6 +305,10 @@ static __thread const void  *tls_sync_codeptr[MAX_DEPTH];
 static __thread int          tls_sync_depth      = 0;
 static __thread uint64_t     tls_target_start[MAX_DEPTH];
 static __thread int          tls_target_depth    = 0;
+static __thread uint64_t     tls_itask_start[MAX_DEPTH];
+static __thread uint64_t     tls_itask_par[MAX_DEPTH];
+static __thread unsigned int tls_itask_index[MAX_DEPTH];
+static __thread int          tls_itask_depth     = 0;
 
 /* Open tasks on this thread, keyed by task ID -- NOT a LIFO stack. Untied
  * tasks and task-yield points can hand a thread a task that isn't its most
@@ -403,6 +409,45 @@ static void cb_parallel_end(
         }
     }
     (void)parallel_data;
+}
+
+/* Per-thread implicit task: the only OMPT event that shows WORKER threads
+ * doing a region's work. Without it an OMPT trace had one parallel_region
+ * span on the primary thread and only barrier spans on workers, so worker
+ * compute was invisible and every breakdown read "sync-bound" -- while the
+ * same program under GNU libgomp (gomp_hook.c's per-thread trampoline
+ * spans) read "openmp-bound". The initial task (whole program) is skipped.
+ * parallel_data may be NULL at scope_end per the spec, so the region id is
+ * captured at begin. */
+static void cb_implicit_task(
+    ompt_scope_endpoint_t endpoint, ompt_data_t *parallel_data,
+    ompt_data_t *task_data, unsigned int actual_parallelism,
+    unsigned int index, int flags)
+{
+    (void)task_data; (void)actual_parallelism;
+    if (flags & 0x1 /* ompt_task_initial */) return;
+    if (endpoint == ompt_scope_begin) {
+        if (tls_itask_depth < MAX_DEPTH) {
+            tls_itask_start[tls_itask_depth] = now_ns();
+            tls_itask_par[tls_itask_depth]   = (parallel_data ? parallel_data->value : 0);
+            tls_itask_index[tls_itask_depth] = index;
+        }
+        tls_itask_depth++;  /* unconditional -- see cb_parallel_begin */
+    } else if (endpoint == ompt_scope_end && tls_itask_depth > 0) {
+        tls_itask_depth--;
+        if (tls_itask_depth >= MAX_DEPTH) return;
+        uint64_t t0 = tls_itask_start[tls_itask_depth];
+        char extra[128];
+        if (tls_itask_par[tls_itask_depth])
+            snprintf(extra, sizeof(extra), "type=implicit_task,index=%u,psid=%llu",
+                     tls_itask_index[tls_itask_depth],
+                     (unsigned long long)tls_itask_par[tls_itask_depth]);
+        else
+            snprintf(extra, sizeof(extra), "type=implicit_task,index=%u",
+                     tls_itask_index[tls_itask_depth]);
+        emit_span("openmp", gettid_compat(), t0, now_ns() - t0,
+                  "omp_implicit_task", extra);
+    }
 }
 
 static void cb_work(
@@ -705,6 +750,7 @@ static int tool_initialize(ompt_function_lookup_t lookup,
     REG(ompt_callback_thread_end,     cb_thread_end);
     REG(ompt_callback_parallel_begin, cb_parallel_begin);
     REG(ompt_callback_parallel_end,   cb_parallel_end);
+    REG(ompt_callback_implicit_task,  cb_implicit_task);
     REG(ompt_callback_task_create,    cb_task_create);
     REG(ompt_callback_task_schedule,  cb_task_schedule);
     REG(ompt_callback_work,           cb_work);

@@ -173,8 +173,11 @@ class TestTopFindings(unittest.TestCase):
         # The cheap always-available fallback -- must fire even for a
         # trace with no GPU/MPI backends at all, so the Dashboard's "Top
         # findings" panel is never silently empty for a plain CPU trace.
-        spans = [_span(1, 1, Category.CPU, i, 100, "hot_fn") for i in range(10)]
-        spans.append(_span(1, 1, Category.CPU, 2000, 5, "cold_fn"))
+        # Back-to-back calls on one thread (the old fixture overlapped ten
+        # same-thread calls 1ns apart, which only "dominated" because
+        # their overlapping durations were summed).
+        spans = [_span(1, 1, Category.CPU, i * 100, 100, "hot_fn") for i in range(10)]
+        spans.append(_span(1, 1, Category.CPU, 1000, 5, "cold_fn"))
         findings = _top_findings(_mk_trace(spans, backends=["cpu"]))
         self.assertTrue(findings)
         self.assertTrue(any("hot_fn" in f[2] for f in findings))
@@ -498,3 +501,61 @@ class TestWallTimeConsistency(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThreadTimeSemantics(unittest.TestCase):
+    """Headline WAIT % and '<category>-bound' are judged against available
+    thread-time, not the union across threads / instrumented time only."""
+
+    def _omp_trace(self, shape):
+        import importlib
+        tab = importlib.import_module("tests.test_activity_buckets")
+        return _mk_trace(tab._omp_program(shape), backends=["openmp"])
+
+    def test_wait_is_thread_average_not_union(self):
+        from src.analysis.dashboard import wait_fraction
+        label, pct = wait_fraction(self._omp_trace("gomp"))
+        self.assertEqual(label, "SYNC WAIT")
+        # 3 regions x 24ns of waiting over 4 threads x 56ns wall.
+        self.assertAlmostEqual(pct, 100.0 * 72 / (4 * 56), places=6)
+
+    def test_mpi_wait_is_per_rank_average(self):
+        from src.analysis.dashboard import wait_fraction
+        spans = [_span(1, 1, Category.CPU, 0, 100, "work"), _span(2, 2, Category.CPU, 0, 100, "work"),
+                 _span(1, 1, Category.MPI, 0, 50, "MPI_Barrier", tags={"type": "barrier"}),
+                 _span(2, 2, Category.MPI, 50, 10, "MPI_Barrier", tags={"type": "barrier"})]
+        label, pct = wait_fraction(_mk_trace(spans, backends=["mpi"]))
+        self.assertEqual(label, "MPI WAIT")
+        self.assertAlmostEqual(pct, 100.0 * (50 / 100 + 10 / 100) / 2)
+
+    def test_same_diagnosis_for_both_openmp_runtimes(self):
+        self.assertEqual(_diagnose(self._omp_trace("ompt")), _diagnose(self._omp_trace("gomp")))
+        self.assertEqual(_diagnose(self._omp_trace("gomp"))[0], "openmp-bound")
+
+    def test_small_instrumented_fraction_is_not_called_bound(self):
+        # MPI is the ONLY thing instrumented but covers 2% of the run.
+        spans = [_span(1, 1, Category.MPI, 0, 20, "MPI_Barrier", tags={"type": "barrier"}),
+                 _span(1, 1, Category.MPI, 980, 20, "MPI_Allreduce", tags={"type": "allreduce"})]
+        t = _mk_trace(spans, backends=["cpu"])
+        self.assertNotEqual(_diagnose(t)[0], "mpi-bound")
+
+
+class TestFmtNs(unittest.TestCase):
+    def test_negative_values_keep_their_unit_scaling(self):
+        from src.analysis.dashboard import fmt_ns
+        self.assertEqual(fmt_ns(-2_500_000), "-2.50ms")
+        self.assertEqual(fmt_ns(-1500), "-1.5µs")
+
+    def test_nan_renders_as_missing_not_a_number(self):
+        from src.analysis.dashboard import fmt_ns, fmt_pct
+        self.assertEqual(fmt_ns(float("nan")), "—")
+        self.assertEqual(fmt_pct(float("nan")), "—")
+
+
+class TestNoDataIsNotAVerdict(unittest.TestCase):
+    def test_empty_trace_is_not_called_balanced(self):
+        self.assertEqual(_diagnose(_mk_trace([]))[0], "No timed events")
+
+    def test_zero_duration_samples_only_is_not_called_balanced(self):
+        spans = [_span(1, 1, Category.CPU, i, 0, "sample") for i in range(5)]
+        self.assertEqual(_diagnose(_mk_trace(spans, backends=["cpu"]))[0], "No timed events")

@@ -226,3 +226,138 @@ class TestLoadTraceProgressAndCancellation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLosslessRoundTrip(unittest.TestCase):
+    """Everything `hprofiler run` keeps in memory must survive the save/
+    reload every other entry point (GUI, `view`, `summary`,
+    `critical-path`, `merge-nodes`) goes through. Before this, span ids,
+    parent links, GPU spans' real tid, the profiling window, instant tags
+    and counter units were all dropped -- measured on a real MPI run:
+    the critical-path graph lost every communication edge on reload."""
+
+    def _roundtrip(self, trace: Trace) -> Trace:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            chrome_trace.write(trace, path)
+            return chrome_trace.load_trace_from_json(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def _mpi_trace(self) -> Trace:
+        base = 432_000_123_456_789
+        t = Trace(TraceMetadata(command="a.out", args=[], pid=7,
+                                start_time_ns=base - 1000, end_time_ns=base + 10_000_000))
+        mk = lambda name, typ, off, dur, **kw: SpanEvent(
+            name=name, category=Category.MPI, start_ns=base + off, duration_ns=dur,
+            pid=7, tid=7, tags={"type": typ, "rank": "0", **kw.pop("tags", {})}, **kw)
+        t.add(mk("MPI_Irecv", "irecv", 0, 500, span_id="1", tags={"peer": "0", "tag": "5", "bytes": "8"}))
+        t.add(mk("MPI_Isend", "isend", 1000, 500, span_id="2", tags={"peer": "0", "tag": "5", "bytes": "8"}))
+        t.add(mk("MPI_Waitall", "waitall", 2000, 3000, parent_span_id="1;2"))
+        t.add(mk("MPI_Irecv", "irecv", 6000, 500, span_id="3", tags={"peer": "-2", "tag": "-1", "wildcard": "1"}))
+        t.add(mk("MPI_Wait", "wait", 7000, 800, parent_span_id="3", tags={"rpeer": "0", "rtag": "100"}))
+        return t
+
+    def test_span_ids_and_parent_links_survive(self):
+        orig = self._mpi_trace()
+        loaded = self._roundtrip(orig)
+        self.assertEqual([(s.span_id, s.parent_span_id) for s in orig.spans],
+                         [(s.span_id, s.parent_span_id) for s in loaded.spans])
+        # and they are not left behind as ordinary tags
+        for s in loaded.spans:
+            self.assertNotIn("sid", s.tags)
+            self.assertNotIn("psid", s.tags)
+
+    def test_critical_path_graph_identical_after_reload(self):
+        from src.analysis import criticalpath as cp
+        orig = self._mpi_trace()
+        loaded = self._roundtrip(orig)
+
+        def edges(t):
+            spans, preds = cp.build_dependency_graph(t)
+            key = lambda i: (spans[i].name, spans[i].start_ns)
+            return sorted((key(u), key(v), kind, conf)
+                          for v, es in preds.items() for (u, kind, conf) in es)
+
+        e_orig, e_loaded = edges(orig), edges(loaded)
+        self.assertTrue(any(k == "explicit_span_id" for _, _, k, _ in e_orig))
+        self.assertEqual(e_orig, e_loaded)
+
+    def test_gpu_span_real_tid_survives_but_perfetto_track_is_virtual(self):
+        t = Trace(TraceMetadata(command="a.out", args=[]))
+        t.add(SpanEvent(name="k", category=Category.GPU_CUDA, start_ns=1_000, duration_ns=50,
+                        pid=3, tid=4242, tags={"type": "kernel", "stream": "0"}))
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            chrome_trace.write(t, path)
+            import json
+            raw = [e for e in json.loads(Path(path).read_text())["traceEvents"] if e.get("ph") == "X"]
+            self.assertGreaterEqual(raw[0]["tid"], 2_000_000_000)
+            loaded = chrome_trace.load_trace_from_json(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(loaded.spans[0].tid, 4242)
+        self.assertNotIn("_tid", loaded.spans[0].tags)
+
+    def test_profiling_window_and_pid_survive(self):
+        orig = self._mpi_trace()
+        loaded = self._roundtrip(orig)
+        self.assertEqual(loaded.metadata.start_time_ns, orig.metadata.start_time_ns)
+        self.assertEqual(loaded.metadata.end_time_ns, orig.metadata.end_time_ns)
+        self.assertEqual(loaded.duration_ns, orig.duration_ns)
+        self.assertEqual(loaded.metadata.pid, 7)
+
+    def test_old_file_without_window_uses_event_extent_not_load_time(self):
+        import json, time
+        orig = self._mpi_trace()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            path = f.name
+        try:
+            chrome_trace.write(orig, path)
+            data = json.loads(Path(path).read_text())
+            for k in ("startTimeNs", "endTimeNs"):
+                del data["metadata"][k]
+            Path(path).write_text(json.dumps(data))
+            loaded = chrome_trace.load_trace_from_json(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        first = min(s.start_ns for s in orig.spans)
+        last = max(s.end_ns for s in orig.spans)
+        d1 = loaded.duration_ns
+        time.sleep(0.01)
+        self.assertEqual(d1, last - first)
+        self.assertEqual(loaded.duration_ns, d1)  # must not grow with wall-clock time
+
+    def test_instant_tags_and_counter_units_survive(self):
+        from src.core.events import InstantEvent, CounterEvent
+        t = Trace(TraceMetadata(command="a.out", args=[]))
+        t.add(InstantEvent(name="m", category=Category.NVTX, timestamp_ns=10, pid=1, tid=2, tags={"x": "1"}))
+        t.add(CounterEvent(name="mem", category=Category.MEMORY, timestamp_ns=20, value=1.5, unit="MB", pid=1))
+        loaded = self._roundtrip(t)
+        self.assertEqual(loaded.instants[0].tags, {"x": "1"})
+        self.assertEqual(loaded.counters[0].unit, "MB")
+        self.assertEqual(loaded.counters[0].value, 1.5)
+
+    def test_counter_without_value_is_skipped_not_zero(self):
+        import json
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({"traceEvents": [{"ph": "C", "name": "gpu_util", "cat": "other", "ts": 1.0, "pid": 1}]}, f)
+            path = f.name
+        try:
+            loaded = chrome_trace.load_trace_from_json(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(loaded.counters, [])
+
+    def test_timestamps_exact_at_realistic_magnitudes(self):
+        import random
+        rng = random.Random(7)
+        t = Trace(TraceMetadata(command="a.out", args=[]))
+        for i in range(3000):
+            t.add(SpanEvent(name=f"f{i}", category=Category.CPU, start_ns=rng.randint(10**12, 10**15),
+                            duration_ns=rng.choice([1, 2, 7, 999, 123_457, 10**9 + 1]), pid=1, tid=1))
+        loaded = self._roundtrip(t)
+        for a, b in zip(t.spans, loaded.spans):
+            self.assertEqual((a.start_ns, a.duration_ns), (b.start_ns, b.duration_ns))

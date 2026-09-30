@@ -229,10 +229,28 @@ def _add_program_order_edges(preds: dict[int, list[tuple[int, str, str]]], spans
     by_thread: dict[tuple[int, int], list[int]] = defaultdict(list)
     for i, s in enumerate(spans):
         by_thread[(s.pid, s.tid)].append(i)
+    # Predecessor = the most recently COMPLETED span on the thread (latest
+    # end <= b.start; ties -> the outermost). Linking to the previous span
+    # by start time broke the chain at every nested span: a barrier inside
+    # a parallel region / implicit task has the ENCLOSING span as its
+    # start-order predecessor, whose end gate it can never satisfy, so the
+    # edge was dropped and nothing after it connected back -- on a
+    # continuously busy OpenMP program the path explained 28% of wall time.
+    import heapq
     for key, idxs in by_thread.items():
         idxs.sort(key=lambda i: spans[i].start_ns)
-        for a, b in zip(idxs, idxs[1:]):
-            preds[b].append((a, "sequential", "certain"))
+        pending: list[tuple[int, int, int]] = []   # (end, start, idx) not yet completed
+        best: tuple[int, int, int] | None = None   # (end, -start, idx) latest completed
+        for b in idxs:
+            b_start = spans[b].start_ns
+            while pending and pending[0][0] <= b_start:
+                end, start, i = heapq.heappop(pending)
+                cand = (end, -start, i)
+                if best is None or cand > best:
+                    best = cand
+            if best is not None:
+                preds[b].append((best[2], "sequential", "certain"))
+            heapq.heappush(pending, (spans[b].end_ns, b_start, b))
 
 
 def _add_stream_order_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["SpanEvent"]) -> None:
