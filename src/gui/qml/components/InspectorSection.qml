@@ -19,6 +19,11 @@ ColumnLayout {
         Layout.preferredHeight: headerRow.implicitHeight
         onClicked: root.expanded = !root.expanded
 
+        Accessible.role: Accessible.Button
+        Accessible.name: (root.expanded ? "Collapse " : "Expand ") + root.title
+        Accessible.description: "Toggles the \"" + root.title + "\" Inspector section"
+        Accessible.onPressAction: root.expanded = !root.expanded
+
         RowLayout {
             id: headerRow
             width: parent.width

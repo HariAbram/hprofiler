@@ -12,7 +12,7 @@ Spec: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKch
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import IO
+from typing import IO, Callable
 
 from ..core.trace import Trace, TraceMetadata
 from ..core.events import SpanEvent, InstantEvent, CounterEvent, Category
@@ -165,13 +165,37 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
         json.dump(payload, out, indent=indent)
 
 
-def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trace:
+class LoadCancelled(Exception):
+    """Raised by load_trace_from_json() when `cancel_check` reports a
+    cancellation request mid-parse. Generic (not GUI-specific) so this
+    module stays usable by the TUI/CLI/analysis code exactly as before --
+    a caller that never passes `cancel_check` can never see this."""
+
+
+def load_trace_from_json(
+    path: str | Path,
+    collect_disasm: bool = False,
+    *,
+    progress_cb: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> Trace:
     """Reconstruct a Trace from a Chrome Trace JSON file written by write()
     above -- the read side of this module's format, moved here from
     src/ui/app.py (which re-exports this name for backward compatibility)
     so loading a trace doesn't require importing the whole Textual-based
     TUI module; every UI (TUI, GUI, `hprofiler compare`/`export`/etc.)
-    needs this regardless of which viewer it ends up using, if any."""
+    needs this regardless of which viewer it ends up using, if any.
+
+    `progress_cb`/`cancel_check` are optional and additive -- every
+    existing caller passes neither and sees byte-identical behavior.
+    Both exist for the GUI's async-loading worker (src/gui/loader.py),
+    which runs this on a background thread and needs SOME way to report
+    "N of M events processed" and check "has the user asked to cancel"
+    during the one genuinely large loop below (the event-parsing loop --
+    the dominant cost for a large trace, confirmed by direct profiling:
+    a single blocking json.load() followed by one Python object per
+    event). Deliberately plain callables, not Qt Signals -- this module
+    has no Qt dependency and must not gain one just for this."""
     with open(path) as f:
         data = json.load(f)
 
@@ -188,7 +212,21 @@ def load_trace_from_json(path: str | Path, collect_disasm: bool = False) -> Trac
     )
     trace = Trace(metadata)
 
-    for ev in data.get("traceEvents", []):
+    events = data.get("traceEvents", [])
+    total_events = len(events)
+    # Every 5000 events, not every single one -- calling back into
+    # Python (and, transitively, emitting a Qt signal across the thread
+    # boundary) has real per-call overhead; this keeps that overhead
+    # negligible relative to the parse itself while still giving
+    # "measurable progress" many times over the course of a large trace.
+    _PROGRESS_STRIDE = 5000
+
+    for i, ev in enumerate(events):
+        if progress_cb is not None and (i % _PROGRESS_STRIDE == 0 or i == total_events - 1):
+            progress_cb(i + 1, total_events)
+        if cancel_check is not None and i % _PROGRESS_STRIDE == 0 and cancel_check():
+            raise LoadCancelled(f"Cancelled while parsing event {i}/{total_events}")
+
         ph      = ev.get("ph", "")
         cat_str = ev.get("cat", "other")
         try:

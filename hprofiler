@@ -514,7 +514,9 @@ def view(trace_file, disasm, otlp_endpoint, otlp_file):
 @click.argument("trace_file", type=click.Path(exists=True))
 @click.option("--disasm/--no-disasm", default=False,
               help="Collect per-kernel disassembly in the background  [default: no]")
-def gui(trace_file, disasm):
+@click.option("--compare", default=None, type=click.Path(exists=True), metavar="TRACE_B",
+              help="Open a second trace as a comparison run (Compare tab)")
+def gui(trace_file, disasm, compare):
     """Open the Qt/QML popup GUI for a saved trace JSON file.
 
     Same trace data as 'hprofiler view', in a native popup window instead
@@ -527,16 +529,24 @@ def gui(trace_file, disasm):
     \b
     Examples:
       hprofiler gui app.hprofiler.json
+      hprofiler gui after.hprofiler.json --compare before.hprofiler.json
       ssh -X cluster.example.edu   # X11 forwarding enabled
       hprofiler gui app.hprofiler.json  # pops up locally over the tunnel
     """
     from src.gui.launch import launch_gui
-    shown = launch_gui(trace_file, disasm=disasm)
+    shown = launch_gui(trace_file, disasm=disasm, compare_path=compare)
     if not shown:
         from src.ui.app import load_trace_from_json, launch_viewer
         click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)
         trace = load_trace_from_json(trace_file, collect_disasm=disasm)
         click.echo(f"[hprofiler] {len(trace.spans)} spans loaded", err=True)
+        if compare:
+            # The TUI has no Compare-mode view of its own -- pointed at
+            # the existing `analyze --compare` command instead of either
+            # silently ignoring --compare or trying to half-implement
+            # comparison in the TUI fallback.
+            click.echo(f"[hprofiler] Note: the TUI has no comparison view. "
+                       f"Try: hprofiler analyze --compare {trace_file} {compare}", err=True)
         launch_viewer(trace, collect_disasm=disasm)
 
 

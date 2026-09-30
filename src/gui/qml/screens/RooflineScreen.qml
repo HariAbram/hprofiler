@@ -21,11 +21,12 @@ ColumnLayout {
         radius: AppTheme.radiusPanel
         clip: true
 
-        EmptyState {
-            centered: true
-            monospace: true
-            visible: !Roofline.available
-            message: "No roofline data for this trace -- needs GPU hardware-counter\n" +
+        ScreenState {
+            objectName: "rooflineScreenState"
+            anchors.fill: parent
+            state: Roofline.available ? "ready" : "unsupported"
+            unsupportedMonospace: true
+            unsupportedMessage: "No roofline data for this trace -- needs GPU hardware-counter\n" +
                      "or disassembly-estimated kernel metrics. Try:\n\n" +
                      "  hprofiler roofline --backend <backend> -- ./app"
         }

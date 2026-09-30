@@ -85,6 +85,36 @@ def fmt_tf(tf: float) -> str:
     return f"{tf:.2g} TF"
 
 
+def fmt_count(n: float) -> str:
+    """Thousands-grouped integer -- a table's "Calls" column needs exact
+    counts a user might compare precisely, not a k/M-abbreviated estimate
+    the way fmt_bytes/fmt_tf compress large magnitudes."""
+    return f"{int(n):,}"
+
+
+def fmt_pct(x: float, digits: int = 1) -> str:
+    return f"{x:.{digits}f}%"
+
+
+def fmt_bandwidth_gbs(gbs: float) -> str:
+    if gbs >= 1000:
+        return f"{gbs/1000:.2f} TB/s"
+    if gbs >= 1:
+        return f"{gbs:.1f} GB/s"
+    return f"{gbs*1000:.0f} MB/s"
+
+
+def fmt_signed_ns(ns: float) -> str:
+    """Comparison-delta formatting -- an explicit sign even for a decrease,
+    since a bare fmt_ns(-500) would read as "500ns", losing the direction
+    that's the entire point of a delta column."""
+    return ("+" if ns >= 0 else "-") + fmt_ns(abs(ns))
+
+
+def fmt_signed_pct(pct: float, digits: int = 1) -> str:
+    return f"{'+' if pct >= 0 else '-'}{abs(pct):.{digits}f}%"
+
+
 def fmt_kernel_name(name: str) -> str:
     """Shorten ACPP SSCP hash-named JIT kernels to a readable form."""
     m = _JIT_HASH_RE.match(name)
@@ -108,6 +138,36 @@ def merged_ns(spans: list) -> int:
             cur_hi = max(cur_hi, hi)
     merged += cur_hi - cur_lo
     return merged
+
+
+def bucket_coverage(spans: list, n_buckets: int, view_start: int, view_dur: float) -> list[float]:
+    """Fraction of each of `n_buckets` equal-width time buckets covered
+    by at least one span -- the GUI's mini-timeline-preview analog of the
+    TUI's _mini_row, returning plain floats (0..1) instead of a Rich Text
+    so QML can render them with a Repeater/Rectangle row. Moved here from
+    src/gui/bridge.py (which still uses it for Overview's execution-
+    timeline preview) so src/analysis/compare.py -- pure Python, no Qt,
+    like every other analysis module -- can reuse the exact same
+    technique for each side's normalized comparison coverage strip,
+    without analysis/ depending on gui/ (the wrong direction)."""
+    cov = [0.0] * n_buckets
+    if view_dur <= 0 or n_buckets <= 0:
+        return cov
+    scale = n_buckets / view_dur
+    for s in spans:
+        if s.duration_ns <= 0:
+            continue
+        x0 = max(0.0, min(float(n_buckets), (s.start_ns - view_start) * scale))
+        x1 = max(0.0, min(float(n_buckets), (s.start_ns + s.duration_ns - view_start) * scale))
+        if x1 <= x0:
+            ix = min(int(x0), n_buckets - 1)
+            if ix >= 0:
+                cov[ix] = max(cov[ix], 0.2)
+            continue
+        i0, i1 = int(x0), min(int(x1), n_buckets - 1)
+        for i in range(i0, i1 + 1):
+            cov[i] = 1.0
+    return cov
 
 
 def trace_wall_ns(trace: Any) -> int:

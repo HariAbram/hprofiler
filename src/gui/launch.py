@@ -78,7 +78,8 @@ def _run_gui_tiers(argv: list[str], verbose: bool) -> bool:
     return False
 
 
-def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False) -> bool:
+def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False,
+               compare_path: str | None = None) -> bool:
     """
     Attempts the Qt/QML GUI on a trace JSON file already written to disk
     (both `hprofiler run --gui` and `hprofiler gui <trace.json>` go
@@ -101,7 +102,18 @@ def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False) -> b
     was silently dropped whenever the GUI actually launched (only used on
     the TUI-fallback path), so `--disasm` had no effect on a working GUI
     -- a real bug, not by design.
+
+    `compare_path`: a second trace JSON to load as the Compare tab's
+    comparison run (mirrors the existing `hprofiler analyze --compare`
+    option's naming). Appended as `--compare <path>` BEFORE `--disasm`,
+    not after -- tests/test_gui_launch.py hard-asserts `argv[-1] ==
+    "--disasm"` when disasm is set, and this keeps that true regardless
+    of whether compare_path is also given.
     """
     app_main = os.path.join(os.path.dirname(__file__), "app.py")
-    argv = [sys.executable, app_main, trace_path] + (["--disasm"] if disasm else [])
+    argv = [sys.executable, app_main, trace_path]
+    if compare_path:
+        argv += ["--compare", compare_path]
+    if disasm:
+        argv += ["--disasm"]
     return _run_gui_tiers(argv, verbose)

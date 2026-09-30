@@ -105,15 +105,16 @@ Opens automatically after `hprofiler run`. Tabs:
 
 ## GUI Viewer
 
-An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI (including Flame Graph), plus a few GUI-specific additions: smooth wheel-zoom/drag-pan on the Timeline, a scrollable node-and-edge call-graph panel showing which functions call which for whatever's currently visible, an idle-time overlay, so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy, and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
+An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI (including Flame Graph), plus GUI-specific additions: smooth wheel-zoom/drag-pan, filtering, grouping/collapsing, event search, and bookmarks/named ranges on the Timeline; real sortable/filterable/exportable tables (Kernels, System, Call Tree, Overview) instead of hand-rolled lists; a 10th **Compare** tab for diffing two runs (matched by stable `(category,name)` identifiers, with a disclosed noise-floor threshold — not a statistical test — for improved/regressed classification); an idle-time overlay so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy; and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
 
 ```bash
 hprofiler run --gui --backend cuda -- ./cuda_app
 hprofiler gui trace.hprofiler.json
 hprofiler run --gui --perf-callgraph dwarf -- ./app   # + populate the Flame Graph tab
+hprofiler gui after.hprofiler.json --compare before.hprofiler.json   # Compare tab
 ```
 
-Falls back to the TUI automatically — no error shown — if PySide6 isn't installed, X11 isn't reachable, or GPU-rendered Qt Quick fails over indirect/forwarded X11 (retried once with software rendering first). See [DOCUMENTATION.md](DOCUMENTATION.md) §21 for the full tab reference and §2 for install/troubleshooting (including the `libxcb-cursor0` system-library requirement and a VNC fallback for machines where installing it isn't an option).
+Falls back to the TUI automatically — no error shown — if PySide6 isn't installed, X11 isn't reachable, or GPU-rendered Qt Quick fails over indirect/forwarded X11 (retried once with software rendering first). See [DOCUMENTATION.md](DOCUMENTATION.md) §21 for the full tab reference (including Timeline exploration, Tables, and Comparison mode) and §2 for install/troubleshooting (including the `libxcb-cursor0` system-library requirement and a VNC fallback for machines where installing it isn't an option).
 
 ## Flame Graph Tab Controls
 

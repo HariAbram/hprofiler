@@ -20,221 +20,239 @@ need on-demand/viewport-culled fetching.
 """
 from __future__ import annotations
 
+import csv
 from typing import Any
 
 from PySide6.QtCore import QObject, Property, Signal, Slot, QTimer
 
 from ..core.trace import Trace
 from ..analysis import dashboard as dash
+from ..analysis import activity_buckets
 from ..disasm.classifier import InsnType
+from . import columns
+from . import theme as theme_mod
+from .tablemodel import TableBundle
 
 
-def _bucket_coverage(spans: list, n_buckets: int, view_start: int, view_dur: float) -> list[float]:
-    """Fraction of each of `n_buckets` equal-width time buckets covered
-    by at least one span -- the GUI's mini-timeline-preview analog of the
-    TUI's _mini_row, returning plain floats (0..1) instead of a
-    Rich Text so QML can render them with a Repeater/Rectangle row."""
-    cov = [0.0] * n_buckets
-    if view_dur <= 0 or n_buckets <= 0:
-        return cov
-    scale = n_buckets / view_dur
-    for s in spans:
-        if s.duration_ns <= 0:
-            continue
-        x0 = max(0.0, min(float(n_buckets), (s.start_ns - view_start) * scale))
-        x1 = max(0.0, min(float(n_buckets), (s.start_ns + s.duration_ns - view_start) * scale))
-        if x1 <= x0:
-            ix = min(int(x0), n_buckets - 1)
-            if ix >= 0:
-                cov[ix] = max(cov[ix], 0.2)
-            continue
-        i0, i1 = int(x0), min(int(x1), n_buckets - 1)
-        for i in range(i0, i1 + 1):
-            cov[i] = 1.0
-    return cov
+_DASHBOARD_TIMELINE_BUCKETS = 60
+
+
+def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
+    """The expensive, Qt-free part of DashboardBridge's construction --
+    several full passes over `trace.spans` plus a handful of analysis-
+    module calls -- as a module-level function the async-loading worker
+    thread can call directly (see compute_call_tree_data()'s docstring
+    for why: no QObject touched off its owning thread). Returns a flat
+    dict whose keys match DashboardBridge's own `_foo` attribute names
+    (minus the leading underscore) -- __init__ applies it via a single
+    mechanical `setattr` loop instead of hand-duplicating each field
+    twice, which would be its own source of transcription bugs.
+
+    Does NOT build `top_bottlenecks`' TableBundle (a QObject) -- that
+    stays in DashboardBridge.__init__, built from this dict's
+    `top_bottlenecks` list, since TableBundle itself must be constructed
+    on the thread that will own it, never on the worker thread."""
+    meta = trace.metadata
+    wall_ns = dash.trace_wall_ns(trace)
+    result: dict[str, Any] = {}
+
+    diag_label, diag_severity = dash.diagnose(trace)
+    result["diagnosis_label"] = diag_label
+    result["diagnosis_severity"] = diag_severity
+    result["wall_time"] = dash.fmt_ns(wall_ns)
+
+    # Kept as the full dict (not just gpu_active_pct) -- the time-
+    # breakdown/investigate-next logic below reuses launch_gap_pct/
+    # sync_stall_pct from the SAME gpu_starvation() call rather than
+    # invoking it a second time.
+    gpu_stats: dict[str, float] | None = None
+    if any(b in dash._GPU_CATS for b in (meta.backends_used or [])):
+        try:
+            from ..analysis.cct import gpu_starvation
+            gpu_stats = gpu_starvation(trace)
+        except Exception:
+            gpu_stats = None
+    result["gpu_active_available"] = gpu_stats is not None
+    result["gpu_active_pct"] = gpu_stats["gpu_active_pct"] if gpu_stats else 0.0
+
+    mpi_present = any(s.category.value == "mpi" for s in trace.spans)
+    if mpi_present:
+        wait_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "mpi"])
+        result["wait_label"] = "MPI WAIT"
+    else:
+        wait_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "sync"])
+        result["wait_label"] = "SYNC WAIT"
+    result["wait_pct"] = 100.0 * wait_ns / wall_ns if wall_ns else 0.0
+
+    ctrs = {c.name: c.value for c in trace.counters}
+    rss = ctrs.get("process_max_rss_bytes", 0.0)
+    if rss > 0:
+        result["peak_memory"] = dash.fmt_bytes(rss)
+    else:
+        vram_total = sum(v for k, v in ctrs.items() if k.startswith("gpu_mem_used_bytes"))
+        result["peak_memory"] = dash.fmt_bytes(vram_total) if vram_total > 0 else "n/a"
+
+    result["findings"] = [
+        {"icon": icon, "color": theme_mod.severity_color(severity, dark),
+         "title": title, "metric": metric}
+        for icon, severity, title, metric in dash.top_findings(trace)
+    ]
+
+    stats = trace.aggregated_stats()
+    total_all = sum(r["total_ns"] for r in stats) or 1
+    result["hot_kernels"] = [
+        {
+            "name": dash.fmt_kernel_name(r["name"])[:40],
+            "category": r["category"],
+            "color": theme_mod.category_color(r["category"], dark),
+            "calls": r["count"],
+            "total": dash.fmt_ns(r["total_ns"]),
+            "share": f"{r['total_ns']/total_all*100:.1f}%",
+        }
+        for r in stats[:8]
+    ]
+
+    by_cat: dict[str, list] = {}
+    for s in trace.spans:
+        if s.duration_ns > 0:
+            by_cat.setdefault(s.category.value, []).append(s)
+    top_cats = sorted(by_cat.items(), key=lambda kv: -sum(s.duration_ns for s in kv[1]))[:3]
+    timed = [s for s in trace.spans if s.duration_ns > 0]
+    view_start = min((s.start_ns for s in timed), default=0)
+    view_end = max((s.end_ns for s in timed), default=1)
+    view_dur = max(view_end - view_start, 1)
+    result["timeline_preview"] = [
+        {
+            "category": cat,
+            "color": theme_mod.category_color(cat, dark),
+            "coverage": dash.bucket_coverage(cspans, _DASHBOARD_TIMELINE_BUCKETS, view_start, view_dur),
+        }
+        for cat, cspans in top_cats
+    ]
+
+    ctx = dash.find_source_context(trace)
+    if ctx is not None:
+        result["has_source"] = True
+        result["source_display_name"] = ctx.display_name
+        result["source_hotspot_name"] = ctx.hotspot_name
+        result["source_hot_line"] = ctx.hot_line
+        result["source_lines"] = [{"line": ln, "text": text} for ln, text in ctx.lines]
+    else:
+        result["has_source"] = False
+        result["source_display_name"] = ""
+        result["source_hotspot_name"] = ""
+        result["source_hot_line"] = -1
+        result["source_lines"] = []
+
+    # ── Overview redesign: run summary, breakdown, "investigate next" ──
+    result["executable"] = meta.command
+    result["host"] = meta.hostname or "—"
+    result["backends"] = list(meta.backends_used or [])
+    result["devices"] = [f"{d.name} ({d.backend})" for d in trace.devices]
+    result["process_count"] = len({s.pid for s in trace.spans})
+    result["thread_count"] = len({(s.pid, s.tid) for s in trace.spans})
+    result["profiling_duration"] = result["wall_time"]
+    result["capture_time"] = meta.capture_time_iso
+
+    # Same merged-interval technique as waitPct/gpuActivePct above -- a
+    # plain sum would double-count overlapping spans on different CPU
+    # threads and could read well over 100%.
+    cpu_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "cpu"])
+    result["cpu_util_pct"] = 100.0 * cpu_ns / wall_ns if wall_ns else 0.0
+
+    # Shared with Timeline's own bucket legend/grouping (activity_buckets.py)
+    # so the two views can never disagree about what counts as
+    # Computation vs Runtime overhead vs Annotation -- see that module's
+    # docstring for why the type= tag (already this codebase's
+    # established compute-vs-overhead discriminator) drives this instead
+    # of category alone.
+    idle_ns = 0
+    if gpu_stats is not None:
+        idle_ns = max(int(gpu_stats["launch_gap_pct"] / 100.0 * wall_ns), 0)
+    buckets = activity_buckets.bucket_totals(trace.spans, idle_ns=idle_ns)
+    grand = sum(buckets.values()) or 1
+    _order = list(activity_buckets.BUCKETS)
+    result["time_breakdown"] = [
+        {"label": label, "pct": buckets[label] / grand * 100, "ns": buckets[label], "kind": "derived"}
+        for label in _order if buckets.get(label, 0) > 0
+    ]
+
+    # No overhead-measurement instrumentation exists anywhere in this
+    # codebase (confirmed during design) -- reported honestly as
+    # unavailable rather than invented from an unrelated proxy number.
+    result["profiling_overhead"] = {
+        "label": "Profiling overhead", "value": "", "kind": "unavailable",
+        "reason": "not measured by this build -- no overhead-instrumentation exists yet",
+    }
+
+    result["top_bottlenecks"] = [
+        {"label": title, "value": metric, "kind": "measured", "reason": "",
+         "icon": icon, "color": theme_mod.severity_color(severity, dark)}
+        for icon, severity, title, metric in dash.top_findings(trace)
+    ]
+
+    # Tab indices match Main.qml's TabBar order (Overview=0 .. Compare=9).
+    _TAB = {"timeline": 1, "kernels": 2, "call_tree": 3, "roofline": 5, "source": 6}
+    actions: list[dict[str, Any]] = []
+    if gpu_stats is not None:
+        if gpu_stats["launch_gap_pct"] > 30:
+            actions.append({"label": "Find idle GPU gaps on the Timeline",
+                             "tab": _TAB["timeline"], "category": "", "name": ""})
+            actions.append({"label": "Check compute intensity on the Roofline",
+                             "tab": _TAB["roofline"], "category": "", "name": ""})
+        if gpu_stats["sync_stall_pct"] > 20:
+            actions.append({"label": "Find synchronization hotspots in the Call Tree",
+                             "tab": _TAB["call_tree"], "category": "", "name": ""})
+    if result["wait_pct"] > 20 and not actions:
+        actions.append({"label": "Find synchronization hotspots in the Call Tree",
+                         "tab": _TAB["call_tree"], "category": "", "name": ""})
+    if stats and stats[0]["pct"] > 30:
+        top_cat, top_name = stats[0]["category"], stats[0]["name"]
+        short = dash.fmt_kernel_name(top_name)[:30]
+        actions.append({"label": f"Investigate dominant kernel '{short}' in Kernels",
+                         "tab": _TAB["kernels"], "category": top_cat, "name": top_name})
+        if result["has_source"]:
+            actions.append({"label": f"View source for '{short}'",
+                             "tab": _TAB["source"], "category": top_cat, "name": top_name})
+    if not actions and stats:
+        actions.append({"label": "Browse hot functions in Kernels", "tab": _TAB["kernels"],
+                         "category": stats[0]["category"], "name": stats[0]["name"]})
+    result["investigate_next"] = actions[:5]
+
+    return result
 
 
 class DashboardBridge(QObject):
     """Backs the Overview screen (Main.qml's OverviewScreen.qml)."""
 
-    _TIMELINE_BUCKETS = 60
+    _TIMELINE_BUCKETS = _DASHBOARD_TIMELINE_BUCKETS
 
-    def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
+    def __init__(self, trace: Trace, theme, parent: QObject | None = None, *, comparison=None,
+                 precomputed: dict[str, Any] | None = None) -> None:
         super().__init__(parent)
         self._trace = trace
         self._theme = theme
-        self._compute()
+        # Optional, additive -- every existing caller passes nothing here
+        # and gets byte-identical behavior to before this parameter
+        # existed (asserted directly in tests, not just assumed). When
+        # given, `comparison` is a ComparisonBridge (already computed its
+        # own topImprovements/topRegressions; this bridge just surfaces
+        # them for Overview's "largest improvements/regressions" ranking
+        # instead of recomputing anything).
+        self._comparison = comparison
+        self._compute(precomputed)
 
-    def _compute(self) -> None:
-        trace = self._trace
-        meta = trace.metadata
-        wall_ns = dash.trace_wall_ns(trace)
-
-        diag_label, diag_severity = dash.diagnose(trace)
-        self._diagnosis_label = diag_label
-        self._diagnosis_severity = diag_severity
-        self._wall_time = dash.fmt_ns(wall_ns)
-
-        # Kept as the full dict (not just gpu_active_pct) -- the new
-        # time-breakdown/investigate-next logic below reuses
-        # launch_gap_pct/sync_stall_pct from the SAME gpu_starvation()
-        # call rather than invoking it a second time.
-        gpu_stats: dict[str, float] | None = None
-        if any(b in dash._GPU_CATS for b in (meta.backends_used or [])):
-            try:
-                from ..analysis.cct import gpu_starvation
-                gpu_stats = gpu_starvation(trace)
-            except Exception:
-                gpu_stats = None
-        self._gpu_active_available = gpu_stats is not None
-        self._gpu_active_pct = gpu_stats["gpu_active_pct"] if gpu_stats else 0.0
-
-        mpi_present = any(s.category.value == "mpi" for s in trace.spans)
-        if mpi_present:
-            wait_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "mpi"])
-            self._wait_label = "MPI WAIT"
-        else:
-            wait_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "sync"])
-            self._wait_label = "SYNC WAIT"
-        self._wait_pct = 100.0 * wait_ns / wall_ns if wall_ns else 0.0
-
-        ctrs = {c.name: c.value for c in trace.counters}
-        rss = ctrs.get("process_max_rss_bytes", 0.0)
-        if rss > 0:
-            self._peak_memory = dash.fmt_bytes(rss)
-        else:
-            vram_total = sum(v for k, v in ctrs.items() if k.startswith("gpu_mem_used_bytes"))
-            self._peak_memory = dash.fmt_bytes(vram_total) if vram_total > 0 else "n/a"
-
-        self._findings: list[dict[str, Any]] = [
-            {"icon": icon, "color": self._theme.severityColor(severity),
-             "title": title, "metric": metric}
-            for icon, severity, title, metric in dash.top_findings(trace)
-        ]
-
-        stats = trace.aggregated_stats()
-        total_all = sum(r["total_ns"] for r in stats) or 1
-        self._hot_kernels: list[dict[str, Any]] = [
-            {
-                "name": dash.fmt_kernel_name(r["name"])[:40],
-                "category": r["category"],
-                "color": self._theme.categoryColor(r["category"]),
-                "calls": r["count"],
-                "total": dash.fmt_ns(r["total_ns"]),
-                "share": f"{r['total_ns']/total_all*100:.1f}%",
-            }
-            for r in stats[:8]
-        ]
-
-        by_cat: dict[str, list] = {}
-        for s in trace.spans:
-            if s.duration_ns > 0:
-                by_cat.setdefault(s.category.value, []).append(s)
-        top_cats = sorted(by_cat.items(), key=lambda kv: -sum(s.duration_ns for s in kv[1]))[:3]
-        timed = [s for s in trace.spans if s.duration_ns > 0]
-        view_start = min((s.start_ns for s in timed), default=0)
-        view_end = max((s.end_ns for s in timed), default=1)
-        view_dur = max(view_end - view_start, 1)
-        self._timeline_preview: list[dict[str, Any]] = [
-            {
-                "category": cat,
-                "color": self._theme.categoryColor(cat),
-                "coverage": _bucket_coverage(cspans, self._TIMELINE_BUCKETS, view_start, view_dur),
-            }
-            for cat, cspans in top_cats
-        ]
-
-        ctx = dash.find_source_context(trace)
-        if ctx is not None:
-            self._has_source = True
-            self._source_display_name = ctx.display_name
-            self._source_hotspot_name = ctx.hotspot_name
-            self._source_hot_line = ctx.hot_line
-            self._source_lines = [{"line": ln, "text": text} for ln, text in ctx.lines]
-        else:
-            self._has_source = False
-            self._source_display_name = ""
-            self._source_hotspot_name = ""
-            self._source_hot_line = -1
-            self._source_lines = []
-
-        # ── Overview redesign: run summary, breakdown, "investigate next" ──
-        self._executable = meta.command
-        self._host = meta.hostname or "—"
-        self._backends = list(meta.backends_used or [])
-        self._devices: list[str] = [f"{d.name} ({d.backend})" for d in trace.devices]
-        self._process_count = len({s.pid for s in trace.spans})
-        self._thread_count = len({(s.pid, s.tid) for s in trace.spans})
-        self._profiling_duration = self._wall_time
-        self._capture_time = meta.capture_time_iso
-
-        # Same merged-interval technique as waitPct/gpuActivePct above --
-        # a plain sum would double-count overlapping spans on different
-        # CPU threads and could read well over 100%.
-        cpu_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "cpu"])
-        self._cpu_util_pct = 100.0 * cpu_ns / wall_ns if wall_ns else 0.0
-
-        _bucket_of = {
-            "cpu": "Computation", "cuda": "Computation", "rocm": "Computation",
-            "opencl": "Computation", "openmp": "Computation",
-            "mpi": "Communication", "nccl": "Communication",
-            "sync": "Synchronization", "memory": "Memory transfer",
-        }
-        buckets: dict[str, int] = {}
-        for s in trace.spans:
-            label = _bucket_of.get(s.category.value, "Other")
-            buckets[label] = buckets.get(label, 0) + max(s.duration_ns, 0)
-        if gpu_stats is not None:
-            idle_ns = int(gpu_stats["launch_gap_pct"] / 100.0 * wall_ns)
-            buckets["Idle"] = buckets.get("Idle", 0) + max(idle_ns, 0)
-        grand = sum(buckets.values()) or 1
-        _order = ["Computation", "Communication", "Synchronization", "Memory transfer", "Idle", "Other"]
-        self._time_breakdown: list[dict[str, Any]] = [
-            {"label": label, "pct": buckets[label] / grand * 100, "ns": buckets[label], "kind": "derived"}
-            for label in _order if buckets.get(label, 0) > 0
-        ]
-
-        # No overhead-measurement instrumentation exists anywhere in this
-        # codebase (confirmed during design) -- reported honestly as
-        # unavailable rather than invented from an unrelated proxy number.
-        self._profiling_overhead = {
-            "label": "Profiling overhead", "value": "", "kind": "unavailable",
-            "reason": "not measured by this build -- no overhead-instrumentation exists yet",
-        }
-
-        self._top_bottlenecks: list[dict[str, Any]] = [
-            {"label": title, "value": metric, "kind": "measured", "reason": "",
-             "icon": icon, "color": self._theme.severityColor(severity)}
-            for icon, severity, title, metric in dash.top_findings(trace)
-        ]
-
-        # Tab indices match Main.qml's TabBar order (Overview=0 .. Profile=8).
-        _TAB = {"timeline": 1, "kernels": 2, "call_tree": 3, "roofline": 5, "source": 6}
-        actions: list[dict[str, Any]] = []
-        if gpu_stats is not None:
-            if gpu_stats["launch_gap_pct"] > 30:
-                actions.append({"label": "Find idle GPU gaps on the Timeline",
-                                 "tab": _TAB["timeline"], "category": "", "name": ""})
-                actions.append({"label": "Check compute intensity on the Roofline",
-                                 "tab": _TAB["roofline"], "category": "", "name": ""})
-            if gpu_stats["sync_stall_pct"] > 20:
-                actions.append({"label": "Find synchronization hotspots in the Call Tree",
-                                 "tab": _TAB["call_tree"], "category": "", "name": ""})
-        if self._wait_pct > 20 and not actions:
-            actions.append({"label": "Find synchronization hotspots in the Call Tree",
-                             "tab": _TAB["call_tree"], "category": "", "name": ""})
-        if stats and stats[0]["pct"] > 30:
-            top_cat, top_name = stats[0]["category"], stats[0]["name"]
-            short = dash.fmt_kernel_name(top_name)[:30]
-            actions.append({"label": f"Investigate dominant kernel '{short}' in Kernels",
-                             "tab": _TAB["kernels"], "category": top_cat, "name": top_name})
-            if self._has_source:
-                actions.append({"label": f"View source for '{short}'",
-                                 "tab": _TAB["source"], "category": top_cat, "name": top_name})
-        if not actions and stats:
-            actions.append({"label": "Browse hot functions in Kernels", "tab": _TAB["kernels"],
-                             "category": stats[0]["category"], "name": stats[0]["name"]})
-        self._investigate_next = actions[:5]
+    def _compute(self, precomputed: dict[str, Any] | None = None) -> None:
+        # `precomputed`: the async-loading worker already ran
+        # compute_dashboard_data() off-thread; every existing caller
+        # (including every test) still computes it right here instead,
+        # unchanged. Either way, every value lands on `self` via the same
+        # `_<key>` attribute-name convention the Property getters below
+        # already expect.
+        data = precomputed if precomputed is not None else compute_dashboard_data(self._trace, self._theme.dark)
+        for key, value in data.items():
+            setattr(self, f"_{key}", value)
+        self._findings_table = TableBundle(self._top_bottlenecks, columns.FINDINGS_COLUMNS, self)
 
     # ── Stat cards ───────────────────────────────────────────────────────
     @Property(str, constant=True)
@@ -351,9 +369,27 @@ class DashboardBridge(QObject):
     def topBottlenecks(self) -> list[dict[str, Any]]:
         return self._top_bottlenecks
 
+    @Property(QObject, constant=True)
+    def findingsTable(self) -> QObject:
+        return self._findings_table
+
     @Property('QVariantList', constant=True)
     def investigateNext(self) -> list[dict[str, Any]]:
         return self._investigate_next
+
+    @Property(bool, constant=True)
+    def hasComparison(self) -> bool:
+        return self._comparison is not None and self._comparison.available
+
+    @Property('QVariantList', constant=True)
+    def comparisonTopChanges(self) -> list[dict[str, Any]]:
+        """The largest improvements/regressions from Compare mode, for
+        Overview's own ranking -- empty (not an error) when no comparison
+        trace is loaded, same "additive, no comparison" case
+        hasComparison covers."""
+        if not self.hasComparison:
+            return []
+        return list(self._comparison.topImprovements) + list(self._comparison.topRegressions)
 
 
 class KernelsBridge(QObject):
@@ -391,17 +427,27 @@ class KernelsBridge(QObject):
             }
             for r in stats
         ]
+        self._table = TableBundle(self._rows, columns.KERNEL_COLUMNS, self)
 
     @Property('QVariantList', constant=True)
     def rows(self) -> list[dict[str, Any]]:
         return self._rows
 
+    @Property(QObject, constant=True)
+    def table(self) -> QObject:
+        return self._table
 
-def _ct_node_to_dict(node, theme) -> dict[str, Any]:
+
+def _ct_node_to_dict(node, dark: bool) -> dict[str, Any]:
+    """`dark: bool`, not a Theme QObject -- so this (and the tree build
+    it wraps, analysis/call_tree.py's _ct_build(), already Qt-free) is
+    safe to call from the async-loading worker thread (src/gui/loader.py).
+    See theme.py's category_color()/etc. for why a bool is passed
+    instead of the Theme instance."""
     return {
         "name": node.name,
         "category": node.category,
-        "color": theme.categoryColor(node.category),
+        "color": theme_mod.category_color(node.category, dark),
         "totalNs": node.total_ns,
         "selfNs": node.self_ns,
         "avgNs": node.avg_ns,
@@ -409,8 +455,47 @@ def _ct_node_to_dict(node, theme) -> dict[str, Any]:
         "total": dash.fmt_ns(node.total_ns),
         "self": dash.fmt_ns(node.self_ns),
         "avg": dash.fmt_ns(node.avg_ns),
-        "children": [_ct_node_to_dict(c, theme) for c in node.children],
+        "children": [_ct_node_to_dict(c, dark) for c in node.children],
     }
+
+
+def _ct_filter_tree(nodes: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Prunes to nodes whose name matches `query` PLUS their ancestor
+    chain (a match with its ancestors pruned away would float with no
+    indication of where it's actually called from -- the call tree's
+    whole point is that context). Case-insensitive substring match, same
+    convention DataTable's own text filter uses."""
+    if not query:
+        return nodes
+    q = query.lower()
+    out = []
+    for n in nodes:
+        kept_children = _ct_filter_tree(n["children"], query)
+        if q in n["name"].lower() or kept_children:
+            out.append({**n, "children": kept_children})
+    return out
+
+
+def _ct_sort_tree(nodes: list[dict[str, Any]], key: str, desc: bool) -> list[dict[str, Any]]:
+    if not key:
+        return nodes
+    ordered = sorted(nodes, key=lambda n: n.get(key, 0), reverse=desc)
+    return [{**n, "children": _ct_sort_tree(n["children"], key, desc)} for n in ordered]
+
+
+def compute_call_tree_data(trace: Trace, dark: bool) -> list[dict[str, Any]]:
+    """The expensive, Qt-free part of CallTreeBridge's construction (tree
+    build + node-to-dict conversion) -- a module-level function so the
+    async-loading worker thread (src/gui/loader.py) can call it directly
+    without ever touching a QObject off its owning thread. `dark`, not a
+    Theme instance, for the same reason (see theme.py's category_color()
+    docstring)."""
+    try:
+        from ..analysis.call_tree import _ct_build
+        roots = _ct_build(trace.spans)
+    except Exception:
+        roots = []
+    return [_ct_node_to_dict(r, dark) for r in roots]
 
 
 class CallTreeBridge(QObject):
@@ -422,23 +507,89 @@ class CallTreeBridge(QObject):
     nested dicts a QML recursive component can walk. Also used by the
     TUI's CallTreeWidget (src/ui/app.py, via a re-export) -- extracted to
     analysis/call_tree.py specifically so importing it here doesn't pull
-    in the whole Textual-based TUI module."""
+    in the whole Textual-based TUI module.
 
-    def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
+    Deliberately NOT rebuilt on DataTable/TableBundle -- flattening a call
+    TREE into a flat table would destroy the hierarchy that's the entire
+    point of it. `roots` is now live (filter/sort applied) instead of
+    `constant=True`; `allRoots` stays the permanently-unfiltered tree so
+    InspectorBridge's "appears in the call tree" relationship can never be
+    silently flipped to "unavailable" by an unrelated text filter here."""
+
+    rootsChanged = Signal()
+
+    def __init__(self, trace: Trace, theme, parent: QObject | None = None, *,
+                 precomputed: list[dict[str, Any]] | None = None) -> None:
         super().__init__(parent)
-        try:
-            from ..analysis.call_tree import _ct_build
-            roots = _ct_build(trace.spans)
-        except Exception:
-            roots = []
-        self._roots: list[dict[str, Any]] = [_ct_node_to_dict(r, theme) for r in roots]
+        # `precomputed`: the async-loading worker already ran
+        # compute_call_tree_data() off-thread; the common (non-worker)
+        # construction path -- every existing caller, including every
+        # test -- still computes it right here, unchanged.
+        self._all_roots: list[dict[str, Any]] = (
+            precomputed if precomputed is not None else compute_call_tree_data(trace, theme.dark)
+        )
+        self._filter_query = ""
+        self._sort_key = ""
+        self._sort_desc = True
+        self._roots = self._all_roots
 
-    @Property('QVariantList', constant=True)
+    def _recompute(self) -> None:
+        nodes = self._all_roots
+        if self._filter_query:
+            nodes = _ct_filter_tree(nodes, self._filter_query)
+        if self._sort_key:
+            nodes = _ct_sort_tree(nodes, self._sort_key, self._sort_desc)
+        self._roots = nodes
+        self.rootsChanged.emit()
+
+    @Property('QVariantList', notify=rootsChanged)
     def roots(self) -> list[dict[str, Any]]:
         return self._roots
 
+    @Property('QVariantList', constant=True)
+    def allRoots(self) -> list[dict[str, Any]]:
+        return self._all_roots
 
-def _flame_node_with_color(node: dict[str, Any], theme) -> dict[str, Any]:
+    @Slot(str)
+    def setFilter(self, query: str) -> None:
+        self._filter_query = query
+        self._recompute()
+
+    @Slot(str, bool)
+    def sortChildren(self, key: str, desc: bool) -> None:
+        self._sort_key = key
+        self._sort_desc = desc
+        self._recompute()
+
+    @Slot(str, result=bool)
+    def exportCsv(self, path: str) -> bool:
+        """Flattens the CURRENTLY visible (filtered+sorted) tree, one row
+        per node, with a "Path" column (root-to-node names) standing in
+        for the frozen identifier column a flat table would have --
+        same open()+csv.writer+try/except OSError pattern TableBundle's
+        own exportCsv uses."""
+        rows: list[list[Any]] = []
+
+        def walk(nodes: list[dict[str, Any]], path_parts: list[str]) -> None:
+            for n in nodes:
+                full_path = path_parts + [n["name"]]
+                rows.append([n["name"], n["category"], " > ".join(full_path),
+                             n["count"], n["totalNs"], n["selfNs"], n["avgNs"]])
+                walk(n["children"], full_path)
+
+        walk(self._roots, [])
+        try:
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Function", "Category", "Path", "Calls",
+                                  "Total (ns)", "Self (ns)", "Avg (ns)"])
+                writer.writerows(rows)
+            return True
+        except OSError:
+            return False
+
+
+def _flame_node_with_color(node: dict[str, Any], dark: bool) -> dict[str, Any]:
     """analysis/flamegraph_tree.py's build_flame_tree() already returns
     the exact {name, value, category, children} shape the Flame Graph
     screen needs -- this just adds a theme-resolved "color" field
@@ -446,14 +597,26 @@ def _flame_node_with_color(node: dict[str, Any], theme) -> dict[str, Any]:
     Tree, so the two tabs share one color language (category -> hex)
     instead of the flame graph introducing its own separate per-function
     hash-coloring scheme the way the now-removed standalone
-    `hprofiler flamegraph --gui` popup did in isolation."""
+    `hprofiler flamegraph --gui` popup did in isolation. `dark: bool`,
+    not a Theme QObject -- see theme.py's category_color() docstring for
+    why (this runs on the async-loading worker thread)."""
     return {
         "name": node["name"],
         "value": node["value"],
         "category": node["category"],
-        "color": theme.categoryColor(node["category"]),
-        "children": [_flame_node_with_color(c, theme) for c in node["children"]],
+        "color": theme_mod.category_color(node["category"], dark),
+        "children": [_flame_node_with_color(c, dark) for c in node["children"]],
     }
+
+
+def compute_flame_graph_data(trace: Trace, dark: bool) -> dict[str, Any]:
+    """The expensive, Qt-free part of FlameGraphBridge's construction --
+    a module-level function so the async-loading worker thread can call
+    it directly (see compute_call_tree_data()'s docstring for why)."""
+    from ..analysis.flamegraph_tree import build_flame_tree
+    spans = [s for s in trace.spans if s.duration_ns > 0]
+    tree = build_flame_tree(spans)
+    return _flame_node_with_color(tree, dark)
 
 
 class FlameGraphBridge(QObject):
@@ -463,12 +626,10 @@ class FlameGraphBridge(QObject):
     the underlying call structure -- only the rendering differs
     (indented list there, proportional icicle here)."""
 
-    def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
+    def __init__(self, trace: Trace, theme, parent: QObject | None = None, *,
+                 precomputed: dict[str, Any] | None = None) -> None:
         super().__init__(parent)
-        from ..analysis.flamegraph_tree import build_flame_tree
-        spans = [s for s in trace.spans if s.duration_ns > 0]
-        tree = build_flame_tree(spans)
-        self._tree = _flame_node_with_color(tree, theme)
+        self._tree = precomputed if precomputed is not None else compute_flame_graph_data(trace, theme.dark)
 
     @Property('QVariant', constant=True)
     def tree(self) -> dict[str, Any]:
@@ -839,6 +1000,28 @@ class SystemBridge(QObject):
         rss = ctrs.get("process_max_rss_bytes", 0.0)
         self._rss = dash.fmt_bytes(rss) if rss > 0 else ""
 
+        self._device_table = TableBundle(self._devices, columns.DEVICE_COLUMNS, self)
+
+        # Field-shaped rows -- an absent PMU counter becomes an honest
+        # "unavailable" row instead of the old `visible: System.ipc > 0`-
+        # style silent disappearance (same style QML used to gate these).
+        no_perf_reason = "no PMU counters captured -- run with `perf` available, or --no-perf wasn't used"
+        metric_rows = [
+            {"label": "IPC", "value": f"{self._ipc:.2f}" if self._ipc > 0 else "",
+             "kind": "measured" if self._ipc > 0 else "unavailable",
+             "reason": "" if self._ipc > 0 else no_perf_reason},
+            {"label": "Cache miss", "value": f"{self._cacheMiss:.1f}%" if self._cacheMiss >= 0 else "",
+             "kind": "measured" if self._cacheMiss >= 0 else "unavailable",
+             "reason": "" if self._cacheMiss >= 0 else no_perf_reason},
+            {"label": "Branch miss", "value": f"{self._branchMiss:.1f}%" if self._branchMiss >= 0 else "",
+             "kind": "measured" if self._branchMiss >= 0 else "unavailable",
+             "reason": "" if self._branchMiss >= 0 else no_perf_reason},
+            {"label": "Peak RSS", "value": self._rss,
+             "kind": "measured" if self._rss else "unavailable",
+             "reason": "" if self._rss else "process_max_rss_bytes counter not present in this trace"},
+        ]
+        self._metric_table = TableBundle(metric_rows, columns.SYSTEM_METRIC_COLUMNS, self)
+
     @Property(str, constant=True)
     def command(self) -> str: return self._command
 
@@ -865,6 +1048,12 @@ class SystemBridge(QObject):
 
     @Property(str, constant=True)
     def peakRss(self) -> str: return self._rss
+
+    @Property(QObject, constant=True)
+    def deviceTable(self) -> QObject: return self._device_table
+
+    @Property(QObject, constant=True)
+    def metricTable(self) -> QObject: return self._metric_table
 
 
 class ProfileBridge(QObject):

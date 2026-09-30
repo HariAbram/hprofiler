@@ -10,8 +10,20 @@ import "../components"
 // instruction-mix breakdown + static analysis hints (analysis/
 // asm_advisor.py) -- both already existed and were already shown in the
 // TUI (_show_mix/_show_hints); this screen just never called them.
-RowLayout {
+Item {
+    id: sourceRoot
+
+    ScreenState {
+        objectName: "sourceScreenState"
+        anchors.fill: parent
+        state: Source.kernels.length === 0 ? "empty" : "ready"
+        emptyMessage: "No kernels profiled."
+    }
+
+    RowLayout {
     id: root
+    anchors.fill: parent
+    visible: Source.kernels.length > 0
     spacing: AppTheme.spacingMd
 
     property int selectedIndex: 0
@@ -40,6 +52,11 @@ RowLayout {
                 color: root.selectedIndex === index ? AppTheme.panelBorder : "transparent"
                 radius: AppTheme.radiusSmall
 
+                Accessible.role: Accessible.Button
+                Accessible.name: modelData.name + (modelData.hasDisasm ? ", disassembly available" : "")
+                Accessible.description: "Selects this kernel for disassembly and analysis"
+                Accessible.onPressAction: root.selectedIndex = index
+
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: AppTheme.spacingSm
@@ -64,12 +81,6 @@ RowLayout {
                     anchors.fill: parent
                     onClicked: root.selectedIndex = index
                 }
-            }
-
-            EmptyState {
-                centered: true
-                visible: Source.kernels.length === 0
-                message: "No kernels profiled."
             }
         }
     }
@@ -334,5 +345,6 @@ RowLayout {
                 }
             }
         }
+    }
     }
 }

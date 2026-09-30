@@ -250,6 +250,7 @@ ColumnLayout {
         // never repainted on the light/dark toggle, unlike everything
         // else on this screen).
         Tooltip {
+            objectName: "flameGraphTooltip"
             visible: !!root.hoveredFrame
             followCursor: true
             anchorX: root.hoverViewX

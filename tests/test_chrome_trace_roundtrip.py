@@ -125,5 +125,104 @@ class TestCaptureTimeRoundtrip(unittest.TestCase):
         self.assertEqual(self._roundtrip(meta).capture_time_iso, "")
 
 
+class TestLoadTraceProgressAndCancellation(unittest.TestCase):
+    """progress_cb/cancel_check (GUI async-loading worker support, see
+    src/gui/loader.py) -- optional and additive, every pre-existing
+    caller (TUI/CLI/analysis code, every OTHER test in this file) passes
+    neither and is completely unaffected; verified separately below."""
+
+    def _write_trace_with_n_events(self, n: int) -> str:
+        trace = Trace(TraceMetadata(command="a.out", args=[]))
+        for i in range(n):
+            trace.add(SpanEvent(name=f"fn{i}", category=Category.CPU,
+                                start_ns=i * 1000, duration_ns=100, pid=1, tid=1))
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        chrome_trace.write(trace, path)
+        return path
+
+    def test_no_callbacks_behaves_exactly_as_before(self):
+        path = self._write_trace_with_n_events(10)
+        try:
+            trace = chrome_trace.load_trace_from_json(path)
+            self.assertEqual(len(trace.spans), 10)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_progress_cb_called_with_final_total(self):
+        path = self._write_trace_with_n_events(10)
+        calls = []
+        try:
+            chrome_trace.load_trace_from_json(path, progress_cb=lambda i, t: calls.append((i, t)))
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertTrue(calls)
+        # Every call reports the same total (the event count is known
+        # up front, right after json.load()).
+        totals = {t for _, t in calls}
+        self.assertEqual(len(totals), 1)
+        # The LAST progress call must report the final index -- "reached
+        # 100%", not silently stopping short.
+        self.assertEqual(calls[-1][0], calls[-1][1])
+
+    def test_progress_cb_reports_increasing_progress_on_a_larger_trace(self):
+        # Large enough to cross the internal reporting stride more than
+        # once, so this proves genuinely incremental progress, not just
+        # a single "done" call.
+        path = self._write_trace_with_n_events(12_000)
+        calls = []
+        try:
+            chrome_trace.load_trace_from_json(path, progress_cb=lambda i, t: calls.append((i, t)))
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertGreater(len(calls), 2)
+        indices = [i for i, _ in calls]
+        self.assertEqual(indices, sorted(indices))
+        # The final call's index must equal ITS OWN reported total (not a
+        # hardcoded event count -- write() also emits one leading
+        # "process_name" metadata event alongside the N spans, so the
+        # true JSON event count is N+1, which is exactly what's being
+        # measured here and is correct, not an off-by-one).
+        self.assertEqual(indices[-1], calls[-1][1])
+
+    def test_cancel_check_true_raises_load_cancelled_before_any_work(self):
+        path = self._write_trace_with_n_events(10)
+        try:
+            with self.assertRaises(chrome_trace.LoadCancelled):
+                chrome_trace.load_trace_from_json(path, cancel_check=lambda: True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_cancel_check_false_loads_normally(self):
+        path = self._write_trace_with_n_events(10)
+        try:
+            trace = chrome_trace.load_trace_from_json(path, cancel_check=lambda: False)
+            self.assertEqual(len(trace.spans), 10)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_cancel_check_only_consulted_not_called_every_single_event(self):
+        # cancel_check is checked on the same stride as progress_cb, not
+        # once per event -- a real (if cheap) per-call cost shouldn't be
+        # paid tens of thousands of times for a large trace.
+        path = self._write_trace_with_n_events(12_000)
+        call_count = [0]
+        def counting_check():
+            call_count[0] += 1
+            return False
+        try:
+            chrome_trace.load_trace_from_json(path, cancel_check=counting_check)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertLess(call_count[0], 12_000)
+
+    def test_load_cancelled_is_a_distinct_exception_type(self):
+        # The GUI worker needs to tell "the user cancelled" apart from
+        # "loading genuinely failed" -- LoadCancelled must not be
+        # confusable with a generic Exception a classifier would treat
+        # as a real failure.
+        self.assertTrue(issubclass(chrome_trace.LoadCancelled, Exception))
+
+
 if __name__ == "__main__":
     unittest.main()

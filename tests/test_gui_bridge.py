@@ -182,6 +182,30 @@ class TestGuiBridge(unittest.TestCase):
         self.assertEqual(theme.categoryColor("jit"), "#581c87")
         self.assertEqual(theme.categoryColor("nvtx"), "#9a3412")
 
+    def test_bucket_color_covers_every_bucket_and_varies_with_theme(self):
+        from src.analysis.activity_buckets import BUCKETS
+        theme = self._theme()
+        for bucket in BUCKETS:
+            theme.dark = True
+            dark_color = theme.bucketColor(bucket)
+            self.assertTrue(dark_color.startswith("#"))
+            theme.dark = False
+            light_color = theme.bucketColor(bucket)
+            self.assertTrue(light_color.startswith("#"))
+
+    def test_bucket_color_unknown_bucket_falls_back_gracefully(self):
+        theme = self._theme()
+        self.assertTrue(theme.bucketColor("NotARealBucket").startswith("#"))
+
+    def test_change_color_covers_every_status(self):
+        theme = self._theme()
+        for status in ("improved", "regressed", "unchanged", "new", "removed",
+                       "unavailable", "zero"):
+            self.assertTrue(theme.changeColor(status).startswith("#"))
+        self.assertEqual(theme.changeColor("improved"), theme.severityColor("green"))
+        self.assertEqual(theme.changeColor("regressed"), theme.severityColor("red"))
+        self.assertEqual(theme.changeColor("unchanged"), theme.textMuted)
+
     def test_no_raw_hex_colors_outside_theme_py(self):
         # Regression guard for the visual-consistency audit's core
         # finding: FlameGraphScreen.qml alone had 8 raw hex literals that
@@ -329,6 +353,17 @@ class TestGuiBridge(unittest.TestCase):
         for row in kb.rows:
             self.assertTrue(row["color"].startswith("#"))
 
+    def test_kernels_bridge_table_matches_rows(self):
+        from src.gui.bridge import KernelsBridge
+        spans = [_span(1, 1, Category.CPU, i, 100, "hot") for i in range(10)]
+        spans += [_span(1, 1, Category.CPU, 2000 + i, 5, "cold") for i in range(2)]
+        trace = _mk_trace(spans, backends=["cpu"])
+        kb = KernelsBridge(trace, self._theme())
+        self.assertIsNotNone(kb.table)
+        self.assertEqual(kb.table.rows.sourceCount, len(kb.rows))
+        kb.table.filters.textFilter = "cold"
+        self.assertEqual(kb.table.filters.matchCount, 1)
+
     # ── CallTreeBridge ───────────────────────────────────────────────────
 
     def test_call_tree_bridge_empty_without_stacks(self):
@@ -351,6 +386,91 @@ class TestGuiBridge(unittest.TestCase):
         self.assertTrue(root["color"].startswith("#"))
         self.assertEqual(len(root["children"]), 1)
         self.assertEqual(root["children"][0]["name"], "work")
+
+    def _deep_call_tree_bridge(self):
+        from src.gui.bridge import CallTreeBridge
+        spans = [
+            SpanEvent(name="alpha_fn", category=Category.CPU, start_ns=0, duration_ns=100,
+                      pid=1, tid=1, tags={}, stack_frames=["main"]),
+            SpanEvent(name="beta_fn", category=Category.CPU, start_ns=200, duration_ns=50,
+                      pid=1, tid=1, tags={}, stack_frames=["main"]),
+        ]
+        trace = _mk_trace(spans, backends=["cpu"])
+        return CallTreeBridge(trace, self._theme())
+
+    def test_call_tree_bridge_all_roots_never_changes(self):
+        ctb = self._deep_call_tree_bridge()
+        before = ctb.allRoots
+        ctb.setFilter("alpha")
+        self.assertEqual(ctb.allRoots, before)
+        self.assertNotEqual(ctb.roots, before)
+
+    def test_call_tree_bridge_filter_keeps_ancestors_of_a_match(self):
+        ctb = self._deep_call_tree_bridge()
+        ctb.setFilter("alpha_fn")
+        # "main" (the ancestor) must survive even though it doesn't match
+        # "alpha_fn" itself -- otherwise the match would float with no
+        # indication of where it's actually called from.
+        self.assertEqual(len(ctb.roots), 1)
+        self.assertEqual(ctb.roots[0]["name"], "main")
+        names = {c["name"] for c in ctb.roots[0]["children"]}
+        self.assertEqual(names, {"alpha_fn"})
+
+    def test_call_tree_bridge_clear_filter_restores_full_tree(self):
+        ctb = self._deep_call_tree_bridge()
+        full = ctb.roots
+        ctb.setFilter("alpha_fn")
+        ctb.setFilter("")
+        self.assertEqual(ctb.roots, full)
+
+    def test_call_tree_bridge_sort_children_orders_by_key(self):
+        ctb = self._deep_call_tree_bridge()
+        ctb.sortChildren("totalNs", True)   # descending
+        names = [c["name"] for c in ctb.roots[0]["children"]]
+        self.assertEqual(names, ["alpha_fn", "beta_fn"])   # 100ns > 50ns
+        ctb.sortChildren("totalNs", False)
+        names = [c["name"] for c in ctb.roots[0]["children"]]
+        self.assertEqual(names, ["beta_fn", "alpha_fn"])
+
+    def test_call_tree_bridge_export_csv_includes_path_column(self):
+        import csv
+        import tempfile
+        ctb = self._deep_call_tree_bridge()
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            path = f.name
+        try:
+            self.assertTrue(ctb.exportCsv(path))
+            with open(path, newline="") as fh:
+                rows = list(csv.reader(fh))
+            self.assertIn("Path", rows[0])
+            path_col = rows[0].index("Path")
+            paths = [r[path_col] for r in rows[1:]]
+            self.assertIn("main > alpha_fn", paths)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_inspector_call_tree_relationship_unaffected_by_filter(self):
+        from src.gui.bridge import KernelsBridge, RooflineBridge, SourceBridge, CallTreeBridge
+        from src.gui.models import TimelineModel
+        from src.gui.nav import Selection
+        from src.gui.inspector import InspectorBridge
+        span = SpanEvent(name="alpha_fn", category=Category.CPU, start_ns=0, duration_ns=100,
+                         pid=1, tid=1, tags={}, stack_frames=["main"])
+        trace = _mk_trace([span], backends=["cpu"])
+        theme = self._theme()
+        ctb = CallTreeBridge(trace, theme)
+        # Filter that would remove "alpha_fn" from the FILTERED roots.
+        ctb.setFilter("something_else_entirely")
+        kernels = KernelsBridge(trace, theme)
+        roofline = RooflineBridge(trace)
+        source = SourceBridge(trace)
+        timeline = TimelineModel(trace, theme)
+        selection = Selection()
+        inspector = InspectorBridge(trace, selection, kernels, ctb, roofline, source, timeline)
+        selection.selectFunction("cpu", "alpha_fn")
+        relationships = {f["label"]: f for f in inspector.content["relationships"]}
+        self.assertEqual(relationships["Call Tree"]["kind"], "measured")
+        self.assertEqual(relationships["Call Tree"]["value"], "appears in the call tree")
 
     # ── FlameGraphBridge ─────────────────────────────────────────────────
     # Moved here (from the now-removed standalone `hprofiler flamegraph
@@ -626,6 +746,32 @@ class TestGuiBridge(unittest.TestCase):
         from src.gui.bridge import SystemBridge
         SystemBridge(_mk_trace([_span(1, 1, Category.CPU, 0, 10, "x")]))
 
+    def test_system_bridge_device_table_matches_devices(self):
+        from src.gui.bridge import SystemBridge
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")], backends=["cuda"])
+        trace.set_devices([_dev()])
+        sysb = SystemBridge(trace)
+        self.assertEqual(sysb.deviceTable.rows.sourceCount, 1)
+
+    def test_system_bridge_metric_table_reports_unavailable_without_counters(self):
+        from src.gui.bridge import SystemBridge
+        sysb = SystemBridge(_mk_trace([_span(1, 1, Category.CPU, 0, 10, "x")]))
+        self.assertEqual(sysb.metricTable.rows.sourceCount, 4)
+        rows = [sysb.metricTable._model.rowDict(i) for i in range(4)]
+        by_label = {r["label"]: r for r in rows}
+        self.assertEqual(by_label["IPC"]["kind"], "unavailable")
+        self.assertTrue(by_label["IPC"]["reason"])
+
+    def test_system_bridge_metric_table_reports_measured_with_counters(self):
+        from src.gui.bridge import SystemBridge
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")])
+        trace.add(CounterEvent(name="ipc", category=Category.OTHER, timestamp_ns=0, value=1.85, pid=1))
+        sysb = SystemBridge(trace)
+        rows = [sysb.metricTable._model.rowDict(i) for i in range(4)]
+        by_label = {r["label"]: r for r in rows}
+        self.assertEqual(by_label["IPC"]["kind"], "measured")
+        self.assertIn("1.85", by_label["IPC"]["value"])
+
     # ── ProfileBridge ────────────────────────────────────────────────────
 
     def test_profile_bridge_gpu_activity_and_breakdown(self):
@@ -710,6 +856,13 @@ class TestGuiBridge(unittest.TestCase):
             self.assertEqual(field["value"], metric)
             self.assertEqual(field["kind"], "measured")
 
+    def test_dashboard_bridge_findings_table_matches_top_bottlenecks(self):
+        spans = [_span(1, 1, Category.GPU_CUDA, i * 1_000_000, 50_000, "k",
+                       tags={"type": "kernel"}) for i in range(5)]
+        trace = _mk_trace(spans, backends=["cuda"])
+        bridge = self._bridge(trace)
+        self.assertEqual(bridge.findingsTable.rows.sourceCount, len(bridge.topBottlenecks))
+
     # ── InspectorBridge ──────────────────────────────────────────────────
     # Field shape/kind-tagging is what makes "clearly distinguish
     # measured, derived, estimated, and unavailable values" a concrete
@@ -792,9 +945,335 @@ class TestGuiBridge(unittest.TestCase):
             Path(path).unlink(missing_ok=True)
 
 
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 not installed")
+class TestDataTableModels(unittest.TestCase):
+    """src/gui/tablemodel.py -- the shared table infrastructure (real Qt
+    model/view: QAbstractListModel + QSortFilterProxyModel, not the
+    per-screen hand-rolled JS sort/filter every table used before this
+    round). Built as a reference implementation against KERNEL_COLUMNS,
+    but this module itself is table-agnostic."""
+
+    _app = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = QGuiApplication.instance() or QGuiApplication([])
+
+    def _rows(self):
+        return [
+            {"name": "matmul", "rawName": "matmul", "category": "cuda", "color": "#f87171",
+             "count": 100, "totalNs": 500_000, "avgNs": 5_000, "minNs": 1_000, "maxNs": 9_000, "sharePct": 60.0},
+            {"name": "reduce", "rawName": "reduce", "category": "cuda", "color": "#f87171",
+             "count": 20, "totalNs": 200_000, "avgNs": 10_000, "minNs": 5_000, "maxNs": 15_000, "sharePct": 24.0},
+            {"name": "copy_9x_kernel", "rawName": "copy_9x_kernel", "category": "memory", "color": "#a78bfa",
+             "count": 5, "totalNs": 133_333, "avgNs": 26_666, "minNs": 10_000, "maxNs": 40_000, "sharePct": 16.0},
+        ]
+
+    def _bundle(self):
+        from src.gui.tablemodel import TableBundle
+        from src.gui.columns import KERNEL_COLUMNS
+        return TableBundle(self._rows(), KERNEL_COLUMNS)
+
+    def test_role_names_cover_every_column_plus_row(self):
+        bundle = self._bundle()
+        names = {v.decode() if isinstance(v, (bytes, bytearray)) else v
+                  for v in bundle._model.roleNames().values()}
+        for col in bundle._model.columnSpecs():
+            self.assertIn(col.key, names)
+        self.assertIn("row", names)
+
+    def test_numeric_sort_is_correct_not_lexicographic(self):
+        # A naive string/JS sort would order "1000" < "200" < "9000"
+        # lexicographically -- this is the exact bug class the old JS
+        # `b[key]-a[key]` sort in KernelsScreen.qml's recompute() could
+        # hit if a numeric field were ever stringified; TableFilterProxy's
+        # lessThan() must sort by real numeric value regardless.
+        bundle = self._bundle()
+        bundle.filters.toggleSort("count")   # 100, 20, 5 -> ascending: 5, 20, 100
+        names = []
+        for r in range(bundle.rows.rowCount()):
+            idx = bundle.rows.index(r, 0)
+            names.append(bundle.rows.data(idx, bundle._model.roleForKey("name")))
+        self.assertEqual(names, ["copy_9x_kernel", "reduce", "matmul"])
+
+    def test_toggle_sort_same_key_flips_direction(self):
+        bundle = self._bundle()
+        bundle.filters.toggleSort("count")
+        self.assertFalse(bundle.filters.sortDescending)
+        bundle.filters.toggleSort("count")
+        self.assertTrue(bundle.filters.sortDescending)
+
+    def test_text_filter_matches_name(self):
+        bundle = self._bundle()
+        bundle.filters.textFilter = "copy"
+        self.assertEqual(bundle.filters.matchCount, 1)
+        bundle.filters.clearFilters()
+        self.assertEqual(bundle.filters.matchCount, 3)
+
+    def test_min_max_value_filters(self):
+        bundle = self._bundle()
+        bundle.filters.setMin("totalNs", 150_000)
+        self.assertEqual(bundle.filters.matchCount, 2)
+        bundle.filters.clearMin("totalNs")
+        bundle.filters.setMax("totalNs", 150_000)
+        self.assertEqual(bundle.filters.matchCount, 1)
+
+    def test_category_filter(self):
+        bundle = self._bundle()
+        bundle.filters.setCategoryEnabled("memory", True)
+        self.assertEqual(bundle.filters.matchCount, 1)
+        bundle.filters.setCategoryEnabled("memory", False)
+        self.assertEqual(bundle.filters.matchCount, 3)
+
+    def test_percent_mode_toggle_does_not_change_stored_role_value(self):
+        # percentMode is a DISPLAY concern (DataTableCell.qml computes the
+        # percentage at render time) -- the underlying role value must
+        # stay the raw number so sorting/filtering/export are unaffected
+        # by whether percent mode happens to be on.
+        bundle = self._bundle()
+        idx = bundle.rows.index(0, 0)
+        role = bundle._model.roleForKey("totalNs")
+        before = bundle.rows.data(idx, role)
+        bundle.config.togglePercentMode()
+        after = bundle.rows.data(idx, role)
+        self.assertEqual(before, after)
+
+    def test_table_config_width_and_visibility_round_trip(self):
+        bundle = self._bundle()
+        bundle.config.setColumnWidth("name", 300)
+        bundle.config.setColumnVisible("minNs", True)
+        cols = {c["key"]: c for c in bundle.config.columns}
+        self.assertEqual(cols["name"]["width"], 300)
+        self.assertTrue(cols["minNs"]["visible"])
+        bundle.config.resetLayout()
+        cols = {c["key"]: c for c in bundle.config.columns}
+        self.assertNotEqual(cols["name"]["width"], 300)
+        self.assertFalse(cols["minNs"]["visible"])
+
+    def test_move_column_reorders(self):
+        bundle = self._bundle()
+        order_before = [c["key"] for c in bundle.config.columns]
+        bundle.config.moveColumn(0, len(order_before) - 1)
+        order_after = [c["key"] for c in bundle.config.columns]
+        self.assertNotEqual(order_before, order_after)
+        self.assertEqual(order_after[-1], order_before[0])
+
+    def test_bar_maxima_computed_from_full_row_set(self):
+        bundle = self._bundle()
+        self.assertEqual(bundle.barMaxima["totalNs"], 500_000)
+        self.assertEqual(bundle.barMaxima["sharePct"], 60.0)
+
+    def test_export_csv_writes_visible_filtered_sorted_rows(self):
+        import csv
+        import tempfile
+        bundle = self._bundle()
+        bundle.config.setColumnVisible("minNs", False)
+        bundle.filters.setMin("totalNs", 150_000)
+        bundle.filters.toggleSort("totalNs")
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            path = f.name
+        try:
+            self.assertTrue(bundle.exportCsv(path))
+            with open(path, newline="") as fh:
+                reader = list(csv.reader(fh))
+            header, rows = reader[0], reader[1:]
+            self.assertNotIn("Min", header)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][0], "reduce")   # ascending totalNs first
+            self.assertEqual(rows[1][0], "matmul")
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_copy_row_and_copy_all_do_not_raise(self):
+        bundle = self._bundle()
+        bundle.copyRow(0)   # clipboard access under offscreen QPA -- must not raise
+        bundle.copyAll()
+
+    def test_sort_and_filter_never_reset_the_source_model(self):
+        # The literal "avoid unnecessary full-table rebuilding" requirement:
+        # sorting/filtering go through QSortFilterProxyModel's incremental
+        # sort()/invalidateFilter(), never beginResetModel() on the SOURCE
+        # DictListTableModel.
+        bundle = self._bundle()
+        resets = []
+        bundle._model.modelAboutToBeReset.connect(lambda: resets.append(1))
+        bundle.filters.toggleSort("count")
+        bundle.filters.toggleSort("totalNs")
+        bundle.filters.textFilter = "cuda"
+        bundle.filters.setMin("count", 1)
+        bundle.filters.clearFilters()
+        bundle.config.setColumnVisible("minNs", True)
+        self.assertEqual(resets, [])
+
+    def test_set_rows_does_reset_the_source_model(self):
+        # The one legitimate case -- a genuine data replacement, distinct
+        # from sort/filter above.
+        bundle = self._bundle()
+        resets = []
+        bundle._model.modelAboutToBeReset.connect(lambda: resets.append(1))
+        bundle._model.setRows(self._rows())
+        self.assertEqual(resets, [1])
+
+    def test_row_as_text_reflects_visible_columns_only(self):
+        bundle = self._bundle()
+        bundle.config.setColumnVisible("category", False)
+        text = bundle.rowAsText(0)
+        self.assertNotIn("cuda", text.split("\t"))
+
+    def test_format_bridge_matches_dashboard_fmt_helpers(self):
+        from src.gui.tablemodel import FormatBridge
+        from src.analysis import dashboard as dash
+        fmt = FormatBridge()
+        self.assertEqual(fmt.formatNumber("time_ns", 500_000), dash.fmt_ns(500_000))
+        self.assertEqual(fmt.formatNumber("count", 1234), dash.fmt_count(1234))
+        self.assertEqual(fmt.formatNumber("pct", 12.3), dash.fmt_pct(12.3))
+        self.assertEqual(fmt.signedNs(-500_000), dash.fmt_signed_ns(-500_000))
+        self.assertEqual(fmt.signedPct(12.3), dash.fmt_signed_pct(12.3))
+
+
 def DashboardBridgeBuckets() -> int:
     from src.gui.bridge import DashboardBridge
     return DashboardBridge._TIMELINE_BUCKETS
+
+
+@unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 not installed")
+class TestComparisonBridge(unittest.TestCase):
+    _app = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = QGuiApplication.instance() or QGuiApplication([])
+
+    def _theme(self):
+        from src.gui.theme import Theme
+        return Theme(dark=True)
+
+    def _bridge(self, trace_a, trace_b):
+        from src.gui.comparison import ComparisonBridge
+        return ComparisonBridge(trace_a, trace_b, self._theme())
+
+    def test_unavailable_when_no_comparison_trace(self):
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
+        bridge = self._bridge(trace_a, None)
+        self.assertFalse(bridge.available)
+        self.assertEqual(bridge.table.rows.rowCount(), 0)
+        self.assertEqual(bridge.bucketDeltas, [])
+        self.assertEqual(bridge.topImprovements, [])
+        self.assertEqual(bridge.topRegressions, [])
+        for field in bridge.comparisonFields:
+            self.assertEqual(field["kind"], "unavailable")
+            self.assertTrue(field["reason"])
+        # Baseline fields must still be fully populated -- unavailability
+        # is a property of the COMPARISON side only.
+        for field in bridge.baselineFields:
+            self.assertEqual(field["kind"], "measured")
+
+    def test_export_methods_fail_cleanly_when_unavailable(self):
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
+        bridge = self._bridge(trace_a, None)
+        self.assertFalse(bridge.exportReport("/tmp/should_not_be_written.json"))
+        self.assertFalse(bridge.exportCsv("/tmp/should_not_be_written.csv"))
+
+    def test_real_comparison_reports_statuses_and_match_kinds(self):
+        trace_a = _mk_trace([
+            _span(1, 1, Category.GPU_CUDA, 0, 10_000_000, "matmul", tags={"type": "kernel"}),
+            _span(1, 1, Category.GPU_CUDA, 0, 5_000_000, "old_only", tags={"type": "kernel"}),
+        ])
+        trace_b = _mk_trace([
+            _span(1, 1, Category.GPU_CUDA, 0, 20_000_000, "matmul", tags={"type": "kernel"}),
+            _span(1, 1, Category.GPU_CUDA, 0, 3_000_000, "new_only", tags={"type": "kernel"}),
+        ])
+        bridge = self._bridge(trace_a, trace_b)
+        self.assertTrue(bridge.available)
+        # Read directly from the underlying rows the bridge computed
+        # (the same data table.rows' proxy wraps), matching how other
+        # bridges' tests in this file verify table CONTENT rather than
+        # poking at TableFilterProxy internals.
+        by_name = {r["name"]: r for r in bridge._rows}
+        self.assertEqual(by_name["matmul"]["status"], "regressed")
+        self.assertEqual(by_name["matmul"]["matchKind"], "exact")
+        self.assertEqual(by_name["old_only"]["status"], "removed")
+        self.assertEqual(by_name["new_only"]["status"], "new")
+        self.assertEqual(bridge.newCount, 1)
+        self.assertEqual(bridge.removedCount, 1)
+
+    def test_noise_floor_note_present_and_not_a_statistical_claim(self):
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
+        trace_b = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
+        bridge = self._bridge(trace_a, trace_b)
+        note = bridge.noiseFloor["note"]
+        self.assertIn("not a statistical", note.lower())
+        self.assertEqual(bridge.noiseFloor["pct"], bridge.noiseFloor["pct"])   # present, no KeyError
+
+    def test_set_change_thresholds_reclassifies_without_rematching(self):
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
+        trace_b = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_060_000, "k")])   # +6%, +60us
+        bridge = self._bridge(trace_a, trace_b)
+        self.assertEqual(bridge._rows[0]["status"], "unchanged")   # 60us < 1ms floor
+        bridge.setChangeThresholds(1000.0, 1.0)   # 1us / 1% floor -- now clears both
+        self.assertEqual(bridge._rows[0]["status"], "regressed")
+
+    def test_export_report_round_trips(self):
+        import json
+        import tempfile
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 10_000_000, "k")])
+        trace_b = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 20_000_000, "k")])
+        bridge = self._bridge(trace_a, trace_b)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            self.assertTrue(bridge.exportReport(path))
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertIn("aggregates", data)
+            self.assertIn("noiseFloor", data)
+            self.assertEqual(data["aggregates"][0]["name"], "k")
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_export_csv_round_trips(self):
+        import csv
+        import tempfile
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 10_000_000, "k")])
+        trace_b = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 20_000_000, "k")])
+        bridge = self._bridge(trace_a, trace_b)
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            path = f.name
+        try:
+            self.assertTrue(bridge.exportCsv(path))
+            with open(path, newline="") as fh:
+                rows = list(csv.reader(fh))
+            self.assertEqual(rows[1][1], "k")
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_coverage_strips_are_independently_normalized(self):
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
+        trace_b = _mk_trace([_span(1, 1, Category.GPU_CUDA, 5_000_000, 1_000_000, "k")])
+        bridge = self._bridge(trace_a, trace_b)
+        self.assertEqual(len(bridge.baselineCoverage), 60)
+        self.assertEqual(len(bridge.comparisonCoverage), 60)
+
+    def test_dashboard_bridge_without_comparison_param_is_unchanged(self):
+        # The "keep ordinary single-profile operation unchanged" requirement,
+        # asserted directly: calling DashboardBridge the OLD way (no
+        # comparison=) must behave identically to before this parameter
+        # existed.
+        from src.gui.bridge import DashboardBridge
+        trace = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
+        bridge = DashboardBridge(trace, self._theme())
+        self.assertFalse(bridge.hasComparison)
+        self.assertEqual(bridge.comparisonTopChanges, [])
+
+    def test_dashboard_bridge_with_comparison_exposes_top_changes(self):
+        from src.gui.bridge import DashboardBridge
+        trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 10_000_000, "k")])
+        trace_b = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 20_000_000, "k")])
+        comparison = self._bridge(trace_a, trace_b)
+        bridge = DashboardBridge(trace_a, self._theme(), comparison=comparison)
+        self.assertTrue(bridge.hasComparison)
+        self.assertEqual(len(bridge.comparisonTopChanges), 1)
+        self.assertEqual(bridge.comparisonTopChanges[0]["name"], "k")
 
 
 if __name__ == "__main__":

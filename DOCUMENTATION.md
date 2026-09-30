@@ -297,11 +297,13 @@ hprofiler gui [OPTIONS] TRACE_FILE
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--disasm / --no-disasm` | `--no-disasm` | Collect disassembly in the background; populates the Source tab |
+| `--compare TRACE_B` | — | Open a second trace as a comparison run (populates the Compare tab); see §21's Comparison mode |
 | `--verbose / --no-verbose` | `--no-verbose` | Print which rendering tier was used (GPU-rendered Qt Quick, software-rendered, or TUI fallback) and why |
 
 ```bash
 hprofiler gui my_program.hprofiler.json
 hprofiler gui --disasm my_program.hprofiler.json
+hprofiler gui after.hprofiler.json --compare before.hprofiler.json
 ```
 
 Falls back to the TUI automatically — with no error — if PySide6 isn't
@@ -3816,6 +3818,7 @@ hprofiler run --gui --backend cuda -- ./app     # profile, then open the GUI
 hprofiler gui trace.hprofiler.json              # open a previously saved trace
 hprofiler gui --disasm trace.hprofiler.json      # + background disassembly collection
 hprofiler run --gui --perf-callgraph dwarf -- ./app  # + populate the Flame Graph tab
+hprofiler gui after.hprofiler.json --compare before.hprofiler.json  # open the Compare tab
 ```
 
 ### Three-tier fallback
@@ -3856,55 +3859,40 @@ for machines where installing it isn't an option at all.
 
 Mirrors the TUI's tab set (§5) closely, but with one real difference in
 how conditional tabs are handled: the TUI hides a tab entirely when its
-data isn't present, while the GUI's `TabBar` always shows all 9 tabs and
+data isn't present, while the GUI's `TabBar` always shows all 10 tabs and
 each screen renders its own empty-state message instead (e.g. Call Tree/
 Flame Graph both show "No call-stack data..." pointing at `--call-tree`/
-`--perf-callgraph` rather than disappearing) — always-visible tabs with
-inline empty states, not conditional visibility, is the deliberate GUI
+`--perf-callgraph` rather than disappearing, and Compare shows the exact
+CLI syntax to load a comparison trace) — always-visible tabs with inline
+empty states, not conditional visibility, is the deliberate GUI
 convention throughout.
 
 | # | Tab | Notes vs. the TUI equivalent |
 |---|-----|-------------------------------|
-| 1 | Overview | Same stat cards / top findings / hot kernels / source correlation as §5's Overview Tab |
-| 2 | Timeline | Real vector Gantt view, not character cells — see below for GUI-specific additions |
-| 3 | Kernels | Same aggregated-stats table |
-| 4 | Call Tree | Same stack-frame tree, proportional-width tree rows instead of ASCII indentation |
+| 1 | Overview | Same stat cards / top findings / hot kernels / source correlation as §5's Overview Tab, plus the largest comparison changes when a `--compare` trace is loaded (see Comparison mode below) |
+| 2 | Timeline | Real vector Gantt view, not character cells — see Timeline exploration below for filtering/grouping/search/bookmarks, all GUI-only |
+| 3 | Kernels | Same aggregated stats, now a real sortable/filterable/exportable table — see Tables below |
+| 4 | Call Tree | Same stack-frame tree, proportional-width tree rows instead of ASCII indentation, plus a text filter (keeps ancestors of a match, not a flat hide) and per-level sort |
 | 5 | Flame Graph | Same tree as Call Tree (same `_ct_build` call, via `analysis/flamegraph_tree.py`), rendered as a Canvas-drawn proportional icicle chart instead of character-cell blocks — see §5's own Flame Graph Tab section, same tab, same interaction model, just vector-rendered |
 | 6 | Roofline | Canvas-drawn scatter instead of a Plotly-rendered static image |
 | 7 | Source | Same per-kernel disassembly, plus a third panel (see below) not present in the TUI |
-| 8 | System | Same hardware info |
+| 8 | System | Same hardware info, now real sortable tables for devices and CPU metrics (unavailable metrics show *why*, e.g. "no PMU counters captured", instead of silently vanishing) |
 | 9 | Profile | Same activity breakdown |
+| 10 | Compare | GUI-only. Empty state (with the literal `--compare` CLI syntax) unless a second trace was loaded — see Comparison mode below |
 
-**Timeline tab, GUI-specific additions beyond the TUI's equivalent:**
-
-- **Smooth wheel-zoom and drag-to-pan** over the full trace duration, not
-  fixed `+`/`-` zoom steps — plus a horizontal scrollbar (custom thumb,
-  bound to the same pan state) and a vertical `ScrollBar` for traces with
-  more lanes than fit the window.
-- **A call-graph panel** below the lanes (`analysis/call_graph.py`): a
-  node-and-edge diagram of which functions call which, aggregated over
-  whatever time window is currently visible — not the same thing as the
-  Call Tree tab, which shows time breakdown down each specific call
-  *path* (the same function under two different callers is two separate
-  rows there, by design); this merges every occurrence of a function into
-  one node regardless of caller. Edge thickness/opacity scales with
-  relative time weight. Capped to the 60 hottest nodes by time, reports
-  how many were truncated; scrolls (fixed pixel pitch per node, sized off
-  the actual layer count) rather than squeezing an unbounded number of
-  nodes into a fixed-height box.
-- **Idle-time overlay within each lane's own bars:** a span like an
-  OpenMP `omp_parallel_region` or an OpenCL kernel enqueue times its
-  *entire* call, which can include time genuinely spent blocked at a
-  nested barrier/critical-section/sync call — reported correctly as its
-  own separate `sync`-category span, but otherwise invisible within the
-  parent span's own solid-colored bar. Any lane paired with a same-thread
-  `sync` lane (by name: `<category>/thread-N` pairs with
-  `sync/thread-N`) automatically overlays that sync time, dimmed, in
-  place — so a thread blocked at a barrier for half of an
-  `omp_parallel_region` call shows that visually within the one bar,
-  rather than requiring a separate look at the `sync` lane underneath. A
-  small legend appears in the status row when at least one lane has this
-  pairing.
+**Idle-time overlay within each lane's own bars (Timeline):** a span like
+an OpenMP `omp_parallel_region` or an OpenCL kernel enqueue times its
+*entire* call, which can include time genuinely spent blocked at a
+nested barrier/critical-section/sync call — reported correctly as its
+own separate `sync`-category span, but otherwise invisible within the
+parent span's own solid-colored bar. Any lane paired with a same-thread
+`sync` lane (by name: `<category>/thread-N` pairs with
+`sync/thread-N`) automatically overlays that sync time, dimmed, in
+place — so a thread blocked at a barrier for half of an
+`omp_parallel_region` call shows that visually within the one bar,
+rather than requiring a separate look at the `sync` lane underneath. A
+small legend appears in the status row when at least one lane has this
+pairing.
 
 **Source tab, GUI-specific addition:** a third panel (kernel list |
 assembly+source | mix+analysis) beyond what the TUI's Disasm tab shows —
@@ -3914,6 +3902,139 @@ instruction-type mix breakdown (vector/memory/branch/etc. percentages,
 threshold-based advisor described in §8, not an LLM call) rendered
 side-by-side with the assembly instead of requiring a separate summary
 view.
+
+### Timeline exploration
+
+Beyond smooth wheel-zoom and drag-to-pan (custom horizontal scrollbar
+thumb bound to the same pan state, plus a vertical `ScrollBar` for traces
+with more lanes than fit the window), the Timeline tab supports:
+
+- **Filters** (`TimelineFilterBar.qml`, the "Filters" button): rank,
+  process, thread, runtime, stream, activity bucket, event name
+  (substring or regex), minimum duration, and time range. Each control
+  only appears when the trace actually has that dimension's data — e.g.
+  "MPI rank" and "Stream" both honestly report "not available, no
+  <rank/stream> tags in this trace" rather than showing an empty,
+  confusing control. Filtering narrows both which *rows* stay visible
+  (lane-level dimensions: rank/process/thread/runtime/stream) and which
+  *events* paint within a visible row (event-level: name/duration/
+  bucket/time-range) — "Show only active rows" hides a lane entirely
+  once its event-level filters leave it with zero matches.
+- **Grouping** (`TimelineViewControls.qml`, the "Group" button): by rank,
+  process, runtime, stream, or thread — one collapsible group header per
+  distinct value, "(unavailable)" honestly grouping together lanes with
+  no data for that dimension rather than fabricating one. A collapsed
+  group shows a coverage strip standing in for its member lanes'
+  activity instead of just disappearing. "Collapse all"/"Expand all" and
+  per-lane right-click "Hide this lane"/"Isolate this lane" (solo
+  semantics — replaces, not adds to, the isolated set) round out
+  reorganizing what's visible; "Show all lanes" undoes hide/isolate.
+- **Event search** (`TimelineSearchBar.qml`): substring or regex against
+  event names, backed by a `(category,name) -> occurrences` index (not a
+  linear scan of every span) so it stays fast even on a trace with tens
+  of thousands of events. Matches are outlined on the Canvas; ◂/▸ step
+  through them (wrapping), recentering the view at the *current* zoom
+  level (search stepping never also changes zoom) and scrolling the
+  matched row into view.
+- **Color mode** (the "Color" button in `TimelineViewControls.qml`):
+  cycles function-name coloring (the default, stable per-function hash)
+  with activity-bucket coloring (`BucketLegend.qml` appears alongside)
+  and runtime-category coloring.
+- **Time ruler, bookmarks, named ranges** (`TimeRuler.qml`, above the
+  lanes): "nice" round-number tick labels (the classic 1/2/5-times-a-
+  power-of-ten interval selection), plus "+ Bookmark" (marks the current
+  view's center; right-click a marker or its chip in the toolbar to
+  remove it) and shift-drag-to-select a time range on the lanes area (a
+  dormant `Nav.selectedTimeRange` from an earlier round, now used) →
+  "+ Range" promotes the current selection to a persistent named range,
+  shown as a translucent band on the ruler.
+
+All of the above is Timeline-local view state (filters/grouping/search/
+bookmarks/named ranges), not persisted across a relaunch — it lives in
+`TimelineModel` (`src/gui/models.py`) for the life of the window, same
+"session" scope as every other GUI screen's state.
+
+### Tables
+
+Kernels, System's device/CPU-metric panels, Call Tree (flattened for
+export only — it stays a real tree on screen, that's the point of a call
+tree), and Overview's "Top bottlenecks" panel all share one table
+implementation (`src/gui/tablemodel.py` + `src/gui/qml/components/
+DataTable.qml` and friends) built on `QAbstractListModel` +
+`QSortFilterProxyModel` (Qt's real model/view architecture — plain
+`ListView`-based rendering, not `TableView`/`HorizontalHeaderView`, both
+*styled* Qt Quick Controls types this project has already been bitten by
+under offscreen-QPA testing) instead of each screen's own hand-rolled
+JS sort/filter:
+
+- Click a header to sort (numeric-aware — a plain string sort would
+  order "2" after "10"); drag a header's right edge to resize; the
+  "Columns" button toggles visibility and offers "Reset layout".
+- A text filter narrows rows live; Kernels' identifier column stays
+  frozen (fixed, doesn't scroll horizontally) the same way Timeline's
+  lane labels do.
+- Hovering a cell shows its full, unformatted value plus a one-line
+  metric definition where one exists (`columns.py`'s
+  `METRIC_DEFINITIONS`).
+- "Copy row"/"Copy all" (tab-separated, for pasting into a spreadsheet)
+  and "Export CSV" (the currently sorted/filtered/visible view, raw
+  values not display-formatted strings) are on every table.
+- Sorting and filtering never rebuild the underlying model (a genuine
+  `QAbstractItemModel` reset only happens when the trace's own data
+  changes, which is never, post-construction, for an ordinary single-
+  profile session) — a directly-asserted regression guard
+  (`test_sort_and_filter_never_reset_the_source_model`), not just an
+  informal goal.
+
+### Comparison mode
+
+`hprofiler gui trace1.json --compare trace2.json` opens a second trace as
+a comparison run: `trace1.json` is the **baseline**, `trace2.json` is the
+**comparison**. The Compare tab (always tab 10, per the "always visible"
+convention above) is empty with that exact syntax shown until a
+comparison trace is loaded; ordinary single-profile use (no `--compare`)
+is completely unaffected — `DashboardBridge`'s optional `comparison=`
+parameter is additive, and a directly-asserted test confirms calling it
+the old way produces identical output to before this parameter existed.
+
+- **Matching** (`src/analysis/compare.py`): kernels/functions are matched
+  by `(category, name)` — the same stable identifier Round 16 already
+  established for cross-tab navigation (`span_id` is real but never
+  serialized to JSON). A `name` that doesn't match exactly falls back to
+  a *normalized* match via the existing `fmt_kernel_name()` JIT-hash
+  shortener (already used for display); each row's `matchKind` — exact/
+  normalized/baseline_only/comparison_only — is a visible, filterable
+  column, not hidden bookkeeping.
+- **Classification**: improved/regressed requires a delta to clear
+  *both* a minimum percentage (default 5%) *and* a minimum absolute time
+  (default 1ms) — adjustable in the Compare tab's own threshold fields.
+  hprofiler captures single-run traces only, with no repeated-trial
+  variance data anywhere, so this is a disclosed heuristic noise-floor
+  guard against reading run-to-run jitter as a real change, **explicitly
+  not a statistical significance test** — stated in the UI, not just
+  here. True-zero (both sides genuinely 0ns) is kept distinct from
+  unavailable (no data on one or both sides); new/removed rows (present
+  on only one side) are their own statuses, not folded into improved/
+  regressed.
+- **What's compared**: the function/kernel table above; activity-bucket
+  deltas (Computation/Communication/Synchronization/Memory transfer/
+  Runtime overhead/Idle — the same taxonomy Overview's own "Time
+  breakdown" and Timeline's bucket coloring already use, so all three
+  views can never disagree); the largest improvements/regressions,
+  ranked by absolute impact (also surfaced on the Overview tab); and two
+  execution-coverage strips, each normalized to **its own** wall-clock
+  duration rather than overlaid on a shared absolute time axis — two
+  independently-captured runs have unrelated monotonic clock origins and
+  generally different total durations, so a shared-axis overlay would be
+  actively misleading, not just inconvenient. Call-tree-node and system/
+  PMU-metric comparison are a deliberately scoped-out follow-up (see
+  `src/gui/comparison.py`'s own docstring) — each would need its own
+  matching scheme and hierarchical/typed diff rendering, roughly
+  doubling this feature's size for comparatively narrower value than the
+  function-level and bucket-level views already deliver.
+- **Export**: "Export report" (JSON — the full comparison, noise-floor
+  disclosure included) and "Export CSV" (the function/kernel table),
+  both on the Compare tab's own toolbar.
 
 ### Verification status
 
@@ -3931,3 +4052,18 @@ status notes and §13's Known Limitations for what's independently
 confirmed on real hardware vs. compile-checked only; the GUI itself
 doesn't add or remove any of those caveats, it only renders the same
 `Trace` data the TUI does.
+
+Timeline exploration, Tables, and Comparison mode (above) were built with
+real synthesized-input tests (`QTest.mouseMove`/`mouseClick`/`qWait`
+against the actual QML, not property-only checks) in addition to Python-
+level unit tests for the underlying model/matching logic, plus a real
+subprocess launch (`tests/test_gui_compare_launch.py`) of `hprofiler gui
+a.json --compare b.json` for the populated-Compare-tab case specifically
+(the shared-engine test class used for every other GUI-interaction test
+in this project can only ever hold one trace pairing for its whole
+process lifetime, so a second, different trace_a/trace_b pairing
+genuinely needs a separate process). Along the way this also found and
+fixed one real, previously-latent rendering bug: a comparison row's
+status text (e.g. "regressed") overlapped its own colored status dot,
+confirmed via a direct before/after screenshot comparison, not caught by
+any property-level check.

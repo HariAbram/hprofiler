@@ -36,6 +36,7 @@ from src.ui.app import (
     _diagnose, _top_findings, _bottleneck_analysis, _mini_row, _source_snippet,
     _has_roofline_data, _trace_wall_ns,
 )
+from src.analysis import dashboard as dash
 
 
 def _span(pid, tid, cat, start_ns, dur_ns, name, tags=None):
@@ -79,6 +80,33 @@ class _HostApp(App):
 
     def compose(self) -> ComposeResult:
         yield self._widget
+
+
+# ── new fmt_* helpers (cross-tab-navigation/table-upgrade round) ────────────
+
+class TestNewFormatHelpers(unittest.TestCase):
+    def test_fmt_count_groups_thousands(self):
+        self.assertEqual(dash.fmt_count(1234567), "1,234,567")
+        self.assertEqual(dash.fmt_count(42), "42")
+        self.assertEqual(dash.fmt_count(0), "0")
+
+    def test_fmt_pct_default_and_custom_digits(self):
+        self.assertEqual(dash.fmt_pct(12.345), "12.3%")
+        self.assertEqual(dash.fmt_pct(12.345, digits=0), "12%")
+
+    def test_fmt_bandwidth_gbs_tiers(self):
+        self.assertEqual(dash.fmt_bandwidth_gbs(0.5), "500 MB/s")
+        self.assertEqual(dash.fmt_bandwidth_gbs(155.5), "155.5 GB/s")
+        self.assertEqual(dash.fmt_bandwidth_gbs(2000), "2.00 TB/s")
+
+    def test_fmt_signed_ns_keeps_direction(self):
+        self.assertEqual(dash.fmt_signed_ns(500_000), "+500.0µs")
+        self.assertEqual(dash.fmt_signed_ns(-500_000), "-500.0µs")
+        self.assertEqual(dash.fmt_signed_ns(0), "+0ns")
+
+    def test_fmt_signed_pct_keeps_direction(self):
+        self.assertEqual(dash.fmt_signed_pct(12.3), "+12.3%")
+        self.assertEqual(dash.fmt_signed_pct(-12.3), "-12.3%")
 
 
 # ── _bottleneck_analysis ────────────────────────────────────────────────────

@@ -60,6 +60,39 @@ class TestLaunchGuiDisasmThreading(unittest.TestCase):
         self.assertNotIn("--disasm", argv)
 
 
+class TestLaunchGuiComparePath(unittest.TestCase):
+    """`--compare TRACE_B` (Phase C) threading, mirroring the disasm
+    tests above -- same real-bug-class concern: a flag accepted by the
+    CLI silently not reaching the subprocess argv."""
+
+    def _run(self, **kwargs):
+        from src.gui.launch import launch_gui
+        with patch("src.gui.launch.check_x11", return_value=_available()), \
+             patch("src.gui.launch.subprocess.run") as mock_run, \
+             patch.dict("sys.modules", {"PySide6": MagicMock()}):
+            mock_run.return_value = MagicMock(returncode=0)
+            launch_gui("/tmp/trace.json", **kwargs)
+        return mock_run.call_args.args[0]
+
+    def test_compare_path_appended_when_given(self):
+        argv = self._run(compare_path="/tmp/trace_b.json")
+        self.assertIn("--compare", argv)
+        self.assertIn("/tmp/trace_b.json", argv)
+        self.assertEqual(argv[argv.index("--compare") + 1], "/tmp/trace_b.json")
+
+    def test_compare_absent_when_not_given(self):
+        argv = self._run()
+        self.assertNotIn("--compare", argv)
+
+    def test_compare_positioned_before_disasm(self):
+        # test_disasm_flag_appended_to_subprocess_argv_when_true above
+        # hard-asserts argv[-1] == "--disasm" -- --compare must never
+        # land after it.
+        argv = self._run(compare_path="/tmp/trace_b.json", disasm=True)
+        self.assertEqual(argv[-1], "--disasm")
+        self.assertLess(argv.index("--compare"), argv.index("--disasm"))
+
+
 class TestLaunchGuiFallback(unittest.TestCase):
     def test_no_x11_skips_subprocess_entirely(self):
         from src.gui.launch import launch_gui

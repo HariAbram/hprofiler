@@ -20,10 +20,10 @@ import json
 from typing import Any
 
 from PySide6.QtCore import QObject, Property, Signal, Slot
-from PySide6.QtGui import QGuiApplication
 
 from ..core.trace import Trace
 from ..analysis import dashboard as dash
+from . import clipboard
 
 
 def _field(label: str, value: str, kind: str = "measured", reason: str = "") -> dict[str, str]:
@@ -155,7 +155,11 @@ class InspectorBridge(QObject):
                 "no roofline data for this trace" if not self._roofline.available
                 else "no matching kernel in the roofline data"))
 
-        if _node_in_tree(self._call_tree.roots, category, name):
+        # allRoots, NOT roots -- the table-upgrade round made `roots` a
+        # live, filterable view (CallTreeBridge.setFilter()); querying
+        # that instead would mean an unrelated Call Tree text filter
+        # could silently flip this relationship to "unavailable".
+        if _node_in_tree(self._call_tree.allRoots, category, name):
             relationships.append(_field("Call Tree", "appears in the call tree"))
         else:
             relationships.append(_field(
@@ -189,9 +193,7 @@ class InspectorBridge(QObject):
 
     @Slot(str)
     def copyToClipboard(self, text: str) -> None:
-        clipboard = QGuiApplication.clipboard()
-        if clipboard is not None:
-            clipboard.setText(text)
+        clipboard.copy_text(text)
 
     @Slot(str, result=bool)
     def exportTo(self, path: str) -> bool:

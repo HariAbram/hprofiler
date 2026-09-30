@@ -1,17 +1,133 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import Hprofiler 1.0
 import "screens"
 import "components"
 
 ApplicationWindow {
     id: window
-    width: 1280
-    height: 800
+    x: Workspace.hasSavedGeometry ? Workspace.windowX : (Screen.width - width) / 2
+    y: Workspace.hasSavedGeometry ? Workspace.windowY : (Screen.height - height) / 2
+    width: Workspace.hasSavedGeometry ? Workspace.windowWidth : 1280
+    height: Workspace.hasSavedGeometry ? Workspace.windowHeight : 800
+    visibility: Workspace.hasSavedGeometry && Workspace.windowMaximized
+                ? ApplicationWindow.Maximized : ApplicationWindow.Windowed
     visible: true
     title: "hprofiler — " + AppInfo.commandLine
     color: AppTheme.background
+
+    // Persist geometry on every resize/move, and once more on close --
+    // deliberately NOT throttled/debounced: these are cheap QSettings
+    // writes (a handful of ints), not per-frame work, and saving on
+    // every change (not just close) means a hard kill (SIGKILL, a crash)
+    // still leaves the LAST known-good geometry on disk rather than
+    // whatever was there from the session before.
+    function saveGeometry() {
+        Workspace.saveWindowGeometry(window.x, window.y, window.width, window.height,
+                                      window.visibility === ApplicationWindow.Maximized)
+    }
+    onXChanged: saveGeometry()
+    onYChanged: saveGeometry()
+    onWidthChanged: saveGeometry()
+    onHeightChanged: saveGeometry()
+    onVisibilityChanged: saveGeometry()
+    onClosing: saveGeometry()
+
+    // ── Menu bar + global shortcuts ─────────────────────────────────────
+    // Sequences read from Shortcuts (src/gui/shortcuts.py's SHORTCUTS
+    // table), never re-typed here -- the Help > Keyboard Shortcuts
+    // dialog renders that exact same table, so the two can never
+    // disagree about what key does what.
+    menuBar: MenuBar {
+        Menu {
+            title: "File"
+            MenuItem {
+                // "\t<sequence>" -- the standard Qt convention for a
+                // right-aligned shortcut hint in a menu item; used
+                // instead of MenuItem's own `shortcut` property, which
+                // this build's QtQuick.Controls style doesn't expose
+                // ("Cannot assign to non-existent property" at QML load
+                // time, confirmed directly, not assumed) -- the actual
+                // key handling still comes from the real Shortcut{}
+                // items below, this is purely the visual hint text.
+                text: "Open Profile…\t" + Shortcuts.openProfileSequence
+                onTriggered: openProfileDialog.open()
+            }
+            MenuSeparator {}
+            MenuItem {
+                text: "Reset Current View"
+                onTriggered: Workspace.resetCurrentView(App.tracePath)
+            }
+            MenuItem {
+                text: "Reset All UI Settings…"
+                onTriggered: resetAllConfirmDialog.open()
+            }
+        }
+        Menu {
+            title: "View"
+            MenuItem {
+                text: "Command Palette\t" + Shortcuts.commandPaletteSequence
+                onTriggered: commandPalette.open()
+            }
+        }
+        Menu {
+            title: "Help"
+            MenuItem {
+                text: "Keyboard Shortcuts\t" + Shortcuts.shortcutsReferenceSequence
+                onTriggered: shortcutsDialog.open()
+            }
+            MenuItem {
+                text: "Open Log File"
+                onTriggered: App.openLogFile()
+            }
+        }
+    }
+
+    Shortcut {
+        sequence: Shortcuts.commandPaletteSequence
+        onActivated: commandPalette.open()
+    }
+    Shortcut {
+        sequence: Shortcuts.openProfileSequence
+        onActivated: openProfileDialog.open()
+    }
+    Shortcut {
+        sequence: Shortcuts.shortcutsReferenceSequence
+        onActivated: shortcutsDialog.open()
+    }
+
+    CommandPalette {
+        id: commandPalette
+    }
+
+    OpenProfileFileDialog {
+        id: openProfileDialog
+    }
+
+    ShortcutsDialog {
+        id: shortcutsDialog
+    }
+
+    Dialog {
+        id: resetAllConfirmDialog
+        objectName: "resetAllConfirmDialog"
+        title: "Reset All UI Settings?"
+        modal: true
+        standardButtons: Dialog.Yes | Dialog.No
+        anchors.centerIn: parent ? Overlay.overlay : undefined
+        onAccepted: Workspace.resetAll()
+
+        Text {
+            text: "This clears window geometry, theme, table configuration,\n" +
+                  "and every saved profile's filters/bookmarks/zoom state.\n" +
+                  "This cannot be undone."
+            color: AppTheme.textMuted
+            font.pixelSize: AppTheme.typeLabel
+            wrapMode: Text.WordWrap
+        }
+    }
 
     // ── Top bar: app name + command (left), tab strip (right below) ────
     header: ColumnLayout {
@@ -41,11 +157,14 @@ ApplicationWindow {
                     elide: Text.ElideRight
                 }
                 ToolButton {
+                    objectName: "themeToggleButton"
                     text: AppTheme.dark ? "☀" : "☾"
                     font.pixelSize: 16
                     onClicked: AppTheme.toggle()
                     ToolTip.visible: hovered
                     ToolTip.text: "Toggle light/dark theme"
+                    Accessible.name: "Toggle theme"
+                    Accessible.description: "Switches between light and dark color themes"
                 }
             }
         }
@@ -84,6 +203,7 @@ ApplicationWindow {
             TabButton { text: "7 Source" }
             TabButton { text: "8 System" }
             TabButton { text: "9 Profile" }
+            TabButton { text: "10 Compare" }
         }
     }
 
@@ -119,6 +239,7 @@ ApplicationWindow {
             Loader { objectName: "tabLoader6"; active: stack.currentIndex === 6 || item !== null; sourceComponent: sourceComp }
             Loader { objectName: "tabLoader7"; active: stack.currentIndex === 7 || item !== null; sourceComponent: systemComp }
             Loader { objectName: "tabLoader8"; active: stack.currentIndex === 8 || item !== null; sourceComponent: profileComp }
+            Loader { objectName: "tabLoader9"; active: stack.currentIndex === 9 || item !== null; sourceComponent: compareComp }
         }
 
         InspectorPanel {
@@ -136,6 +257,78 @@ ApplicationWindow {
     Component { id: sourceComp; SourceScreen {} }
     Component { id: systemComp; SystemScreen {} }
     Component { id: profileComp; ProfileScreen {} }
+    Component { id: compareComp; CompareScreen {} }
+
+    // ── "Open Profile" overlay ──────────────────────────────────────────
+    // Non-blocking: this window's own content underneath is completely
+    // untouched (never hidden, never a Loader gate) the entire time --
+    // "Open Profile" always spawns a genuinely new OS process (see
+    // controller.py's module docstring for why: a second Controls-
+    // loading QQmlApplicationEngine corrupts Controls resolution in this
+    // PySide6 build), and this window only ever closes itself once that
+    // new process signals it's actually showing something. A failure
+    // there leaves this workspace exactly as it was -- visually, not
+    // just architecturally.
+    Item {
+        id: openProfileOverlay
+        objectName: "openProfileOverlay"
+        anchors.fill: parent
+        z: 1000
+        visible: state !== "idle"
+        property string state: "idle"   // idle | opening | error
+        property var lastError: ({})
+
+        Rectangle {
+            anchors.fill: parent
+            color: AppTheme.scrimColor
+            opacity: 0.55
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: 480
+            height: openProfileOverlay.state === "error" ? 320 : 160
+            radius: AppTheme.radiusPanel
+            color: AppTheme.surface
+            border.color: AppTheme.panelBorder
+            border.width: 1
+
+            ScreenState {
+                anchors.fill: parent
+                anchors.margins: AppTheme.spacingLg
+                state: openProfileOverlay.state === "opening" ? "loading"
+                       : openProfileOverlay.state === "error" ? "error" : "ready"
+                loadingMessage: "Opening new profile…"
+                errorMessage: openProfileOverlay.lastError.message || ""
+                errorDetail: openProfileOverlay.lastError.detail || ""
+                errorTracebackText: openProfileOverlay.lastError.tracebackText || ""
+                errorStage: openProfileOverlay.lastError.stage || ""
+                errorFile: openProfileOverlay.lastError.file || ""
+            }
+
+            Button {
+                objectName: "openProfileOverlayDismiss"
+                visible: openProfileOverlay.state === "error"
+                anchors.bottom: parent.bottom
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottomMargin: AppTheme.spacingSm
+                flat: true
+                text: "Dismiss"
+                onClicked: openProfileOverlay.state = "idle"
+                Accessible.name: "Dismiss"
+                Accessible.description: "Closes this error message; your current profile is unaffected"
+            }
+        }
+    }
+
+    Connections {
+        target: App
+        function onProfileOpening() { openProfileOverlay.state = "opening" }
+        function onProfileOpenFailed(err) {
+            openProfileOverlay.lastError = err
+            openProfileOverlay.state = "error"
+        }
+    }
 
     // ── Footer ───────────────────────────────────────────────────────────
     footer: Rectangle {

@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Hprofiler 1.0
+import "../components"
 
 // Paraver-style Gantt view -- the QML/Canvas counterpart of the TUI's
 // TimelineWidget (src/ui/app.py). Real vector rectangles at whatever
@@ -159,6 +160,29 @@ Item {
         clampViewStart()
     }
 
+    // Search "next/previous match" (Phase B4) jump: pans (does NOT zoom,
+    // unlike zoomToSpan/double-click -- stepping through matches
+    // shouldn't also yank the zoom level around) to center the match at
+    // the CURRENT zoom, scrolls its row into view (rowIndexForLane(), not
+    // the raw laneIndex -- the row may sit under a group header now), and
+    // sets hover state so the connector overlay highlights it the same
+    // way a real mouse hover would.
+    function jumpToMatch(match) {
+        if (!match || match.laneIndex === undefined) return
+        viewStartNs = match.startNs - visibleNs / 2.0
+        clampViewStart()
+        var rowPos = TimelineModel.rowIndexForLane(match.laneIndex)
+        if (rowPos >= 0) flick.positionViewAtIndex(rowPos, ListView.Contain)
+        var detail = TimelineModel.spanAt(match.laneIndex, match.spanIdx)
+        if (detail.name) {
+            root.hoverLane = match.laneIndex
+            root.hoverSpanIdx = match.spanIdx
+            root.hoverText = detail.name + "  @" + root.fmtNs(detail.startNs) +
+                             "  dur " + root.fmtNs(detail.durNs)
+        }
+        overlay.requestPaint()
+    }
+
     // Covers a selection click ON this screen itself (see the pan/zoom
     // MouseArea's onClicked below, which calls Nav.selectFunction) --
     // onVisibleChanged above handles the "selected elsewhere, THEN
@@ -232,6 +256,20 @@ Item {
                 font.pixelSize: AppTheme.typeLabel
             }
             Item { Layout.fillWidth: true }
+            TimelineFilterBar {
+                id: filterBar
+                objectName: "timelineFilterBar"
+            }
+            TimelineViewControls {
+                id: viewControls
+                objectName: "timelineViewControls"
+            }
+            TimelineSearchBar {
+                id: searchBar
+                objectName: "timelineSearchBar"
+                onMatchJumped: (match) => root.jumpToMatch(match)
+            }
+            Item { Layout.fillWidth: true }
             RowLayout {
                 visible: root.hasSyncOverlay
                 spacing: AppTheme.spacingXs
@@ -251,41 +289,133 @@ Item {
             RowLayout {
                 spacing: 2
                 ToolButton {
+                    objectName: "timelineZoomOutButton"
                     text: "−"
                     implicitWidth: AppTheme.iconButtonWidth
                     implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.zoomAtFraction(0.8, 0.5); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Zoom out (-)"
+                    Accessible.name: "Zoom out"
+                    Accessible.description: "Zooms the Timeline out, centered on the current view"
                 }
                 ToolButton {
+                    objectName: "timelineZoomInButton"
                     text: "+"
                     implicitWidth: AppTheme.iconButtonWidth
                     implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.zoomAtFraction(1.25, 0.5); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Zoom in (+)"
+                    Accessible.name: "Zoom in"
+                    Accessible.description: "Zooms the Timeline in, centered on the current view"
                 }
                 ToolButton {
+                    objectName: "timelineFitButton"
                     text: "Fit"
                     implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.resetView(); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Fit entire trace"
+                    Accessible.name: "Fit entire trace"
+                    Accessible.description: "Zooms and pans so the whole trace duration is visible"
                 }
                 ToolButton {
+                    objectName: "timelineResetButton"
                     text: "Reset"
                     implicitHeight: AppTheme.buttonHeight
                     onClicked: { root.resetView(); root.forceActiveFocus() }
                     ToolTip.visible: hovered
                     ToolTip.text: "Reset view (0)"
+                    Accessible.name: "Reset view"
+                    Accessible.description: "Resets zoom and pan to the full trace view"
                 }
             }
             Text {
-                text: "wheel: zoom@cursor · drag: pan · dbl-click event: zoom to it · arrows/+/-/Home/End/0: keyboard"
+                text: "wheel: zoom@cursor · drag: pan · shift-drag: select range · dbl-click event: zoom to it · arrows/+/-/Home/End/0: keyboard"
                 color: AppTheme.textMuted
                 font.pixelSize: AppTheme.typeCaption
             }
+        }
+
+        // ── Bookmarks / named ranges / bucket legend row ────────────────
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 20
+            Layout.maximumHeight: 20
+            spacing: AppTheme.spacingSm
+
+            ToolButton {
+                objectName: "timelineAddBookmarkButton"
+                text: "+ Bookmark"
+                implicitHeight: AppTheme.buttonHeight
+                onClicked: TimelineModel.addBookmark(root.viewStartNs + root.visibleNs / 2, "")
+                ToolTip.visible: hovered
+                ToolTip.text: "Bookmark the center of the current view"
+            }
+            ToolButton {
+                objectName: "timelineAddRangeButton"
+                text: "+ Range"
+                implicitHeight: AppTheme.buttonHeight
+                enabled: Nav.selectedTimeRange.startNs !== undefined
+                onClicked: {
+                    var r = Nav.selectedTimeRange
+                    TimelineModel.addNamedRange(r.startNs, r.endNs, "")
+                }
+                ToolTip.visible: hovered
+                ToolTip.text: enabled ? "Save the selected time range" : "Shift-drag on the lanes area to select a range first"
+            }
+            Repeater {
+                model: TimelineModel.bookmarks
+                delegate: RowLayout {
+                    spacing: 2
+                    Rectangle { width: 8; height: 8; radius: 4; color: AppTheme.warningColor }
+                    Text {
+                        text: modelData.name
+                        color: AppTheme.textMuted
+                        font.pixelSize: AppTheme.typeCaption
+
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Bookmark: " + modelData.name
+                        Accessible.description: "Click to jump the view to this bookmark; right-click to remove it"
+                        Accessible.onPressAction: {
+                            root.viewStartNs = modelData.ns - root.visibleNs / 2
+                            root.clampViewStart()
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.LeftButton | Qt.RightButton
+                            onClicked: (mouse) => {
+                                if (mouse.button === Qt.RightButton) TimelineModel.removeBookmark(modelData.id)
+                                else { root.viewStartNs = modelData.ns - root.visibleNs / 2; root.clampViewStart() }
+                            }
+                        }
+                    }
+                }
+            }
+            Item { Layout.fillWidth: true }
+            BucketLegend {
+                visible: TimelineModel.colorMode === "bucket"
+            }
+        }
+
+        // ── Time ruler ───────────────────────────────────────────────────
+        TimeRuler {
+            id: timeRuler
+            objectName: "timelineRuler"
+            Layout.fillWidth: true
+            Layout.preferredHeight: 26
+            Layout.maximumHeight: 26
+            Layout.leftMargin: root.labelWidth
+            Layout.rightMargin: 14
+            viewStartNs: root.viewStartNs
+            visibleNs: root.visibleNs
+            bookmarks: TimelineModel.bookmarks
+            namedRanges: TimelineModel.namedRanges
+            selectedRange: Nav.selectedTimeRange
+            onBookmarkClicked: (ns) => { root.viewStartNs = ns - root.visibleNs / 2; root.clampViewStart() }
+            onBookmarkRemoveRequested: (id) => TimelineModel.removeBookmark(id)
         }
 
         // ── Lanes ────────────────────────────────────────────────────────
@@ -298,15 +428,27 @@ Item {
             radius: AppTheme.radiusPanel
             clip: true
 
-            Flickable {
+            // ListView, not a plain Flickable+Column+Repeater -- only
+            // instantiates delegates near the viewport (+ a small cache
+            // margin), recycling them while scrolling, instead of
+            // building a Canvas for every lane unconditionally regardless
+            // of whether it's ever visible (a real perf risk already for
+            // a many-rank MPI trace, independent of the table-upgrade/
+            // grouping round this was built alongside). `rows`, not
+            // `lanes` directly: TimelineModel.rows is the NEW visual row
+            // list (group headers + filtered/ordered/hidden-aware lane
+            // references) -- each "lane" row still carries its own
+            // original `laneIndex`, so visibleSpans()/spanAt() calls
+            // below are completely unaffected by this switch.
+            ListView {
                 id: flick
                 objectName: "timelineFlick"
                 anchors.fill: parent
                 anchors.margins: 1
                 anchors.rightMargin: 13
                 anchors.bottomMargin: 13
-                contentHeight: laneColumn.height
                 boundsBehavior: Flickable.StopAtBounds
+                model: TimelineModel.rows
 
                 // Real lanes (rows), for a trace with more of them than
                 // fit the window -- Flickable already supported this
@@ -320,40 +462,222 @@ Item {
                 // (Flickable's native drag-to-scroll vs. the pan
                 // MouseArea's drag-to-pan-in-time) fighting each other.
                 ScrollBar.vertical: ScrollBar {
-                    policy: TimelineModel.lanes.length * root.rowHeight > flick.height
+                    policy: TimelineModel.rows.length * root.rowHeight > flick.height
                             ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
                 }
 
-                Column {
-                    id: laneColumn
+                delegate: Loader {
+                    id: rowLoader
                     width: flick.width
+                    height: root.rowHeight
+                    // Explicit properties, not relying on modelData/index
+                    // propagating implicitly into a Component instantiated
+                    // via sourceComponent -- a Component's creation context
+                    // follows where it was DECLARED, not where the Loader
+                    // that instantiates it happens to sit, so the loaded
+                    // item can't reliably see the delegate's own context
+                    // properties by bare name. Every loaded component below
+                    // reads `parent.rowData`/`parent.rowPos` instead (the
+                    // Loader IS the loaded item's parent) -- same
+                    // "always id/parent-qualify, never rely on implicit
+                    // nested-scope resolution" lesson as laneCanvas's own
+                    // laneIndex property further down.
+                    property var rowData: modelData
+                    property int rowPos: index
+                    sourceComponent: rowData.kind === "group" ? groupRowComponent : laneRowComponent
+                }
 
-                    Repeater {
-                        model: TimelineModel.lanes
-                        delegate: Item {
-                            width: laneColumn.width
-                            height: root.rowHeight
+                // ── Group header row (Phase B3): label + lane count +
+                // aggregated count, click-to-collapse/expand, and (only
+                // while collapsed) a coverage strip standing in for the
+                // member lanes' own bars -- "show meaningful aggregated
+                // activity when collapsed" from the Timeline requirements.
+                Component {
+                    id: groupRowComponent
+                    Item {
+                        id: groupRow
+                        property var rowData: parent.rowData
+                        width: parent.width
+                        height: parent.height
+
+                        Rectangle {
+                            anchors.fill: parent
+                            color: groupMouse.containsMouse ? AppTheme.panelBorder : AppTheme.background
+
+                            Accessible.role: Accessible.Button
+                            Accessible.name: (groupRow.rowData.collapsed ? "Expand " : "Collapse ") + groupRow.rowData.label
+                            Accessible.description: "Toggles whether the \"" + groupRow.rowData.label + "\" lane group is collapsed"
+                            Accessible.onPressAction: TimelineModel.setGroupCollapsed(
+                                groupRow.rowData.groupId, !groupRow.rowData.collapsed)
+                        }
+
+                        RowLayout {
+                            x: AppTheme.spacingXs
+                            width: root.labelWidth - AppTheme.spacingXs
+                            height: parent.height
+                            spacing: AppTheme.spacingXs
+                            Text {
+                                text: groupRow.rowData.collapsed ? "▸" : "▾"
+                                color: AppTheme.textMuted
+                                font.pixelSize: AppTheme.typeLabel
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                text: groupRow.rowData.label + "  (" + groupRow.rowData.laneCount + ")"
+                                color: AppTheme.text
+                                font.bold: true
+                                font.pixelSize: AppTheme.typeLabel
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        Canvas {
+                            id: coverageCanvas
+                            objectName: "groupCoverage_" + groupRow.rowData.groupId
+                            visible: groupRow.rowData.collapsed
+                            x: root.labelWidth
+                            width: parent.width - root.labelWidth
+                            height: parent.height
+                            property real boundZoom: root.zoom
+                            property real boundStart: root.viewStartNs
+                            onBoundZoomChanged: if (visible) requestPaint()
+                            onBoundStartChanged: if (visible) requestPaint()
+                            onVisibleChanged: if (visible) requestPaint()
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.reset()
+                                if (!visible || width <= 0) return
+                                var nBuckets = Math.max(1, Math.floor(width / 3))
+                                var cov = TimelineModel.groupCoverage(
+                                    groupRow.rowData.laneIndexes, root.viewStartNs,
+                                    root.viewStartNs + root.visibleNs, nBuckets)
+                                var bw = width / nBuckets
+                                ctx.fillStyle = AppTheme.accent
+                                for (var i = 0; i < cov.length; i++) {
+                                    if (cov[i] <= 0) continue
+                                    ctx.globalAlpha = 0.35 + 0.45 * cov[i]
+                                    ctx.fillRect(i * bw, 4, Math.max(1, bw), height - 8)
+                                }
+                                ctx.globalAlpha = 1.0
+                            }
+                        }
+
+                        Text {
+                            visible: !groupRow.rowData.collapsed
+                            x: root.labelWidth + AppTheme.spacingSm
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: groupRow.rowData.filteredCount !== groupRow.rowData.count
+                                  ? groupRow.rowData.filteredCount + "/" + groupRow.rowData.count + " events"
+                                  : groupRow.rowData.count + " events"
+                            color: AppTheme.textMuted
+                            font.pixelSize: AppTheme.typeCaption
+                        }
+
+                        MouseArea {
+                            id: groupMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: TimelineModel.setGroupCollapsed(
+                                groupRow.rowData.groupId, !groupRow.rowData.collapsed)
+                        }
+                    }
+                }
+
+                Component {
+                    id: laneRowComponent
+                    Item {
+                        id: laneRow
+                        property var rowData: parent.rowData
+                        width: parent.width
+                        height: parent.height
 
                             Text {
+                                id: laneLabel
                                 width: root.labelWidth
                                 height: parent.height
                                 verticalAlignment: Text.AlignVCenter
-                                text: modelData.label + "  (" + modelData.count + ")"
-                                color: modelData.color
+                                text: laneRow.rowData.label + "  (" +
+                                      (laneRow.rowData.filteredCount !== laneRow.rowData.count
+                                       ? laneRow.rowData.filteredCount + "/" + laneRow.rowData.count
+                                       : laneRow.rowData.count) + ")"
+                                color: laneRow.rowData.filteredCount === 0 ? AppTheme.textMuted : laneRow.rowData.color
                                 font.bold: true
                                 font.pixelSize: AppTheme.typeLabel
                                 elide: Text.ElideRight
                                 leftPadding: AppTheme.spacingSm
+
+                                // Right-click: per-lane hide/isolate -- a
+                                // per-ROW action, distinct from
+                                // TimelineViewControls' screen-level
+                                // grouping/show-all-lanes controls.
+                                MouseArea {
+                                    anchors.fill: parent
+                                    acceptedButtons: Qt.RightButton
+                                    onClicked: laneContextMenu.open()
+                                }
+                                Popup {
+                                    id: laneContextMenu
+                                    objectName: "laneContextMenu_" + laneRow.rowData.laneIndex
+                                    y: laneLabel.height
+                                    width: 160
+                                    modal: false
+                                    focus: true
+                                    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutsideParent
+                                    background: Rectangle {
+                                        color: AppTheme.surface
+                                        border.color: AppTheme.panelBorder
+                                        border.width: 1
+                                        radius: AppTheme.radiusPanel
+                                    }
+                                    Column {
+                                        width: parent.width
+                                        Button {
+                                            width: parent.width
+                                            flat: true
+                                            text: "Hide this lane"
+                                            onClicked: {
+                                                TimelineModel.hideLane(laneRow.rowData.name)
+                                                laneContextMenu.close()
+                                            }
+                                        }
+                                        Button {
+                                            width: parent.width
+                                            flat: true
+                                            text: "Isolate this lane"
+                                            onClicked: {
+                                                TimelineModel.isolateLane(laneRow.rowData.name)
+                                                laneContextMenu.close()
+                                            }
+                                        }
+                                        Button {
+                                            width: parent.width
+                                            flat: true
+                                            enabled: TimelineModel.hiddenLanes.length > 0 || TimelineModel.isolatedLanes.length > 0
+                                            text: "Show all lanes"
+                                            onClicked: {
+                                                TimelineModel.showAllLanes()
+                                                laneContextMenu.close()
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             Canvas {
                                 id: laneCanvas
-                                objectName: "laneCanvas_" + index
+                                objectName: "laneCanvas_" + laneRow.rowData.laneIndex
                                 x: root.labelWidth
                                 width: parent.width - root.labelWidth
                                 height: parent.height
-                                property int laneIndex: index
-                                property string laneName: modelData.name
+                                // laneRow.rowData.laneIndex, NOT the bare
+                                // ListView `index`/rowPos -- a row's visual
+                                // position and its underlying lane's real
+                                // index diverge once grouping/hiding/
+                                // reordering are in play (B3), and every
+                                // visibleSpans()/spanAt() call below needs
+                                // the latter, stable one.
+                                property int laneIndex: laneRow.rowData.laneIndex
+                                property string laneName: laneRow.rowData.name
                                 property var cachedSpans: []
                                 property real boundZoom: root.zoom
                                 property real boundStart: root.viewStartNs
@@ -404,6 +728,22 @@ Item {
                                     onTriggered: laneCanvas.requestPaint()
                                 }
 
+                                // Search query/cursor changes and color-mode toggles
+                                // (Phase B4) don't move boundZoom/boundStart, so they
+                                // need their own repaint trigger -- a direct signal
+                                // connection, not a dirty-checked property, since e.g. a
+                                // query change that happens to keep the same match COUNT
+                                // (different matches, same total) would otherwise be missed.
+                                Connections {
+                                    target: TimelineModel
+                                    function onSearchChanged() {
+                                        if (!repaintThrottle.running) repaintThrottle.start()
+                                    }
+                                    function onColorModeChanged() {
+                                        if (!repaintThrottle.running) repaintThrottle.start()
+                                    }
+                                }
+
                                 // Shared by both the lane's own spans and the sync
                                 // overlay below -- fills `spans` left-to-right with
                                 // the same gap-aware 1px floor (see the comment this
@@ -438,6 +778,27 @@ Item {
                                     ctx.globalAlpha = 1.0
                                 }
 
+                                // Outlines every span visibleSpans() marked "matched"
+                                // (only present while a search is active, see
+                                // TimelineModel.search()'s docstring) -- a thin accent-
+                                // colored stroke on top of the normal fill, so a match
+                                // reads as highlighted without hiding its own color.
+                                function _paintMatchHighlights(ctx, spans, scale) {
+                                    var viewEndNs = root.viewStartNs + root.visibleNs
+                                    ctx.strokeStyle = AppTheme.accent
+                                    ctx.lineWidth = 2
+                                    for (var i = 0; i < spans.length; i++) {
+                                        var sp = spans[i]
+                                        if (!sp.matched) continue
+                                        if (sp.startNs + sp.durNs <= root.viewStartNs || sp.startNs >= viewEndNs)
+                                            continue
+                                        var x0 = (sp.startNs - root.viewStartNs) * scale
+                                        var w = Math.max(1, sp.durNs * scale)
+                                        ctx.strokeRect(Math.max(0, x0) + 0.5, 1.5,
+                                                        Math.min(w, width - x0) - 1, height - 3)
+                                    }
+                                }
+
                                 onPaint: {
                                     var ctx = getContext("2d")
                                     ctx.reset()
@@ -446,6 +807,7 @@ Item {
                                     cachedSpans = spans
                                     var scale = width / root.visibleNs
                                     _paintSpans(ctx, spans, scale, function(sp) { return sp.color }, 1.0)
+                                    _paintMatchHighlights(ctx, spans, scale)
 
                                     // Overlay the paired sync lane's spans ON TOP,
                                     // dimmed, so a barrier/critical-section wait
@@ -533,12 +895,21 @@ Item {
 
                     // ── Connector overlay: spans every lane, draws only
                     // the hovered span's own MPI/NCCL edges ──────────────
+                    // Reparented to flick.contentItem (a ListView's own
+                    // internal scrolling Item, holding every delegate) so
+                    // this stays aligned with the lane rows as the user
+                    // scrolls -- a plain child of the ListView itself
+                    // would stay fixed to the viewport instead, verified
+                    // with an isolated repro (a Rectangle reparented to
+                    // contentItem, contentY moved, scenePos confirmed to
+                    // shift by the same amount) before relying on it here.
                     Canvas {
                         id: overlay
+                        parent: flick.contentItem
                         x: root.labelWidth
                         y: 0
-                        width: laneColumn.width - root.labelWidth
-                        height: TimelineModel.lanes.length * root.rowHeight
+                        width: flick.width - root.labelWidth
+                        height: TimelineModel.rows.length * root.rowHeight
                         z: 10
 
                         onPaint: {
@@ -554,10 +925,21 @@ Item {
                                 if ((c.predSpanIdx !== root.hoverSpanIdx || c.predLane !== root.hoverLane) &&
                                     (c.succSpanIdx !== root.hoverSpanIdx || c.succLane !== root.hoverLane))
                                     continue
+                                // rowIndexForLane(), NOT the raw lane index, as the
+                                // row-position multiplier -- a row's visual position
+                                // and its underlying lane's real index diverge once
+                                // grouping/hiding/isolating/reordering (B3) are in
+                                // play; -1 means that lane isn't currently a visible
+                                // row at all (hidden, filtered out, or collapsed
+                                // inside a group), so its edges simply aren't drawn
+                                // rather than drawn at a wrong/stale position.
+                                var predRow = TimelineModel.rowIndexForLane(c.predLane)
+                                var succRow = TimelineModel.rowIndexForLane(c.succLane)
+                                if (predRow < 0 || succRow < 0) continue
                                 var x0 = (c.predMidNs - root.viewStartNs) * scale
                                 var x1 = (c.succMidNs - root.viewStartNs) * scale
-                                var y0 = c.predLane * root.rowHeight + root.rowHeight / 2
-                                var y1 = c.succLane * root.rowHeight + root.rowHeight / 2
+                                var y0 = predRow * root.rowHeight + root.rowHeight / 2
+                                var y1 = succRow * root.rowHeight + root.rowHeight / 2
                                 ctx.strokeStyle = c.color
                                 ctx.lineWidth = 2
                                 ctx.beginPath()
@@ -570,8 +952,17 @@ Item {
                             }
                         }
                     }
+
+                    // Row POSITIONS (not just which lanes exist) can shift
+                    // under grouping/hide/isolate/collapse/reorder (B3) even
+                    // while a connector is being shown for an already-
+                    // hovered span -- repaint so it never freezes at a
+                    // stale y-position after e.g. a group gets collapsed.
+                    Connections {
+                        target: TimelineModel
+                        function onRowsChanged() { overlay.requestPaint() }
+                    }
                 }
-            }
 
             // ── Zoom (wheel) + pan (drag) ─────────────────────────────────
             // rightMargin/bottomMargin match the Flickable's above --
@@ -579,6 +970,7 @@ Item {
             // (which covers everything else and consumes all drag input
             // for time-panning) never overlaps and steals their clicks.
             MouseArea {
+                objectName: "timelinePanMouseArea"
                 anchors.fill: parent
                 anchors.leftMargin: root.labelWidth
                 anchors.rightMargin: 13
@@ -588,18 +980,36 @@ Item {
 
                 property real dragStartNs: 0
                 property real dragStartX: 0
+                // Shift-drag selects a time range (Nav.selectedTimeRange,
+                // dormant since Round 16 -- feeds TimeRuler's highlighted
+                // band and "+ Range" below) instead of panning -- decided
+                // once at press time from the modifier held THEN, not
+                // re-evaluated mid-drag, so releasing/re-pressing Shift
+                // partway through a drag can't switch modes underneath it.
+                property bool selecting: false
+                property real selectStartNs: 0
 
                 onPressed: (mouse) => {
                     dragStartNs = root.viewStartNs
                     dragStartX = mouse.x
+                    selecting = (mouse.modifiers & Qt.ShiftModifier) !== 0
+                    if (selecting) {
+                        var scale0 = width / root.visibleNs
+                        selectStartNs = root.viewStartNs + mouse.x / scale0
+                    }
                 }
                 onPositionChanged: (mouse) => {
-                    if (pressed) {
-                        var scale = width / root.visibleNs
+                    if (!pressed) return
+                    var scale = width / root.visibleNs
+                    if (selecting) {
+                        var curNs = root.viewStartNs + mouse.x / scale
+                        Nav.selectTimeRange(Math.min(selectStartNs, curNs), Math.max(selectStartNs, curNs))
+                    } else {
                         root.viewStartNs = dragStartNs - (mouse.x - dragStartX) / scale
                         root.clampViewStart()
                     }
                 }
+                onReleased: { selecting = false }
                 // Single click ON a span selects it for cross-tab
                 // navigation (Nav.selectFunction/selectThread), distinct
                 // from the drag-to-pan handled above and the
@@ -612,6 +1022,7 @@ Item {
                 // doesn't use -- see onPositionChanged above).
                 onClicked: (mouse) => {
                     if (Math.abs(mouse.x - dragStartX) > 4) return
+                    if (mouse.modifiers & Qt.ShiftModifier) return
                     if (root.hoverSpanIdx < 0) return
                     var d = TimelineModel.spanAt(root.hoverLane, root.hoverSpanIdx)
                     if (!d.name) return
@@ -703,4 +1114,6 @@ Item {
             }
         }
     }
+
+    TimelineFirstUseOverlay {}
 }

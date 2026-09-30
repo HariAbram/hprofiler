@@ -15,10 +15,23 @@ Column {
 
     property bool expanded: depth < 2   // auto-expand the first couple of levels
 
+    function activate() {
+        root.expanded = !root.expanded
+        // Reachable regardless of recursion depth -- Nav is a
+        // singleton (import Hprofiler 1.0), not resolved through
+        // the visual parent chain the way an ordinary id is.
+        Nav.selectFunction(root.node.category, root.node.name)
+    }
+
     Rectangle {
         width: root.width
         height: AppTheme.rowCompact
         color: rowMouse.containsMouse ? AppTheme.panelBorder : "transparent"
+
+        Accessible.role: Accessible.Button
+        Accessible.name: root.node.name
+        Accessible.description: "Selects " + root.node.name + " and toggles its children"
+        Accessible.onPressAction: root.activate()
 
         RowLayout {
             anchors.fill: parent
@@ -67,13 +80,7 @@ Column {
             id: rowMouse
             anchors.fill: parent
             hoverEnabled: true
-            onClicked: {
-                root.expanded = !root.expanded
-                // Reachable regardless of recursion depth -- Nav is a
-                // singleton (import Hprofiler 1.0), not resolved through
-                // the visual parent chain the way an ordinary id is.
-                Nav.selectFunction(root.node.category, root.node.name)
-            }
+            onClicked: root.activate()
         }
     }
 

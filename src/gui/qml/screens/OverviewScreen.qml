@@ -15,22 +15,6 @@ ScrollView {
     clip: true
     ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-    // English breakdown-bucket labels (see DashboardBridge._compute's
-    // _bucket_of) don't match categoryColor()'s raw category keys
-    // ("cpu","mpi",...) 1:1, so this maps each bucket to the color of
-    // a representative category -- keeps the same hue a user already
-    // associates with e.g. MPI on the Timeline/Profile tabs.
-    function breakdownColor(label) {
-        switch (label) {
-        case "Computation": return AppTheme.categoryColor("cpu")
-        case "Communication": return AppTheme.categoryColor("mpi")
-        case "Synchronization": return AppTheme.categoryColor("sync")
-        case "Memory transfer": return AppTheme.categoryColor("memory")
-        case "Idle": return AppTheme.textMuted
-        default: return AppTheme.textMuted
-        }
-    }
-
     function gotoAction(action) {
         if (action.name && action.name.length > 0) Nav.selectFunction(action.category, action.name)
         Nav.navigateTo(action.tab)
@@ -163,7 +147,7 @@ ScrollView {
                             delegate: Rectangle {
                                 width: breakdownBar.width * modelData.pct / 100
                                 height: breakdownBar.height
-                                color: root.breakdownColor(modelData.label)
+                                color: AppTheme.bucketColor(modelData.label)
                             }
                         }
                     }
@@ -176,7 +160,7 @@ ScrollView {
                         model: Dashboard.timeBreakdown
                         delegate: LegendSwatch {
                             circular: false
-                            swatchColor: root.breakdownColor(modelData.label)
+                            swatchColor: AppTheme.bucketColor(modelData.label)
                             label: modelData.label + "  " + modelData.pct.toFixed(1) + "%  (" + modelData.ns.toLocaleString() + " ns, derived)"
                         }
                     }
@@ -221,6 +205,11 @@ ScrollView {
                         Layout.preferredHeight: AppTheme.buttonHeight
                         color: actionMouse.containsMouse ? AppTheme.panelBorder : "transparent"
                         radius: AppTheme.radiusSmall
+
+                        Accessible.role: Accessible.Button
+                        Accessible.name: modelData.label
+                        Accessible.description: "Navigates to " + modelData.label
+                        Accessible.onPressAction: root.gotoAction(modelData)
 
                         RowLayout {
                             anchors.fill: parent
@@ -312,39 +301,22 @@ ScrollView {
                 }
             }
 
-            // Top bottlenecks
+            // Top bottlenecks -- a real (if deliberately small, at most 4
+            // rows: dash.top_findings() itself caps there) DataTable, not
+            // bespoke styling, so this reuses the same sort/tooltip/copy
+            // chrome as every other table for one consistent look.
             Panel {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                title: "Top bottlenecks"
+                title: ""
 
-                Column {
+                DataTable {
                     anchors.fill: parent
-                    spacing: AppTheme.spacingMd
-
-                    Repeater {
-                        model: Dashboard.topBottlenecks
-                        delegate: Column {
-                            width: parent.width
-                            spacing: AppTheme.spacingXs
-                            RowLayout {
-                                width: parent.width
-                                Text { text: modelData.icon; color: modelData.color; font.bold: true }
-                                Text { text: modelData.label; color: AppTheme.text; font.bold: true }
-                            }
-                            Text {
-                                text: modelData.value
-                                color: modelData.color
-                                font.pixelSize: AppTheme.typeBody
-                                leftPadding: 20
-                            }
-                        }
-                    }
-
-                    EmptyState {
-                        visible: Dashboard.topBottlenecks.length === 0
-                        message: "No actionable findings — looks balanced."
-                    }
+                    title: "Top bottlenecks"
+                    table: Dashboard.findingsTable
+                    compact: true
+                    showFilterField: false
+                    showColumnMenu: false
                 }
             }
 

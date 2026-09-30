@@ -83,6 +83,55 @@ _LIGHT = {
     "accent":       "#0969da",
 }
 
+
+# ── Pure, Qt-free color lookups ─────────────────────────────────────────
+# Same logic as Theme's categoryColor/severityColor/bucketColor/
+# changeColor Slots below, taking `dark: bool` directly instead of
+# reading `self._dark` off a QObject -- lets the GUI's async-loading
+# worker thread (src/gui/loader.py) precompute colors for large per-span
+# structures (Timeline lanes, Call Tree nodes, Flame Graph nodes) without
+# ever touching a QObject from a thread other than the one that owns it,
+# which Qt does not guarantee is safe even for a seemingly-stateless
+# method call. The QObject Slots delegate to these instead of duplicating
+# the logic, so the two can never drift apart.
+def category_color(category: str, dark: bool) -> str:
+    light_dark = _CATEGORY_COLORS.get(category, _CATEGORY_COLORS["other"])
+    return light_dark[0] if dark else light_dark[1]
+
+
+def severity_color(severity: str, dark: bool) -> str:
+    light_dark = _SEVERITY_COLORS.get(severity, _SEVERITY_COLORS["cyan"])
+    return light_dark[0] if dark else light_dark[1]
+
+
+def text_muted_color(dark: bool) -> str:
+    return _DARK["textMuted"] if dark else _LIGHT["textMuted"]
+
+
+_BUCKET_TO_CATEGORY = {
+    "Computation": "cpu", "Communication": "mpi",
+    "Synchronization": "sync", "Memory transfer": "memory",
+    "Runtime overhead": "jit", "Annotation": "nvtx",
+}
+
+
+def bucket_color(bucket: str, dark: bool) -> str:
+    if bucket in ("Idle", "Other"):
+        return text_muted_color(dark)
+    return category_color(_BUCKET_TO_CATEGORY.get(bucket, "other"), dark)
+
+
+_CHANGE_TO_SEVERITY_FAMILY = {
+    "improved": "green", "regressed": "red", "new": "cyan",
+    "removed": "yellow", "unchanged": None, "unavailable": None,
+    "zero": None,
+}
+
+
+def change_color(status: str, dark: bool) -> str:
+    family = _CHANGE_TO_SEVERITY_FAMILY.get(status)
+    return severity_color(family, dark) if family else text_muted_color(dark)
+
 # Non-color layout tokens -- spacing/radius/typography/row/button scales.
 # Unlike the palettes above, these don't vary with the dark/light toggle,
 # so they're plain constants exposed as @Property(int, constant=True)
@@ -170,13 +219,32 @@ class Theme(QObject):
 
     @Slot(str, result=str)
     def categoryColor(self, category: str) -> str:
-        light_dark = _CATEGORY_COLORS.get(category, _CATEGORY_COLORS["other"])
-        return light_dark[0] if self._dark else light_dark[1]
+        return category_color(category, self._dark)
 
     @Slot(str, result=str)
     def severityColor(self, severity: str) -> str:
-        light_dark = _SEVERITY_COLORS.get(severity, _SEVERITY_COLORS["cyan"])
-        return light_dark[0] if self._dark else light_dark[1]
+        return severity_color(severity, self._dark)
+
+    # ── Activity buckets (analysis/activity_buckets.py's BUCKETS) ───────
+    # Computation/Communication/Synchronization/Memory transfer reuse the
+    # SAME category colors OverviewScreen.qml's own breakdownColor()
+    # already mapped them to since Round 16 (cpu/mpi/sync/memory) -- moved
+    # here so Python and QML can't drift into disagreeing about it the way
+    # DashboardBridge's old _bucket_of dict and this slot's absence would
+    # have let them. Runtime overhead/Annotation reuse the jit/nvtx
+    # category colors (already CVD-checked in the Round 15 palette
+    # revision) rather than adding brand-new, unvetted hex values for two
+    # buckets that are thematically close to those categories anyway.
+    @Slot(str, result=str)
+    def bucketColor(self, bucket: str) -> str:
+        return bucket_color(bucket, self._dark)
+
+    # ── Comparison status (src/analysis/compare.py's classify()) ────────
+    # Reuses severityColor()'s existing family palette rather than a new
+    # dict -- one fewer place a future theme edit has to remember to touch.
+    @Slot(str, result=str)
+    def changeColor(self, status: str) -> str:
+        return change_color(status, self._dark)
 
     # ── Semantic severity aliases ───────────────────────────────────────
     # Additive, not a replacement: severityColor()'s "red"/"yellow"/
@@ -279,3 +347,12 @@ class Theme(QObject):
     @Property(int, constant=True)
     def fieldWidth(self) -> int:
         return _FIELD_WIDTH
+
+    # Modal/overlay dimming backdrop (e.g. the "Open Profile" progress/
+    # error overlay in Main.qml) -- plain black regardless of theme (a
+    # dimming scrim reads the same way under either palette; it's the
+    # Rectangle's own `opacity` that does the dimming, not this hex),
+    # constant=True like the layout tokens above, not notify=themeChanged.
+    @Property(str, constant=True)
+    def scrimColor(self) -> str:
+        return "#000000"

@@ -25,6 +25,7 @@ Rectangle {
 
     // ── Collapsed: a thin strip with just a reopen button ──────────────
     ToolButton {
+        objectName: "inspectorReopenButton"
         visible: !Nav.inspectorOpen
         anchors.top: parent.top
         anchors.horizontalCenter: parent.horizontalCenter
@@ -33,6 +34,8 @@ Rectangle {
         onClicked: Nav.toggleInspector()
         ToolTip.visible: hovered
         ToolTip.text: "Open inspector"
+        Accessible.name: "Open inspector"
+        Accessible.description: "Expands the Inspector panel showing details for the current selection"
     }
 
     // ── Expanded content ────────────────────────────────────────────────
@@ -54,11 +57,14 @@ Rectangle {
                 elide: Text.ElideRight
             }
             ToolButton {
+                objectName: "inspectorCollapseButton"
                 text: "▶"
                 implicitWidth: AppTheme.iconButtonWidth
                 onClicked: Nav.toggleInspector()
                 ToolTip.visible: hovered
                 ToolTip.text: "Collapse inspector"
+                Accessible.name: "Collapse inspector"
+                Accessible.description: "Collapses the Inspector panel to a thin strip"
             }
         }
 
