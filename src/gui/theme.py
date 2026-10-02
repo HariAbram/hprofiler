@@ -132,6 +132,28 @@ def change_color(status: str, dark: bool) -> str:
     family = _CHANGE_TO_SEVERITY_FAMILY.get(status)
     return severity_color(family, dark) if family else text_muted_color(dark)
 
+
+# Regression causes (src/analysis/causal_compare.py CAUSES): reuse the
+# activity-bucket and severity palettes -- the measured causes read like
+# the bucket they come from, the graph-derived ones like a warning.
+_CAUSE_TO_BUCKET = {
+    "increased_work": "Computation", "more_invocations": "Runtime overhead",
+    "synchronization": "Synchronization", "communication": "Communication",
+    "queueing": "Memory transfer",
+}
+_CAUSE_TO_SEVERITY = {
+    "lost_overlap": "yellow", "changed_dependency": "cyan", "moved_onto_critical_path": "red",
+    "new_work": "cyan",
+}
+
+
+def cause_color(cause: str, dark: bool) -> str:
+    if cause in _CAUSE_TO_BUCKET:
+        return bucket_color(_CAUSE_TO_BUCKET[cause], dark)
+    if cause in _CAUSE_TO_SEVERITY:
+        return severity_color(_CAUSE_TO_SEVERITY[cause], dark)
+    return text_muted_color(dark)
+
 # Non-color layout tokens -- spacing/radius/typography/row/button scales.
 # Unlike the palettes above, these don't vary with the dark/light toggle,
 # so they're plain constants exposed as @Property(int, constant=True)
@@ -245,6 +267,10 @@ class Theme(QObject):
     @Slot(str, result=str)
     def changeColor(self, status: str) -> str:
         return change_color(status, self._dark)
+
+    @Slot(str, result=str)
+    def causeColor(self, cause: str) -> str:
+        return cause_color(cause, self._dark)
 
     # ── Semantic severity aliases ───────────────────────────────────────
     # Additive, not a replacement: severityColor()'s "red"/"yellow"/

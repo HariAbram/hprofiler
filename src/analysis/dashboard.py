@@ -133,8 +133,9 @@ def fmt_kernel_name(name: str) -> str:
 
 # ── Trace-derived timing helpers ────────────────────────────────────────────
 
-def merged_ns(spans: list) -> int:
-    """Merged-interval sum of span durations — prevents >100% from concurrent streams."""
+def merged_ns(spans) -> int:
+    """Merged-interval sum of span durations — prevents >100% from concurrent
+    streams. Accepts any iterable of spans."""
     ivs = sorted((s.start_ns, s.start_ns + s.duration_ns)
                  for s in spans if s.duration_ns > 0)
     merged = cur_lo = cur_hi = 0
@@ -178,14 +179,68 @@ def bucket_coverage(spans: list, n_buckets: int, view_start: int, view_dur: floa
     return cov
 
 
+def coverage_from_chunks(chunks, n_buckets: int, view_start: int, view_dur: float) -> list[float]:
+    """bucket_coverage() over (start_ns, end_ns) array chunks
+    (TraceStore.interval_arrays), vectorized with numpy -- same values:
+    1.0 where a timed span overlaps the bucket range it spans, 0.2 where a
+    span clipped to nothing (outside the view) lands, else 0.0."""
+    import numpy as np
+    if view_dur <= 0 or n_buckets <= 0:
+        return [0.0] * max(n_buckets, 0)
+    diff = np.zeros(n_buckets + 1, dtype=np.int64)
+    edge = np.zeros(n_buckets, dtype=np.int64)
+    scale = n_buckets / view_dur
+    for starts, ends in chunks:
+        timed = ends > starts
+        if not timed.any():
+            continue
+        x0 = np.clip((starts[timed] - view_start) * scale, 0.0, float(n_buckets))
+        x1 = np.clip((ends[timed] - view_start) * scale, 0.0, float(n_buckets))
+        wide = x1 > x0
+        i0 = x0[wide].astype(np.int64)
+        i1 = np.minimum(x1[wide].astype(np.int64), n_buckets - 1)
+        np.add.at(diff, i0, 1)
+        np.add.at(diff, i1 + 1, -1)
+        np.add.at(edge, np.minimum(x0[~wide].astype(np.int64), n_buckets - 1), 1)
+    full = np.cumsum(diff[:n_buckets]) > 0
+    return np.where(full, 1.0, np.where(edge > 0, 0.2, 0.0)).tolist()
+
+
 def trace_wall_ns(trace: Any) -> int:
     """Derive wall time from span timestamps (works for live runs and JSON-loaded traces)."""
-    timed = [s for s in trace.spans if s.duration_ns > 0]
-    if not timed:
+    ext = trace.store.span_extent(timed_only=True)
+    if ext is None:
         return trace.duration_ns or 1
-    span_end   = max(s.start_ns + s.duration_ns for s in timed)
-    span_start = min(s.start_ns for s in timed)
-    return max(span_end - span_start, 1)
+    return max(ext[1] - ext[0], 1)
+
+
+def merged_ns_by_pid(trace: Any, categories: tuple[str, ...]) -> dict[int, int]:
+    """Union of span time per process for the given categories, streamed
+    per process in start order from the store."""
+    from ..core.store.common import union_length
+    store = trace.store
+
+    def compute() -> dict[int, int]:
+        out: dict[int, int] = {}
+        for pid in store.pids():
+            seen = False
+
+            def intervals():
+                nonlocal seen
+                for iv in store.iter_intervals(pid=pid, categories=categories, timed_only=False):
+                    seen = True
+                    yield iv
+            n = union_length(intervals())
+            if seen:
+                out[pid] = n
+        return out
+    return dict(store.memo(("merged_ns_by_pid", tuple(categories)), compute))
+
+
+def exclusive(trace: Any, et: Any = None):
+    """The trace's exclusive-time aggregate (store-side; see
+    core/store/common.ExclusiveAggregate). `et` lets callers share one."""
+    return et if et is not None else trace.store.exclusive_aggregate()
 
 
 def wait_fraction(trace: Any, et: Any = None) -> tuple[str, float]:
@@ -199,21 +254,17 @@ def wait_fraction(trace: Any, et: Any = None) -> tuple[str, float]:
     MPI present: mean over ranks (pids with MPI spans) of that rank's
     merged MPI time / wall. Otherwise: exclusive "sync" time summed over
     host threads / (host threads x wall)."""
-    from .activity_buckets import ExclusiveTime
     wall = trace_wall_ns(trace)
-    spans = et.spans if et is not None else trace.spans
-    by_pid: dict[int, list] = {}
-    for s in spans:
-        if s.category.value == "mpi":
-            by_pid.setdefault(s.pid, []).append(s)
-    if by_pid:
-        per_rank = [merged_ns(v) / wall for v in by_pid.values()]
+    per_pid = merged_ns_by_pid(trace, ("mpi",))
+    if per_pid:
+        per_rank = [v / wall for v in per_pid.values()]
         return "MPI WAIT", 100.0 * sum(per_rank) / len(per_rank)
-    et = et or ExclusiveTime(spans)
-    if not et.threads:
+    agg = exclusive(trace, et)
+    if not agg.threads:
         return "SYNC WAIT", 0.0
-    sync_ns = sum(et.owned.get(id(s), 0) for s in spans if s.category.value == "sync")
-    return "SYNC WAIT", 100.0 * sync_ns / (len(et.threads) * wall)
+    sync_ns = agg.totals(lambda pid, tid, cat, name, b, dev: cat == "sync",
+                         include_device=False).get(True, 0)
+    return "SYNC WAIT", 100.0 * sync_ns / (len(agg.threads) * wall)
 
 
 # ── Diagnosis / findings ─────────────────────────────────────────────────────
@@ -303,7 +354,7 @@ def diagnose(trace: Trace, et: Any = None) -> tuple[str, str]:
         except Exception:
             pass
 
-    cat, share = _top_exclusive_share(trace, lambda s: s.category.value, et)
+    cat, share = _top_exclusive_share(trace, "category", et)
     if cat is None:
         # Nothing with a duration was measured -- a verdict of "Balanced"
         # (green) here would be a positive claim made from no data.
@@ -314,7 +365,7 @@ def diagnose(trace: Trace, et: Any = None) -> tuple[str, str]:
     return "Balanced", "green"
 
 
-def _top_exclusive_share(trace: Trace, key, et: Any = None) -> tuple[Any, float]:
+def _top_exclusive_share(trace: Trace, field: str, et: Any = None) -> tuple[Any, float]:
     """(key, % of attributed time) for the largest key by EXCLUSIVE time
     (activity_buckets.exclusive_totals). aggregated_stats()'s pct is a
     share of summed inclusive durations, so nested spans (a barrier inside
@@ -325,13 +376,15 @@ def _top_exclusive_share(trace: Trace, key, et: Any = None) -> tuple[Any, float]
     not just the instrumented time: an MPI program spending 2% of its run
     in MPI calls -- the only thing instrumented -- was diagnosed
     "mpi-bound" at 100% share (measured on a ground-truth program)."""
-    from .activity_buckets import ExclusiveTime
-    et = et or ExclusiveTime(trace.spans)
-    totals = et.totals(lambda i, s: key(s))
+    agg = exclusive(trace, et)
+    if field == "category":
+        totals = agg.totals(lambda pid, tid, cat, name, b, dev: cat)
+    else:
+        totals = agg.totals(lambda pid, tid, cat, name, b, dev: name)
     grand = sum(totals.values())
     if not grand:
         return None, 0.0
-    denom = max(grand, len(et.threads) * trace_wall_ns(trace))
+    denom = max(grand, len(agg.threads) * trace_wall_ns(trace))
     top = max(totals, key=totals.get)
     return top, 100.0 * totals[top] / denom
 
@@ -367,7 +420,7 @@ def top_findings(trace: Trace, et: Any = None) -> list[tuple[str, str, str, str]
     except Exception:
         pass
 
-    top, share = _top_exclusive_share(trace, lambda s: s.name, et)
+    top, share = _top_exclusive_share(trace, "name", et)
     if top is not None and share > 30:
         out.append((
             "◆", "cyan",
@@ -399,13 +452,10 @@ def find_source_context(trace: Trace, context: int = 3) -> SourceContext | None:
     profile collected on a cluster and opened locally routinely hits the
     "file doesn't exist here" case — that's an expected, not exceptional,
     outcome, so callers should show an explanatory message, not blank."""
-    # One pass: first file-tagged span per name. The previous per-row scan
-    # re-copied trace.spans for every aggregated row (2.5s at 200k spans x
-    # 400 names, on the TUI's main thread).
-    first_loc: dict[str, tuple[str, Any]] = {}
-    for s in trace.spans:
-        if s.name not in first_loc and s.tags.get("file"):
-            first_loc[s.name] = (s.tags["file"], s.tags.get("line"))
+    # First file-tagged span per name, from the store (only spans whose
+    # tags mention file= are decoded).
+    first_loc: dict[str, tuple[str, Any]] = {
+        name: (s.tags["file"], s.tags.get("line")) for name, s in trace.store.first_with_tag("file").items()}
     for row in trace.aggregated_stats():
         file_tag, line_tag = first_loc.get(row["name"], (None, None))
         if not file_tag:

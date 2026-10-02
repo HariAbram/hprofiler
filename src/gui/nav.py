@@ -44,6 +44,7 @@ class Selection(QObject):
     threadChanged = Signal()
     inspectorOpenChanged = Signal()
     breadcrumbsChanged = Signal()
+    focusRangeChanged = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -55,6 +56,8 @@ class Selection(QObject):
         self._thread: dict[str, int] = {}
         self._inspector_open = True
         self._breadcrumbs: list[dict[str, Any]] = []
+        self._focus_range: dict[str, float] = {}
+        self._focus_serial = 0
 
     # ── currentTab ───────────────────────────────────────────────────
     @Property(int, notify=currentTabChanged)
@@ -87,6 +90,14 @@ class Selection(QObject):
     @Property('QVariantMap', notify=threadChanged)
     def selectedThread(self) -> dict[str, int]:
         return self._thread
+
+    @Property('QVariantMap', notify=focusRangeChanged)
+    def focusRange(self) -> dict[str, float]:
+        """The latest "show this time range" request ({startNs, endNs,
+        serial}; absolute ns of the loaded trace). The Timeline zooms to it
+        once per serial -- unlike selectedTimeRange, which a shift-drag
+        updates continuously and which must not move the view."""
+        return self._focus_range
 
     @Property(bool, notify=inspectorOpenChanged)
     def inspectorOpen(self) -> bool:
@@ -121,6 +132,14 @@ class Selection(QObject):
     def selectTimeRange(self, start_ns: float, end_ns: float) -> None:
         self._time_range = {"startNs": start_ns, "endNs": end_ns}
         self.timeRangeChanged.emit()
+
+    @Slot(float, float)
+    def focusTimeRange(self, start_ns: float, end_ns: float) -> None:
+        """Ask the Timeline to show [start_ns, end_ns] (and select it)."""
+        self._focus_serial += 1
+        self._focus_range = {"startNs": start_ns, "endNs": end_ns, "serial": self._focus_serial}
+        self.selectTimeRange(start_ns, end_ns)
+        self.focusRangeChanged.emit()
 
     @Slot(int, int)
     def selectThread(self, pid: int, tid: int) -> None:

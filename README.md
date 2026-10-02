@@ -8,6 +8,7 @@ Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, Open
 - `pip install click textual rich numpy capstone` (or `pip install -r requirements.txt`)
 - Optional GUI: `pip install "hprofiler[gui]"` (PySide6) plus the system library `libxcb-cursor0` / `xcb-util-cursor` — see [DOCUMENTATION.md](DOCUMENTATION.md#requirements)
 - TUI roofline viewer: `pip install plotly "kaleido==0.2.1"` (0.2.1 specifically — later versions require Chrome and break on clusters); the Flame Graph tab needs neither
+- Optional, for device-measured GPU timing: CUPTI (CUDA toolkit) and ROCprofiler-SDK (ROCm ≥ 6.2) — headers at build time, libraries loaded at run time; without them GPU device timing falls back to event-based proxies
 - Backend-specific: CUDA toolkit, a `libamdhip64` (ROCm/HIP) runtime, LLVM `libomp` or GNU `libgomp`, an MPI implementation (`mpicc`, or a Cray Programming Environment `cc` wrapper), or `perf` — see [DOCUMENTATION.md](DOCUMENTATION.md#requirements) for exact search paths
 
 ## Build
@@ -44,14 +45,20 @@ python3 hprofiler run --backend cuda --disasm --gpu-pc-sampling -- ./app
 # Instruction-level CPU heat (OpenCL CPU runtime via ACPP)
 ACPP_VISIBILITY_MASK=ocl python3 hprofiler run --backend opencl,cpu --disasm -- ./app
 
-# Save trace, skip TUI
+# Save trace, skip TUI (writes trace.hpstore + trace.json)
 python3 hprofiler run --no-ui -o trace.json -- ./app
 
-# Open a saved trace
+# Very long run: indexed store only, no JSON export
+python3 hprofiler run --no-json -o big.hpstore -- ./app
+
+# Open a saved trace (a .hpstore, or JSON -- the store next to it is used)
 python3 hprofiler view trace.json
 
 # Text summary only
 python3 hprofiler summary trace.json
+
+# What changed between two runs, and why (text or --format json)
+python3 hprofiler compare before.json after.json
 
 # Native Qt GUI instead of the TUI (falls back to the TUI automatically
 # if PySide6/X11 aren't available — see GUI Viewer below)
@@ -82,10 +89,10 @@ Always separate hprofiler options from the target program with `--`.
 | Name | Alias | Injection | What is traced |
 |------|-------|-----------|----------------|
 | `cpu` | `perf` | `perf record` subprocess | CPU samples, optional DWARF/fp/lbr call-graph |
-| `cuda` | — | LD_PRELOAD | Kernel launches, memcpy, syncs, NVTX ranges, memory counters |
+| `cuda` | — | LD_PRELOAD + CUPTI | Host API calls (launches, copies, memsets, syncs, events), device-measured kernels/copies/memsets via CUPTI, NVTX ranges, memory counters; statically linked runtimes via CUPTI callbacks |
 | `opencl` | `cl` | LD_PRELOAD | Kernel enqueues (host side) and device execution, buffer transfers, JIT compile time |
 | `openmp` | `omp` | `OMP_TOOL_LIBRARIES` (OMPT, LLVM `libomp`) and LD_PRELOAD (`GOMP_*`, GNU `libgomp`) | Parallel regions with each thread's share, loops, tasks, barriers, critical sections — whichever runtime the binary links is covered |
-| `rocm` | `hip` | LD_PRELOAD | HIP kernel launches, memcpy, memory counters |
+| `rocm` | `hip` | LD_PRELOAD + ROCprofiler-SDK | Host API calls, device-measured kernel dispatches and copies via ROCprofiler-SDK, memory counters |
 | `nccl` | — | LD_PRELOAD | Collectives (AllReduce, Broadcast, …), point-to-point — GPU-accurate timing |
 | `mpi` | — | PMPI / LD_PRELOAD | Send/Recv, collectives, one-sided ops — wall-clock timing |
 | `likwid` | `hwc` | `likwid-perfctr` wrapper | Hardware PMU counters: FLOPS, DRAM bandwidth, cache rates, CPI |
@@ -108,13 +115,13 @@ Opens automatically after `hprofiler run`. Tabs:
 
 ## GUI Viewer
 
-An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI (including Flame Graph), plus GUI-specific additions: smooth wheel-zoom/drag-pan, filtering, grouping/collapsing, event search, and bookmarks/named ranges on the Timeline; real sortable/filterable/exportable tables (Kernels, System, Call Tree, Overview) instead of hand-rolled lists; a 10th **Compare** tab for diffing two runs (matched by stable `(category,name)` identifiers, with a disclosed noise-floor threshold — not a statistical test — for improved/regressed classification); an idle-time overlay so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy; and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
+An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI (including Flame Graph), plus GUI-specific additions: smooth wheel-zoom/drag-pan, filtering, grouping/collapsing, event search, and bookmarks/named ranges on the Timeline; real sortable/filterable/exportable tables (Kernels, System, Call Tree, Overview) instead of hand-rolled lists; a 10th **Compare** tab that explains what changed between two runs (structure-aware matching, ranked causal contributors, phase navigation, before/after critical paths, click-through to the Timeline and source; the `(category,name)` table is kept as a compatibility view; a disclosed noise-floor threshold — not a statistical test — decides improved/regressed); an idle-time overlay so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy; and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
 
 ```bash
 hprofiler run --gui --backend cuda -- ./cuda_app
 hprofiler gui trace.hprofiler.json
 hprofiler run --gui --perf-callgraph dwarf -- ./app   # + populate the Flame Graph tab
-hprofiler gui after.hprofiler.json --compare before.hprofiler.json   # Compare tab
+hprofiler gui after.hprofiler.json --compare before.hprofiler.json   # Compare tab (opened trace = candidate)
 ```
 
 - **Loading** happens on a background thread before the window opens, with stage and percentage progress in the terminal. **Ctrl+C cancels it** (exit code 130). A trace that can't be loaded gets a short, classified error message plus the path to the GUI log (`~/.local/share/hprofiler/hprofiler/hprofiler-gui.log`) instead of a traceback.
@@ -153,14 +160,28 @@ Works in any terminal — plain character-cell rendering, no inline-image protoc
 
 | File | Viewer |
 |------|--------|
-| `<prog>.hprofiler.json` | [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` |
+| `<prog>.hprofiler.hpstore/` | Every hprofiler command (`view`, `gui`, `summary`, `critical-path`, …) |
+| `<prog>.hprofiler.json` | [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`, and every hprofiler command (skip with `--no-json`) |
 | `<prog>.roofline.html` | Any browser (self-contained) |
 
-The JSON trace is lossless for hprofiler itself: reloading it (as the GUI, `view`, `summary`, `efficiency`, `critical-path` and `merge-nodes` all do) reproduces the in-memory trace from `hprofiler run`, including span/request ids, real GPU thread ids and the profiling window.
+Events are written to the indexed trace store (`.hpstore`, SQLite) in bounded batches while the program runs, so memory does not grow with the trace. The viewers then read only the visible time window, plus aggregates precomputed when the run ends. Opening the JSON uses the store next to it; other large JSON files are imported into a cached store once. Both formats are lossless: span/request ids, real GPU thread ids, the profiling window, tags and stacks. Schema, versioning and measured scale (2M–5M spans) are in [DOCUMENTATION.md](DOCUMENTATION.md) §21.
 
 ## How Time Is Attributed
 
 The Overview/Profile time breakdowns, the one-line diagnosis ("openmp-bound", …) and "*f* dominates" findings count **exclusive** time: on each thread, every instant belongs to the innermost instrumented call covering it, so a barrier inside a parallel region counts once, as synchronization. GPU/device work is never counted against the thread that launched it; perf samples only count when their thread isn't inside an instrumented call; shares are relative to available thread-time (threads × wall), so a program that spends 2% of its run in MPI is not called "mpi-bound". The MPI/sync **wait %** is averaged per rank/thread (the old union across threads read ~80% for threads that waited ~38%). The Kernels/Hotspots tables still show inclusive per-function totals. Details: [DOCUMENTATION.md](DOCUMENTATION.md) §5 (Overview Tab).
+
+## GPU Device Timing
+
+CUDA and HIP work is recorded as two linked spans: the **host API call** (`cudaLaunchKernel`, `hipMemcpyAsync`, …, on its thread) and the **device work** it submitted (kernel, copy, memset, on its stream). Device spans come from CUPTI (CUDA) or ROCprofiler-SDK (ROCm) when available, and from the older GPU-event interception otherwise, labelled as a host-side proxy:
+
+| Quantity | With CUPTI / ROCprofiler-SDK | Without (proxy) |
+|---|---|---|
+| Host call start and duration | measured | measured |
+| Device start / end | measured on the GPU, mapped to the hooks' clock | start **estimated** (= submission time) |
+| Device execution time | measured | measured by GPU events (incl. event overhead) or unavailable (`proxy_host`) |
+| Queueing delay (`queue_ns`: call end → device start) | derived | unavailable |
+
+Each device span carries its correlation id, device, context, stream/queue, operation type and timing source, plus `timing=` (`device`, `proxy_event`, `proxy_host`, `proxy_flush`). GPU-active time uses device-measured intervals when a trace has any and proxies otherwise, never both. When both observers see a launch, the measured span wins. The critical path links each call to its device work, orders work within streams, and connects every sync call to the work it actually waited for, including event syncs and cross-stream waits. Binaries with the static CUDA runtime, which LD_PRELOAD can't intercept, are now recorded through CUPTI. `HPROFILER_DEVICE_ACTIVITY=auto|off|both` selects the mode. `hprofiler summary` and the GUI Inspector say which source each number came from. CUDA was checked functionally on a real GPU (GeForce MX550). The ROCm path is compiled against the real ROCprofiler-SDK headers and tested with synthetic records, but has not run on an AMD GPU. Details: [DOCUMENTATION.md](DOCUMENTATION.md) §4 ("CUDA and ROCm: host calls, device work, and where each timestamp comes from") and §17.
 
 ## Measurement Accuracy
 
@@ -173,7 +194,7 @@ Validated against small ground-truth programs that log their own `CLOCK_MONOTONI
 | MPI (single rank) | +1.2 % | 0 / 240 | 0.22 µs / 1.7 µs |
 | OpenCL (Intel CPU device) | within noise | 0 / 50 | device kernel time matches `CL_PROFILING` exactly |
 
-About 5 µs per intercepted call on call-bound loops; no events dropped at 200 000 MPI calls. CUDA/ROCm/NCCL, real multi-rank MPI and perf sampling could not be validated on the development machine. Known artifacts (e.g. CUDA/ROCm kernel spans start at the host launch time) are listed in [DOCUMENTATION.md](DOCUMENTATION.md) §13 "Measured accuracy".
+About 5 µs per intercepted call on call-bound loops; no events dropped at 200 000 MPI calls. GPU timing is covered in [GPU Device Timing](#gpu-device-timing): it was checked for correctness, not measured against vendor profilers. ROCm, NCCL, real multi-rank MPI and perf sampling could not be validated on the development machine. Known artifacts (e.g. proxy GPU device spans start at the host launch time) are listed in [DOCUMENTATION.md](DOCUMENTATION.md) §13 "Measured accuracy".
 
 ## OpenTelemetry Export
 
@@ -257,13 +278,19 @@ QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p 'test_*.py'
 # toolchain is missing). Not found by discovery -- run them by name.
 python3 -m unittest tests.integration.test_profiling_accuracy \
     tests.integration.test_gomp_hook tests.integration.test_mpi_protocol \
-    tests.integration.test_mpi_rma tests.integration.test_gui_cancel
+    tests.integration.test_mpi_rma tests.integration.test_gui_cancel \
+    tests.integration.test_native_gpu_records \
+    tests.integration.test_cuda_native_activity    # needs nvcc + a CUDA GPU
+python3 -m unittest tests.integration.test_store_stress    # 2M-span trace store: memory, latency (~1 min)
 bash tests/integration/run_matrix.sh                        # CLI end-to-end, per backend
 python3 tests/integration/accuracy_report.py --trials 10    # accuracy statistics
 ```
 
 ## Recent Changes
 
+- **Run comparison:** `hprofiler compare BEFORE AFTER` (text or JSON) and the GUI's Compare tab now match runs by structure instead of by function name: repeated phases are detected and aligned (inserted or removed iterations are tolerated), and work is matched by call path, source location, roles (rank, stream, device, communicator) and dependency neighbourhood. Each regression is attributed to increased work, more invocations, queueing, synchronization, communication, lost overlap, a changed dependency edge or a move onto the critical path. Waits are traced back to the work that caused them, contributors are ranked by critical-path impact, and every value is labeled measured, graph-derived, heuristic or unavailable. With low alignment confidence the comparison falls back to the old (category, name) view, which is also still shown. The Compare tab adds phase navigation, before/after critical paths, and "Show in Timeline" / "Open in Source" click-through. In the GUI, the opened trace is now the candidate and `--compare` names the baseline. See DOCUMENTATION.md §22.
+- **Large traces:** events now go into an on-disk, indexed trace store while the program runs, instead of being held in Python memory. The TUI and GUI timelines fetch only the visible time window; zoomed-out views are drawn from a precomputed activity index. Summaries, tables and the overview read store-side aggregates, and the critical path streams the trace and saves its dependency edges for reuse. In tests, a 5M-span trace was captured with +29 MB peak memory and window queries took 0.7 ms median. New `--no-json` option and `.hpstore` output; JSON export and older JSON files still work.
+- **Native GPU device activity:** CUPTI (CUDA) and ROCprofiler-SDK (ROCm) tracing, both loaded at run time. Host calls and device work are now separate spans linked by correlation ids. Measured device start times replace launch-time starts, and the queueing delay is reported. The critical path gains launch, stream-order and sync-wait edges, statically linked CUDA programs are recorded through CUPTI, and proxy timing is labelled as such and never mixed with measured intervals.
 - **Removed:** the LLM/AI performance analysis (`hprofiler analyze`, and `--analyze`/`--llm*`/`--analysis-report` on `run`) and `setup_llm.sh`.
 - **Trace files are now lossless** — span/request ids, real GPU thread ids, the profiling window, instant tags and counter units were previously dropped on save, so `critical-path` on a saved MPI trace lost every communication dependency, and "Total time" after reloading was the time since the file was opened.
 - **Consistent time accounting** (see [How Time Is Attributed](#how-time-is-attributed)): the same OpenMP program was previously diagnosed "sync-bound" under LLVM libomp and "openmp-bound" under GNU libgomp; the OMPT tool now also records each thread's share of a parallel region.

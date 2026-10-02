@@ -160,8 +160,8 @@ def compare_buckets(trace_a: Any, trace_b: Any, *,
     analog of compare_aggregates()'s per-function rows. Annotation is
     excluded, same reasoning as bucket_totals() itself (overlaps real
     work by design, would double-count)."""
-    totals_a = activity_buckets.bucket_totals(trace_a.spans)
-    totals_b = activity_buckets.bucket_totals(trace_b.spans)
+    totals_a = trace_a.store.exclusive_aggregate().bucket_totals()
+    totals_b = trace_b.store.exclusive_aggregate().bucket_totals()
     out = []
     for bucket in activity_buckets.BUCKETS:
         if bucket == "Annotation":
@@ -193,13 +193,12 @@ def normalized_coverage(trace: Any, n_buckets: int = 60) -> list[float]:
     inconvenient; each side's strip is meant to be read as "this run's
     own shape," compared side by side, with that normalization stated in
     the UI (see ComparisonBridge)."""
-    spans = [s for s in trace.spans if s.duration_ns > 0]
-    if not spans:
+    ext = trace.store.span_extent(timed_only=True)
+    if ext is None:
         return [0.0] * n_buckets
-    start = min(s.start_ns for s in spans)
-    end = max(s.start_ns + s.duration_ns for s in spans)
+    start, end = ext
     dur = max(end - start, 1)
-    return dash.bucket_coverage(spans, n_buckets, start, float(dur))
+    return dash.coverage_from_chunks(trace.store.interval_arrays(), n_buckets, start, float(dur))
 
 
 def report_dict(trace_a: Any, trace_b: Any, *,

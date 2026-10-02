@@ -28,7 +28,7 @@ Item {
     // first instantiates it) never actually transitions false->true, so
     // onVisibleChanged below -- which fires correctly on every SUBSEQUENT
     // tab switch -- can't be relied on for that initial activation.
-    Component.onCompleted: jumpToSelectionIfNew()
+    Component.onCompleted: { jumpToSelectionIfNew(); applyFocusIfNew() }
     onVisibleChanged: {
         if (!visible) return
         forceActiveFocus()
@@ -42,6 +42,7 @@ Item {
         // on a different, already-visible tab, so nothing here is alive
         // to receive the signal.
         jumpToSelectionIfNew()
+        applyFocusIfNew()     // an explicit range request wins over the selection jump
     }
 
     property real zoom: 1.0
@@ -59,6 +60,25 @@ Item {
     // tabbing back) doesn't yank the view back every time -- only an
     // actual selection change re-triggers the jump.
     property string lastJumpedKey: ""
+
+    // Nav.focusTimeRange() requests (e.g. the Compare tab's "Show in
+    // Timeline"): zoom to the range once per request -- checked on load and
+    // on every visit, since the request is usually made while this tab's
+    // Loader is not active yet.
+    property int lastFocusSerial: 0
+    function applyFocusIfNew() {
+        var f = Nav.focusRange
+        if (f.serial === undefined || f.serial <= root.lastFocusSerial) return
+        root.lastFocusSerial = f.serial
+        root.zoomToRange(f.startNs, f.endNs)
+    }
+    function zoomToRange(startNs, endNs) {
+        var span = Math.max(endNs - startNs, 1)
+        var pad = span * 0.1
+        zoom = Math.max(1.0, Math.min(256.0, TimelineModel.traceDurationNs / (span + 2 * pad)))
+        viewStartNs = startNs - pad
+        clampViewStart()
+    }
 
     function jumpToSelectionIfNew() {
         if (Nav.selectedName.length === 0) { root.matchCount = 0; return }
@@ -192,6 +212,7 @@ Item {
     Connections {
         target: Nav
         function onSelectionChanged() { root.jumpToSelectionIfNew() }
+        function onFocusRangeChanged() { if (root.visible) root.applyFocusIfNew() }
     }
 
     Keys.onPressed: (event) => {
@@ -799,15 +820,41 @@ Item {
                                     }
                                 }
 
+                                // Zoomed out past ~2000 spans per lane, the model returns
+                                // occupancy bins from the store's precomputed activity
+                                // index (one value per pixel column) instead of spans --
+                                // painted as the lane colour with opacity = how busy
+                                // that column is. Individual spans (and hover detail)
+                                // come back as soon as the window is narrow enough.
+                                function _paintBins(ctx, view, alpha) {
+                                    var bins = view.bins
+                                    if (!bins || bins.length === 0) return
+                                    var bw = width / bins.length
+                                    ctx.fillStyle = view.color
+                                    for (var i = 0; i < bins.length; i++) {
+                                        var v = bins[i]
+                                        if (v <= 0) continue
+                                        ctx.globalAlpha = alpha * (0.25 + 0.75 * v)
+                                        ctx.fillRect(i * bw, 3, Math.max(1, bw), height - 6)
+                                    }
+                                    ctx.globalAlpha = 1.0
+                                }
+
                                 onPaint: {
                                     var ctx = getContext("2d")
                                     ctx.reset()
-                                    var spans = TimelineModel.visibleSpans(
-                                        laneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs, 2000)
-                                    cachedSpans = spans
+                                    var view = TimelineModel.laneView(
+                                        laneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs,
+                                        Math.max(1, Math.round(width)), 2000)
                                     var scale = width / root.visibleNs
-                                    _paintSpans(ctx, spans, scale, function(sp) { return sp.color }, 1.0)
-                                    _paintMatchHighlights(ctx, spans, scale)
+                                    if (view.mode === "bins") {
+                                        cachedSpans = []
+                                        _paintBins(ctx, view, 1.0)
+                                    } else {
+                                        cachedSpans = view.spans
+                                        _paintSpans(ctx, view.spans, scale, function(sp) { return sp.color }, 1.0)
+                                        _paintMatchHighlights(ctx, view.spans, scale)
+                                    }
 
                                     // Overlay the paired sync lane's spans ON TOP,
                                     // dimmed, so a barrier/critical-section wait
@@ -818,8 +865,14 @@ Item {
                                     // comment for why the same time interval can
                                     // legitimately belong to both lanes at once.
                                     if (syncOverlayLaneIndex >= 0) {
-                                        var syncSpans = TimelineModel.visibleSpans(
-                                            syncOverlayLaneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs, 2000)
+                                        var syncView = TimelineModel.laneView(
+                                            syncOverlayLaneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs,
+                                            Math.max(1, Math.round(width)), 2000)
+                                        if (syncView.mode === "bins") {
+                                            _paintBins(ctx, syncView, 0.8)
+                                            return
+                                        }
+                                        var syncSpans = syncView.spans
                                         // Each span's OWN per-function color (sp.color,
                                         // the same field the sync lane's own bars use),
                                         // not a flat category color -- so a given

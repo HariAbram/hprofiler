@@ -32,6 +32,8 @@ from typing import Callable, Optional
 
 from .events import SpanEvent, InstantEvent, CounterEvent, Category, AnyEvent  # noqa: F401
 from .trace import Trace, TraceMetadata
+from .store import TraceStore
+from . import gpu_activity
 
 HOOKS_DIR = Path(__file__).parent.parent.parent / "build" / "lib"
 
@@ -39,6 +41,8 @@ HOOKS_DIR = Path(__file__).parent.parent.parent / "build" / "lib"
 # span:<category>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<tag=val>...]
 # inst:<category>:<pid>:<tid>:<ts_ns>:<name>
 # ctr:<category>:<pid>:<ts_ns>:<name>:<value>:<unit>
+# gpuact:<pid>:<cupti|rocprofiler>:<k=v,...>   native GPU tracer status
+#   (status/reason/clock/dropped...) -- see src/core/gpu_activity.py
 
 # Tags are always "key=val[,key=val...]" with no colons in them, so once a
 # candidate tail (everything after the *last* colon) matches this, it's the
@@ -216,6 +220,7 @@ class Runner:
         perf_freq: int = 99,
         on_event: Callable[[AnyEvent], None] | None = None,
         collect_disasm: bool = False,
+        store: "TraceStore | None" = None,
     ) -> None:
         self.command = command
         self.backends = backends
@@ -223,6 +228,10 @@ class Runner:
         self.perf_freq = perf_freq
         self.on_event = on_event
         self.collect_disasm = collect_disasm
+        # Where received events go: a TraceStore (e.g. DiskTraceStore for a
+        # production capture -- events are appended in bounded batches and
+        # never all held in memory). None = an in-memory store.
+        self.store = store
         self._trace: Trace | None = None
         self._disasm_thread: threading.Thread | None = None
 
@@ -299,13 +308,19 @@ class Runner:
                         ["nm", _target], capture_output=True, text=True, timeout=10
                     )
                     if "T cudaLaunchKernel" in nm_r.stdout or "T cuLaunchKernel" in nm_r.stdout:
+                        # LD_PRELOAD cannot intercept a static runtime; start
+                        # CUPTI when the hook loads instead, so its callbacks
+                        # report the host calls and its activity records the
+                        # device work (hooks/cuda_hook/cupti_trace.c).
+                        env.setdefault("HPROFILER_CUPTI_EAGER", "1")
                         print(
                             f"[hprofiler][warn] '{self.command[0]}' appears to be linked with "
                             f"the STATIC CUDA runtime (libcudart_static.a).\n"
-                            f"  Direct symbol interception via LD_PRELOAD is not possible, so "
-                            f"CUDA Runtime/Driver API calls will NOT be captured for this run "
-                            f"(0 cuda events expected). Rebuild with the shared runtime "
-                            f"(nvcc -cudart shared) to enable CUDA profiling.",
+                            f"  LD_PRELOAD interception is not possible; CUDA calls and device "
+                            f"work will be recorded through CUPTI instead (needs libcupti -- "
+                            f"see the 'gpuact' status in the trace). Without CUPTI no cuda "
+                            f"events are captured: rebuild with the shared runtime "
+                            f"(nvcc -cudart shared).",
                             file=_sys.stderr,
                         )
             except Exception:
@@ -325,7 +340,7 @@ class Runner:
             cwd=os.getcwd(),
             capture_time_iso=datetime.datetime.now().isoformat(timespec="seconds"),
         )
-        trace = Trace(metadata)
+        trace = Trace(metadata, store=self.store)
         self._trace = trace
 
         events_lock = threading.Lock()
@@ -364,9 +379,14 @@ class Runner:
                                         span = _find_recent_span(_recent_spans, pid, tid, start_ns)
                                         if span is not None:
                                             span.stack_frames = frames
-                                            trace._has_stacks = True
+                                            trace.update_span(span)
                             except Exception:
                                 pass
+                        elif line.startswith("gpuact:"):
+                            parsed = gpu_activity.parse_status_line(line)
+                            if parsed is not None:
+                                with events_lock:
+                                    gpu_activity.record_status(trace, *parsed)
                         elif line.startswith("pcsa:"):
                             # pcsa:<pid>:<ts_ns>:<func_name>:<pc_offset_hex>:<stall_reason_int>:<count>
                             try:
@@ -535,6 +555,17 @@ class Runner:
         except OSError:
             pass
 
+        # ── CUDA/ROCm host<->device correlation and de-duplication ────────────
+        # Native activity records arrive in buffers, out of order and often
+        # after the host spans they belong to, so this runs once on the
+        # complete event set.
+        try:
+            gpu_activity.assemble(trace)
+        except Exception as exc:   # never lose a run to post-processing
+            import sys as _sys_ga
+            print(f"[hprofiler][warn] GPU activity correlation failed: {exc!r} -- "
+                  "device spans are left uncorrelated", file=_sys_ga.stderr)
+
         # ── Parse perf record output ──────────────────────────────────────────
         if perf_data and Path(perf_data).exists():
             _parse_perf_script(perf_data, trace, self.perf_freq)
@@ -560,7 +591,7 @@ class Runner:
             _likwid_backend.post_process(trace)
 
         # ── Total zero-event sanity check ───────────────────────────────────────
-        if self.backends and not trace.spans and not trace.instants:
+        if self.backends and not trace.span_count() and not trace.store.instant_count():
             import sys as _sys1
             msg = _total_zero_event_warning(self.backends, self.command)
             print(msg, file=_sys1.stderr)
@@ -574,8 +605,7 @@ class Runner:
         # than assuming which one should have worked.
         if "openmp" in self.backends:
             import sys as _sys2
-            omp_spans = [s for s in trace.spans if s.category.value == "openmp"]
-            if not omp_spans:
+            if next(iter(trace.iter_spans(categories=("openmp",))), None) is None:
                 print(
                     "[hprofiler][warn] openmp backend active but 0 OpenMP events "
                     "were captured.\n"
@@ -953,7 +983,7 @@ def _collect_disasm(
     # cpu_names: function names from perf-sampled CPU spans (no sym/lib tags)
     cpu_names: set[str] = set()
 
-    for span in trace.spans:
+    for span in trace.iter_spans():
         # OpenCL/ACPP SSCP JIT .so files
         if span.category == Category.JIT and span.tags.get("type") == "jit_load":
             so_path = span.tags.get("path", "")
@@ -1035,7 +1065,7 @@ def _collect_disasm(
         # because dladdr can't resolve JIT function pointers.  Map the first
         # captured JIT kernel to that name so clicking it shows something.
         _JIT_NAME = "<jit-kernel>"
-        if (any(s.name == _JIT_NAME for s in trace.spans)
+        if (any(r["name"] == _JIT_NAME for r in trace.aggregate_stats())
                 and _JIT_NAME not in disasm_map):
             # Alias first available GPU kernel to <jit-kernel> so spans get
             # disassembly even when the hook couldn't resolve the name (e.g.

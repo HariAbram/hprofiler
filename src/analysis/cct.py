@@ -115,7 +115,7 @@ class CCT:
         """
         cct = cls()
 
-        for span in trace.spans:
+        for span in trace.iter_spans(has_stack=True):
             frames = _extract_frames(span)
             if not frames:
                 continue
@@ -217,8 +217,14 @@ def gpu_starvation(trace: "Trace") -> dict:
       launch_gap_ns    — wall time with no GPU kernels running (excl. sync)
       launch_gap_pct   — launch_gap_ns / wall_ns * 100
       sync_calls       — number of synchronisation calls captured
+      gpu_active_source — "device" (measured device intervals), "proxy"
+                         (GPU-event durations placed at submission time) or
+                         None -- see core/gpu_activity.kernel_activity; the
+                         two are never combined
+      gpu_kernels_excluded — kernel spans left out for having the other
+                         (or no) device timing source
     """
-    from ..core.events import Category
+    from ..core import gpu_activity as ga
 
     # NOTE: deliberately not trace.duration_ns -- meaningless for a trace
     # reconstructed by load_trace_from_json (TraceMetadata.start_time_ns
@@ -226,13 +232,9 @@ def gpu_starvation(trace: "Trace") -> dict:
     # wall time from the spans themselves instead, same fix already applied
     # in src/output/summary.py, src/analysis/criticalpath.py and
     # src/analysis/pop_efficiency.py.
-    timed = [s for s in trace.spans if s.duration_ns > 0]
-    if timed:
-        wall_ns = max(1, max(s.start_ns + s.duration_ns for s in timed) - min(s.start_ns for s in timed))
-    else:
-        wall_ns = 1
+    ext = trace.store.span_extent(timed_only=True)
+    wall_ns = max(1, ext[1] - ext[0]) if ext else 1
 
-    _GPU_CATS = {Category.GPU_CUDA, Category.GPU_ROCM, Category.GPU_OPENCL}
     _SYNC_NAMES = {
         "cudaDeviceSynchronize", "cudaStreamSynchronize",
         "cudaEventSynchronize",  "hipDeviceSynchronize",
@@ -240,28 +242,19 @@ def gpu_starvation(trace: "Trace") -> dict:
         "clFinish", "clWaitForEvents",
     }
 
-    kernel_intervals: list[tuple[int, int]] = []
+    # Kernel intervals from ONE timing source: device-measured spans when
+    # the trace has any, else event-timed proxies. Host launch/enqueue calls
+    # (side=cpu -- OpenCL's enqueue span, CUDA/ROCm's API span) are never
+    # kernel activity.
+    ka = ga.kernel_activity(trace.iter_spans(categories=("cuda", "rocm", "opencl")))
+    kernel_intervals: list[tuple[int, int]] = ka.intervals
     sync_intervals:   list[tuple[int, int]] = []
     sync_ns = 0
     sync_count = 0
 
-    for span in trace.spans:
-        if span.category in _GPU_CATS:
-            # AND, not OR: CUDA/ROCm kernel spans never carry a `side` tag
-            # (side is OpenCL-only, distinguishing its CPU-side enqueue-
-            # latency span from its GPU-side execution span -- both of
-            # which carry type=="kernel"), so `side in ("gpu", None)` alone
-            # is True for BOTH of an OpenCL kernel's two spans, and an OR
-            # here counted both as separate "kernel active" intervals --
-            # double-counting every OpenCL kernel's enqueue latency as
-            # additional GPU-active time. AND requires type=="kernel" AND
-            # (no side tag, i.e. CUDA/ROCm, or side=="gpu", i.e. OpenCL's
-            # real execution span) -- excludes exactly OpenCL's side=="cpu"
-            # span while leaving CUDA/ROCm (which never set `type` to
-            # anything but "kernel" for an actual kernel launch) unaffected.
-            if span.tags.get("type") == "kernel" and span.tags.get("side") in ("gpu", None):
-                kernel_intervals.append((span.start_ns, span.start_ns + span.duration_ns))
-        if span.name in _SYNC_NAMES and span.duration_ns > 0:
+    from ..core.store import SpanFilter
+    for span in trace.iter_spans(filt=SpanFilter(names=frozenset(_SYNC_NAMES))):
+        if span.name in _SYNC_NAMES and span.duration_ns > 0 and span.tags.get("side") != "gpu":
             sync_intervals.append((span.start_ns, span.start_ns + span.duration_ns))
             sync_ns += span.duration_ns
             sync_count += 1
@@ -288,6 +281,8 @@ def gpu_starvation(trace: "Trace") -> dict:
         "launch_gap_ns":  launch_gap_ns,
         "launch_gap_pct": 100.0 * launch_gap_ns / wall_ns,
         "sync_calls":     sync_count,
+        "gpu_active_source":    ka.source,
+        "gpu_kernels_excluded": ka.excluded,
     }
 
 
@@ -302,18 +297,33 @@ def annotate_stack_frames(trace: "Trace") -> int:
 
     Returns the number of frames resolved.
     """
-    import shutil
-    from ..analysis.addr2line import _find_symbolizer, _resolve_batch
+    from ..analysis.addr2line import _find_symbolizer
 
     tool = _find_symbolizer()
     if tool is None:
         return 0
 
-    # Collect (lib, offset) pairs across all frames in all stacked spans
+    # Stacked spans streamed from the store in bounded chunks; each chunk's
+    # resolved frames are written back before the next is read.
+    resolved_count = 0
+    chunk: list = []
+    for span in trace.iter_spans(has_stack=True):
+        chunk.append(span)
+        if len(chunk) >= 50_000:
+            resolved_count += _annotate_frames_chunk(trace, tool, chunk)
+            chunk = []
+    if chunk:
+        resolved_count += _annotate_frames_chunk(trace, tool, chunk)
+    return resolved_count
+
+
+def _annotate_frames_chunk(trace: "Trace", tool: str, spans: list) -> int:
+    from ..analysis.addr2line import _resolve_batch
+    # Collect (lib, offset) pairs across all frames in this chunk's spans
     lib_addrs: dict[str, list[tuple[str, object, int]]] = {}
     # lib_addrs[lib] = [(hex_addr, span, frame_idx), ...]
 
-    for span in trace.spans:
+    for span in spans:
         for idx, frame in enumerate(span.stack_frames):
             parts = frame.split("|")
             if len(parts) != 3:
@@ -324,6 +334,7 @@ def annotate_stack_frames(trace: "Trace") -> int:
             lib_addrs.setdefault(lib, []).append((offset, span, idx))
 
     resolved_count = 0
+    changed: dict[int, object] = {}
     for lib, entries in lib_addrs.items():
         from pathlib import Path
         if not Path(lib).exists():
@@ -339,7 +350,9 @@ def annotate_stack_frames(trace: "Trace") -> int:
                 parts[0] = f"{sym} ({short_file}:{line_})"
                 span.stack_frames[idx] = "|".join(parts)
                 resolved_count += 1
-
+                changed[id(span)] = span
+    if changed:
+        trace.update_spans(changed.values())
     return resolved_count
 
 

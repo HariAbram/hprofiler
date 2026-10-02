@@ -15,6 +15,11 @@
  *   9. Memory leak detection in destructor.
  *  10. ROCTx annotation interception (roctxRangePushA/Pop/MarkA).
  *  11. hipGraphLaunch span with GPU-accurate timing.
+ *  12. Host submission vs. device execution: every launch/copy/memset/
+ *      graph call emits a host API span (side=cpu) plus a device span
+ *      (side=gpu) -- measured by ROCprofiler-SDK when it is running
+ *      (rocprof_trace.c), otherwise the hipEvent-pair proxy, labelled
+ *      timing=proxy_*.
  */
 
 #define _GNU_SOURCE
@@ -45,8 +50,10 @@ static int             g_sock        = -1;
 static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pid_t           g_pid         = 0;
 
-/* Thread-local recursion guard */
-static __thread int in_hook = 0;
+/* Thread-local recursion guard (shared, hidden, with rocprof_trace.c). */
+#include "hp_rocprof.h"
+__thread int hp_roc_in_hook HP_HIDDEN = 0;
+#define in_hook hp_roc_in_hook
 
 /*
  * Explicit handle to libamdhip64.so opened with RTLD_GLOBAL.
@@ -292,14 +299,15 @@ static void pin_track_rem(void *ptr) {
  * here for consistency even though no AMD-side NCCL-equivalent hook exists
  * yet to cross-reference). Also removes the previous STREAM_MAP_CAP
  * overflow behavior (silently collapsing to stream=-1 past 256 streams). */
-static int get_stream_id(const void *stream) {
-    if (!stream) return 0;
-    uint64_t v = (uint64_t)(uintptr_t)stream;
+static int handle_id(const void *h) {
+    if (!h) return 0;
+    uint64_t v = (uint64_t)(uintptr_t)h;
     v ^= v >> 33; v *= 0xff51afd7ed558ccdULL;
     v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL;
     v ^= v >> 33;
     return (int)(v % 999983) + 1;
 }
+static int get_stream_id(const void *stream) { return handle_id(stream); }
 
 /* ── GPU-accurate timing via hipEvent pairs ──────────────────────────────── */
 #define MAX_PENDING 512
@@ -435,18 +443,16 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
         f_evDestroy(l->ev_s);
         f_evDestroy(l->ev_e);
         if (ok) {
-            char final_extra[300];
-            if (has_xs) {
-                if (l->extra[0])
-                    snprintf(final_extra, sizeof(final_extra), "%s,xs=%llu",
-                             l->extra, (unsigned long long)xs_ns);
-                else
-                    snprintf(final_extra, sizeof(final_extra), "xs=%llu",
-                             (unsigned long long)xs_ns);
-            } else {
-                strncpy(final_extra, l->extra, sizeof(final_extra) - 1);
-                final_extra[sizeof(final_extra) - 1] = '\0';
-            }
+            /* timing=proxy_event: GPU-measured duration (event pair),
+             * start at the host submission time t0. */
+            char final_extra[340];
+            const char *sep = l->extra[0] ? "," : "";
+            if (has_xs)
+                snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event,xs=%llu",
+                         l->extra, sep, (unsigned long long)xs_ns);
+            else
+                snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event",
+                         l->extra, sep);
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
                       l->kname, final_extra);
         } else {
@@ -458,9 +464,9 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
              * distinctly from GPU-accurate timing. */
             char marked[300];
             if (l->extra[0])
-                snprintf(marked, sizeof(marked), "%s,timing=cpu_flush", l->extra);
+                snprintf(marked, sizeof(marked), "%s,timing=proxy_flush", l->extra);
             else
-                snprintf(marked, sizeof(marked), "timing=cpu_flush");
+                snprintf(marked, sizeof(marked), "timing=proxy_flush");
             emit_span(l->cat, l->tid, l->t0, now_ns() - l->t0, l->kname, marked);
         }
     }
@@ -490,20 +496,6 @@ static int pk_try_begin(hipStream_t stream, hipEvent_t *ev_s, hipEvent_t *ev_e) 
     return 1;
 }
 
-/* Appends "timing=cpu" (or ",timing=cpu" if extra already has tags) to mark
- * a span that fell back to CPU-side (launch-call) timing instead of
- * GPU-accurate hipEvent timing -- without this a launch-overhead-only
- * measurement is indistinguishable from a real GPU kernel duration in the
- * emitted span. */
-static void mark_cpu_fallback(char *extra, size_t cap) {
-    size_t len = strlen(extra);
-    if (len == 0) {
-        snprintf(extra, cap, "timing=cpu");
-    } else if (len + 12 < cap) {
-        snprintf(extra + len, cap - len, ",timing=cpu");
-    }
-}
-
 static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
                       hipStream_t stream,
                       const char *cat, const char *kname, const char *extra,
@@ -514,9 +506,9 @@ static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
         PendingKernel *pk = &g_pk[g_pk_n++];
         pk->ev_start = ev_s; pk->ev_end = ev_e;
         pk->stream = stream; pk->cpu_start_ns = t0; pk->tid = tid;
-        strncpy(pk->cat,   cat,   31);  pk->cat[31]   = '\0';
-        strncpy(pk->kname, kname, 2047); pk->kname[2047] = '\0';
-        strncpy(pk->extra, extra, 255); pk->extra[255] = '\0';
+        snprintf(pk->cat,   sizeof(pk->cat),   "%s", cat);
+        snprintf(pk->kname, sizeof(pk->kname), "%s", kname);
+        snprintf(pk->extra, sizeof(pk->extra), "%s", extra);
         pthread_mutex_unlock(&g_pk_mutex);
     } else {
         pthread_mutex_unlock(&g_pk_mutex);
@@ -525,11 +517,119 @@ static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
          * clearly marked so it isn't mistaken for a GPU-accurate one. */
         char marked[300];
         if (extra && *extra)
-            snprintf(marked, sizeof(marked), "%s,timing=cpu", extra);
+            snprintf(marked, sizeof(marked), "%s,timing=proxy_host", extra);
         else
-            snprintf(marked, sizeof(marked), "timing=cpu");
+            snprintf(marked, sizeof(marked), "timing=proxy_host");
         emit_span(cat, tid, t0, now_ns() - t0, kname, marked);
     }
+}
+
+/* Entry points for rocprof_trace.c (see hp_rocprof.h). */
+void hp_roc_emit_span(const char *cat, pid_t tid, uint64_t start_ns,
+                      uint64_t dur_ns, const char *name, const char *extra) {
+    emit_span(cat, tid, start_ns, dur_ns, name, extra);
+}
+
+void hp_roc_emit_line(const char *line) {
+    pthread_mutex_lock(&g_sock_mutex);
+    ensure_connected();
+    if (g_sock >= 0) send_all(line, (int)strlen(line));
+    pthread_mutex_unlock(&g_sock_mutex);
+}
+
+/* ── Host submission / device activity ──────────────────────────────────────
+ * Same model as cuda_hook.c: every intercepted call that submits device
+ * work emits a host span (side=cpu, timing=host, lid=) and the device work
+ * is a separate side=gpu span -- from ROCprofiler-SDK when it is running
+ * (rocprof_trace.c; lid is pushed as the external correlation id around
+ * the real call, so its records carry it), otherwise the hipEvent-pair
+ * proxy labelled timing=proxy_*. HPROFILER_DEVICE_ACTIVITY=auto|off|both as
+ * for CUDA. */
+static uint64_t g_lid_counter = 0;
+static pthread_once_t g_native_once = PTHREAD_ONCE_INIT;
+static int g_device_mode = 0;      /* 0 auto, 1 off, 2 both */
+
+static void native_init_once(void) {
+    const char *m = getenv("HPROFILER_DEVICE_ACTIVITY");
+    if (m && !strcmp(m, "off")) { g_device_mode = 1; return; }   /* rocprof_trace.c reports it */
+    if (m && !strcmp(m, "both")) g_device_mode = 2;
+    /* ROCprofiler-SDK configures its tools while the HIP runtime
+     * initializes, which HIP does lazily on its first API call. Force that
+     * now, so the decision below (native vs. proxy) is made with the tracer
+     * already running even when the application's first HIP call is a
+     * launch. */
+    typedef hipError_t (*fn_t)(int *);
+    fn_t count = (fn_t)_real_hip_sym("hipGetDeviceCount");
+    int n = 0, saved = in_hook;
+    in_hook = 1;
+    if (count) count(&n);
+    in_hook = saved;
+    if (!hp_roc_active()) {
+        char line[160];
+        snprintf(line, sizeof(line), "gpuact:%d:rocprofiler:status=unavailable,reason=%s\n", (int)getpid(),
+                 hp_roc_compiled() ? "sdk_not_loaded" : "built_without_rocprofiler_sdk_headers");
+        hp_roc_emit_line(line);
+    }
+}
+
+static void native_ensure(void) { pthread_once(&g_native_once, native_init_once); }
+static int want_proxy(void) { return !hp_roc_active() || g_device_mode == 2; }
+
+typedef struct {
+    uint64_t   lid, t0, t1;
+    pid_t      tid;
+    int        proxy, gpu_ok;
+    hipEvent_t ev_s, ev_e;
+} Sub;
+
+static void sub_begin(Sub *u, hipStream_t stream, int device_work) {
+    native_ensure();
+    u->lid    = __atomic_add_fetch(&g_lid_counter, 1, __ATOMIC_RELAXED);
+    u->tid    = gettid_compat();
+    u->proxy  = device_work && want_proxy();
+    u->gpu_ok = u->proxy ? pk_try_begin(stream, &u->ev_s, &u->ev_e) : 0;
+    hp_roc_push(u->lid);       /* after pk_try_begin: its events aren't app work */
+    u->t0 = now_ns();
+}
+
+static void sub_end(Sub *u) {
+    u->t1 = now_ns();
+    hp_roc_pop();
+}
+
+static void sub_host(const Sub *u, const char *cat, const char *api,
+                     const char *tags, int ret) {
+    char x[512];
+    int n = snprintf(x, sizeof(x), "%s,side=cpu,rt=rocm,timing=host,lid=%llu,sid=%llu",
+                     tags, (unsigned long long)u->lid,
+                     (unsigned long long)(((uint64_t)(uint32_t)getpid() << 32) | (u->lid & 0xffffffffULL)));
+    if (ret != 0 && n > 0 && n < (int)sizeof(x))
+        snprintf(x + n, sizeof(x) - (size_t)n, ",err=%d", ret);
+    emit_span(cat, u->tid, u->t0, u->t1 - u->t0, api, x);
+}
+
+static void sub_proxy(Sub *u, hipStream_t stream, const char *cat,
+                      const char *name, const char *tags) {
+    if (!u->proxy) return;
+    char x[256];
+    snprintf(x, sizeof(x), "%s,side=gpu,rt=rocm,lid=%llu", tags, (unsigned long long)u->lid);
+    if (u->gpu_ok) {
+        pk_commit(u->ev_s, u->ev_e, stream, cat, name, x, u->t0, u->tid);
+    } else {
+        char y[300];
+        snprintf(y, sizeof(y), "%s,timing=proxy_host", x);
+        emit_span(cat, u->tid, u->t0, u->t1 - u->t0, name, y);
+    }
+}
+
+/* A failed submission produced no device work. */
+static void sub_abort(Sub *u) {
+    if (u->gpu_ok) { f_evDestroy(u->ev_s); f_evDestroy(u->ev_e); u->gpu_ok = 0; }
+}
+
+static const char *memcpy_dir(hipMemcpyKind kind) {
+    static const char *names[] = {"HtoH", "HtoD", "DtoH", "DtoD", "Default"};
+    return (kind >= 0 && kind <= 4) ? names[kind] : "Unknown";
 }
 
 /* ── HIP Runtime API wrappers ───────────────────────────────────────────── */
@@ -544,23 +644,18 @@ hipError_t hipLaunchKernel(const void *fn, dim3 grid, dim3 block,
     in_hook = 1;
 
     const char *kname = resolve_name(fn);
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[256];
-    snprintf(extra, sizeof(extra),
-             "type=kernel,grid=%dx%dx%d,block=%dx%dx%d,stream=%d",
-             grid.x,grid.y,grid.z, block.x,block.y,block.z, sid);
+    char host[64], dev[160];
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%dx%dx%d,block=%dx%dx%d", sid, grid.x, grid.y, grid.z, block.x, block.y, block.z);
 
-    hipEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, stream, 1);
     hipError_t ret = real(fn, grid, block, args, sharedMem, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "rocm", "hipLaunchKernel", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "rocm", kname, dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -570,8 +665,7 @@ hipError_t hipLaunchKernelGGL(hipFunction_t fn,
                                dim3 grid, dim3 block,
                                unsigned int sharedMem, hipStream_t stream,
                                void **kernelParams) {
-    typedef hipError_t (*fn_t)(hipFunction_t, dim3, dim3, unsigned int,
-                                hipStream_t, void**);
+    typedef hipError_t (*fn_t)(hipFunction_t, dim3, dim3, unsigned int, hipStream_t, void**);
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipLaunchKernelGGL");
     if (!real) return -1;
@@ -579,23 +673,18 @@ hipError_t hipLaunchKernelGGL(hipFunction_t fn,
     in_hook = 1;
 
     const char *kname = resolve_name(fn);
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[256];
-    snprintf(extra, sizeof(extra),
-             "type=kernel,grid=%dx%dx%d,block=%dx%dx%d,stream=%d",
-             grid.x,grid.y,grid.z, block.x,block.y,block.z, sid);
+    char host[64], dev[160];
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%dx%dx%d,block=%dx%dx%d", sid, grid.x, grid.y, grid.z, block.x, block.y, block.z);
 
-    hipEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, stream, 1);
     hipError_t ret = real(fn, grid, block, sharedMem, stream, kernelParams);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "rocm", "hipLaunchKernelGGL", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "rocm", kname, dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -606,36 +695,26 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f,
                                   unsigned int bx, unsigned int by, unsigned int bz,
                                   unsigned int sharedMem, hipStream_t stream,
                                   void **kernelParams, void **extra_params) {
-    typedef hipError_t (*fn_t)(hipFunction_t,
-                                unsigned, unsigned, unsigned,
-                                unsigned, unsigned, unsigned,
-                                unsigned, hipStream_t, void**, void**);
+    typedef hipError_t (*fn_t)(hipFunction_t, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, hipStream_t, void**, void**);
     static fn_t real = NULL;
     if (!real) real = (fn_t)_real_hip_sym("hipModuleLaunchKernel");
     if (!real) return -1;
-    if (in_hook) return real(f, gx,gy,gz, bx,by,bz, sharedMem, stream,
-                             kernelParams, extra_params);
+    if (in_hook) return real(f, gx,gy,gz, bx,by,bz, sharedMem, stream, kernelParams, extra_params);
     in_hook = 1;
 
     const char *kname = resolve_name(f);
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[256];
-    snprintf(extra, sizeof(extra),
-             "type=kernel,grid=%ux%ux%u,block=%ux%ux%u,stream=%d",
-             gx,gy,gz, bx,by,bz, sid);
+    char host[64], dev[160];
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u", sid, gx, gy, gz, bx, by, bz);
 
-    hipEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
-    hipError_t ret = real(f, gx,gy,gz, bx,by,bz, sharedMem, stream,
-                          kernelParams, extra_params);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "rocm", kname, extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("rocm", tid, t0, now_ns() - t0, kname, extra);
-    }
+    Sub u;
+    sub_begin(&u, stream, 1);
+    hipError_t ret = real(f, gx,gy,gz, bx,by,bz, sharedMem, stream, kernelParams, extra_params);
+    sub_end(&u);
+    sub_host(&u, "rocm", "hipModuleLaunchKernel", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "rocm", kname, dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -652,15 +731,15 @@ hipError_t hipMemcpy(void *dst, const void *src, size_t size, hipMemcpyKind kind
     /* Synchronous memcpy implies all prior GPU work is complete — flush pending */
     pk_flush(NULL, 1);
 
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=memcpy,bytes=%zu", size);
-    uint64_t t0 = now_ns();
+    /* Blocking: the call spans the transfer itself (type=memcpy, category
+     * memory); ROCprofiler-SDK reports the device-side copy when active. */
+    char host[128];
+    snprintf(host, sizeof(host), "type=memcpy,op=memcpy,dir=%s,bytes=%zu", memcpy_dir(kind), size);
+    Sub u;
+    sub_begin(&u, NULL, 0);
     hipError_t ret = real(dst, src, size, kind);
-    /* "memory", not "rocm" -- matches hipMemcpyAsync/hipMemcpyHtoD/
-     * hipMemcpyDtoH below (all already "memory"); this was the one
-     * memcpy variant in this file still miscategorized as compute time,
-     * silently excluding it from the Memory tab's bandwidth accounting. */
-    emit_span("memory", gettid_compat(), t0, now_ns()-t0, "hipMemcpy", extra);
+    sub_end(&u);
+    sub_host(&u, "memory", "hipMemcpy", host, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -675,21 +754,20 @@ hipError_t hipMemcpyAsync(void *dst, const void *src, size_t size,
     if (in_hook) return real(dst, src, size, kind, stream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[128];
-    snprintf(extra, sizeof(extra), "type=memcpy_async,bytes=%zu,stream=%d", size, sid);
+    const char *dir = memcpy_dir(kind);
+    char host[128], dev[128], dname[32];
+    snprintf(host, sizeof(host), "type=launch,op=memcpy,dir=%s,bytes=%zu,stream=%d", dir, size, sid);
+    snprintf(dev, sizeof(dev), "type=memcpy_async,op=memcpy,dir=%s,bytes=%zu,stream=%d", dir, size, sid);
+    snprintf(dname, sizeof(dname), "memcpy %s", dir);
 
-    hipEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, stream, 1);
     hipError_t ret = real(dst, src, size, kind, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "memory", "hipMemcpyAsync", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("memory", tid, t0, now_ns()-t0, "hipMemcpyAsync", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "memory", "hipMemcpyAsync", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "memory", dname, dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -703,11 +781,16 @@ hipError_t hipMemcpyHtoD(void *dst, const void *src, size_t size) {
     if (in_hook) return real(dst, src, size);
     in_hook = 1;
 
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=HtoD,bytes=%zu", size);
-    uint64_t t0 = now_ns();
+
+    /* Blocking: the call spans the transfer itself (type=memcpy, category
+     * memory); ROCprofiler-SDK reports the device-side copy when active. */
+    char host[128];
+    snprintf(host, sizeof(host), "type=memcpy,op=memcpy,dir=%s,bytes=%zu", "HtoD", size);
+    Sub u;
+    sub_begin(&u, NULL, 0);
     hipError_t ret = real(dst, src, size);
-    emit_span("memory", gettid_compat(), t0, now_ns()-t0, "hipMemcpyHtoD", extra);
+    sub_end(&u);
+    sub_host(&u, "memory", "hipMemcpyHtoD", host, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -721,11 +804,16 @@ hipError_t hipMemcpyDtoH(void *dst, const void *src, size_t size) {
     if (in_hook) return real(dst, src, size);
     in_hook = 1;
 
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=DtoH,bytes=%zu", size);
-    uint64_t t0 = now_ns();
+
+    /* Blocking: the call spans the transfer itself (type=memcpy, category
+     * memory); ROCprofiler-SDK reports the device-side copy when active. */
+    char host[128];
+    snprintf(host, sizeof(host), "type=memcpy,op=memcpy,dir=%s,bytes=%zu", "DtoH", size);
+    Sub u;
+    sub_begin(&u, NULL, 0);
     hipError_t ret = real(dst, src, size);
-    emit_span("memory", gettid_compat(), t0, now_ns()-t0, "hipMemcpyDtoH", extra);
+    sub_end(&u);
+    sub_host(&u, "memory", "hipMemcpyDtoH", host, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -870,11 +958,14 @@ hipError_t hipDeviceSynchronize(void) {
     if (in_hook) return real();
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=device");
+    Sub u;
+    sub_begin(&u, NULL, 0);
     hipError_t ret = real();
+    sub_end(&u);
     pk_flush(NULL, 1);
-    emit_span("sync", gettid_compat(), t0, now_ns()-t0,
-              "hipDeviceSynchronize", "type=sync");
+    sub_host(&u, "sync", "hipDeviceSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -888,13 +979,14 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
     if (in_hook) return real(stream);
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=stream,stream=%d", get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
     hipError_t ret = real(stream);
+    sub_end(&u);
     pk_flush(stream, 0);
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=sync,stream=%d", get_stream_id(stream));
-    emit_span("sync", gettid_compat(), t0, now_ns()-t0,
-              "hipStreamSynchronize", extra);
+    sub_host(&u, "sync", "hipStreamSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -908,11 +1000,14 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
     if (in_hook) return real(event);
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=event,event=%d", handle_id(event));
+    Sub u;
+    sub_begin(&u, NULL, 0);
     hipError_t ret = real(event);
+    sub_end(&u);
     pk_flush(NULL, 1);
-    emit_span("sync", gettid_compat(), t0, now_ns()-t0,
-              "hipEventSynchronize", "type=sync");
+    sub_host(&u, "sync", "hipEventSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -926,11 +1021,106 @@ hipError_t hipDeviceReset(void) {
     if (in_hook) return real();
     in_hook = 1;
 
-    pk_flush(NULL, 1);
-    uint64_t t0 = now_ns();
+    pk_flush(NULL, 1);   /* device state is destroyed by the call */
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=device");
+    Sub u;
+    sub_begin(&u, NULL, 0);
     hipError_t ret = real();
-    emit_span("sync", gettid_compat(), t0, now_ns()-t0,
-              "hipDeviceReset", "type=sync");
+    sub_end(&u);
+    sub_host(&u, "sync", "hipDeviceReset", tags, (int)ret);
+
+    in_hook = 0;
+    return ret;
+}
+
+/* Event record / stream wait: they define which stream an event sync or a
+ * cross-stream wait refers to (the critical path resolves them through
+ * these spans). */
+hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
+    typedef hipError_t (*fn_t)(hipEvent_t, hipStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipEventRecord");
+    if (!real) return -1;
+    if (in_hook) return real(event, stream);
+    in_hook = 1;
+
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=event_record,op=event_record,event=%d,stream=%d",
+             handle_id(event), get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    hipError_t ret = real(event, stream);
+    sub_end(&u);
+    sub_host(&u, "rocm", "hipEventRecord", tags, (int)ret);
+
+    in_hook = 0;
+    return ret;
+}
+
+hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int flags) {
+    typedef hipError_t (*fn_t)(hipStream_t, hipEvent_t, unsigned int);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipStreamWaitEvent");
+    if (!real) return -1;
+    if (in_hook) return real(stream, event, flags);
+    in_hook = 1;
+
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=stream_wait,op=stream_wait,event=%d,stream=%d",
+             handle_id(event), get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    hipError_t ret = real(stream, event, flags);
+    sub_end(&u);
+    sub_host(&u, "rocm", "hipStreamWaitEvent", tags, (int)ret);
+
+    in_hook = 0;
+    return ret;
+}
+
+hipError_t hipMemsetAsync(void *dst, int value, size_t size, hipStream_t stream) {
+    typedef hipError_t (*fn_t)(void*, int, size_t, hipStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipMemsetAsync");
+    if (!real) return -1;
+    if (in_hook) return real(dst, value, size, stream);
+    in_hook = 1;
+
+    int sid = get_stream_id(stream);
+    char host[96], dev[96];
+    snprintf(host, sizeof(host), "type=launch,op=memset,bytes=%zu,stream=%d", size, sid);
+    snprintf(dev, sizeof(dev), "type=memset,op=memset,bytes=%zu,stream=%d", size, sid);
+    Sub u;
+    sub_begin(&u, stream, 1);
+    hipError_t ret = real(dst, value, size, stream);
+    sub_end(&u);
+    sub_host(&u, "memory", "hipMemsetAsync", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "memory", "memset", dev);
+    else          sub_abort(&u);
+
+    in_hook = 0;
+    return ret;
+}
+
+hipError_t hipMemset(void *dst, int value, size_t size) {
+    typedef hipError_t (*fn_t)(void*, int, size_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipMemset");
+    if (!real) return -1;
+    if (in_hook) return real(dst, value, size);
+    in_hook = 1;
+
+    char host[96], dev[96];
+    snprintf(host, sizeof(host), "type=launch,op=memset,bytes=%zu,stream=0", size);
+    snprintf(dev, sizeof(dev), "type=memset,op=memset,bytes=%zu,stream=0", size);
+    Sub u;
+    sub_begin(&u, NULL, 1);
+    hipError_t ret = real(dst, value, size);
+    sub_end(&u);
+    sub_host(&u, "memory", "hipMemset", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, NULL, "memory", "memset", dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -1173,21 +1363,18 @@ hipError_t hipGraphLaunch(hipGraphExec_t graphExec, hipStream_t stream) {
     if (in_hook) return real(graphExec, stream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=graph_launch,stream=%d", sid);
+    char host[64], dev[64];
+    snprintf(host, sizeof(host), "type=launch,op=graph,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=graph_launch,op=graph,stream=%d", sid);
 
-    hipEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, stream, 1);
     hipError_t ret = real(graphExec, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "rocm", "hipGraphLaunch", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("rocm", tid, t0, now_ns()-t0, "hipGraphLaunch", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "rocm", "hipGraphLaunch", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "rocm", "graph", dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;

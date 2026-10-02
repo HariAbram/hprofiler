@@ -27,6 +27,20 @@ Item {
     spacing: AppTheme.spacingMd
 
     property int selectedIndex: 0
+    // Follows the cross-tab selection (Nav) when it names a kernel listed
+    // here -- e.g. the Compare tab's "Open in Source".
+    function selectFromNav() {
+        var ks = Source.kernels
+        for (var i = 0; i < ks.length; i++) {
+            if (ks[i].rawName === Nav.selectedName) { root.selectedIndex = i; return }
+        }
+    }
+    Component.onCompleted: selectFromNav()
+    onVisibleChanged: if (visible) selectFromNav()
+    Connections {
+        target: Nav
+        function onSelectionChanged() { root.selectFromNav() }
+    }
     readonly property var selectedKernel: Source.kernels.length > selectedIndex
                                           ? Source.kernels[selectedIndex] : null
     readonly property bool hasSelection: !!selectedKernel && selectedKernel.hasDisasm

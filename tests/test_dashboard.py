@@ -204,10 +204,37 @@ class TestTopFindings(unittest.TestCase):
 
 # ── _mini_row ────────────────────────────────────────────────────────────────
 
+def _chunks(spans, size=7):
+    """Spans as TraceStore.interval_arrays() chunks."""
+    import numpy as np
+    return [(np.array([s.start_ns for s in spans[i:i + size]], dtype=np.int64),
+             np.array([s.end_ns for s in spans[i:i + size]], dtype=np.int64))
+            for i in range(0, len(spans), size)]
+
+
+def _mini_row_reference(spans, width, view_start, view_dur):
+    """The per-span loop _mini_row replaced (columns drawn)."""
+    cov = [0.0] * width
+    scale = width / view_dur
+    for s in spans:
+        if s.duration_ns <= 0:
+            continue
+        x0 = max(0.0, min(float(width), (s.start_ns - view_start) * scale))
+        x1 = max(0.0, min(float(width), (s.start_ns + s.duration_ns - view_start) * scale))
+        if x1 <= x0:
+            ix = min(int(x0), width - 1)
+            if ix >= 0:
+                cov[ix] = max(cov[ix], 0.2)
+            continue
+        for i in range(int(x0), min(int(x1), width - 1) + 1):
+            cov[i] = 1.0
+    return "".join("█" if c > 0.05 else " " for c in cov)
+
+
 class TestMiniRow(unittest.TestCase):
     def test_full_coverage_span_fills_every_column(self):
         span = _span(1, 1, Category.CPU, 0, 1000, "x")
-        row = _mini_row([span], width=10, view_start=0, view_dur=1000, color="cyan")
+        row = _mini_row(_chunks([span]), width=10, view_start=0, view_dur=1000, color="cyan")
         self.assertEqual(row.plain, "█" * 10)
 
     def test_no_spans_renders_all_blank(self):
@@ -215,9 +242,29 @@ class TestMiniRow(unittest.TestCase):
         self.assertEqual(row.plain, " " * 10)
 
     def test_zero_duration_view_returns_empty_without_crashing(self):
-        row = _mini_row([_span(1, 1, Category.CPU, 0, 10, "x")],
+        row = _mini_row(_chunks([_span(1, 1, Category.CPU, 0, 10, "x")]),
                         width=10, view_start=0, view_dur=0, color="cyan")
         self.assertEqual(row.plain, "")
+
+    def test_vectorized_bucket_coverage_matches_per_span_version(self):
+        import random
+        from src.analysis.dashboard import bucket_coverage, coverage_from_chunks
+        rng = random.Random(1)
+        for _ in range(500):
+            spans = [_span(1, 1, Category.CPU, rng.randrange(-300, 1300), rng.choice([0, 1, 5, 500, 2000]), "x")
+                     for _ in range(rng.randrange(0, 25))]
+            n, vs, vd = rng.choice([1, 3, 64]), rng.choice([0, 100]), rng.choice([0, 999.5, 1000])
+            self.assertEqual(coverage_from_chunks(_chunks(spans, 4), n, vs, vd), bucket_coverage(spans, n, vs, vd))
+
+    def test_matches_per_span_reference_on_random_spans(self):
+        import random
+        rng = random.Random(5)
+        for _ in range(200):
+            spans = [_span(1, 1, Category.CPU, rng.randrange(-200, 1200), rng.choice([0, 1, 3, 40, 400]), "x")
+                     for _ in range(rng.randrange(0, 30))]
+            width = rng.choice([1, 7, 40])
+            got = _mini_row(_chunks(spans), width=width, view_start=0, view_dur=1000, color="cyan").plain
+            self.assertEqual(got, _mini_row_reference(spans, width, 0, 1000))
 
 
 # ── _source_snippet ──────────────────────────────────────────────────────────

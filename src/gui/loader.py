@@ -40,7 +40,8 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal, Slot
 
 from ..core.trace import Trace
-from ..output.chrome_trace import load_trace_from_json, LoadCancelled
+from ..output.chrome_trace import LoadCancelled
+from ..core.trace_io import open_trace
 from .errors import HprofilerLoadError, classify_load_exception
 from .logging_setup import get_logger, log_error
 
@@ -52,6 +53,7 @@ class LoadStage(str, Enum):
     COMPUTING_CALL_TREE = "computing_call_tree"
     COMPUTING_FLAME_GRAPH = "computing_flame_graph"
     LOADING_COMPARISON = "loading_comparison"
+    COMPUTING_COMPARISON = "computing_comparison"
     DONE = "done"
 
 
@@ -62,6 +64,7 @@ _STAGE_LABELS: dict[LoadStage, str] = {
     LoadStage.COMPUTING_CALL_TREE: "Building call tree…",
     LoadStage.COMPUTING_FLAME_GRAPH: "Building flame graph…",
     LoadStage.LOADING_COMPARISON: "Loading comparison trace…",
+    LoadStage.COMPUTING_COMPARISON: "Comparing runs…",
     LoadStage.DONE: "Done",
 }
 
@@ -80,6 +83,7 @@ class LoadResult:
     dashboard_data: dict[str, Any] = field(default_factory=dict)
     call_tree_data: list[dict[str, Any]] = field(default_factory=list)
     flame_graph_data: dict[str, Any] = field(default_factory=dict)
+    comparison_data: dict[str, Any] | None = None
 
 
 class ProfileLoadWorker(QObject):
@@ -131,7 +135,10 @@ class ProfileLoadWorker(QObject):
                 return
 
             self._emit_stage(LoadStage.PARSING_JSON)
-            trace = load_trace_from_json(
+            # A .hpstore directory opens instantly (indexed, on disk); a
+            # JSON file loads into memory, or is imported into a disk
+            # store first when large (core/trace_io.open_trace).
+            trace = open_trace(
                 self._trace_path, collect_disasm=self._disasm,
                 progress_cb=lambda i, t: self.progress.emit(i, t),
                 cancel_check=self._is_cancelled,
@@ -148,7 +155,7 @@ class ProfileLoadWorker(QObject):
                 # inspected, not something a comparison-only trace needs
                 # (matches the design already established for --compare
                 # in app.py before this round).
-                trace_b = load_trace_from_json(
+                trace_b = open_trace(
                     self._compare_path, collect_disasm=False,
                     cancel_check=self._is_cancelled,
                 )
@@ -174,6 +181,17 @@ class ProfileLoadWorker(QObject):
             from .bridge import compute_flame_graph_data
             flame_graph_data = compute_flame_graph_data(trace, self._dark)
 
+            comparison_data = None
+            if trace_b is not None:
+                if self._is_cancelled():
+                    self.cancelled.emit()
+                    return
+                self._emit_stage(LoadStage.COMPUTING_COMPARISON)
+                # The opened trace is the candidate, --compare names the
+                # baseline (see src/gui/comparison.py).
+                from .comparison import compute_comparison_data
+                comparison_data = compute_comparison_data(trace, trace_b)
+
         except LoadCancelled:
             self.cancelled.emit()
             return
@@ -194,5 +212,5 @@ class ProfileLoadWorker(QObject):
         self.finished.emit(LoadResult(
             trace=trace, trace_b=trace_b, dark=self._dark,
             dashboard_data=dashboard_data, call_tree_data=call_tree_data,
-            flame_graph_data=flame_graph_data,
+            flame_graph_data=flame_graph_data, comparison_data=comparison_data,
         ))

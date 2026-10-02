@@ -116,7 +116,10 @@ def cli():
 @click.option("--backend", "-b", default="auto",
               help="Comma-separated backends: cpu,cuda,opencl,rocm,openmp  [default: auto]")
 @click.option("--output", "-o", default=None,
-              help="Output trace file (JSON).  Default: <program>.hprofiler.json")
+              help="Output trace: a .json file (also writes the indexed <name>.hpstore store next "
+                   "to it) or a .hpstore directory (store only).  Default: <program>.hprofiler.json")
+@click.option("--json/--no-json", "write_json", default=True,
+              help="Also export Chrome/Perfetto JSON next to the trace store  [default: yes]")
 @click.option("--ui/--no-ui", default=True,
               help="Open a viewer after profiling  [default: yes]")
 @click.option("--gui", is_flag=True, default=False,
@@ -142,7 +145,7 @@ def cli():
 @click.option("--otlp-file", default=None, metavar="PATH",
               help="Write OTLP JSON to file (e.g. trace.otlp.json)")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
-def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, call_tree,
+def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph, disasm, call_tree,
         gpu_pc_sampling, otlp_endpoint, otlp_file, command):
     """Profile COMMAND with the selected backends.
 
@@ -152,8 +155,11 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
 
     \b
     Every run produces:
-      <prog>.hprofiler.json  — Chrome Trace JSON (Perfetto / chrome://tracing)
-      TUI viewer             — opened automatically unless --no-ui
+      <prog>.hprofiler.hpstore — indexed trace store (events written to disk
+                                 in batches while capturing; opens instantly)
+      <prog>.hprofiler.json    — Chrome Trace JSON (Perfetto / chrome://tracing;
+                                 skip with --no-json)
+      TUI viewer               — opened automatically unless --no-ui
 
     \b
     Examples:
@@ -186,6 +192,12 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
     if not out_path:
         prog_name = Path(cmd[0]).name
         out_path = f"{prog_name}.hprofiler.json"
+    if out_path.endswith(".hpstore"):
+        store_path, json_path = out_path, None
+    else:
+        stem = out_path[:-5] if out_path.endswith(".json") else out_path
+        store_path, json_path = stem + ".hpstore", (out_path if write_json else None)
+    view_path = json_path or store_path
 
     env_extra: dict = {}
     if perf_callgraph:
@@ -195,25 +207,34 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
     if gpu_pc_sampling:
         env_extra["HPROFILER_GPU_PCSAMPLING"] = "1"
 
+    # Events stream into an on-disk store in bounded batches while the
+    # program runs (src/core/store/disk.py), never all held in memory.
+    from src.core.trace_io import create_disk_trace
+    capture = create_disk_trace(store_path)
     runner = Runner(
         command=cmd,
         backends=backends,
         perf_freq=perf_freq,
         env_extra=env_extra,
         collect_disasm=disasm,
+        store=capture.store,
     )
 
     trace = runner.run()
-    click.echo(f"\n[hprofiler] Run complete — {len(trace.spans)} events captured", err=True)
+    click.echo(f"\n[hprofiler] Run complete — {trace.span_count()} events captured", err=True)
 
-    # Save trace
-    from src.output import chrome_trace
-    chrome_trace.write(trace, out_path)
-    click.echo(f"[hprofiler] Trace written to: {out_path}", err=True)
+    # Indexes, lanes, activity index and aggregates for the viewers.
+    trace.finalize()
+    click.echo(f"[hprofiler] Trace store: {store_path}", err=True)
+
+    if json_path:
+        from src.core.trace_io import write_json_export
+        write_json_export(trace, json_path)
+        click.echo(f"[hprofiler] Trace written to: {json_path}", err=True)
 
     if otlp_endpoint or otlp_file:
         from src.output.otlp import export as _otlp_export
-        otlp_out = otlp_file or (Path(out_path).stem + ".otlp.json")
+        otlp_out = otlp_file or (Path(view_path).stem + ".otlp.json")
         try:
             _otlp_export(trace, endpoint=otlp_endpoint, output_file=otlp_file)
             if otlp_file:
@@ -233,11 +254,11 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
     if disasm and runner._disasm_thread is not None:
         runner._disasm_thread.join(timeout=60)
 
-    if ui and trace.spans:
+    if ui and trace.span_count():
         shown = False
         if gui:
             from src.gui.launch import launch_gui
-            shown = launch_gui(out_path, disasm=disasm)
+            shown = launch_gui(store_path, disasm=disasm)
         if not shown:
             from src.ui.app import launch_viewer
             launch_viewer(trace, collect_disasm=disasm)
@@ -248,8 +269,11 @@ def run(backend, output, ui, gui, summary, perf_freq, perf_callgraph, disasm, ca
     if disasm and runner._disasm_thread is not None:
         runner._disasm_thread.join()
         if trace.disasm:
-            chrome_trace.write(trace, out_path)
-            click.echo(f"[hprofiler] Disasm added to: {out_path}", err=True)
+            trace.save()
+            if json_path:
+                from src.core.trace_io import write_json_export
+                write_json_export(trace, json_path)
+            click.echo(f"[hprofiler] Disasm added to: {view_path}", err=True)
 
 
 @cli.command()
@@ -286,10 +310,11 @@ def view(trace_file, disasm, otlp_endpoint, otlp_file):
     See also: 'hprofiler gui' opens the same trace in the Qt/QML popup GUI
     instead (falls back to this TUI automatically if unavailable).
     """
-    from src.ui.app import load_trace_from_json, launch_viewer
+    from src.ui.app import launch_viewer
+    from src.core.trace_io import open_trace
     click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)
-    trace = load_trace_from_json(trace_file, collect_disasm=disasm)
-    click.echo(f"[hprofiler] {len(trace.spans)} spans loaded", err=True)
+    trace = open_trace(trace_file, collect_disasm=disasm)
+    click.echo(f"[hprofiler] {trace.span_count()} spans loaded", err=True)
 
     if otlp_endpoint or otlp_file:
         from src.output.otlp import export as _otlp_export
@@ -309,8 +334,9 @@ def view(trace_file, disasm, otlp_endpoint, otlp_file):
 @click.argument("trace_file", type=click.Path(exists=True))
 @click.option("--disasm/--no-disasm", default=False,
               help="Collect per-kernel disassembly in the background  [default: no]")
-@click.option("--compare", default=None, type=click.Path(exists=True), metavar="TRACE_B",
-              help="Open a second trace as a comparison run (Compare tab)")
+@click.option("--compare", default=None, type=click.Path(exists=True), metavar="BEFORE",
+              help="Compare against a baseline run (Compare tab): the opened trace is the "
+                   "candidate, BEFORE the baseline -- as in 'hprofiler compare BEFORE AFTER'")
 def gui(trace_file, disasm, compare):
     """Open the Qt/QML popup GUI for a saved trace JSON file.
 
@@ -331,10 +357,11 @@ def gui(trace_file, disasm, compare):
     from src.gui.launch import launch_gui
     shown = launch_gui(trace_file, disasm=disasm, compare_path=compare)
     if not shown:
-        from src.ui.app import load_trace_from_json, launch_viewer
+        from src.ui.app import launch_viewer
+        from src.core.trace_io import open_trace
         click.echo(f"[hprofiler] Loading {trace_file} ...", err=True)
-        trace = load_trace_from_json(trace_file, collect_disasm=disasm)
-        click.echo(f"[hprofiler] {len(trace.spans)} spans loaded", err=True)
+        trace = open_trace(trace_file, collect_disasm=disasm)
+        click.echo(f"[hprofiler] {trace.span_count()} spans loaded", err=True)
         if compare:
             # The TUI has no Compare-mode view; say so rather than
             # silently ignoring --compare.
@@ -538,10 +565,10 @@ def roofline(backend, output, use_html, target):
         err=True,
     )
 
-    from src.ui.app import load_trace_from_json
+    from src.core.trace_io import open_trace
     from src.output.roofline_html import write_from_trace
 
-    trace = load_trace_from_json(trace_file, collect_disasm=True)
+    trace = open_trace(trace_file, collect_disasm=True)
     for _ in range(40):          # wait up to 12 s for background disasm
         if trace.disasm:
             break
@@ -616,10 +643,10 @@ def summary(trace_file, top):
     Example:
       hprofiler summary --top 10 app.hprofiler.json
     """
-    from src.ui.app import load_trace_from_json
+    from src.core.trace_io import open_trace
     from src.output.summary import print_summary
     # Disasm is never used in a text summary — skip the background collection.
-    trace = load_trace_from_json(trace_file, collect_disasm=False)
+    trace = open_trace(trace_file, collect_disasm=False)
     print_summary(trace, top_n=top)
 
 
@@ -645,8 +672,8 @@ def disasm(trace_file, kernel, output, list_only):
       hprofiler disasm trace.json -o kernels.asm           # write to file
       hprofiler disasm trace.json -k kernel1 -o k1.asm
     """
-    from src.ui.app import load_trace_from_json
-    trace = load_trace_from_json(trace_file, collect_disasm=False)
+    from src.core.trace_io import open_trace
+    trace = open_trace(trace_file, collect_disasm=False)
 
     if not trace.disasm:
         click.echo("[hprofiler] No disassembly in this trace. "
@@ -712,11 +739,11 @@ def efficiency(trace_file, baseline, interconnect_bw, use_cp):
       hprofiler efficiency trace.json --baseline trace_1rank.json
       hprofiler efficiency trace.json --interconnect-bw 300
     """
-    from src.ui.app import load_trace_from_json
+    from src.core.trace_io import open_trace
     from src.analysis import pop_efficiency as pe
 
-    trace = load_trace_from_json(trace_file, collect_disasm=True)
-    baseline_trace = load_trace_from_json(baseline, collect_disasm=False) if baseline else None
+    trace = open_trace(trace_file, collect_disasm=True)
+    baseline_trace = open_trace(baseline, collect_disasm=False) if baseline else None
 
     cp_report = None
     if use_cp:
@@ -789,10 +816,10 @@ def critical_path_cmd(trace_file, top, export):
       hprofiler critical-path trace.json
       hprofiler critical-path trace.json --export trace.critpath.json
     """
-    from src.ui.app import load_trace_from_json
+    from src.core.trace_io import open_trace
     from src.analysis import criticalpath as cpmod
 
-    trace = load_trace_from_json(trace_file, collect_disasm=False)
+    trace = open_trace(trace_file, collect_disasm=False)
     report = cpmod.analyze(trace)
 
     def fmt_ns(ns):
@@ -840,23 +867,83 @@ def critical_path_cmd(trace_file, top, export):
 
     if export:
         from src.output import chrome_trace
-        on_path = {id(report.spans[i]) for i in report.path_span_indices}
-        # path_edge_confidence[i-1] is the confidence of the edge explaining
-        # path[i]'s inclusion (path[0], the root of the backward walk, has
-        # none -- see CriticalPathReport.confidence_breakdown_ns).
-        conf_by_id = {
-            id(report.spans[report.path_span_indices[i]]): report.path_edge_confidence[i - 1]
-            for i in range(1, len(report.path_span_indices))
-        }
-        for s in trace.spans:
-            if id(s) in on_path:
-                s.tags["on_critical_path"] = "1"
-                if id(s) in conf_by_id:
-                    s.tags["path_confidence"] = conf_by_id[id(s)]
-        chrome_trace.write(trace, export, pretty=True)
+        # Tags added to the exported copy only (the trace itself is not
+        # modified). path_edge_confidence[i-1] is the confidence of the edge
+        # explaining path[i]'s inclusion (path[0], the root of the backward
+        # walk, has none -- see CriticalPathReport.confidence_breakdown_ns).
+        extra: dict[int, dict] = {}
+        for pos, idx in enumerate(report.path_span_indices):
+            tags = {"on_critical_path": "1"}
+            if pos > 0:
+                tags["path_confidence"] = report.path_edge_confidence[pos - 1]
+            extra[report.spans[idx].eid] = tags
+        chrome_trace.write(trace, export, pretty=True, extra_args=extra)
         click.echo(f"\n  Annotated trace written to: {export}")
 
     click.echo(f"{'='*64}\n")
+
+
+@cli.command("compare")
+@click.argument("before", type=click.Path(exists=True))
+@click.argument("after", type=click.Path(exists=True))
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text", show_default=True,
+              help="Text report, or the full comparison as JSON")
+@click.option("-o", "--output", default=None, type=click.Path(),
+              help="Write the report to a file instead of stdout")
+@click.option("--top", default=10, show_default=True, help="Entries shown per section (text)")
+@click.option("--min-pct", default=None, type=float,
+              help="Noise floor: minimum relative change, %  [default: 5]")
+@click.option("--min-ns", default=None, type=float,
+              help="Noise floor: minimum absolute change, ns  [default: 1000000]")
+@click.option("--min-confidence", default=None, type=float,
+              help="Alignment confidence below which the (category, name) aggregate "
+                   "comparison is used instead  [default: 0.5]")
+def compare_cmd(before, after, fmt, output, top, min_pct, min_ns, min_confidence):
+    """Explain what changed between two runs (BEFORE = baseline, AFTER = candidate).
+
+    \b
+    Matches the runs by structure, not by function name alone: repeated
+    phases/iterations are detected and aligned (tolerating inserted or
+    removed ones), and within aligned phases work is matched by normalized
+    call path, source location, backend/device/stream/rank/communicator
+    role and dependency-graph neighbourhood -- independent of raw pids,
+    tids, stream handles and timestamps. Each regression is attributed to
+    increased work, more invocations, queueing, synchronization,
+    communication, lost overlap, a changed dependency edge or movement
+    onto the critical path, and contributors are ranked by the change of
+    critical-path time they account for.
+
+    \b
+    Every value is labeled measured / graph-derived / heuristic /
+    unavailable. With low alignment confidence the plain (category, name)
+    comparison is reported instead. Single runs carry no variance data:
+    changes are screened by a disclosed noise floor, not a significance
+    test.
+
+    \b
+    Examples:
+      hprofiler compare before.hprofiler.json after.hprofiler.json
+      hprofiler compare before.hpstore after.hpstore --format json -o diff.json
+    """
+    import json as _json
+    from src.core.trace_io import open_trace
+    from src.analysis import causal_compare as cc, compare as agg
+
+    click.echo(f"[hprofiler] Loading {before} and {after} ...", err=True)
+    trace_a = open_trace(before, collect_disasm=False)
+    trace_b = open_trace(after, collect_disasm=False)
+    report = cc.compare_traces(
+        trace_a, trace_b,
+        noise_pct=agg.NOISE_FLOOR_PCT if min_pct is None else min_pct,
+        noise_ns=agg.NOISE_FLOOR_NS if min_ns is None else min_ns,
+        min_confidence=cc.DEFAULT_MIN_CONFIDENCE if min_confidence is None else min_confidence,
+        top_n=max(top, 25))
+    text = _json.dumps(report, indent=2) if fmt == "json" else cc.render_text(report, top=top)
+    if output:
+        Path(output).write_text(text + "\n")
+        click.echo(f"[hprofiler] Comparison written to {output}", err=True)
+    else:
+        click.echo(text)
 
 
 @cli.command("merge-nodes")
@@ -893,13 +980,12 @@ def merge_nodes_cmd(trace_files, output, offset_ns):
       hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
       hprofiler merge-nodes node0.json node1.json -o merged.json --offset-ns 0 --offset-ns 15000
     """
-    from src.ui.app import load_trace_from_json
+    from src.core.trace_io import open_trace, create_disk_trace
     from src.analysis import multinode as mn
-    from src.output import chrome_trace
 
     nodes = []
     for i, path in enumerate(trace_files):
-        trace = load_trace_from_json(path, collect_disasm=False)
+        trace = open_trace(path, collect_disasm=False)
         if i < len(offset_ns):
             offset = offset_ns[i]
             error_bound = 0
@@ -918,7 +1004,13 @@ def merge_nodes_cmd(trace_files, output, offset_ns):
         nodes.append(mn.NodeTrace(trace=trace, offset_ns=offset, error_bound_ns=error_bound,
                                   label=str(path)))
 
-    merged, warnings = mn.merge_traces(nodes)
+    # Merged into an on-disk store (events streamed, never all in memory):
+    # the output itself when it is a .hpstore, else a store next to the
+    # JSON output.
+    store_out = output if output.endswith(".hpstore") else \
+        (output[:-5] if output.endswith(".json") else output) + ".hpstore"
+    merged, warnings = mn.merge_traces(nodes, into=create_disk_trace(store_out))
+    merged.finalize()
     for w in warnings:
         click.echo(f"  Warning: {w}")
 
@@ -931,9 +1023,11 @@ def merge_nodes_cmd(trace_files, output, offset_ns):
         if len(problems) > 10:
             click.echo(f"    ... and {len(problems) - 10} more")
 
-    chrome_trace.write(merged, output, pretty=True)
-    click.echo(f"\n  Merged {len(trace_files)} node(s), {len(merged.spans)} spans "
-              f"-> {output}")
+    if not output.endswith(".hpstore"):
+        from src.core.trace_io import write_json_export
+        write_json_export(merged, output, pretty=True)
+    click.echo(f"\n  Merged {len(trace_files)} node(s), {merged.span_count()} spans "
+              f"-> {output} (store: {store_out})")
 
 
 @cli.command()

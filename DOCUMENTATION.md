@@ -27,8 +27,8 @@ execution-start timing; a lock-free collection path; OS-level scheduler
 visibility; multi-node clock alignment; and quantitative accuracy
 validation instead of crash-only testing). Verification depth differs
 per piece **because this specific development machine's hardware/
-privileges differ per piece** — a broken NVIDIA driver, no AMD GPU, no
-real multi-rank MPI (confirmed a PMI/KVS rank-discovery failure in this
+privileges differ per piece** — a broken NVIDIA driver (until 2026-10-01; it
+now has a working GeForce MX550), no AMD GPU, no real multi-rank MPI (confirmed a PMI/KVS rank-discovery failure in this
 machine's MPICH/UCX/PMIx setup, unrelated to hprofiler), and no root/
 CAP_BPF — not because some pieces were designed or tested less carefully
 than others. Each row states exactly what was and wasn't possible to
@@ -38,11 +38,12 @@ confirm here, so nothing is implicitly overstated.
 |---|---|---|---|---|
 | 1 | MPI protocol semantics (resolved wildcard matching, `Waitany`/`Waitsome`/`Test*`/`Cancel`, communicator identity) | ✅ **Verified end-to-end** | Real hook built + `LD_PRELOAD`ed into a fixture; actual wire-protocol bytes captured over a real `AF_UNIX` socket and parsed with the production parser (`tests/integration/test_mpi_protocol.py`, 8 tests) | §4 `mpi`, §12 |
 | 2 | Typed causal DAG: edge confidence tiers + formal DAG longest-path DP (replaces the old greedy walk) | ✅ **Verified end-to-end** | 27 hand-computed unit tests (`tests/test_criticalpath.py`), including a constructed case proving the DP finds a materially better (650ns vs. 60ns) answer than the old algorithm on the same graph | §17 |
-| 3 | GPU lifecycle split: real exec-start via reference-event calibration (`xs=` tag) | ⚠️ **Compile-verified only** | Clean `gcc -Wall -Wextra` compile of `cuda_hook.c`/`rocm_hook.c`, clean rebuild via the real CMake path, integrated into the DP (unit-tested against synthetic `xs=` tags) — **never run against a real GPU** (this machine's NVIDIA driver is broken, no AMD GPU present) | §4 `cuda`, §17, §13 |
+| 3 | GPU lifecycle split: real exec-start via reference-event calibration (`xs=` tag) | ⚠️ **Superseded by #8 where CUPTI/ROCprofiler-SDK is available; observed inaccurate** | Integrated into the DP (unit-tested against synthetic `xs=` tags). One real-GPU run (MX550, CUDA) against CUPTI's measured start of the same kernels: ~2.4 ms late for 8 of 9 kernels — treat as a rough estimate. Never run on ROCm hardware | §4 `cuda`, §17, §13 |
 | 4 | Collection-path redesign: lock-free per-thread ring buffer (removes mutex+socket from the hot path) | ✅ **Primitive verified in isolation**; ⚠️ **not wired into any hook** | Concurrent correctness stress test, exact drop-counter accounting, FIFO-under-wraparound, ThreadSanitizer-clean, and real measured overhead (1.5–58x faster than today's mutex+`send()` pattern, depending on thread count) — deliberately not integrated into any hook's actual `emit_span()` this pass (see §13 for why) | §13 |
 | 5 | eBPF OS-level scheduler tracer (off-CPU/wakeup/migrate visibility) | ⚠️ **Compiled, linked, and run to the exact expected privilege wall — never loaded into a kernel** | `bpftool gen skeleton` independently confirms the compiled object's structure (fully offline check); running it reaches libbpf's internal probe-load self-test and fails with `EPERM`, precisely the error `kernel.unprivileged_bpf_disabled=2` should produce, handled gracefully — the kernel BPF verifier itself has never run against it | §18 |
 | 6 | Multi-node design: clock-offset estimation (Cristian's algorithm) + trace merging | ✅ **Python side (merge, validation, offset arithmetic) verified end-to-end**; ⚠️ **C-side round-trip capture compile-verified only** | 14 unit tests including an asymmetric-latency case proving the error bound brackets the real error, plus a real CLI run merging two actual traces (confirmed correct pid remapping) — the C-side round-trip exchange itself has never executed a real 2+-rank exchange (same MPI multi-rank limitation as #1's cross-process piece) | §19 |
 | 7 | Validation suite: aggregate precision/recall + determinism checks (vs. crash-only testing) | ✅ **Verified** | 100%/100% precision/recall across 22 hand-constructed ground-truth edges spanning all three confidence tiers; 35 determinism trials (7 scenarios × 5 random reorderings) with byte-identical results | §17, `tests/validation/` |
+| 8 | Native device activity: CUPTI (CUDA) / ROCprofiler-SDK (ROCm), host/device span split, correlation edges, never-mixed GPU-active time | ✅ **CUDA verified functionally on a real GPU**; ⚠️ **ROCm decoder-tested only** | CUDA: two-stream fixture on a GeForce MX550 in all three modes plus a static-runtime build (`tests/integration/test_cuda_native_activity.py`) — every submission correlated to one measured device op, stream order and a cross-stream wait respected, no duplicates. Both decoders: real vendor headers + synthetic records (`tests/integration/test_native_gpu_records.py`); correlation logic: 40 unit tests. No comparison against vendor profilers. ROCm registration never executed (no AMD GPU) | §4 "CUDA and ROCm: host calls...", §12, §17 |
 
 Every ⚠️ item is re-stated with full detail, including the exact command
 and error that was reached, in its own section and in §13's Known
@@ -73,6 +74,8 @@ hunted for, not to replace it.
 18. [OS-Level Observability (eBPF Scheduler Tracer)](#18-os-level-observability-ebpf-scheduler-tracer)
 19. [Multi-Node Trace Merging and Clock Synchronization](#19-multi-node-trace-merging-and-clock-synchronization)
 20. [GUI Viewer](#20-gui-viewer)
+21. [Trace Storage](#21-trace-storage)
+22. [Comparing Runs](#22-comparing-runs)
 
 ---
 
@@ -130,14 +133,16 @@ python3 hprofiler run --no-ui -- ./my_program
 | Component | Requirement |
 |-----------|-------------|
 | Python | 3.10+ |
-| Python packages | `click`, `textual`, `rich`, `capstone>=5.0` |
+| Python packages | `click`, `textual`, `rich`, `numpy`, `capstone>=5.0` |
 | C compiler | GCC 9+ or Clang 12+ |
 | CMake | 3.16+ |
 | CPU backend | Linux `perf` tool |
-| OpenMP backend | `libomp` (LLVM) — not GCC's `libgomp` (see §4) |
+| OpenMP backend | LLVM `libomp` (OMPT) or GNU `libgomp` (`GOMP_*` interception) — see §4 |
 | CUDA backend | CUDA Runtime installed (`libcuda.so`) |
+| CUDA device activity (optional, recommended) | Build: CUPTI headers (`cupti.h`, CUDA toolkit ≥ 12.0 record layouts). Run: `libcupti.so` (CUDA toolkit), loaded with `dlopen`. Without either, device timing falls back to GPU-event proxies (§4) |
 | OpenCL backend | Any ICD loader (`libOpenCL.so`) |
 | ROCm backend | `libamdhip64.so` findable via ldconfig, `$ROCM_PATH`/`$ROCM_HOME`, or a system/`/opt/rocm*` lib dir (not required to be exactly `/opt/rocm`) |
+| ROCm device activity (optional, recommended) | Build: ROCprofiler-SDK headers (`rocprofiler-sdk/`, ROCm ≥ 6.2). Run: `librocprofiler-sdk` + `rocprofiler-register` (ROCm ≥ 6.2), found by the HIP runtime itself. Otherwise hipEvent proxies (§4) |
 | NCCL backend | CUDA Runtime + `libnccl.so` at runtime |
 | MPI backend | Any MPI implementation with `mpicc`, **or** a Cray Programming Environment (`$CRAY_MPICH_DIR` + the `cc` compiler wrapper) — no `mpicc` needed there |
 | Call-path unwinding (optional) | `libunwind-dev` (apt) / `libunwind-devel` (dnf) — for accurate C++ stack capture without frame pointers |
@@ -226,7 +231,8 @@ hprofiler run [OPTIONS] -- COMMAND [ARGS...]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--backend`, `-b` | `auto` | Comma-separated list of backends to enable |
-| `--output`, `-o` | `<prog>.hprofiler.json` | Path for the Chrome Trace JSON output file |
+| `--output`, `-o` | `<prog>.hprofiler.json` | Output trace. A `.json` path writes the indexed trace store `<name>.hpstore` next to it plus the Chrome Trace JSON export; a `.hpstore` path writes only the store. See §21. |
+| `--json / --no-json` | `--json` | Also export Chrome/Perfetto JSON next to the store. `--no-json` skips the export (and its time and disk space) for very large captures; the store alone is enough for every hprofiler command. |
 | `--ui / --no-ui` | `--ui` | Open the TUI viewer after profiling |
 | `--summary / --no-summary` | `--summary` | Print the text summary after profiling |
 | `--perf-freq` | `9999` | Sampling frequency in Hz (CPU/perf backend only) |
@@ -258,7 +264,17 @@ hprofiler run -- ./app
 
 # With disassembly (adds Disasm tab in TUI)
 hprofiler run --backend cuda --disasm -- ./app
+
+# Very long run: store only, no JSON export
+hprofiler run --no-json -o big.hpstore -- ./app
+hprofiler view big.hpstore
 ```
+
+Events are written to the on-disk trace store in bounded batches while the
+program runs, so capture memory does not grow with the trace (§21). After
+the program exits, the store is *finalized*: indexes, timeline lanes,
+per-name and exclusive-time aggregates and the multiresolution activity
+index are built once and persisted, so viewers open it immediately.
 
 ---
 
@@ -269,6 +285,13 @@ Open the TUI viewer for a previously saved trace file.
 ```
 hprofiler view [OPTIONS] TRACE_FILE
 ```
+
+`TRACE_FILE` is anything hprofiler writes (every analysis command accepts
+the same): a `.hpstore` trace store, the JSON `hprofiler run` exported (the
+store next to it is opened instead of parsing the JSON, as long as the JSON
+is unchanged), or any other hprofiler JSON (parsed into memory when small,
+imported once into a cached `<file>.json.hpstore` when larger than 256 MB,
+see §21).
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -296,7 +319,7 @@ hprofiler gui [OPTIONS] TRACE_FILE
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--disasm / --no-disasm` | `--no-disasm` | Collect disassembly in the background; populates the Source tab |
-| `--compare TRACE_B` | — | Open a second trace as a comparison run (populates the Compare tab); see §20's Comparison mode |
+| `--compare BEFORE` | — | Compare against a baseline run (populates the Compare tab): the opened trace is the candidate, `BEFORE` the baseline -- the roles of `hprofiler compare BEFORE AFTER`; see §20's Comparison mode and §22 |
 | `--verbose / --no-verbose` | `--no-verbose` | Print which rendering tier was used (GPU-rendered Qt Quick, software-rendered, or TUI fallback) and why |
 
 ```bash
@@ -492,7 +515,7 @@ hprofiler merge-nodes [OPTIONS] TRACE_FILES...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-o`, `--output` | *(required)* | Where to write the merged trace (Chrome Trace JSON) |
+| `-o`, `--output` | *(required)* | Where to write the merged trace: a `.json` path writes the merged trace store `<name>.hpstore` plus the JSON export, a `.hpstore` path only the store. Events are streamed node by node into the store, never all held in memory. |
 | `--offset-ns NS` | none | Explicit per-node clock offset in ns, repeatable, same order as `TRACE_FILES` — overrides embedded `HPROFILER_CLOCK_SYNC` counters for that node |
 
 ```bash
@@ -500,6 +523,36 @@ hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
 hprofiler merge-nodes node0.json node1.json -o merged.json --offset-ns 0 --offset-ns 15000
 hprofiler critical-path merged.json   # analyze across node boundaries
 ```
+
+---
+
+### `hprofiler compare`
+
+Explain what changed between two runs: BEFORE is the baseline, AFTER the
+candidate. Both can be any trace hprofiler reads (`.hpstore` or JSON).
+
+```
+hprofiler compare [OPTIONS] BEFORE AFTER
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--format text\|json` | `text` | Text report, or the full comparison as JSON (schema `hprofiler-compare/1`) |
+| `-o`, `--output PATH` | stdout | Write the report to a file |
+| `--top N` | `10` | Entries per section (text) |
+| `--min-pct`, `--min-ns` | `5`, `1000000` | The noise floor: a change must exceed both to count |
+| `--min-confidence` | `0.5` | Alignment confidence below which the plain (category, name) comparison is reported instead |
+
+```bash
+hprofiler compare before.hprofiler.json after.hprofiler.json
+hprofiler compare before.hpstore after.hpstore --format json -o diff.json
+hprofiler gui after.hprofiler.json --compare before.hprofiler.json   # the same, in the GUI's Compare tab
+```
+
+The runs are matched by structure, not by function name alone, and every
+regression is attributed to a cause; contributors are ranked by the change
+of critical-path time they account for. What each number means, and how
+far to trust it, is in §22.
 
 ---
 
@@ -588,41 +641,239 @@ hprofiler run --backend cpu --perf-freq 199 -- ./my_program
 
 ---
 
+### CUDA and ROCm: host calls, device work, and where each timestamp comes from
+
+Every intercepted CUDA/HIP call that submits work to the GPU (kernel launch,
+async or blocking copy, memset, graph launch) is reported as **two kinds of
+span**, linked by a correlation id:
+
+| Span | Tags | What it is |
+|---|---|---|
+| **Host API span** | `side=cpu`, `timing=host`, `lid=`, `sid=` (+ `corr=`/`corr2=` with CUPTI) | The call itself (`cudaLaunchKernel`, `hipMemcpyAsync`, ...) on the calling thread. Named after the API; `type=launch` for submissions (Runtime overhead), `type=memcpy` for a blocking copy (the call spans the transfer), `type=sync` for sync calls, `type=event_record` / `type=stream_wait` for event bookkeeping. |
+| **Device span** | `side=gpu`, `timing=device` or `timing=proxy_*` | The work on the GPU: kernel (category `cuda`/`rocm`, named after the kernel), copy (`memory`, `memcpy HtoD` ...), memset (`memory`, `memset`). On its stream's Timeline lane, never in host-thread time. |
+
+All of them carry `rt=cuda|rocm`, `op=` (`kernel`, `memcpy`, `memset`,
+`graph`, `sync`, `event_record`, `stream_wait`) and `stream=` (the
+program's stream handle, hashed -- the same id in the CUDA, ROCm and NCCL
+hooks). Native device spans add `dev=`, `ctx=` (CUDA), `nstream=` (the
+vendor's stream id) or `queue=`/`dispatch=` (ROCm), and `src=cupti` /
+`src=rocprofiler`.
+
+#### Native tracing (preferred) and the proxy fallback
+
+* **CUDA -- CUPTI.** Activity API for `CONCURRENT_KERNEL`, `MEMCPY`,
+  `MEMCPY2` (peer), `MEMSET` and `SYNCHRONIZATION` records; Callback API on
+  the runtime and driver domains. The hook arms a thread-local capture
+  around each intercepted call and records the CUPTI correlation ids of the
+  outermost runtime and driver call made inside it (`corr`, `corr2` --
+  kernel records may carry either; memcpy records carry the driver id plus
+  the runtime id). Kernel launches, copies and memsets made through calls
+  the LD_PRELOAD layer cannot see (libraries with a statically linked
+  runtime, e.g. cuBLAS) get a host span from the callback itself
+  (`src=cupti_cb`). `libcupti` is opened with `dlopen` at the first
+  intercepted CUDA call -- never in shells or launchers that merely
+  inherit `LD_PRELOAD` -- trying, in order: a copy already loaded in the
+  process (a second copy is never loaded next to it), `$HPROFILER_CUPTI_LIB`,
+  the toolkit whose headers were compiled in, `$CUDA_HOME`, then the loader
+  path. A libcupti older than the compiled headers is refused (it could
+  deliver older record versions).
+* **ROCm -- ROCprofiler-SDK buffered tracing.** `KERNEL_DISPATCH` and
+  `MEMORY_COPY` buffer records plus the code-object callback for kernel
+  names. The hook exports `rocprofiler_configure`; when the HIP runtime
+  starts, rocprofiler-register finds it and loads `librocprofiler-sdk`
+  (nothing is linked). Around each intercepted HIP call the hook pushes its
+  `lid` as ROCprofiler's *external* correlation id, so the records carry
+  the exact host call that submitted them. The hook forces HIP
+  initialization before the first submission so the native/proxy decision
+  is made with the tracer already running.
+* **Proxy fallback.** Without a native tracer the pre-existing interception
+  timing stays: a GPU event pair around each submission (`timing=
+  proxy_event`), or the host call's own interval when events can't be used
+  (`timing=proxy_host`), or launch-to-flush time when the event query
+  failed (`timing=proxy_flush`). Proxy device spans start at the host
+  submission time.
+
+`HPROFILER_DEVICE_ACTIVITY` selects the mode: `auto` (default: native when
+available, else proxy), `off` (proxy only, the behaviour before native
+tracing existed), `both` (native and proxy for every launch, for comparing
+them; the analysis keeps the native span). Other knobs:
+`HPROFILER_CUPTI_LIB` (libcupti path), `HPROFILER_CUPTI_FLUSH_MS` (CUPTI
+periodic flush, default 1000 ms), `HPROFILER_CUPTI_EAGER=1` (start CUPTI
+when the hook loads; set automatically for static-runtime binaries, below).
+
+**Building.** The vendor *headers* are needed at build time for the record
+layouts; the libraries are not linked. `hprofiler build` finds `cupti.h`
+(`$CUDA_HOME`, `/usr/local/cuda`, `/usr/include`, `extras/CUPTI`) and
+`rocprofiler-sdk/rocprofiler.h` (`$ROCM_PATH`, `/opt/rocm`, or
+`-DROCPROFILER_SDK_INCLUDE_DIR=`), test-compiles exactly the record types
+used (CUDA 12.9 documents `CUpti_ActivityMemcpy6` and
+`CUpti_ActivitySynchronization2`; older toolkits `...Memcpy5` /
+`...Synchronization` -- the newer ones only append fields, and the newest
+available is used) and otherwise builds a stub that reports
+`built_without_cupti_headers` / `built_without_rocprofiler_sdk_headers`.
+The hook libraries load and run either way.
+
+**Statically linked CUDA runtime.** `nvcc`'s default `libcudart_static.a`
+cannot be intercepted with LD_PRELOAD. The Runner detects such binaries
+(`nm`) and sets `HPROFILER_CUPTI_EAGER=1`, so CUPTI starts in the hook's
+constructor and its callbacks report launches, copies, memsets, syncs,
+event records and stream waits (without stream/event handles, which only
+the wrappers see -- device spans then use CUPTI's stream ids, and event
+syncs fall back to the device-wide wait rule). Without libcupti a static
+binary still records nothing.
+
+#### What each timestamp is
+
+| Quantity | Native tracer | Proxy |
+|---|---|---|
+| Host call start / duration (host span) | **measured** -- `CLOCK_MONOTONIC` around the call | same |
+| Device start / end | **measured** on the GPU by CUPTI / ROCprofiler-SDK, mapped onto `CLOCK_MONOTONIC` (below) | start **estimated**: the host submission time |
+| Device execution time | **measured** (end - start) | `proxy_event`: **measured** by a GPU event pair, including event overhead; `proxy_host`: host call only (no device information); `proxy_flush`: upper bound |
+| `api_ns` on a device span | **measured** host call duration, copied from the correlated host span | -- |
+| `queue_ns` | **derived**: device start - host call end, clamped at 0 (time between the call returning and the work starting) | not available |
+| `launch_ns` | **derived**: device start - host call start | -- |
+| `queued=` / `submitted=` / `submit_ns` (CUDA kernels) | **measured** by CUPTI latency timestamps (command-buffer queue/submit); `submit_ns` = start - submitted (**derived**) | -- |
+| `xs=` | -- | **estimated** execution start from a one-time event calibration (see the `cuda` section) |
+| CUPTI synchronization records | **measured on the host** by CUPTI (`timing=host`): the wait interval of a sync call | -- |
+
+Clock mapping. CUPTI's default timestamps are `CLOCK_REALTIME`; when
+`cuptiActivityRegisterTimestampCallback` is available the hook registers
+`CLOCK_MONOTONIC` before enabling any activity kind, so device timestamps
+are in the hooks' clock directly (`clock=monotonic_callback`). Otherwise,
+and always for ROCprofiler-SDK, an offset is measured by bracketing the
+tracer's own timestamp call between two `CLOCK_MONOTONIC` reads (best of 5,
+re-measured for every buffer; `clock=offset`, `clock_err_ns` = half the
+tightest bracket). A wall-clock step while a CUPTI buffer is filling shifts
+that buffer's records by the step in offset mode.
+
+#### Correlation, de-duplication and streams (`src/core/gpu_activity.py`)
+
+Native records arrive in buffers, out of order and often after the host
+spans they belong to, so the Runner correlates once on the complete trace
+(`gpu_activity.assemble`), and the result is saved in the JSON:
+
+* **Matching.** `lid` first (hook-assigned, exact; ROCm records carry it as
+  the external id), otherwise the union of hosts sharing `corr`/`corr2`.
+  A correlation id can repeat (CUPTI's are 32-bit and wrap): the latest
+  submission that started no later than the device operation wins. Only if
+  every candidate started after it is a 50 µs clock-mapping tolerance
+  allowed; beyond that the record is counted as `precedes_submission`.
+  Graph launches legitimately have many device operations per host call.
+* **De-duplication.** A proxy device span whose host call also has a
+  native record (`both` mode) is removed (`deduplicated_proxy`); identical
+  native records delivered twice are removed (`duplicate_records`). In
+  `both` mode the hook's own event synchronizations would produce CUPTI
+  sync records; those are dropped in the hook (`internal_records`).
+* **Streams.** A native device span takes its host call's `stream=`; other
+  records with the same vendor stream/queue id inherit the mapping learned
+  from 1:1 submissions; anything else keeps a vendor lane (`stream=n7`,
+  `stream=q160`). HIP streams that share one HSA queue are never merged.
+* The device span gets the launching thread as `tid`, its host span as
+  `parent_span_id`, and the derived tags above.
+
+**GPU-active time never mixes sources.** `gpu_activity.kernel_activity`
+uses device-measured kernels when the trace has any, otherwise
+`proxy_event` kernels -- never the union, which would count one kernel at
+its submission time *and* at its execution time. `proxy_host` /
+`proxy_flush` kernels are never interval sources. Every consumer (Overview
+diagnosis, `gpu_starvation`, Profile tab, `hprofiler summary`) uses it and
+reports which source it used and how many kernel spans it left out.
+
+**Provenance in the trace.** The hooks report tracer status over the wire
+(`gpuact:` lines, §12). It is merged with the assembly counts into
+`metadata.deviceActivity` (keyed `"<pid>/<rt>"`): `status` (`active` /
+`unavailable` + `reason` / `disabled`), `clock`, `clock_err_ns`,
+`correlation`, record counts, `correlated`, `unmatched_device`,
+`host_without_device` (a submission whose device record never arrived
+while native tracing was producing records -- e.g. dropped),
+`dropped`, `notime` (records without timestamps from the at-exit forced
+flush), `bad_records`, and `timing` (`device`, `proxy`, `device+proxy`).
+`hprofiler summary` prints it; the GUI Inspector shows per-span provenance
+("Device timing: measured on the device (cupti)" vs. "estimated").
+
+**Buffer overflow.** CUPTI counts records it had to drop
+(`cuptiActivityGetNumDroppedRecords`) and the hook adds buffer allocation
+failures; ROCprofiler-SDK uses a DISCARD buffer and reports its
+`drop_count`. Both arrive as `dropped=` and are summed per process.
+
+**Verification status.**
+* CUDA: run on a real GPU (GeForce MX550, driver 580.173.02, CUDA 12.9
+  CUPTI) by `tests/integration/test_cuda_native_activity.py`: every
+  submission of a two-stream fixture (async copies, memsets, a cross-stream
+  event wait, event/stream/device syncs) correlated to exactly one measured
+  device operation; in-order execution per stream and the cross-stream
+  wait respected by the measured timestamps; `both` mode keeps exactly the
+  measured span; a statically linked build is fully correlated through
+  callbacks. These are functional checks -- no comparison against Nsight
+  Systems or other vendor tools was made.
+* ROCm: the record decoder and buffer callback are compiled against the
+  real ROCprofiler-SDK 1.0 headers (ROCm 7.1) and tested with synthetic
+  records (`tests/integration/test_native_gpu_records.py`); the tool
+  registration path has **never run** -- no AMD GPU on the development
+  machine.
+* Both decoders: synthetic records built from the real CUPTI / ROCprofiler
+  structs (concurrent streams, async copies, incomplete and corrupt
+  records, drops, clock offset, callback correlation capture). The
+  correlation/assembly logic: `tests/test_gpu_activity.py` (missing
+  correlations, reused ids, buffer overflow, out-of-order delivery,
+  de-duplication, never mixing sources, JSON round trip, critical-path
+  edges).
+
+**Limitations.** CUPTI allows one subscriber per process: under Nsight
+Systems or an application that uses CUPTI itself, correlation capture is
+reported as `correlation=unavailable` and device spans stay uncorrelated.
+Record layouts newer than the compiled headers are assumed to extend the
+old ones (true for every version pair in the CUDA 12.9 headers);
+implausible records are skipped and counted, not emitted. A process that
+exits abnormally (signal, `_exit`) loses its unflushed records. Hardware
+counters per kernel are not collected (see the roofline backends).
+
+---
+
 ### `cuda` — CUDA Runtime + Driver API + NVTX
 
-Injects `libhprofiler_cuda.so` via `LD_PRELOAD` to wrap CUDA API calls.
+Injects `libhprofiler_cuda.so` via `LD_PRELOAD` to wrap CUDA API calls, and
+uses CUPTI (loaded at run time) for the device side -- see "CUDA and ROCm:
+host calls, device work, and where each timestamp comes from" above.
 
-**Wrapped functions:**
+**Wrapped functions** (host API spans; every one carries `side=cpu,rt=cuda,
+timing=host,lid=N,sid=N` and, with CUPTI, `corr=`/`corr2=`):
 
-| Function | Category | Tags |
-|----------|---------|------|
-| `cudaLaunchKernel` | `cuda` | `type=kernel,grid=NxNxN,block=NxNxN,stream=N` |
-| `cuLaunchKernel` (driver API) | `cuda` | `type=kernel,grid=...,stream=N` |
-| `cudaMemcpy` | `memory` | `type=memcpy,dir=HtoD,bytes=N` |
-| `cudaMemcpyAsync` | `memory` | `type=memcpy_async,bytes=N,stream=N` |
-| `cuMemcpyHtoDAsync` | `memory` | `type=HtoD,bytes=N,stream=N` |
-| `cuMemcpyDtoHAsync` | `memory` | `type=DtoH,bytes=N,stream=N` |
-| `cudaMalloc` / `cudaMallocManaged` | `memory` | `type=alloc,bytes=N` |
-| `cudaFree` | `memory` | `type=free` |
-| `cudaDeviceSynchronize` / `cuCtxSynchronize` | `sync` | `type=sync` |
-| `cudaStreamSynchronize` / `cuStreamSynchronize` | `sync` | `type=sync,stream=N` |
-| `nvtxRangePushA/W/Ex` + `nvtxRangePop` | `nvtx` | `type=nvtx_range` |
+| Function | Category | Tags | Device span |
+|----------|---------|------|-------------|
+| `cudaLaunchKernel` / `cuLaunchKernel` | `cuda` | `type=launch,op=kernel,stream=N` | kernel (`type=kernel,grid=,block=`) |
+| `cudaGraphLaunch` / `cuGraphLaunch` | `cuda` | `type=launch,op=graph,stream=N` | native: one per graph node; proxy: one `graph` span |
+| `cudaMemcpyAsync`, `cuMemcpyAsync`, `cuMemcpyHtoDAsync`, `cuMemcpyDtoHAsync` | `memory` | `type=launch,op=memcpy,dir=,bytes=,stream=N` | `memcpy <dir>` |
+| `cudaMemsetAsync` / `cudaMemset` | `memory` | `type=launch,op=memset,bytes=,stream=N` | `memset` |
+| `cudaMemcpy` (blocking) | `memory` | `type=memcpy,op=memcpy,dir=,bytes=` | native only |
+| `cudaDeviceSynchronize` / `cuCtxSynchronize` / `cudaDeviceReset` | `sync` | `type=sync,op=sync,sync=device` | -- |
+| `cudaStreamSynchronize` / `cuStreamSynchronize` | `sync` | `type=sync,op=sync,sync=stream,stream=N` | -- |
+| `cudaEventSynchronize` | `sync` | `type=sync,op=sync,sync=event,event=N` | -- |
+| `cudaEventRecord` | `cuda` | `type=event_record,op=event_record,event=N,stream=N` | -- |
+| `cudaStreamWaitEvent` | `cuda` | `type=stream_wait,op=stream_wait,event=N,stream=N` | -- |
+| `cudaMalloc*` / `cudaFree*` / `cudaHostAlloc` / `cuMemAlloc*` / `cuMemFree*` | `memory` | `type=alloc...,bytes=N` / `type=free...` | -- |
+| `nvtxRangePushA/W/Ex` + `nvtxRangePop` | `nvtx` | `type=nvtx_range` | -- |
 
-All memory-transfer variants (`cudaMemcpy`/`Async`, `cuMemcpy*`) use category
-`memory`, not `cuda` — this is what makes their bytes/duration count toward
-the Memory tab's bandwidth accounting rather than being silently folded into
-compute time; only the kernel-launch/graph-launch functions above are
-category `cuda`.
+`stream=` and `event=` are the same pointer hash, so an event sync or a
+cross-stream wait can be resolved to the stream its event was recorded on
+(§17). A failed call carries `err=<code>` and produces no device span.
 
-**GPU-accurate kernel timing:** The hook creates `cudaEvent_t` pairs around
-each kernel launch. The end-of-kernel event is recorded (`cuEventRecord`)
-*before* acquiring the pending-kernel mutex so that no CUDA API call is ever
-made while holding a lock — avoiding potential deadlock with CUDA's internal
-serialisation. At each sync point the pending events are flushed and
-`cudaEventElapsedTime` gives the true GPU execution time.
+All memory-transfer variants use category `memory`, not `cuda`; only the
+kernel-launch/graph-launch calls and event bookkeeping are category `cuda`.
+Host submission calls are *Runtime overhead* in time breakdowns; the device
+work they submit is never counted as host-thread time.
 
-**Exec-start calibration (`xs=` tag) — GPU lifecycle split:** `start_ns` on
-a kernel span is the CPU-side *launch-call* time, not when the GPU actually
+**Proxy device timing (no CUPTI):** The hook creates `cudaEvent_t` pairs
+around each submission. The end event is recorded *before* acquiring the
+pending-kernel mutex so that no CUDA API call is ever made while holding a
+lock. At each sync point the pending events are flushed and
+`cudaEventElapsedTime` gives the GPU-side duration; the span is placed at
+the host submission time and tagged `timing=proxy_event`. Proxy spans name
+a kernel by `dladdr` on its host stub, which only works for exported
+symbols (`<jit-kernel>` otherwise); CUPTI records carry the real name.
+
+**Exec-start calibration (`xs=` tag, proxy spans only):** `start_ns` on
+a proxy kernel span is the CPU-side *launch-call* time, not when the GPU actually
 began executing it — under stream queue backlog (several kernels launched
 back-to-back on a busy stream), only the first can start immediately; the
 rest wait on the GPU for however long their predecessors take, but
@@ -645,13 +896,15 @@ issued this kernel" is itself useful information for a programmer
 optimizing their code's launch pattern, a different question than "what
 was on the critical path").
 
-**Verification status:** compile-checked only (`gcc -Wall -Wextra` clean,
-and via the real `./hprofiler build` CMake path) — **not independently
-verified against real kernel execution**, since this development machine
-has no working CUDA GPU (broken NVIDIA driver, see §13 Known Limitations).
-The logic mirrors `opencl_hook.c`'s calibration technique, which *is*
-hardware-verified, but treat `xs=` as unverified on real hardware until
-confirmed on a working CUDA/ROCm GPU.
+**Verification status:** observed once on a real GPU (GeForce MX550, the
+two-stream fixture run in `HPROFILER_DEVICE_ACTIVITY=both` mode so CUPTI's
+measured start of the same kernel is available): `xs=` was present but
+about **2.4 ms later** than CUPTI's start for 8 of 9 kernels and 0.9 ms
+early for the first one, whose proxy duration was also 3.3 ms too long
+(lazy module loading inside the event pair). One run on one GPU -- not an
+accuracy study -- but enough to treat `xs=` as a rough estimate. With CUPTI
+available the device span carries the measured start and `xs=` is not
+used. Not run on ROCm hardware.
 
 **NVTX range interception:** Fully replaced — no `libnvToolsExt.so` required.
 NVTX v3 (header-only inline API) is not intercepted.
@@ -667,9 +920,10 @@ is saved to `/tmp/hprofiler_cubin_<pid>_<n>.bin` for post-run disassembly.
 
 **Requirements:** `libcuda.so.1` on the library path, or `nvidia-smi` present.
 
-**Required: link with the shared CUDA runtime.** hprofiler injects itself via
+**Prefer the shared CUDA runtime.** hprofiler's wrappers are injected via
 LD_PRELOAD, which only intercepts symbols resolved at runtime from shared
-libraries.  Your binary **must** be linked against the dynamic CUDA runtime:
+libraries. With the dynamic CUDA runtime every call is intercepted (stream
+and event handles, kernel launch geometry, NVTX parents):
 
 ```bash
 # nvcc
@@ -680,19 +934,20 @@ set_target_properties(myapp PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 ```
 
 The default (`libcudart_static.a`) bakes the runtime into the binary at compile
-time, so LD_PRELOAD wrappers are never called and hprofiler will capture
-**0 events**.  Switching to `-cudart shared` has no runtime performance impact —
-kernel execution, memory bandwidth, and timing are identical either way; only
-the binary size changes (~10–20 MB smaller).
-
-**Known limitation (static runtime):** If you cannot recompile, binaries linked
-with `libcudart_static.a` will show 0 events. The CUPTI PC sampling path
-(`--gpu-pc-sampling`) also requires the hook to be loaded, so it has the same
-requirement.
+time, so the LD_PRELOAD wrappers are never called. The Runner detects this and
+starts CUPTI when the hook loads instead (`HPROFILER_CUPTI_EAGER=1`): host calls
+then come from CUPTI callbacks and device work from activity records, without
+stream/event handles (see above). **Without libcupti such a binary still
+records 0 CUDA events.** Switching to `-cudart shared` has no runtime
+performance impact -- only the binary size changes.
 
 **CUPTI PC sampling** is available via `--gpu-pc-sampling` (see §3 and §8).
-`libcupti.so` is loaded at runtime with `dlopen` — no recompile or CUPTI
-headers are needed. When `libcupti.so` is absent, the flag is silently ignored.
+`libcupti.so` is loaded at runtime with `dlopen`. CUPTI accepts one
+buffer-callback registration per process, so when the hook was built with
+CUPTI headers the device-activity code owns it and hands PC-sampling records
+back; without headers the PC-sampling path registers its own (hand-mirrored
+record layouts, as before). When `libcupti.so` is absent, the flag is
+silently ignored.
 
 ```bash
 hprofiler run --backend cuda -- ./my_cuda_program
@@ -888,14 +1143,25 @@ exercises there haven't been checked against what was verified here.
 
 ### `rocm` — ROCm / HIP
 
-Injects `libhprofiler_rocm.so` via `LD_PRELOAD`. Uses `hipEvent_t` pairs for
-GPU-accurate kernel timing, tracks device memory with counter events, groups
-spans by stream ID, and saves JIT binaries for disassembly. Kernel/memcpy
-spans also carry the same `xs=<ns>` exec-start calibration tag as the `cuda`
-backend (`hipEvent_t`/`hipEventElapsedTime` have the same FIFO-completion
-semantics `cudaEvent_t` does) — see the `cuda` section above for the full
-rationale; also compile-checked only here, no AMD GPU on this development
-machine to verify against.
+Injects `libhprofiler_rocm.so` via `LD_PRELOAD`. Same host/device model as
+`cuda`: `hipLaunchKernel`, `hipLaunchKernelGGL`, `hipModuleLaunchKernel`,
+`hipGraphLaunch`, `hipMemcpyAsync`, `hipMemsetAsync`/`hipMemset` emit host
+API spans (`type=launch`); `hipMemcpy`/`hipMemcpyHtoD`/`hipMemcpyDtoH` are
+blocking host spans (`type=memcpy`); the sync calls carry `sync=device|
+stream|event`; `hipEventRecord`/`hipStreamWaitEvent` carry `event=`/
+`stream=`. Device work comes from **ROCprofiler-SDK** buffered tracing when
+the SDK is installed (kernel dispatches with queue, dispatch id and the
+launching thread; memory copies with source/destination agents), matched to
+the host call through the external correlation id the hook pushes around
+each call -- see "CUDA and ROCm: host calls, device work ..." above.
+Otherwise `hipEvent_t` pairs give proxy device spans (`timing=proxy_*`,
+same `xs=` estimate as the `cuda` backend). Also tracks device memory with
+counter events and saves JIT binaries for disassembly.
+
+**Verification status:** the ROCprofiler-SDK record decoder is compiled
+against the real SDK 1.0 headers (ROCm 7.1) and tested with synthetic
+records; registration, external correlation and the hipEvent proxy have
+never run on an AMD GPU (none on the development machine).
 
 **Requirements:** `libamdhip64.so` findable at runtime. Checked, in order: the
 system ldconfig cache; `$ROCM_PATH`/`$ROCM_HOME` (if set) plus their `lib`/
@@ -1322,6 +1588,13 @@ merged multi-node traces reuse tids — each process gets its own lane
 previously every rank's kernels were drawn overlapping in one lane.
 Single-process traces keep the plain names.
 
+Only the visible window is read from the trace store, so a multi-million-
+event trace opens and scrolls without being loaded into memory (§13 "TUI
+Timeline rendering performance"). When a lane's visible window holds more
+than 20,000 spans, its row is drawn from the store's activity index in the
+lane's category color (columns with any activity filled); zoom in and the
+row switches back to exact spans colored by function, with hover details.
+
 **Keyboard controls:**
 
 | Key | Action |
@@ -1581,9 +1854,16 @@ without requiring a re-render.
 
 ## 6. Output Formats
 
+### Trace store (`.hpstore`)
+
+Every `hprofiler run` writes `<prog>.hprofiler.hpstore/`, an indexed SQLite
+trace store, while the program runs. Every hprofiler command opens it
+directly, and it is what the viewers query. Its schema, versioning and
+scale are described in §21.
+
 ### Chrome Trace / Perfetto JSON
 
-Every `hprofiler run` saves a `.json` file in
+Unless `--no-json` is given, every `hprofiler run` also saves a `.json` file in
 [Chrome Trace Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU).
 It can be opened in **[ui.perfetto.dev](https://ui.perfetto.dev)** or
 `chrome://tracing`.
@@ -1591,15 +1871,20 @@ It can be opened in **[ui.perfetto.dev](https://ui.perfetto.dev)** or
 `ts` and `dur` fields are in **microseconds**. The `metadata` block records the
 command, backends, hostname, and `cwd` (used to resolve relative binary paths
 when reloading), plus `startTimeNs`/`endTimeNs`/`pid` (the profiling window on
-the hooks' CLOCK_MONOTONIC) and `counterUnits`.
+the hooks' CLOCK_MONOTONIC), `counterUnits`, and `deviceActivity` (CUDA/ROCm
+native-tracer status, clock mapping and correlation counts per process --
+§4 "CUDA and ROCm: host calls...").
 
-Reloading must reproduce what `hprofiler run` held in memory, because every
-other entry point (GUI, `view`, `summary`, `critical-path`, `merge-nodes`)
-works from the file. Span `args` therefore also carry `sid`/`psid` (request
+Reloading must reproduce the captured trace exactly, because every other
+entry point (GUI, `view`, `summary`, `critical-path`, `merge-nodes`) can work
+from the file (when the run's `.hpstore` is next to it and unchanged, they
+open the store instead). The export is streamed one event per line (§21
+"JSON compatibility"), so writing it doesn't need the trace in memory. Span `args` therefore also carry `sid`/`psid` (request
 and parent ids — critical-path request linking, MPI wildcard resolution and
-call-tree parent links depend on them) and, for GPU spans, `_tid` (the real
-launching thread; the event's own `tid` is a virtual per-stream track for
-Perfetto's layout). Instant events keep their tags in `args`. Timestamps are
+call-tree parent links depend on them) and, for GPU device spans, `_tid` (the
+real launching thread; the event's own `tid` is a virtual per-stream track for
+Perfetto's layout). CUDA/HIP host API calls (`side=cpu`) stay on their real
+thread's track. Instant events keep their tags in `args`. Timestamps are
 rounded, not truncated, back to integer ns. Files written before these fields
 existed load with ids absent and the profiling window taken from the event
 extent.
@@ -2104,10 +2389,10 @@ flowchart TB
 
         subgraph HK["  Hook libraries  "]
             direction LR
-            H1["libhprofiler_cuda\n─────────────\nGPU event timing\nNVTX interception\nstream ID tagging\nmemory counters\nJIT cubin capture\nCUPTI PC sampling (opt)"]
+            H1["libhprofiler_cuda\n─────────────\nhost API spans\nCUPTI device activity\n+ callback correlation\n(GPU-event proxy fallback)\nNVTX interception\nmemory counters\nJIT cubin capture\nCUPTI PC sampling (opt)"]
             H2["libhprofiler_opencl\n─────────────\nforce queue profiling\nGPU-side timestamps\nJIT span timing"]
             H3["libhprofiler_ompt\n─────────────\nOMPT callbacks\ndladdr + /proc/maps\ncodeptr → symbol"]
-            H4["libhprofiler_rocm\n─────────────\nGPU event timing\nstream ID tagging\nmemory counters\nJIT binary capture"]
+            H4["libhprofiler_rocm\n─────────────\nhost API spans\nROCprofiler-SDK device activity\n+ external correlation\n(hipEvent proxy fallback)\nmemory counters\nJIT binary capture"]
             H5["libhprofiler_nccl\n─────────────\nGPU event timing\ncollective type + bytes\nstream ID tagging\ngroup boundaries"]
             H6["libhprofiler_mpi\n─────────────\nPMPI wrappers\nwall-clock timing\nbytes · rank · peer\ncollectives + p2p"]
             H7["libhprofiler_gomp\n─────────────\nGOMP_* interposition\nper-thread region timing\nbarriers · loops · critical"]
@@ -2135,13 +2420,13 @@ flowchart TB
             PERF["perf backend\nperf record + script\nDWARF stack unwinding"]
         end
 
-        TRACE[("Trace\nspans · counters\ninstants · disasm")]
+        TRACE[("Trace → TraceStore\nDiskTraceStore (.hpstore)\nbatched appends · per-process shards\nindexes · lanes · activity index\naggregates · dependency edges")]
 
         RUNNER & PERF --> TRACE
 
         subgraph OUTPUTS[" "]
             direction LR
-            J["Chrome Trace JSON\nPerfetto / chrome://tracing"]
+            J["Chrome Trace JSON\nPerfetto / chrome://tracing\n(streamed export)"]
             S["Text\nSummary"]
             T["TUI/GUI Viewer\nOverview · Timeline · Kernels\n[Call Tree / Flame Graph — stack data]\n[Roofline — kernel metrics]\n[Source — --disasm]\nSystem · Profile"]
         end
@@ -2178,13 +2463,28 @@ flowchart TB
 1. `hprofiler run` creates a Unix domain socket and sets `HPROFILER_SOCKET`.
 2. C hook libraries are injected via `LD_PRELOAD` (CUDA, OpenCL, ROCm, NCCL, GNU libgomp), the OMPT tool via `OMP_TOOL_LIBRARIES`, and the MPI hook via PMPI link-time interposition.
 3. Each hook streams newline-delimited `span:` / `ctr:` / `stk:` records as API calls are intercepted. `stk:` records are emitted only when `HPROFILER_CALLSTACK=1` (set by `--call-tree`).
-4. The Python receiver matches `stk:` records to their preceding `span:` by `(pid, tid, start_ns)` and attaches the call stack to the `SpanEvent`.
-5. After the process exits, the `Trace` is serialized to Chrome Trace JSON —
-   losslessly (span/request ids, real GPU thread ids, the profiling window;
-   see §6), because the GUI and every command other than `run` (`view`,
-   `summary`, `efficiency`, `critical-path`, `merge-nodes`) work from that
-   file, not from the in-memory trace. The GUI runs in its own process and
-   loads the file on a background thread (§20).
+4. The Python receiver parses each record into an event and appends it to
+   the trace's store -- for `hprofiler run`, a `DiskTraceStore` that writes
+   bounded batches into per-process SQLite shards while the program runs
+   (§21), so capture memory does not grow with the trace. It matches `stk:`
+   records to their preceding `span:` by `(pid, tid, start_ns)` and attaches
+   the call stack to that span (in the write buffer, before it is flushed).
+   CUDA/ROCm native device records (CUPTI / ROCprofiler-SDK, delivered in
+   buffers and out of order) and the hooks' `gpuact:` status lines arrive on
+   the same connections; once the process has exited,
+   `gpu_activity.assemble()` correlates device spans to their host calls,
+   removes duplicates and derives queueing tags (§4 "CUDA and ROCm: host
+   calls...").
+5. After the process exits, the store is finalized (indexes, timeline lanes,
+   aggregates, exclusive time and the multiresolution activity index, all
+   persisted -- §21) and, unless `--no-json`, exported to Chrome Trace JSON,
+   streamed one event per line and lossless (span/request ids, real GPU
+   thread ids, the profiling window; see §6). The GUI and every command
+   other than `run` (`view`, `summary`, `efficiency`, `critical-path`,
+   `merge-nodes`) work from the store (or the JSON, which opens its store
+   when one is next to it), not from an in-memory copy; viewers fetch only
+   the visible time window. The GUI runs in its own process and opens the
+   trace on a background thread (§20).
 6. When `--disasm` is passed, a background thread starts `_collect_disasm`:
    - CUDA: parses PTX/cubin blobs from `/tmp/hprofiler_cubin_<pid>_*.bin`
    - ROCm: parses AMDGCN blobs from `/tmp/hprofiler_rocm_<pid>_*.bin`
@@ -2287,6 +2587,21 @@ profiling runs).
 zero immediately after flushing a stack sample, preventing duplicate CPU spans
 if two consecutive sample headers appear without a blank-line separator between
 them (a rare but valid output from some `perf script` versions).
+
+### `src/core/gpu_activity.py` — CUDA/ROCm host/device correlation
+
+- `timing_source(span)` — `host` / `device` / `proxy_event` / `proxy_host` /
+  `proxy_flush` (also classifies pre-split traces and OpenCL spans).
+- `correlate(spans)` — device span → host submission (`lid`, else
+  `corr`/`corr2`; reused ids resolved by time; 50 µs clock tolerance).
+- `assemble(trace)` — run once by the Runner after collection: correlation,
+  de-duplication, stream unification, launching tid / parent link, derived
+  `api_ns`/`queue_ns`/`launch_ns`/`submit_ns`, summary into
+  `metadata.device_activity`. Idempotent; a no-op on pre-split traces.
+- `kernel_activity(spans)` — kernel intervals from one timing source for
+  every GPU-active metric.
+- `parse_status_line` / `record_status` / `describe` — the hooks' `gpuact:`
+  status lines.
 
 ### `src/disasm/extractor.py` — Disassembly engine
 
@@ -2468,7 +2783,12 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 |---------|-----|---------|
 | `cuda`, `rocm` | `type=kernel,grid=NxNxN,block=NxNxN` | Launch configuration |
 | `cuda`, `rocm` | `stream=N` | Sequential stream ID (0 = default) |
-| `cuda`, `rocm` | `xs=<ns>` | Calibrated real GPU-timeline execution-start time, vs. `start_ns` (CPU launch-call time) — see §4 `cuda`'s "Exec-start calibration" |
+| `cuda`, `rocm` | `xs=<ns>` | Proxy device spans only: estimated GPU-timeline execution start, vs. `start_ns` (the launch-call time) — see §4 `cuda`'s "Exec-start calibration" |
+| CUDA/ROCm host & device spans | `side=cpu\|gpu`, `rt=cuda\|rocm`, `op=`, `timing=host\|device\|proxy_event\|proxy_host\|proxy_flush`, `src=cupti\|cupti_cb\|rocprofiler` | Host submission vs. device work and how each interval was obtained — §4 "CUDA and ROCm: host calls..." (`timing=cpu`/`cpu_flush` in older traces = `proxy_host`/`proxy_flush`) |
+| CUDA/ROCm host & device spans | `lid=`, `corr=`, `corr2=` | Correlation ids: hook-assigned launch id; CUPTI correlation ids (runtime/driver) or ROCprofiler's internal id |
+| CUDA/ROCm device spans | `dev=`, `ctx=`, `nstream=`, `queue=`, `dispatch=`, `graph=`, `queued=`, `submitted=` | Native record fields (device/agent, context, vendor stream id, HSA queue, dispatch id, CUDA graph id, CUPTI latency timestamps) |
+| CUDA/ROCm device spans (added by the Runner) | `api_ns`, `queue_ns`, `launch_ns`, `submit_ns` | Host call duration, call-end→start, call-start→start, submitted→start |
+| CUDA/ROCm sync / event spans | `sync=device\|stream\|event`, `event=` | Which wait; event handle hash (same scheme as `stream=`) |
 | `memory` | `type=memcpy,bytes=N` | Transfer size |
 | `memory` | `type=alloc,bytes=N` | Device allocation |
 | `openmp` | `sym=<mangled>` | Symbol resolved via `dladdr()` |
@@ -2578,6 +2898,21 @@ even when a hook sent one — no call site relied on it until `mpi_hook.c`'s
 tagging instant events with `flag=`/`psid=`/`rpeer=`/`rtag=`, which
 surfaced it. `InstantEvent.tags` (`src/core/events.py`) is populated from
 this segment the same way `SpanEvent.tags` is.
+
+### Device-activity status record
+
+```
+gpuact:<pid>:<cupti|rocprofiler>:<key=value,...>
+```
+
+Native GPU tracer status and counters from `cupti_trace.c` /
+`rocprof_trace.c`: `status=active|unavailable|disabled`, `reason=`,
+`clock=monotonic_callback|offset|unmapped`, `offset_ns=`, `clock_err_ns=`,
+`correlation=callback|external|unavailable`, `api_version=`,
+`headers_version=`, `latency=`; per-buffer deltas `dropped=`, `notime=`,
+`bad_records=`, `buffer_alloc_failed=`, `internal_records=` (summed by the
+Runner). Stored in the trace's `metadata.deviceActivity`
+(`src/core/gpu_activity.py`).
 
 ### PC sample record *(emitted only when `HPROFILER_GPU_PCSAMPLING=1`)*
 
@@ -2795,22 +3130,28 @@ the profiler for the hot region using the NVTX `nvtxRangePush/Pop` pattern
 
 ### TUI Timeline rendering performance
 
-The Timeline widget uses fully vectorised numpy rendering:
+The Timeline widget never holds a lane's spans. Per render it asks the trace
+store (§21) for each visible lane's window only:
 
-- **Spatial index**: `np.searchsorted` on sorted per-lane start arrays clips
-  computation to only the spans that overlap the visible viewport — O(log n)
-  per render call regardless of total span count.
+- **Window query**: an indexed `(lane, start)` range query with a per-lane
+  look-back of that lane's longest span returns just the spans overlapping
+  the viewport, as numpy start/end arrays plus names (no span objects).
+  Results are cached per view, so hover-driven re-renders don't re-query.
+- **Activity bins when dense**: when a lane's window holds more than 20,000
+  spans, the row is drawn from the store's multiresolution activity index
+  (union occupancy per column, in the lane's category color) instead;
+  zooming in far enough brings back exact spans and per-function colors.
 - **Numpy accumulation**: pixel activity and dominant-function color are
   computed with numpy broadcast + diff/cumsum — no Python loop over spans.
-- **Measured render times** (20-render average, single CUDA lane, 200-wide terminal):
+- **Hover** looks up the spans under the cursor with the same window query;
+  MPI/NCCL connectors come from the persisted dependency edges (only the
+  p2p/arrival kinds are loaded), keyed by store event id.
 
-| Span count | Full view | 64× zoom |
-|------------|-----------|----------|
-| 10k spans | 1.5 ms | 1.2 ms |
-| 100k spans | 7 ms | 1.7 ms |
-| 250k spans | 8 ms | 2.3 ms |
-
-The TUI remains responsive at 250k spans at all zoom levels.
+Measured on a 1M-span, 32-lane disk store (200x60 terminal): widget
+construction 137 ms / +15 MB, render 1.2 ms fully zoomed out (bins),
+~150 ms for the first render at a new 8x-zoomed window (exact spans, ~110k
+fetched across 28 visible lanes), 16 ms at 128x, 8 ms cached re-render. The
+whole TUI (all tabs) opens the same store in ~3 s with a peak of +55 MB.
 
 ### Measured accuracy (ground-truth validation)
 
@@ -2845,12 +3186,14 @@ Known measurement artifacts:
   shows up as synchronization on worker threads (≈ +40 ms sync on the
   ground-truth program vs GNU libgomp). The first region's start also lags
   by ~3 ms (runtime initialization precedes the first `parallel_begin`).
-- **CUDA/ROCm kernel spans start at the host launch time** with the GPU
-  duration. Kernels queued behind others therefore appear earlier than they
-  ran and can overlap within a stream lane, which under-counts GPU Active %
-  and over-counts launch gaps under queue backlog. The hooks also emit
-  `xs=` (a calibrated execution-start estimate), currently used only by the
-  critical path; switching other consumers to it is untested on hardware.
+- **CUDA/ROCm proxy device spans start at the host launch time** with the
+  GPU-event duration (`timing=proxy_event`, only when no native tracer is
+  available or `HPROFILER_DEVICE_ACTIVITY=off`). Kernels queued behind
+  others then appear earlier than they ran and can overlap within a stream
+  lane, which under-counts GPU Active % and over-counts launch gaps under
+  queue backlog. With CUPTI / ROCprofiler-SDK the device span carries the
+  measured device start instead (§4 "CUDA and ROCm: host calls..."). The
+  proxy `xs=` estimate was ~2.4 ms late in one MX550 run (§4 `cuda`).
 
 ### Known limitations
 
@@ -2858,24 +3201,27 @@ Known measurement artifacts:
 |------|-----------|------------|
 | **Synchronous IPC** | Each intercepted call blocks on a Unix socket write. At very high rates (>100k calls/s), this adds measurable latency. | Reduce profiling scope; use `--backend cuda` only (not `--backend cuda,cpu,opencl`). |
 | **OpenCL GPU timing accuracy** | GPU-side timestamps are converted to wall-clock time using a single calibration sample at first event. Sub-millisecond kernels may have ±50 µs timestamp error. | Use CUDA or ROCm backends for accurate short-kernel timing. |
-| **CUDA GPU timing latency** | `cudaEventElapsedTime` is called at sync points, not immediately after each kernel. Kernels appear in the trace with GPU-accurate duration but a slight delay in when they are recorded. | Expected behaviour; all durations are accurate. |
+| **CUDA/ROCm device records arrive late** | Native records are delivered in buffers (CUPTI flushes every `HPROFILER_CUPTI_FLUSH_MS`, default 1 s, and at exit); proxy durations are queried at sync points. The live view shows device spans after a delay; correlation runs once after the run. | Expected behaviour. |
 | **NCCL stream tracking** | Tracks up to 512 unique CUDA streams per process. Beyond that, all excess streams are tagged `stream=-1`. | Rare in practice; most multi-GPU programs use 1–16 streams. |
 | **Roofline bandwidth model** | Uses HBM (DRAM) bandwidth as the memory-bound ceiling. L2-resident kernels with high reuse will appear memory-bound on the chart even though they run at L2 bandwidth (2–4× higher). | Treat the roofline as a conservative lower bound for cache-resident workloads. |
 | **OpenCL semantic depth** | OpenCL only shows host-API events (kernel name, memcpy size). Intra-kernel constructs (barriers, local memory, work-group size) are not visible. OpenMP shows construct-level detail via OMPT. | Expected: OpenCL has no host-visible construct callback API. |
 | **NVTX v3** | NVTX v3 (header-only, inline-expanded API) is not intercepted by LD_PRELOAD. Only NVTX v2 (library-dispatched) calls are captured. | Compile with `NVTX_DISABLE` or use `nvtxRangePushA` (v2 path). |
 | **snprintf truncation** | Span records longer than 2048 bytes (e.g., extremely long kernel names + many tags) are silently dropped. | Unlikely in practice; kernel names from `nm`/CUDA are typically < 256 chars. |
-| **Static CUDA runtime** | Binaries linked with `libcudart_static.a` (nvcc default) show 0 events because LD_PRELOAD cannot intercept compile-time-resolved `cudaXxx` symbols. `--gpu-pc-sampling` has the same requirement. | Rebuild with `-cudart shared` (no runtime-performance impact). |
+| **Static CUDA runtime** | LD_PRELOAD cannot intercept `libcudart_static.a` (nvcc default). The Runner starts CUPTI at load time for such binaries, so calls and device work are still recorded -- without stream/event handles, so event syncs use the device-wide wait rule (§17). Without libcupti: 0 events. | Rebuild with `-cudart shared` for full detail (no runtime-performance impact). |
+| **One CUPTI subscriber per process** | Under Nsight Systems, or in an application that uses CUPTI itself, the Callback API is unavailable: `correlation=unavailable`, device spans stay uncorrelated. | Profile with one tool at a time. |
+| **ROCm native tracing untested on hardware** | The ROCprofiler-SDK path is compiled against the real SDK headers and record-tested with synthetic data, but registration / external correlation have never run on an AMD GPU. | Check `metadata.deviceActivity` (`hprofiler summary`) for `status=active` on your system. |
 | **Device bandwidth estimates** | The roofline `device.py` memory-bandwidth formula under-reports peak bandwidth by ~2× for HBM-based cards (A100, H100, MI300). | Treat bandwidth peaks in the System tab as conservative estimates; check vendor datasheets for exact numbers. |
 | **ROCm PC sampling** | `--gpu-pc-sampling` is silently ignored for ROCm runs. Instruction-level heat annotation requires `librocprofiler-sdk.so` integration (not yet implemented). | Use CUDA backend for instruction-level GPU heat. |
 | **Multi-node critical-path needs a merge step first, and its clock-offset mechanism is unverified** | A single trace is still inherently single-node (the collector's `AF_UNIX` socket is only reachable within one node/filesystem) — `hprofiler merge-nodes` (§19) combines several nodes' traces first, using clock offsets from `mpi_hook.c`'s opt-in `HPROFILER_CLOCK_SYNC` round-trip exchange. The Python-side offset arithmetic and merge logic are fully unit-tested; the C-side round-trip *capture* has never executed against a real multi-node job (this machine can't form a real multi-rank `MPI_COMM_WORLD` at all, see below). | Run `merge-nodes` before `critical-path` for a multi-node trace; treat the resulting cross-node edges as unverified until `HPROFILER_CLOCK_SYNC` has been confirmed on a real cluster — `validate_causality()` (also run automatically by the `merge-nodes` CLI command) flags any resulting send-after-receive violation rather than silently trusting the offset. |
 | **POP efficiency's Serialization/Transfer split is approximate** | `hprofiler efficiency` (§16) fits latency/bandwidth from the trace's own messages instead of a Dimemas network replay. | Treat Transfer Efficiency as a proxy; check `EfficiencyReport.notes` for when it was too under-determined to compute at all. |
 | **Cross-process `commid=` agreement untested on this dev machine** | `MPI_Comm_dup`/`split`/`create`'s bootstrap `Bcast` (§4 `mpi`) is only meaningfully exercised at 2+ real ranks; this development machine's MPICH/Hydra cannot form a multi-rank `MPI_COMM_WORLD` at all (every rank under `mpirun -np N`, N>1, independently sees size 1 — a PMI/KVS rank-discovery failure in this machine's MPICH/UCX/PMIx setup, reproducible with the pre-existing unmodified `mpi_mini.c` fixture, unrelated to hprofiler). | Verified here only via a self-communicating fixture (real completion semantics, no real second rank) plus compile-checked multi-rank code (`tests/fixtures/mpi_proto.c`); needs a real multi-rank run (e.g. on Dardel) to confirm cross-process agreement. |
-| **`xs=` exec-start calibration unverified on real GPU hardware** | `cuda_hook.c`/`rocm_hook.c`'s reference-event calibration (§4 `cuda`) has no working GPU to run against on this development machine (broken NVIDIA driver, no AMD GPU) — only compile-checked (`gcc -Wall -Wextra` clean, and via `./hprofiler build`), and `src/analysis/criticalpath.py`'s consumption of it (`_effective_start_ns`/`_edge_gap_and_gate`) is only unit-tested against hand-constructed synthetic spans with a fake `xs=` tag, never a real captured trace. | Treat `xs=`-derived gap/idle-time numbers as unverified until confirmed on a working CUDA/ROCm GPU; the underlying technique mirrors `opencl_hook.c`'s calibration, which *is* hardware-verified. |
+| **`xs=` exec-start estimate is rough** | The proxy path's reference-event calibration (§4 `cuda`) was ~2.4 ms late against CUPTI's measured start in the one real-GPU run made (MX550); it is only used for proxy device spans, by the critical path. | Use native tracing (CUPTI / ROCprofiler-SDK); treat `xs=`-derived idle times on proxy traces as estimates. |
 | **Lock-free ring buffer (`hooks/common/ringbuffer.h`) not wired into any hook** | Built and verified in isolation (stress-tested, ThreadSanitizer-clean, benchmarked — see §13 "Reducing collection-path overhead"), but no hook's `emit_span()` actually uses it yet; today's real collection path is still the mutex+`send()` pattern for every hook. | The measured 1.5–58x overhead reduction is real for the primitive itself, not yet realized end-to-end in a profiling run; treat it as available infrastructure for a future integration pass, not a shipped speedup. |
 | **eBPF OS tracer (`hooks/os_tracer/`) never loaded into a kernel** | `kernel.unprivileged_bpf_disabled=2` on this development machine blocks BPF loading for non-root — see §18. Compiled, linked, and run up to `EPERM` at the exact expected privilege wall; the kernel BPF verifier (a distinct pass beyond compilation) has never actually run against it. | Needs root/`CAP_BPF` on a machine where that's authorized to confirm the tracepoint handlers pass kernel verification and emit semantically correct events under real scheduler activity. |
 | **`gomp_hook.c` (direct `GOMP_*` interception) — now confirmed on the real cluster that motivated it** | Built in response to a real user run on the Dardel HPC cluster (`ldd gmx_mpi` showed `libgomp.so.1`, confirming OMPT alone would never capture events there); fully verified end-to-end on this development machine, and subsequently confirmed working on Dardel itself via a real GROMACS run's Timeline screenshots (populated `omp`/`sync`/`mpi` lanes with real per-thread/per-rank span counts) — see §4 `openmp`. | None currently open for event capture itself. The GCC/`cpeGNU` toolchain-version specifics of what was actually exercised on Dardel beyond what this development machine's `gcc` produces are still not independently confirmed. |
 | **Call-site disassembly (`sym=`/`lib=` codeptr tags) doesn't cover every construct yet** | `ompt_tool.c` always resolved this; `gomp_hook.c` (`omp_parallel_region`, `omp_barrier`, `omp_critical_wait`/`_name_wait`, work-sharing loops) and `mpi_hook.c` (the collectives + `MPI_Barrier`) were fixed to do the same, via the shared `hooks/common/codeptr_resolve.h` helper, after a real Dardel run showed the Source tab's "No disassembly available" for every OpenMP/MPI construct — not an `objdump`-availability problem, but that `gomp_hook.c` never resolved/emitted the tag at all, and `src/core/runner.py`'s `_collect_disasm` unconditionally excluded category `"mpi"` from even looking for one. A SECOND, separate bug surfaced immediately after: a genuinely-resolved `sym=` still produced "No disassembly available" because `collect_disasm` always disassembled `command[0]`, but the profiled command is routinely a launcher (`srun`/`mpirun`) wrapping the real binary — fixed via a new `symfile=` tag carrying `dladdr()`'s own `dli_fname` (see §12's Span record tag table). Verified end-to-end (hook → wire protocol → real disassembly attached to the trace, including a real reproduction of the launcher-wrapped case) on this development machine. | Point-to-point MPI calls (`MPI_Send`/`Recv`/`Isend`/`Irecv`/`Wait*`) and `gomp_hook.c`'s `omp_critical_hold` span don't capture a call-site tag yet — those still show "No disassembly available" regardless of `objdump`/`nm` availability. `ompt_tool.c`'s own `sym=` tags don't carry `symfile=` yet, so the same launcher-wrapped-binary problem this fix solved for `gomp_hook.c`/`mpi_hook.c` could still affect a pure-OMPT (LLVM libomp) profiling run of a launcher-wrapped command — not confirmed broken, just not yet fixed the same way. |
 | **Zero-event runs via a job launcher can be intermittent, and hprofiler can't fix it from inside the profiled process** | A real user's `srun`-launched GROMACS run completed normally but captured zero events across every active backend, then the IDENTICAL command captured 60381 events on the next invocation with no code change in between — consistent with `srun` not propagating `HPROFILER_SOCKET`/`LD_PRELOAD` to the spawned job step on that particular invocation (every hook's `ensure_connected()` retries on every emit call, so a total loss across a multi-second run rules out a simple startup race). `src/core/runner.py` now has a `_total_zero_event_warning` check (see §4) that fires when EVERY active backend captured zero events and gives launcher-specific advice (e.g. `srun --export=ALL`) when the command is a recognized launcher (`srun`/`mpirun`/`mpiexec`/`aprun`/`jsrun`/`ibrun`). | This is a launcher/site environment-export configuration issue, not something fixable from inside the already-spawned profiled process — if the warning fires, check your site's launcher environment-export defaults, or just re-run (the user's own report suggests it may not reproduce every time). |
+| **Trace store: what still scales with the trace** | Every viewer reads windows/aggregates from the store (§21), but a few whole-trace analyses still hold a subset in memory: the call tree without stacks holds one thread's spans at a time (light objects, no tags), the stack-based call tree and flame graph hold the stacked spans, the critical path holds compact per-span arrays (~170 bytes/span: +171 MB at 1M spans) plus each process's CUDA/ROCm host/device spans, and the OTLP exporter builds its payload in memory. Whole-trace analyses are linear-time passes (1M spans: overview ~2.5 s, call tree ~4.6 s, critical path ~16 s cold / ~7 s with persisted edges). | Capture with `--no-json` and open the `.hpstore`; run `hprofiler critical-path` once to persist edges (later runs and the timeline connectors reuse them). |
 | **NCCL timing for operations issued inside `ncclGroupStart`/`ncclGroupEnd` is unverified** | NCCL's documented group semantics defer the actual kernel launch for every grouped op until `ncclGroupEnd()` itself returns — a `cudaEvent_t` pair recorded for an op called *inside* a group may record/sync against a stream that doesn't have the real work enqueued yet at that point. Follows directly from NCCL's own documented contract (not a guess), but has never been confirmed against real timestamps from an actual multi-GPU run (§4 `nccl`). | Treat per-op durations for anything issued inside a group as unverified until confirmed on real multi-GPU hardware; ungrouped NCCL calls are unaffected. |
 | **`ompt_tool.c` per-worker-thread `parallel_begin`/`end` firing semantics not independently confirmed** | `ompt_callback_implicit_task` (the OMPT callback specifically meant for per-thread region participation) is not registered by this hook; whether `ompt_callback_parallel_begin`/`end` fire once per region on the encountering thread only, or once per participating worker thread too, could not be determined from source alone (§4 `openmp`). | If per-worker-thread `parallel_region` spans look sparse or duplicated for an LLVM-libomp-linked binary, this is the first thing to check against LLVM's actual OMPT implementation. |
 
@@ -2929,7 +3275,21 @@ QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p 'test_*.py'
 # modules by name. Each skips (not fails) when its toolchain is missing.
 python3 -m unittest tests.integration.test_profiling_accuracy \
     tests.integration.test_gomp_hook tests.integration.test_mpi_protocol \
-    tests.integration.test_mpi_rma tests.integration.test_gui_cancel
+    tests.integration.test_mpi_rma tests.integration.test_gui_cancel \
+    tests.integration.test_native_gpu_records \
+    tests.integration.test_cuda_native_activity
+
+# Trace-store stress test: 2M synthetic spans captured into a disk store,
+# finalized, reopened and explored in fresh processes; asserts bounded,
+# non-scaling peak memory, window-query latency and exact answers (~1 min).
+# HPROFILER_STRESS_EVENTS=5000000 for a bigger run (~2 min).
+python3 -m unittest tests.integration.test_store_stress
+
+# test_native_gpu_records compiles the CUPTI / ROCprofiler-SDK record
+# decoders against the real vendor headers (found via the CMake cache or
+# the usual install paths) and feeds them synthetic records; point it at a
+# ROCm SDK with HPROFILER_ROCPROFILER_SDK_INCLUDE=<rocm>/include.
+# test_cuda_native_activity needs nvcc and a working CUDA GPU.
 
 # End-to-end CLI matrix (run/summary/efficiency/critical-path per backend)
 bash tests/integration/run_matrix.sh
@@ -2939,31 +3299,43 @@ python3 tests/integration/accuracy_report.py --trials 10
 ```
 
 Any analysis that reads span fields should be tested on a trace that has
-been through `chrome_trace.write` → `load_trace_from_json`: the GUI and
-every command except `run` only ever see the reloaded trace, and
-in-memory-only tests are exactly how a lossy round trip once went
-unnoticed (see §6).
+been through `chrome_trace.write` → `load_trace_from_json`, and on a
+disk-backed store: the GUI and every command except `run` only ever see a
+reloaded trace, and in-memory-only tests are exactly how a lossy round trip
+once went unnoticed (see §6). `tests/test_trace_store_parity.py` runs the
+same synthetic trace through `MemoryTraceStore` and `DiskTraceStore` and
+requires identical results from every consumer (§21).
 
 ### Consuming the trace programmatically
 
 ```python
-from src.ui.app import load_trace_from_json
+from src.core.trace_io import open_trace
 
-trace = load_trace_from_json("my_program.hprofiler.json")
+# A .hpstore directory, or any hprofiler JSON (see §21 for how large JSON
+# is handled)
+trace = open_trace("my_program.hprofiler.hpstore")
 
-# Top 10 hotspots
+# Top 10 hotspots (store-side aggregate)
 for row in trace.aggregated_stats()[:10]:
     print(f"{row['name']:40} {row['total_ns']/1e6:.2f}ms  {row['pct']:.1f}%")
 
-# All CUDA kernel spans longer than 1ms
-for span in trace.spans:
-    if span.category.value == "cuda" and span.duration_ns > 1_000_000:
+# All CUDA kernel spans longer than 1ms -- streamed, never all in memory
+for span in trace.iter_spans(categories=("cuda",)):
+    if span.duration_ns > 1_000_000:
         print(span.name, span.tags.get("stream"), span.duration_ns / 1e6)
 
+# What one timeline lane shows between t0 and t1 (indexed query)
+lane = trace.lane_infos()[0].name
+for span in trace.store.window(lane, t0, t1):
+    ...
+
 # GPU memory usage over time
-for ctr in trace.counters:
+for ctr in trace.iter_counters():
     if ctr.name == "gpu_memory_bytes":
         print(f"t={ctr.timestamp_ns/1e9:.3f}s  {ctr.value/1e6:.1f} MB")
+
+# `trace.spans` / `trace.counters` still work and return lists -- fine for
+# small traces, but they materialize every event.
 
 # Access disassembly (may need a short wait if called right after load)
 import time; time.sleep(2)
@@ -3125,6 +3497,16 @@ was doing work, and separates it into two root causes:
 - **Launch gaps**: gaps between consecutive GPU kernel intervals where neither
   GPU nor a sync call is active. Typically caused by CPU-side compute (e.g.
   data preparation, boundary condition updates, I/O) between GPU launches.
+
+Kernel intervals come from one timing source only
+(`gpu_activity.kernel_activity`): device-measured kernels when the trace has
+any (CUPTI / ROCprofiler-SDK, OpenCL's `side=gpu` spans), otherwise
+GPU-event proxies placed at their submission time -- never both, and never a
+host-timed fallback (`timing=proxy_host`). The result carries
+`gpu_active_source` (`device` / `proxy`) and `gpu_kernels_excluded`; host
+launch/enqueue calls are never kernel activity. With proxies, queued kernels
+appear to start early, so GPU-active time is under-counted and launch gaps
+over-counted under backlog.
 
 **Output section in the text summary** (shown automatically for CUDA/ROCm/OpenCL):
 
@@ -3349,6 +3731,31 @@ original greedy walk, which stays correct in the presence of a cycle by
 construction (its `visited` set prevents infinite loops), with the caller
 free to notice the discrepancy rather than the tool silently hanging.
 
+### Large traces: streamed edge building, persisted edges
+
+`analyze()` never needs the trace in memory. Nodes are numbered by arrival
+order (the same numbering the reference `build_dependency_graph()` uses).
+Program-order edges are built one thread at a time from start-ordered
+store iterators, holding only that thread's still-open spans. Stream,
+device-sync, CUDA/ROCm host/device and OpenMP-barrier edges never cross
+processes, so they are built one process at a time. Explicit-id, MPI
+point-to-point/collective and NCCL edges are built from one streaming pass
+that keeps small tuples (ordinal, times, a few tag values), not span
+objects. Edges go into compact typed arrays and the DP runs over per-node
+arrays. Every builder reproduces its reference version's iteration order,
+so each node receives the same predecessors in the same order and every
+tie-break is preserved. `tests/test_trace_store_parity.py` checks edges
+and paths against the dict-based pipeline, including MPI wildcard /
+`rmatches` / multi-request cases, and real CUDA traces were checked the
+same way.
+
+The edges are persisted in the trace store (table `edges`, tagged with the
+builder version `cp-1` and the store's content version), so a second
+`critical-path`, `efficiency` (which uses the critical path by default) or the timelines' MPI
+connectors reuse them; any change to the events (e.g. disassembly added
+later) invalidates them. On a 1M-span disk store: 16 s and +171 MB peak
+the first time, 7 s with persisted edges.
+
 ### GPU exec-start calibration feeds the DP directly
 
 The DP's gate/gap computation (`_edge_gap_and_gate`) uses each span's
@@ -3367,6 +3774,35 @@ correct for that); it only changes the *numeric* causal reasoning the DP
 does once those edges already exist. Falls back to `start_ns` for any span
 without an `xs=` tag — everything non-GPU, and any GPU span calibration
 wasn't available for — so this is purely additive.
+
+### CUDA/ROCm: host-to-device, stream, and wait edges
+
+For traces with the host/device split (spans carrying `rt=`, §4 "CUDA and
+ROCm: host calls..."), `_add_gpu_edges` builds the GPU part of the graph
+from the same correlation `src/core/gpu_activity.py` uses everywhere:
+
+| Edge | From → to | Semantics | Confidence |
+|---|---|---|---|
+| `launch` | host submission → its device work (by `lid` / `corr` / `corr2`) | The work cannot start before the call started; it **may** start before the call returns. Gate: call start ≤ work start. | `certain` for a unique id; `high` when a reused id was resolved by time |
+| `sequential` | device op → next device op on the same program stream, in submission (= FIFO) order | Stream order | `certain` |
+| `device_wait` | device work → the sync call that waited for it | Stream sync: the last work submitted to that stream before the call. Device/context sync: the last work on each stream. Event sync: the last work submitted to the event's stream before the matching `cudaEventRecord`/`hipEventRecord`. The call starts before the work ends -- that is the wait -- so the gate is work end ≤ call end. | `certain`; `medium` for an event sync whose record call was never seen (falls back to the device-wide rule) |
+| `sequential` | last work before an event record → first work submitted to the waiting stream after `cudaStreamWaitEvent`/`hipStreamWaitEvent` | Cross-stream dependency | `certain` |
+
+Device spans are left out of their launching thread's program order (they
+did not run on it), and a sync call made from a CUPTI callback without a
+`stream=` tag takes its stream from the correlated CUPTI synchronization
+record. `launch` and `device_wait` hops add only the part of the successor
+that lies beyond its predecessor's end (the queueing delay plus the work,
+or the sync call's tail after the work finished), so on these edges the
+reported path time never exceeds wall time. These edges make many chains
+between the same two points account exactly the same time (a sync's full
+duration via program order equals the work it waited for plus its tail);
+among such ties the DP picks the predecessor that finished last -- the
+one that actually gated the successor. On the real two-stream fixture this
+is what routes the path through the producer kernel on the other stream
+rather than an earlier, unrelated kernel on the consumer's own stream.
+Pre-split traces keep the original stream-order/device-sync rules and tie
+handling unchanged.
 
 ### Accuracy validation
 
@@ -3647,6 +4083,11 @@ if given explicitly. `src/analysis/multinode.py`'s `merge_traces()`:
   uncorrected 0 offset because no `HPROFILER_CLOCK_SYNC` data or
   `--offset-ns` was available for it.
 
+Events are streamed node by node into the output's trace store (`<output
+stem>.hpstore`, or the output itself when it ends in `.hpstore`) in bounded
+batches, so merging never holds every node's events in memory at once; the
+merged store is finalized and, for a `.json` output, exported as JSON.
+
 Selective aggregation (merging only a subset of nodes/ranks) needs no
 separate API: just pass fewer `TRACE_FILES`.
 
@@ -3812,6 +4253,24 @@ view.
 
 ### Timeline exploration
 
+**Only the visible range is ever requested.** Each lane's Canvas asks
+`TimelineModel.laneView(lane, start, end, pixelWidth, maxSpans)` for its
+current view. When the window holds at most `maxSpans` (2,000) spans, the
+answer is those exact spans (an indexed window query against the trace
+store, §21). Otherwise it is one occupancy value per pixel column from the
+multiresolution activity index built at finalization (union busy time per
+bin, so overlapping spans never read as more than 100%), painted as bars —
+zoomed-out views never create one object per event. Zooming in until the
+window holds few enough spans switches the lane back to exact, hoverable
+spans. With event-level filters active (name, duration, bucket, range),
+occupancy is binned from the filtered window instead, since the
+precomputed index covers all spans. On a 300k-span disk store the fully
+zoomed-out view paints in bins and a zoomed window returns its 11 spans in
+0.2 ms. MPI/NCCL connectors are built from persisted dependency edges
+(p2p/arrival kinds only); above 500,000 spans they are drawn only once
+`hprofiler critical-path` has persisted the edges, rather than building
+the dependency graph just to open the view.
+
 Beyond smooth wheel-zoom and drag-to-pan (custom horizontal scrollbar
 thumb bound to the same pan state, plus a vertical `ScrollBar` for traces
 with more lanes than fit the window), the Timeline tab supports:
@@ -3837,9 +4296,9 @@ with more lanes than fit the window), the Timeline tab supports:
   semantics — replaces, not adds to, the isolated set) round out
   reorganizing what's visible; "Show all lanes" undoes hide/isolate.
 - **Event search** (`TimelineSearchBar.qml`): substring or regex against
-  event names, backed by a `(category,name) -> occurrences` index (not a
-  linear scan of every span) so it stays fast even on a trace with tens
-  of thousands of events. Matches are outlined on the Canvas; ◂/▸ step
+  event names, resolved store-side (matching name ids, then an indexed
+  query; at most 10,000 matches are collected) rather than a linear scan
+  of every span held in memory. Matches are outlined on the Canvas; ◂/▸ step
   through them (wrapping), recentering the view at the *current* zoom
   level (search stepping never also changes zoom) and scrolling the
   matched row into view.
@@ -3905,57 +4364,67 @@ JS sort/filter:
 
 ### Comparison mode
 
-`hprofiler gui trace1.json --compare trace2.json` opens a second trace as
-a comparison run: `trace1.json` is the **baseline**, `trace2.json` is the
-**comparison**. The Compare tab (always tab 10, per the "always visible"
-convention above) is empty with that exact syntax shown until a
-comparison trace is loaded; ordinary single-profile use (no `--compare`)
-is completely unaffected — `DashboardBridge`'s optional `comparison=`
-parameter is additive, and a directly-asserted test confirms calling it
-the old way produces identical output to before this parameter existed.
+`hprofiler gui AFTER.json --compare BEFORE.json` opens a second trace for
+comparison. **The opened trace is the candidate** (it is what every other
+tab shows) and `--compare` names the **baseline**, the same roles as
+`hprofiler compare BEFORE AFTER`. That way, "Show in Timeline" on a
+regression lands on the trace the Timeline displays. (Before this change the
+opened trace was treated as the baseline, so the documented
+`gui after.json --compare before.json` reported every regression as an
+improvement.) Without `--compare` the Compare tab (always tab 10) shows how
+to load one; single-profile use is unaffected. The comparison itself runs on
+the loader's background thread ("Comparing runs…").
 
-- **Matching** (`src/analysis/compare.py`): kernels/functions are matched
-  by `(category, name)` — the same identifier cross-tab navigation uses
-  (span ids are per-run, so they can't match anything across two runs).
-  All exact matches are claimed first; a `name` with no exact match then
-  falls back to a *normalized* match via the existing `fmt_kernel_name()`
-  JIT-hash shortener, and a comparison row is never matched twice. Each
-  row's `matchKind` — exact/normalized/baseline_only/comparison_only — is
-  a visible, filterable column, not hidden bookkeeping.
-- **Classification**: improved/regressed requires a delta to clear
-  *both* a minimum percentage (default 5%) *and* a minimum absolute time
-  (default 1ms) — adjustable in the Compare tab's own threshold fields.
-  hprofiler captures single-run traces only, with no repeated-trial
-  variance data anywhere, so this is a disclosed heuristic noise-floor
-  guard against reading run-to-run jitter as a real change, **explicitly
-  not a statistical significance test** — stated in the UI, not just
-  here. True-zero (both sides genuinely 0ns) is kept distinct from
-  unavailable (no data on one or both sides); new/removed rows (present
-  on only one side) are their own statuses, not folded into improved/
-  regressed. A side with no value shows **—** (not 0), as does the
-  percentage change of a new/removed row; such rows sort below every real
-  value and never pass a numeric range filter. Changing the thresholds
-  re-classifies the table, the top-changes panels, the bucket deltas and
-  the exported report together.
-- **What's compared**: the function/kernel table above; activity-bucket
-  deltas (Computation/Communication/Synchronization/Memory transfer/
-  Runtime overhead/Idle — the same taxonomy Overview's own "Time
-  breakdown" and Timeline's bucket coloring already use, so all three
-  views can never disagree); the largest improvements/regressions,
-  ranked by absolute impact (also surfaced on the Overview tab); and two
-  execution-coverage strips, each normalized to **its own** wall-clock
-  duration rather than overlaid on a shared absolute time axis — two
-  independently-captured runs have unrelated monotonic clock origins and
-  generally different total durations, so a shared-axis overlay would be
-  actively misleading, not just inconvenient. Call-tree-node and system/
-  PMU-metric comparison are a deliberately scoped-out follow-up (see
-  `src/gui/comparison.py`'s own docstring) — each would need its own
-  matching scheme and hierarchical/typed diff rendering, roughly
-  doubling this feature's size for comparatively narrower value than the
-  function-level and bucket-level views already deliver.
-- **Export**: "Export report" (JSON — the full comparison, noise-floor
-  disclosure included) and "Export CSV" (the function/kernel table),
-  both on the Compare tab's own toolbar.
+The tab presents the structure- and causality-aware comparison of §22,
+top to bottom:
+
+- **Verdict**: wall time before → after (measured), critical-path length
+  (graph-derived), the alignment method and its confidence with the phase
+  and node-matching factors (heuristic), how the critical-path change
+  splits between the ranked contributors and work that left the path, and
+  — when confidence is too low — the reason the tab fell back to the
+  aggregate view.
+- **Phases**: one chip per aligned phase pair (iterations, prologue,
+  epilogue or top-level segments), colored by status: regressed, improved,
+  unchanged, inserted (only in the candidate) or removed (only in the
+  baseline); an extra iteration whose position is arbitrary because its
+  neighbours are identical says so in its tooltip. Clicking a chip filters
+  the contributors and the critical-path view to that phase; "Show phase in
+  Timeline" zooms the Timeline to it.
+- **Ranked causal contributors**: each with its cause (increased work,
+  more invocations, queueing, synchronization, communication, lost overlap,
+  changed dependency edge, moved onto the critical path) and the
+  critical-path time it accounts for. A wait caused upstream is listed with
+  `← origin`.
+- **Details** for the selected contributor: the explanation; before /
+  after / Δ of calls, self time, inclusive time, queue delay, waiting,
+  overlap with other work (measured), critical-path time and idle time
+  blamed on it (graph-derived), each labeled; the graph evidence (dependency
+  edges added or removed, stream changes, moving on or off the path,
+  phases inserted or removed); the upstream chain; the match kind and
+  confidence; the source location with a snippet when the file exists on
+  this machine. **Show in Timeline** selects the function and zooms the
+  Timeline to where it ran in the phase where it changed most (or in the
+  selected phase) — `Nav.focusTimeRange()`, a new one-shot request the
+  Timeline honours when it becomes visible. **Open in Source** selects it in
+  the Source tab, which now follows the cross-tab selection.
+- **Critical path composition**: before and after bars of critical-path
+  time per identity (same color on both bars; click a segment to select
+  it), for the whole run or the selected phase.
+- **Waits caused upstream**, **off the critical path** (regressed but with
+  no measured wall-time effect), **new / removed** work, **improvements**,
+  and **conclusions not available** with the reason for each.
+- The **(category, name) aggregate view** kept for compatibility: the
+  noise-floor thresholds (changing them re-runs both layers), activity
+  bucket deltas, execution-coverage strips (each normalized to its own
+  wall time), largest aggregate regressions and improvements, and the full
+  matched table. Aggregate matching: `(category, name)`, then the
+  `fmt_kernel_name()`-normalized name; a row is never matched twice;
+  missing sides show **—**, never 0.
+
+**Export report** writes the aggregate tables under their existing keys plus
+the full causal report under `causal`; **Export CSV** writes the aggregate
+table.
 
 ### Menus, command palette and keyboard shortcuts
 
@@ -4049,3 +4518,530 @@ which sends SIGINT to a real GUI process mid-load and expects exit code
 mocked) child process. **Not tested:** the platform file-picker dialog
 itself and clicking through menus with the mouse (menu actions are tested
 by invoking them directly and through their shortcuts).
+
+---
+
+## 21. Trace Storage
+
+Every `Trace` keeps its events in a **trace store** (`src/core/store/`), so
+a large trace can be captured, opened and explored without every event
+living in Python memory. There are two implementations behind one
+interface:
+
+| Store | Used for | Holds |
+|-------|----------|-------|
+| `DiskTraceStore` | `hprofiler run`, `merge-nodes`, opening a `.hpstore`, opening JSON larger than 256 MB | An indexed SQLite store on disk (`<name>.hpstore/`), written in bounded batches |
+| `MemoryTraceStore` | Small JSON files, unit tests, programmatic traces | Every event as a Python object (what `Trace` always did) |
+
+The C-hook socket protocol (§12) is unchanged: the Runner parses records
+exactly as before and appends the resulting events to the store.
+
+### The store API
+
+`Trace` keeps its existing API (`add`, `spans`, `counters`, `lanes()`,
+`aggregated_stats()`, …) on top of the store, so existing code still works.
+`trace.spans` and `trace.lanes()` still return complete lists, though,
+which materializes every event, so hprofiler's own viewers and analyses
+use the query API instead:
+
+| Call | Returns |
+|------|---------|
+| `iter_spans(order="seq"\|"start", pid=, tid=, lane=, categories=, window=, has_stack=, gpu_model=, with_ids=, filt=)` | Spans matching every constraint, streamed in arrival or start order |
+| `events_in_window(start, end)` / `lanes_in_window(start, end)` | Spans overlapping a time range, flat (start order) or per lane |
+| `store.window(lane, start, end)` / `count_window(...)` / `window_columns(...)` | One lane's spans overlapping a range (or their count, or numpy start/end arrays plus names) |
+| `event_by_id(eid)` | One event by its stable id (`span.eid`) |
+| `lane_infos()` | Display lanes with count, extent and longest span, no span data |
+| `aggregate_stats()` | Per-(category, name) count/total/min/max/avg/pct |
+| `store.exclusive_aggregate()` | Exclusive (self) time per thread, name and activity bucket (the Overview time breakdown) |
+| `store.activity(lane)` / `occupancy(lane, start, end, n)` | The multiresolution activity index, and occupancy resampled to `n` bins |
+| `store.iter_intervals(...)` / `interval_arrays(...)` / `first_with_tag(key)` / `iter_spans_light(...)` | Lightweight scans for whole-trace numbers (intervals, numpy chunks, the first span per name carrying a tag, spans without tags) |
+| `store.save_edges(version, edges)` / `load_edges(version, kinds=)` | Persisted critical-path dependency edges |
+| `update_span(s)` / `update_spans(...)` / `delete_spans(eids)` | In-place changes (call-stack attachment, GPU correlation, source annotation) |
+| `finalize()` | Build indexes and derived tables (below) |
+
+`store.memo(key, fn)` caches any derived result until the events change.
+Both stores share one implementation of every derived algorithm (lane
+assignment, aggregate ordering, the exclusive-time sweep, the activity
+builder), which is how they give identical answers.
+
+### Which store a file opens with
+
+`src/core/trace_io.open_trace(path)` is what every command and both
+viewers use:
+
+1. A `.hpstore` directory opens directly. A store that was never finalized
+   (the collector was killed) is finalized first.
+2. A `.json` file that `hprofiler run` or `merge-nodes` exported opens the
+   `.hpstore` next to it instead of parsing the JSON. The store records the
+   export's name, size and mtime (`meta.json_export`); if the JSON was
+   edited or replaced since, the JSON itself is read.
+3. Any other JSON up to 256 MB (`HPROFILER_JSON_MEMORY_LIMIT_MB`) loads
+   into a `MemoryTraceStore`.
+4. Larger JSON is imported once into a `DiskTraceStore` cached as
+   `<file>.json.hpstore` beside it (in a temp directory if that isn't
+   writable), streamed line by line, so memory stays bounded. The cache is
+   reused only while its `meta.imported_from` stamp (name, size, mtime,
+   written as the last step of a completed import) matches the JSON, so an
+   interrupted import is never mistaken for a complete one.
+
+### On-disk layout (schema version 1)
+
+```
+<name>.hpstore/
+    catalog.sqlite        store info, dictionaries, metadata, batch log,
+                          and every derived table
+    shards/p<pid>.sqlite  one per process (pm<n>.sqlite for pid -n):
+                          that process's spans, instants and counters
+```
+
+Per-process shards keep each shard's indexes small, let process-local
+queries (one thread, one lane, one process) touch one file, and keep
+appends from different processes in separate transactions. Every
+connection uses WAL journaling, `synchronous=NORMAL`, file-backed temp
+storage (index-build sorts spill to disk, not RAM) and a small page cache
+(2 MB per shard, 8 MB for the catalog), so memory does not grow with the
+number of processes. Shard connections are opened lazily, at most 256 at
+a time (LRU).
+
+**Catalog tables**
+
+| Table | Contents |
+|-------|----------|
+| `store_info(key, value)` | `format` = `hprofiler-trace-store`, `schema_version`, `derived_version`, `finalized`, `content_version`, `next_seq`, `next_batch` |
+| `categories(code, value)`, `buckets(code, value)` | Category and activity-bucket dictionaries. Codes are assigned when the store is created; categories unknown to the store are added on first use. |
+| `names(id, name)` | Event-name dictionary (spans store `name_id`) |
+| `lane_keys(id, cat, kind, ident)` | Lane identity per span: `(category, thread\|stream\|device\|"", id)` |
+| `shards(shard, pid, file)` | Process → shard file |
+| `batches(id, shard, kind, first_seq, last_seq, rows)` | One row per committed append batch |
+| `meta(key, value)` | JSON blobs: `metadata` (the `TraceMetadata` fields), `flags`, `devices`, `disasm`, `pc_samples`, `json_export`, `imported_from` |
+| `lanes(...)` | Derived: display lane name, shard, lane key, pid, count, first seq, min start, max end, longest span |
+| `activity(lane, level, t0, nbins, bin_ns, busy, starts)` | Derived: activity index, zlib-compressed float32 busy-ns per bin (int64 start counts at the finest level) |
+| `agg_names(cat, name_id, count, total_ns, min_ns, max_ns, first_seq)` | Derived: per-name aggregates |
+| `exclusive(pid, tid, cat, name_id, bucket, device, ns)`, `exclusive_threads(pid, tid)` | Derived: exclusive-time aggregate |
+| `extents(key, lo, hi)` | Derived: timed-span, all-span and all-event extents |
+| `edges(version, ord, dst, src, kind, conf)` | Critical-path edges (dst/src are arrival-order ordinals) tagged `<builder version>@<content_version>` |
+
+**Shard tables**
+
+| Table | Columns |
+|-------|---------|
+| `spans` | `row` (id within the shard), `seq` (global arrival order), `batch`, `start_ns`, `end_ns`, `tid`, `cat`, `name_id`, `lane_key`, `bucket`, `flags` (1 device-timed, 2 has stack, 4 CUDA/ROCm host/device model, 8 perf sample), promoted tag columns `stream`, `corr`, `lid`, `type`, `side`, `span_id`, `parent_span_id`, and `tags` / `stack` (compact JSON) |
+| `instants` | `row`, `seq`, `batch`, `ts_ns`, `tid`, `cat`, `name_id`, `tags` |
+| `counters` | `row`, `seq`, `batch`, `ts_ns`, `cat`, `name_id`, `value`, `unit` |
+
+Tags are stored losslessly: the full tag dictionary (any JSON value: strings,
+numbers, booleans, null, lists) is kept in `tags`, and the promoted columns
+duplicate the keys queries filter or join on. The same holds for stacks, span/parent ids, and therefore every
+dependency the critical path, call tree and GPU correlation use.
+
+**Indexes** (built at finalization, not during capture, so appends stay
+cheap): `spans(seq)`, `spans(start_ns, seq)` (time windows),
+`spans(lane_key, start_ns, seq)` (lane windows), `spans(tid, start_ns,
+seq)` (per-thread order), `spans(cat, name_id)`, and partial indexes on
+`stream`, `span_id`, `parent_span_id`, `corr` and `lid` (rows where the
+value is present); `instants(ts_ns, seq)`; `counters(name_id, ts_ns, seq)`.
+PID is the shard.
+
+**Event ids.** `eid = (shard << 38) | (kind << 36) | row`, where kind is
+0 span, 1 instant, 2 counter. Ids stay below 2^53, so they survive a
+round trip through QML/JavaScript numbers (the GUI passes them to and from
+QML). They are stable for the life of the store. `seq` is the global
+arrival order: iteration "in arrival order" means by `seq`, and every
+order-dependent tie-break in the analyses uses it.
+
+### Capture
+
+`hprofiler run` creates the store and hands it to the `Runner`; each
+parsed event is appended to an in-memory buffer, and every 8,192 events
+the buffer is written out: one transaction per shard, logged in `batches`.
+A call stack (`stk:` record) that arrives for a span still in the buffer
+replaces it there, with no extra write. After the program exits, CUDA/ROCm
+correlation (`gpu_activity.assemble`) reads just the host/device-model
+spans and writes changes back in place. Every flush, update or delete bumps
+`content_version`. Anything flushed before a crash of the collector is
+kept: the store reopens as not finalized and is finalized on open.
+
+Measured capture rate: about 119,000 spans/s through `Trace.add`, with
+peak RSS +29 MB independent of trace size (200k, 2M and 5M spans alike).
+
+### Finalization
+
+`trace.finalize()`, run by `hprofiler run`/`merge-nodes` after capture and
+by `open_trace` on an unfinalized store, builds the indexes and then the
+derived tables, each streamed from the store:
+
+- **Lanes**: the display-lane rule from `Trace.lanes()` (§5 Timeline Tab):
+  per-stream lanes for CUDA/ROCm, per-category `device` lanes, a per-process
+  `@<pid>` suffix when several processes share a lane id, plus each lane's
+  count, extent and longest span (the look-back that makes time-window
+  queries exact).
+- **Activity index**: per lane, busy time of the *union* of its spans
+  (nested or overlapping spans count once) in 65,536 equal bins over the
+  trace's timed-span extent, pre-summed to 16,384, 4,096, 1,024 and 256
+  bins, plus how many spans start in each finest bin. Built in one
+  start-ordered pass per lane with bounded state.
+- **Aggregates**: per-name count/total/min/max (the Kernels table, text
+  summary, hotspot lists), the exclusive-time aggregate (Overview
+  breakdown, wait %), and extents.
+
+On the 2M-span stress trace this takes 14.6 s (+51 MB peak). The result is
+persisted, so reopening a finalized store takes ~40 ms. Any later change
+to the events marks the store not finalized and invalidates persisted
+edges; reopening it then rebuilds the derived tables.
+
+### What viewers ask for
+
+- **Time windows**: spans with `start_ns <= end` and `end_ns > start`, in
+  `(start_ns, seq)` order, through the lane index with a look-back of that
+  lane's longest span. Answers are exact. The parity tests compare them
+  against brute-force filtering.
+- **Zoomed-out views** use occupancy: the coarsest activity level whose
+  bin is no wider than one output bin, resampled to the requested width. A
+  window finer than the finest level, or a filtered view, is binned from
+  the window's spans instead (streamed). The GUI switches a lane to exact
+  spans at ≤ 2,000 spans in view (§20), the TUI at ≤ 20,000 (§5).
+- **Whole-trace numbers** (Overview, Profile, POP efficiency, wait %,
+  hot-kernel table, source correlation) come from the persisted aggregates
+  or from lightweight scans that read only start/end or one tag column.
+  None of them builds a span object per event, and their results are
+  memoized per trace content.
+
+### JSON compatibility
+
+`chrome_trace.write` streams the export from the store, one event per
+line, with constant memory. The file starts with the layout marker
+`{"hprofilerJsonLayout": 1,` and remains one ordinary JSON document, so
+Perfetto, `chrome://tracing` and `json.load` read it unchanged. Files in
+that layout are read back line by line (bounded memory when importing into
+a disk store). Every older hprofiler JSON (one single-line document) still
+loads through the original whole-file parser. Export and import of a
+1M-span trace: 7.0 s / +16 MB and 19.3 s / +17 MB. `critical-path --export`
+adds its `on_critical_path`/`path_confidence` args to the exported copy
+only, without changing the trace.
+
+### Versioning and migrations
+
+Four independent version numbers decide what an older or newer hprofiler
+does with a store:
+
+| Version | Where | Changes when | On mismatch |
+|---------|-------|--------------|-------------|
+| `SCHEMA_VERSION` (now 1) | `store_info.schema_version` | The meaning or columns of an existing table, the event-id encoding or the tag encoding change | Newer than supported: refused with "upgrade hprofiler". Older: `disk.migrate()` upgrades in place, one step per version |
+| `DERIVED_VERSION` (now 1) | `store_info.derived_version` | A derived table (lanes, activity, aggregates, exclusive, extents) changes meaning | Derived tables are rebuilt on open; events are untouched |
+| `EDGES_VERSION` (`cp-1`) | `edges.version` | A critical-path edge builder changes what it emits | Edges are rebuilt on next use |
+| `hprofilerJsonLayout` (1) | First line of exported JSON | The streamed JSON layout changes | Unknown layouts fall back to the whole-file parser |
+
+Policy for future changes: adding a table needs no version bump, because
+tables are created with `IF NOT EXISTS` on every open. Changing an existing
+table bumps `SCHEMA_VERSION` and adds the upgrade step to `migrate()`.
+Migrations must preserve events, their `seq` (persisted edges are numbered
+by arrival order) and event ids (`row` within each shard). They may simply
+drop derived tables, since those rebuild from events. `content_version` is not a format version: it
+counts changes to one store's events and keys the validity of everything
+derived from them.
+
+### Measured scale
+
+`tests/integration/test_store_stress.py` (run by name; see §14 "Running
+the tests"): synthetic spans over 4 processes × 8 threads, captured
+through `Trace.add`, finalized, then reopened and explored in a fresh
+process.
+
+| | 2M spans | 5M spans |
+|--|--|--|
+| Capture | 17.0 s, +29 MB | 43.7 s, +29 MB |
+| Finalize | 14.6 s, +51 MB | 40.5 s, +52 MB |
+| Store size | 374 MB | 928 MB |
+| Reopen | 40 ms | 43 ms |
+| Window queries (median / p95 / max) | 0.6 / 3.7 / 5.2 ms | 0.7 / 10.6 / 14.5 ms |
+| TUI timeline: init, per lane window | 55 ms, 3.0 ms | — |
+| Overview numbers, call tree | 5.2 s, 11.6 s | — |
+
+The test asserts that peak memory growth in each phase stays under
+300 MB and grows by less than 120 MB between a 200k-span and the full
+run, that window queries stay interactive, and that answers are exact
+(per-name totals and windows against the generator). Exploring, with
+PySide6 and Textual loaded, costs +130 MB at 200k spans, +140 MB at 1M
+and +155 MB at 2M, almost all of it fixed import cost. For comparison,
+holding 2M `SpanEvent` objects in Python alone takes well over 1 GB.
+What still scales with trace size is listed in §13 "Known limitations"
+(trace storage row).
+
+`tests/test_trace_store_parity.py` writes one synthetic trace into both
+stores. The trace covers several processes and threads, nesting, perf
+samples, CUDA host/device and legacy GPU spans, MPI point-to-point,
+collectives and requests, OpenMP barriers, stacks, NVTX, instants,
+counters and JSON-typed tags. The test requires identical events, lanes,
+windows (also checked against brute force), aggregates, exclusive time
+(also checked against the original `ExclusiveTime`), activity bins, text
+summary, dashboard numbers, call tree, critical path (also checked against
+the dict-based pipeline, including MPI edge cases), multi-node merge,
+GUI timeline answers, byte-identical JSON export and its reload, and the
+same metadata after save and reopen. It also checks schema-version
+refusal, rebuilding of outdated derived tables, edge invalidation,
+concurrent appends from 8 threads, source annotation write-back, and the
+JSON-to-store reuse rules above.
+
+---
+
+## 22. Comparing Runs
+
+`hprofiler compare BEFORE AFTER` (§3), the GUI's Compare tab (§20) and
+`src/analysis/causal_compare.compare_traces()` answer "what got slower,
+where, and why" for two runs of the same program. They match the runs by
+structure: repeated phases, calling context, roles and dependencies. Every
+change is explained by a cause, and contributors are ranked by the
+critical-path time they account for. The older comparison by `(category,
+name)` totals (`src/analysis/compare.py`) is still computed and shown. It
+is the fallback when the runs cannot be aligned confidently, and it is the
+compatibility view. No language model is involved anywhere.
+
+### What kind of statement each value is
+
+| Kind | Meaning | Examples | Trust it as |
+|------|---------|----------|-------------|
+| **measured** | Computed directly from both runs' timestamps and counts | wall time, calls, self time, queue delay (native device timing only), time overlapped with other work | Exact for the two runs recorded; single runs carry no variance information |
+| **graph-derived** | Follows from the dependency graph and critical path of §17 | critical-path time and its change, idle time on the path blamed on a node, added / removed dependency edges, moving onto or off the path, the upstream chain a wait is traced along | As good as the edges: each edge's confidence tier (§17) applies, and the critical path inherits §17's semantics, including its known over-counting of overlapping rendezvous waits |
+| **heuristic** | A judgment call with a stated confidence | phase detection, phase alignment, node matching, alignment confidence, which of identical iterations was the inserted one, phase-relative offsets used to pick the upstream chain | Read the confidence; low confidence falls back to the aggregate comparison |
+| **unavailable** | Could not be concluded, with the reason | queueing without CUPTI / ROCprofiler-SDK timing, source locations without `file=`/`sym=` tags or stacks, rank roles without `rank=` tags, statistical significance (always) | Not a zero: the data needed to conclude it is missing |
+
+The JSON report labels values the same way (`kind` on wall time, alignment,
+critical-path views, impacts and evidence items; separate `measured` and
+`derived` blocks per contributor; an `unavailable` list).
+
+### The trace projection
+
+`src/analysis/projection.build_projection(trace)` turns one trace into a
+run-independent model that other analyses can reuse; it is memoized per
+trace content. It groups spans into **nodes**, one per (phase, calling
+context, role):
+
+- **Calling context**: the chain of enclosing host calls on the same thread
+  (temporal containment, the call tree's rule), as `category:name` tokens.
+  A device span's context is that of the host call that launched it (the
+  CUDA/ROCm launch edge), or else of the host call open on its launching
+  thread when it started. Names are normalized: JIT hash names shortened,
+  code addresses and compiler clone suffixes removed.
+- **Roles** replace raw ids, which differ between runs:
+
+| Role | Value |
+|------|-------|
+| backend | category; GPU runtimes split into `.host` / `.device` |
+| rank | `rank<N>` from MPI `rank=` tags, else `proc<k>` by order of first activity |
+| thread | `main` (first active thread of its process), `worker`, or `device` |
+| stream | `s<k>`: numeric stream ids in order, opaque handles by first use |
+| device | the device ordinal tag |
+| comm | `c<k>` by first use of the communicator within the process (`commid=`), `unregistered` for -1 |
+
+- **Measured values per node**: calls, inclusive and self time, queue
+  delay (from native device timing), and the time it overlapped work on
+  another stream (device) or thread (top-level host calls), found by a sweep
+  over each process.
+- **Graph-derived values per node**: the critical-path time credited to it,
+  and idle time on the path blamed on it. When the path runs through an
+  enclosing call (an NVTX range, a parallel region), its credit is spread
+  over the self time of that call and everything inside it, so the
+  enclosing range is not blamed for its children.
+- **Node-level dependency edges**: the span-level edges of §17 aggregated
+  per node pair and kind, with their best confidence.
+
+Memory is O(spans) only for three int32 arrays (node, call path and phase
+per span). On a 1M-span disk store: ~22 s and +270 MB peak, after which
+comparing two projections takes under a second.
+
+### Phases and their alignment (heuristic)
+
+**Detection.** The driver thread is the main thread of rank 0, or of the
+first process. Its top-level calls are tokenized as `category:name`, plus
+the kinds of cross-thread dependency edges under each call (p2p, arrival,
+device_wait, device_sync), so recurring dependency patterns count as well as
+recurring names. If one call covers ≥ 80% of the driver's time and has
+children (a `solve()` wrapping the loop), detection descends into it.
+
+Every recurring token is tried as an iteration marker. A token scores (the
+share of iterations whose call multiset is ≥ 80% similar to the most common
+one) × (the share of driver time they cover). The best scorer at ≥ 0.6
+splits the run into prologue, iterations and epilogue. The cuts are then
+moved back over calls that consistently precede the marker, so an iteration
+`[launch, launch, sync]` starts at its first launch, not at the sync.
+Without a recurring pattern the run is cut into segments of consecutive
+same-token calls, and without any driver calls it is one whole-run phase.
+
+Every span of every process belongs to the phase window that contains its
+start; device work belongs to its launching call's phase. More than 400
+iterations are grouped into blocks, and more than 200 segments are merged.
+
+**Alignment.** The two phase sequences are aligned monotonically (edit
+distance), maximizing the summed phase similarity, where similarity =
+½ Jaccard(driver tokens) + ½ Jaccard(call paths present), halved across
+phase kinds. Pairs below 0.4 never match. Unmatched phases are *inserted*
+(only in the candidate) or *removed* (only in the baseline). A tiny
+duration-similarity bonus places a gap among otherwise identical
+iterations, and such a gap is marked ambiguous: with identical
+iterations, *which* one is the extra one cannot be known.
+
+**Phase confidence** is the time-weighted similarity of matched pairs. An
+unmatched phase counts as explained when the same shape also occurs among
+the matched phases (an extra iteration of the same loop is a real
+difference, not an alignment failure), and as unexplained when it is a new
+shape.
+
+### Matching work within aligned phases (heuristic)
+
+1. Nodes with the same identity (call path and all roles) match exactly.
+2. The rest are scored against candidates with the same leaf name or the
+   same source location (`file:line` basename, or `sym=`). The score is
+   40% call-path similarity, 20% roles, 20% source location and 20% graph
+   neighbourhood (the kinds and names of its dependency-edge neighbours).
+   Backends must agree, and a different name only matches through the same
+   source location (a rename).
+3. Pairs are assigned greedily by score above 0.55; whatever is left is
+   new or removed work.
+
+The **node-matching confidence** is the time-weighted score of matched
+nodes. Raw pids, tids, stream handles, communicator ids and timestamps
+never enter identity. A test relabels all of them and shifts the clock, and
+the comparison stays an exact match.
+
+### Explaining a change
+
+Matched nodes are summed across aligned phases into identities. A node of
+an inserted or removed phase joins the identity with the same key, so an
+extra iteration shows up as extra invocations of known work. For each
+identity:
+
+- **Measured components** of the own-time change (self time + queue delay):
+  - *more invocations* = Δcalls × the baseline mean self time;
+  - the per-call remainder is *increased work*, or *synchronization* /
+    *communication* when the node is a wait (its activity bucket, §5);
+  - *queueing* = Δqueue delay, measured only when both runs have native
+    device timing;
+  - *lost overlap* = the decrease of time overlapped with other work.
+- **Primary cause**:
+  - If the own time changed beyond the noise floor, the cause is the
+    largest measured component. Longer queueing combined with lost overlap
+    and a structural change (a different stream, a new stream-order edge)
+    counts as *lost overlap*: the work is now serialized behind other
+    work.
+  - If the own time did not change but the critical-path time did, the
+    cause is structural, checked in this order:
+    1. *lost overlap* with a new incoming edge or a stream change;
+    2. *changed dependency edge*: a new incoming edge between work present
+       in both runs;
+    3. *moved onto the critical path*: it was off the path before;
+    4. *lost overlap*;
+    5. otherwise *moved onto the critical path*.
+- **Upstream chain** (graph-derived, using heuristic phase offsets): for a
+  wait or a delay, the chain repeatedly follows the incoming dependency
+  whose source finished latest relative to its phase (among sources that
+  finished within the node's own span). It stops at the first identity
+  whose own measured time regressed through increased work, more
+  invocations or queueing: the *origin*.
+- **Critical-path impact** = Δ(critical-path time credited + idle time
+  blamed). The critical path credits a blocking wait's whole duration to
+  the wait, e.g. an `MPI_Recv` waiting for a late sender. So a wait's
+  impact is moved to its origin, capped at the origin's own measured
+  regression; anything beyond the cap stays with the wait. The same
+  transfer applies per phase.
+
+Contributors are identities whose impact exceeds the noise floor, ranked
+by impact; on equal impact, origins come before the waits they caused. The
+report also lists waits and delays caused upstream (with their origin),
+regressions off the critical path (own time grew with no measured
+wall-time effect), new and removed work, improvements (mirrored labels:
+*less work*, *fewer invocations*, *moved off the critical path*…), and per
+phase the changed duration and its top contributors. The **critical-path
+change** is decomposed into ranked contributors, work that left or shrank on
+the path, and the remainder below the noise floor.
+
+### Confidence and fallback
+
+Overall confidence = phase confidence × node-matching confidence. Below
+`--min-confidence` (0.5), the runs are compared as whole runs (all phases
+merged). The confidence is then the whole-run similarity × the
+node-matching confidence. If that is also too low, the method becomes
+`aggregate` and the report shows the `(category, name)` comparison with the
+reason. Node-level explanations are not offered for runs whose structure
+differs that much. Two unrelated programs get a confidence near 0.
+
+### Noise floor
+
+The disclosed rule of the aggregate comparison applies everywhere: a change
+must exceed both 5% and 1 ms (adjustable) to count. It applies to own time
+and to critical-path impact, per identity and per phase. It is a heuristic
+guard against single-run jitter, **not a statistical significance test**.
+The report always lists statistical significance as unavailable.
+
+### Output
+
+The text report has these sections: the verdict (wall time, critical path,
+alignment with its notes), the ranked causal contributors (measured line,
+call path, source, explanation, evidence, confidence), waits caused
+upstream, regressions off the critical path, new and removed work,
+improvements, changed phases, unavailable conclusions and the noise floor.
+The JSON report (`--format json`, schema `hprofiler-compare/1`) has these
+top-level keys:
+
+| Key | Content |
+|-----|---------|
+| `baseline`, `candidate` | command, wall time, spans, phase method, driver, availability flags |
+| `wallTime` | before / after / Δ / status (measured) and critical-path lengths |
+| `alignment` | method, confidence and its factors, both phase lists, the aligned pairs (status, similarity, ambiguous), notes, fallback reason |
+| `contributors`, `propagated`, `offCriticalPath`, `improvements`, `newWork`, `removedWork` | per identity: label, call path, roles, source, status, cause, components, `measured` and `derived` before/after pairs, evidence, upstream chain, match kind and score, confidence, timeline ranges (focus phase and whole run) |
+| `phases` | per aligned pair: both phases, Δ duration, Δ critical path, top contributors |
+| `criticalPath` | per side: composition by identity (whole run and per pair) and the merged path segments |
+| `criticalPathChange` | the decomposition of the critical-path change |
+| `unavailable` | conclusions that could not be drawn, with reasons |
+| `aggregate` | the `(category, name)` comparison (`compare.report_dict`) |
+| `noiseFloor` | the thresholds and their disclosure |
+
+### Validation
+
+`tests/test_causal_compare.py` builds before/after pairs whose single
+difference is known (`tests/compare_scenarios.py`; the GPU ones use CUPTI
+records and go through the same correlation step as a real run). Each
+scenario checks a specific expected attribution:
+
+- **identical function names under different call paths**: only
+  `solve_y > update` is blamed, not `solve_x > update`, while the
+  aggregate view sees one merged `update`;
+- **reordered independent work**: nothing is reported;
+- **inserted and removed iterations**: alignment gaps, and *more* or
+  *fewer invocations*;
+- **changed stream overlap**: *lost overlap*, with the new stream-order
+  edge and the stream change as evidence, and the device sync as a wait
+  caused by it;
+- **MPI wait propagation**: the slower rank-0 compute is the top
+  contributor, and `MPI_Recv` on rank 1 is a communication wait whose chain
+  runs `MPI_Send ← compute`;
+- **a non-critical kernel becoming critical**: *moved onto the critical
+  path*, traced to the host work that delayed its launch.
+
+The suite also covers renamed functions matched through their source
+location, relabeled pids, tids, streams, communicators and clocks, phase
+detection and rotation, the fallback for unrelated programs, memory /
+disk-store parity, JSON output and the CLI. `tests/test_gui_compare_interaction.py`
+drives the populated Compare tab with synthesized clicks in its own
+process: selecting a contributor, Show in Timeline, Open in Source, phase
+selection and thresholds. It also checks that no QML warning is emitted.
+
+### Limitations
+
+- Phase detection relies on the driver thread's top-level structure.
+  Programs whose ranks run different code paths (MPMD), or whose iterations
+  differ structurally from one to the next, may get segments or a single
+  phase; the comparison then works on whole runs.
+- Critical-path semantics come from §17: blocking waits are credited
+  their full duration, and start-gated rendezvous edges can make the path
+  longer than the wall time. The origin transfer corrects the ranking, but
+  the critical-path change can still exceed the wall-time change.
+- Upstream chains use phase-relative offsets averaged over phases, so a
+  chain can stop early or pick a plausible but wrong predecessor when work
+  moves between phases. The chain's evidence is labeled heuristic for this
+  reason.
+- Queueing needs native device timing in both runs. Perf samples
+  (zero-duration spans) are not projected; they remain in the aggregate
+  view. Worker threads of a process are aggregated (`worker`), so
+  imbalance between individual workers is not separated.
+- Cost: building a projection is a few streaming passes plus the critical
+  path (about 22 s for 1M spans); it is memoized per trace.

@@ -203,6 +203,9 @@ def validate_profile_path(trace_path: str) -> HprofilerLoadError | None:
     via load_trace_from_json -- this is a fast pre-filter, not a
     replacement), or a classified, ready-to-display error otherwise."""
     p = Path(trace_path)
+    from ..core.trace_io import is_store
+    if p.is_dir() and is_store(p):
+        return None                      # a .hpstore trace store
     try:
         if not p.exists():
             raise FileNotFoundError(str(trace_path))

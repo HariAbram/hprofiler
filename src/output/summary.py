@@ -33,11 +33,11 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
     print(f"{'='*72}")
     print(f"  Total time  : {_fmt_ns(trace.duration_ns)}")
     print(f"  Backends    : {', '.join(meta.backends_used) or '(none)'}")
-    print(f"  Total spans : {len(trace.spans)}")
+    print(f"  Total spans : {trace.span_count()}")
 
     # ── CPU microarch + memory stats from counter events ───────────────────
     ctrs: dict[str, float] = {}
-    for c in trace.counters:
+    for c in trace.iter_counters():
         if c.name in ("ipc", "cache_miss_pct", "branch_miss_pct",
                       "process_max_rss_bytes"):
             ctrs[c.name] = c.value   # last sample wins
@@ -45,7 +45,7 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
     # Peak GPU utilisation / memory from polling counters
     gpu_util_peak: dict[str, float] = {}
     gpu_mem_peak:  dict[str, float] = {}
-    for c in trace.counters:
+    for c in trace.iter_counters():
         if c.name.startswith("gpu_utilization_pct"):
             key = c.name
             gpu_util_peak[key] = max(gpu_util_peak.get(key, 0.0), c.value)
@@ -69,56 +69,42 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
 
     # GPU kernel active % — use merged intervals so concurrent streams don't
     # cause the percentage to exceed 100%.
-    timed_spans = [s for s in trace.spans if s.duration_ns > 0]
-    if timed_spans:
-        _sp_end   = max(s.start_ns + s.duration_ns for s in timed_spans)
-        _sp_start = min(s.start_ns for s in timed_spans)
-        wall_ns   = max(_sp_end - _sp_start, 1)
-    else:
-        wall_ns = trace.duration_ns or 1
+    ext = trace.store.span_extent(timed_only=True)
+    wall_ns = max(ext[1] - ext[0], 1) if ext else (trace.duration_ns or 1)
 
-    def _merged_active_ns(spans: list) -> int:
-        ivs = sorted((s.start_ns, s.end_ns) for s in spans if s.duration_ns > 0)
-        merged_ns = 0
-        cur_lo = cur_hi = 0
-        for lo, hi in ivs:
-            if lo > cur_hi:
-                merged_ns += cur_hi - cur_lo
-                cur_lo, cur_hi = lo, hi
-            else:
-                cur_hi = max(cur_hi, hi)
-        merged_ns += cur_hi - cur_lo
-        return merged_ns
-
-    for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm")):
-        gpu_spans = [s for s in trace.spans
-                     if s.category.value == cat_val
-                     and s.tags.get("type") == "kernel"]
-        if gpu_spans:
-            active_ns = _merged_active_ns(gpu_spans)
-            total_ns  = sum(s.duration_ns for s in gpu_spans)
-            pct = 100.0 * active_ns / wall_ns
-            print(f"\n  {label} kernel active      : "
-                  f"{pct:.2f}% of wall time  "
-                  f"({_fmt_ns(active_ns)} active, "
-                  f"{_fmt_ns(total_ns)} accumulated, "
-                  f"{len(gpu_spans)} launches)")
-
-    # OpenCL: use side=gpu spans only (GPU-accurate via event callback).
-    # CPU-side spans (scheduling latency) carry side=cpu and are excluded.
-    opencl_gpu_spans = [s for s in trace.spans
-                        if s.category.value == "opencl"
-                        and s.tags.get("type") == "kernel"
-                        and s.tags.get("side") == "gpu"]
-    if opencl_gpu_spans:
-        active_ns = _merged_active_ns(opencl_gpu_spans)
-        total_ns  = sum(s.duration_ns for s in opencl_gpu_spans)
+    # One timing source per number (core/gpu_activity.kernel_activity):
+    # device-measured kernels when present, else event-timed proxies --
+    # never a union of both, which would place the same kernel at its
+    # submission time AND at its real execution time.
+    from ..core import gpu_activity as _ga
+    for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm"), ("opencl", "OpenCL")):
+        ka = _ga.kernel_activity(trace.iter_spans(categories=(cat_val,)))
+        if not ka.used:
+            continue
+        active_ns = _ga.merged_length(ka.intervals)
+        total_ns = sum(hi - lo for lo, hi in ka.intervals)
         pct = 100.0 * active_ns / wall_ns
-        print(f"\n  OpenCL kernel active   : "
+        print(f"\n  {label + ' kernel active':<23}: "
               f"{pct:.2f}% of wall time  "
               f"({_fmt_ns(active_ns)} active, "
               f"{_fmt_ns(total_ns)} accumulated, "
-              f"{len(opencl_gpu_spans)} launches)")
+              f"{ka.used} launches)")
+        print(f"    timing source       : {_ga.SOURCE_LABELS.get(ka.source, ka.source)}")
+        if ka.excluded:
+            print(f"    excluded            : {ka.excluded} kernel span(s) -- {ka.excluded_reason}")
+        if ka.source == "device" and cat_val in _ga.RUNTIMES:
+            native = [s for s in trace.iter_spans(categories=(cat_val,))
+                      if _ga.is_device_kernel(s) and "queue_ns" in s.tags]
+            if native:
+                def _p50(key: str) -> float:
+                    vals = sorted(int(s.tags[key]) for s in native)
+                    return vals[len(vals) // 2]
+                print(f"    per launch (median) : host call {_fmt_ns(_p50('api_ns'))}, "
+                      f"queued {_fmt_ns(_p50('queue_ns'))}, "
+                      f"device {_fmt_ns(sorted(s.duration_ns for s in native)[len(native) // 2])}")
+
+    for line in _ga.describe(meta.device_activity):
+        print(f"  {line}")
 
     if gpu_util_peak:
         _amd_backends = {"rocm"}
@@ -134,13 +120,15 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
             print(f"    {lbl:<6}  mem used : {_fmt_bytes(val)}")
 
     # ── Category breakdown ──────────────────────────────────────────────────
-    by_cat = trace.spans_by_category()
+    by_cat: dict[str, list[int]] = {}
+    for r in trace.aggregate_stats():           # store-side per-name totals
+        v = by_cat.setdefault(r["category"], [0, 0])
+        v[0] += r["count"]
+        v[1] += r["total_ns"]
     if by_cat:
         print(f"\n  Events by category:")
-        for cat, spans in sorted(by_cat.items(),
-                                  key=lambda kv: -sum(s.duration_ns for s in kv[1])):
-            total = sum(s.duration_ns for s in spans)
-            print(f"    {cat.value:<12} {len(spans):>6} events   {_fmt_ns(total):>12}")
+        for cat, (n, total) in sorted(by_cat.items(), key=lambda kv: -kv[1][1]):
+            print(f"    {cat:<12} {n:>6} events   {_fmt_ns(total):>12}")
 
     stats = trace.aggregated_stats()
     timed  = [r for r in stats if r["total_ns"] > 0]

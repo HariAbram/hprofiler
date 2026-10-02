@@ -454,7 +454,7 @@ def analyze_trace(trace: "Trace") -> list[tuple[DevicePeak, KernelMetrics]]:
 
     # Group spans by name, pick the one with max duration per name
     best_span: dict[str, "SpanEvent"] = {}
-    for span in trace.spans:
+    for span in trace.iter_spans():
         key = _disasm_key(span.name)
         if key is None:
             continue

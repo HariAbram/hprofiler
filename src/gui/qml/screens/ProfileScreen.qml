@@ -34,6 +34,14 @@ ColumnLayout {
                         color: AppTheme.textMuted
                         font.pixelSize: AppTheme.typeLabel
                     }
+                    Text {
+                        visible: (modelData.timingSource || "") !== ""
+                        text: "Timing: " + (modelData.timingSource || "")
+                        color: AppTheme.textMuted
+                        font.pixelSize: AppTheme.typeLabel
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
                 }
             }
         }

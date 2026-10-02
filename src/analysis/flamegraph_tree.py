@@ -47,3 +47,12 @@ def build_flame_tree(spans: list[SpanEvent]) -> dict[str, Any]:
         "category": "other",
         "children": roots,
     }
+
+
+def build_flame_tree_for(trace) -> dict[str, Any]:
+    """build_flame_tree() for a trace of any size (see
+    call_tree.build_call_tree)."""
+    from .call_tree import build_call_tree
+    roots = [_ctnode_to_flame(r) for r in build_call_tree(trace)]
+    total = sum(r["value"] for r in roots)
+    return {"name": "all", "value": total, "category": "other", "children": roots}

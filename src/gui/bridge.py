@@ -57,7 +57,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     result: dict[str, Any] = {}
     # One exclusive-time pass shared by diagnosis, findings, wait % and
     # the time breakdown (each used to redo it: 2.8x slower at 1M spans).
-    et = activity_buckets.ExclusiveTime(trace.spans)
+    et = trace.store.exclusive_aggregate()       # store-side, computed once
     findings = dash.top_findings(trace, et)
 
     diag_label, diag_severity = dash.diagnose(trace, et)
@@ -81,7 +81,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
 
     result["wait_label"], result["wait_pct"] = dash.wait_fraction(trace, et)
 
-    ctrs = {c.name: c.value for c in trace.counters}
+    ctrs = trace.counter_values()
     rss = ctrs.get("process_max_rss_bytes", 0.0)
     if rss > 0:
         result["peak_memory"] = dash.fmt_bytes(rss)
@@ -109,22 +109,24 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
         for r in stats[:8]
     ]
 
-    by_cat: dict[str, list] = {}
-    for s in trace.spans:
-        if s.duration_ns > 0:
-            by_cat.setdefault(s.category.value, []).append(s)
-    top_cats = sorted(by_cat.items(), key=lambda kv: -sum(s.duration_ns for s in kv[1]))[:3]
-    timed = [s for s in trace.spans if s.duration_ns > 0]
-    view_start = min((s.start_ns for s in timed), default=0)
-    view_end = max((s.end_ns for s in timed), default=1)
+    # Per-category totals from the store's aggregates; each preview strip
+    # streams that category's spans.
+    cat_totals: dict[str, int] = {}
+    for r in stats:
+        if r["total_ns"] > 0:
+            cat_totals[r["category"]] = cat_totals.get(r["category"], 0) + r["total_ns"]
+    top_cats = sorted(cat_totals, key=lambda c: -cat_totals[c])[:3]
+    ext = trace.store.span_extent(timed_only=True) or (0, 1)
+    view_start, view_end = ext
     view_dur = max(view_end - view_start, 1)
     result["timeline_preview"] = [
         {
             "category": cat,
             "color": theme_mod.category_color(cat, dark),
-            "coverage": dash.bucket_coverage(cspans, _DASHBOARD_TIMELINE_BUCKETS, view_start, view_dur),
+            "coverage": dash.coverage_from_chunks(trace.store.interval_arrays(categories=(cat,)),
+                                                  _DASHBOARD_TIMELINE_BUCKETS, view_start, view_dur),
         }
-        for cat, cspans in top_cats
+        for cat in top_cats
     ]
 
     ctx = dash.find_source_context(trace)
@@ -146,15 +148,16 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     result["host"] = meta.hostname or "—"
     result["backends"] = list(meta.backends_used or [])
     result["devices"] = [f"{d.name} ({d.backend})" for d in trace.devices]
-    result["process_count"] = len({s.pid for s in trace.spans})
-    result["thread_count"] = len({(s.pid, s.tid) for s in trace.spans})
+    result["process_count"] = len(trace.store.pids())
+    result["thread_count"] = len(trace.store.threads())
     result["profiling_duration"] = result["wall_time"]
     result["capture_time"] = meta.capture_time_iso
 
     # Same merged-interval technique as waitPct/gpuActivePct above -- a
     # plain sum would double-count overlapping spans on different CPU
     # threads and could read well over 100%.
-    cpu_ns = dash.merged_ns([s for s in trace.spans if s.category.value == "cpu"])
+    from ..core.store.common import union_length
+    cpu_ns = union_length(trace.store.iter_intervals(categories=("cpu",)))
     result["cpu_util_pct"] = 100.0 * cpu_ns / wall_ns if wall_ns else 0.0
 
     # Shared with Timeline's own bucket legend/grouping (activity_buckets.py)
@@ -166,7 +169,9 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     idle_ns = 0
     if gpu_stats is not None:
         idle_ns = max(int(gpu_stats["launch_gap_pct"] / 100.0 * wall_ns), 0)
-    buckets = activity_buckets.bucket_totals(et.spans, idle_ns=idle_ns, et=et)
+    buckets = et.bucket_totals()
+    if idle_ns > 0:
+        buckets["Idle"] = buckets.get("Idle", 0) + idle_ns
     grand = sum(buckets.values()) or 1
     _order = list(activity_buckets.BUCKETS)
     result["time_breakdown"] = [
@@ -488,8 +493,8 @@ def compute_call_tree_data(trace: Trace, dark: bool) -> list[dict[str, Any]]:
     Theme instance, for the same reason (see theme.py's category_color()
     docstring)."""
     try:
-        from ..analysis.call_tree import _ct_build
-        roots = _ct_build(trace.spans)
+        from ..analysis.call_tree import build_call_tree
+        roots = build_call_tree(trace)
     except Exception:
         roots = []
     return [_ct_node_to_dict(r, dark) for r in roots]
@@ -610,9 +615,8 @@ def compute_flame_graph_data(trace: Trace, dark: bool) -> dict[str, Any]:
     """The expensive, Qt-free part of FlameGraphBridge's construction --
     a module-level function so the async-loading worker thread can call
     it directly (see compute_call_tree_data()'s docstring for why)."""
-    from ..analysis.flamegraph_tree import build_flame_tree
-    spans = [s for s in trace.spans if s.duration_ns > 0]
-    tree = build_flame_tree(spans)
+    from ..analysis.flamegraph_tree import build_flame_tree_for
+    tree = build_flame_tree_for(trace)
     return _flame_node_with_color(tree, dark)
 
 
@@ -881,7 +885,8 @@ class SourceBridge(QObject):
         from a tag that resolved but disassembly still failed (missing
         objdump/nm) -- see that method's own comment for why this
         distinction matters (a real user report)."""
-        for s in self._trace.spans:
+        from ..core.store import SpanFilter
+        for s in self._trace.iter_spans(filt=SpanFilter(names=frozenset({raw_name}))):
             if s.name != raw_name:
                 continue
             if s.tags.get("sym"):
@@ -990,7 +995,7 @@ class SystemBridge(QObject):
                 "ridgeHint": ridge_hint,
             })
 
-        ctrs = {c.name: c.value for c in trace.counters}
+        ctrs = trace.counter_values()
         self._ipc = ctrs.get("ipc", 0.0)
         self._cacheMiss = ctrs.get("cache_miss_pct", -1.0)
         self._branchMiss = ctrs.get("branch_miss_pct", -1.0)
@@ -1062,30 +1067,33 @@ class ProfileBridge(QObject):
     def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
         super().__init__(parent)
         wall_ns = dash.trace_wall_ns(trace)
-        spans = trace.spans
 
         self._gpu_activity: list[dict[str, Any]] = []
+        from ..core import gpu_activity as ga
         for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm")):
-            kspans = [s for s in spans if s.category.value == cat_val and s.tags.get("type") == "kernel"]
-            if not kspans:
+            # One timing source (device-measured, else proxy) -- never both.
+            ka = ga.kernel_activity(trace.iter_spans(categories=(cat_val,)))
+            if not ka.used:
                 continue
-            kern_ns = dash.merged_ns(kspans)
-            kern_acc = sum(s.duration_ns for s in kspans)
-            sync_ns = dash.merged_ns([s for s in spans if s.category.value == "sync"])
+            kern_ns = ga.merged_length(ka.intervals)
+            kern_acc = sum(hi - lo for lo, hi in ka.intervals)
+            sync_ns = dash.merged_ns(s for s in trace.iter_spans(categories=("sync",))
+                                     if s.tags.get("side") != "gpu")
             pct = 100.0 * kern_ns / wall_ns if wall_ns else 0.0
             sync_pct = 100.0 * sync_ns / wall_ns if wall_ns else 0.0
             eff = pct / (pct + sync_pct) * 100 if (pct + sync_pct) > 0 else 0
             self._gpu_activity.append({
                 "label": label, "activePct": pct, "syncPct": sync_pct, "efficiency": eff,
-                "launches": len(kspans), "total": dash.fmt_ns(kern_acc),
+                "launches": ka.used, "total": dash.fmt_ns(kern_acc),
+                "timingSource": ga.SOURCE_LABELS.get(ka.source, ka.source or ""),
                 "color": theme.categoryColor(cat_val),
             })
 
         by_cat: dict[str, dict[str, Any]] = {}
-        for s in spans:
-            d = by_cat.setdefault(s.category.value, {"ns": 0, "n": 0})
-            d["ns"] += s.duration_ns
-            d["n"] += 1
+        for r in trace.aggregate_stats():       # store-side per-name totals
+            d = by_cat.setdefault(r["category"], {"ns": 0, "n": 0})
+            d["ns"] += r["total_ns"]
+            d["n"] += r["count"]
         grand = sum(v["ns"] for v in by_cat.values()) or 1
         self._breakdown: list[dict[str, Any]] = [
             {
@@ -1108,7 +1116,7 @@ class ProfileBridge(QObject):
             for r in stats[:12]
         ]
 
-        ctrs = {c.name: c.value for c in trace.counters}
+        ctrs = trace.counter_values()
         ctr_sub = {k: ctrs[k] for k in ("ipc", "cache_miss_pct", "branch_miss_pct") if k in ctrs}
         try:
             tips = dash.bottleneck_analysis(trace, ctr_sub)

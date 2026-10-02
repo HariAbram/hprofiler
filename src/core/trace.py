@@ -9,8 +9,11 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 from .events import SpanEvent, InstantEvent, CounterEvent, Category, AnyEvent
+
+if TYPE_CHECKING:
+    from .store import LaneInfo, TraceStore
 
 
 @dataclass
@@ -30,18 +33,29 @@ class TraceMetadata:
     # captured before this field existed, or built by hand in a test --
     # the GUI renders that as "unavailable", not a fake/guessed time.
     capture_time_iso: str = ""
+    # CUDA/ROCm device-activity provenance, keyed "pid/rt" (see
+    # src/core/gpu_activity.py): native tracer status, clock mapping,
+    # dropped records, correlation/de-duplication counts.
+    device_activity: dict = field(default_factory=dict)
 
 
 class Trace:
-    """Collects and queries profiling events."""
+    """Collects and queries profiling events.
 
-    def __init__(self, metadata: TraceMetadata | None = None) -> None:
+    Events live in a TraceStore (src/core/store): MemoryTraceStore by
+    default (small traces, tests), DiskTraceStore for captures and large
+    traces. The list properties (`spans`, `instants`, `counters`,
+    `all_events`) and `lanes()` materialize every event and remain for
+    compatibility and small traces; code that may see large traces uses the
+    iterator/query methods (iter_spans, events_in_window, lanes_in_window,
+    aggregate_stats, lane_infos, event_by_id) and the store's precomputed
+    aggregations."""
+
+    def __init__(self, metadata: TraceMetadata | None = None, store: "TraceStore | None" = None) -> None:
+        from .store import MemoryTraceStore
         self.metadata = metadata or TraceMetadata()
+        self.store = store if store is not None else MemoryTraceStore()
         self._lock = threading.Lock()
-        self._events:   list[AnyEvent]     = []
-        self._spans:    list[SpanEvent]    = []
-        self._instants: list[InstantEvent] = []
-        self._counters: list[CounterEvent] = []
         # Fast-path flags for compose() checks
         self._has_stacks: bool = False
         self._has_cpu:    bool = False
@@ -80,87 +94,141 @@ class Trace:
     def devices(self) -> list["DevicePeak"]:  # type: ignore[type-arg]
         return list(self._devices)
 
+    # ── writing ──────────────────────────────────────────────────────────
     def add(self, event: AnyEvent) -> None:
-        with self._lock:
-            self._events.append(event)
-            if isinstance(event, SpanEvent):
-                self._spans.append(event)
-                if event.stack_frames:
-                    self._has_stacks = True
-                if event.category == Category.CPU:
-                    self._has_cpu = True
-            elif isinstance(event, InstantEvent):
-                self._instants.append(event)
-            elif isinstance(event, CounterEvent):
-                self._counters.append(event)
+        self.store.append(event)
+        if isinstance(event, SpanEvent):
+            if event.stack_frames:
+                self._has_stacks = True
+            if event.category == Category.CPU:
+                self._has_cpu = True
 
     def add_many(self, events: list[AnyEvent]) -> None:
         for event in events:
             self.add(event)
 
+    def update_span(self, span: SpanEvent) -> None:
+        """Persist in-place changes to a span obtained from this trace
+        (required for disk-backed traces; harmless in memory)."""
+        self.store.update_span(span)
+        if span.stack_frames:
+            self._has_stacks = True
+
+    def update_spans(self, spans: "Iterable[SpanEvent]") -> None:
+        spans = list(spans)
+        if hasattr(self.store, "update_spans"):
+            self.store.update_spans(spans)
+        else:
+            for s in spans:
+                self.store.update_span(s)
+        if any(s.stack_frames for s in spans):
+            self._has_stacks = True
+
+    def delete_spans(self, spans: "Iterable[SpanEvent]") -> None:
+        self.store.delete_spans([s.eid for s in spans])
+
+    def remove_spans(self, span_ids: set[int]) -> None:
+        """Drop the spans whose id() is in span_ids (compatibility; prefer
+        delete_spans)."""
+        if span_ids:
+            self.store.delete_spans([s.eid for s in self.iter_spans() if id(s) in span_ids])
+
+    # ── list views (materialize; small traces / compatibility) ───────────
     @property
     def spans(self) -> list[SpanEvent]:
-        with self._lock:
-            return list(self._spans)
+        spans_list = getattr(self.store, "spans_list", None)
+        if spans_list is not None:
+            return spans_list()
+        return list(self.store.iter_spans())
 
     @property
     def instants(self) -> list[InstantEvent]:
-        with self._lock:
-            return list(self._instants)
+        return list(self.store.iter_instants())
 
     @property
     def counters(self) -> list[CounterEvent]:
-        with self._lock:
-            return list(self._counters)
+        return list(self.store.iter_counters())
 
     @property
     def all_events(self) -> list[AnyEvent]:
-        with self._lock:
-            return list(self._events)
+        return list(heapq.merge(self.store.iter_spans(), self.store.iter_instants(),
+                                self.store.iter_counters(), key=lambda e: e.seq))
+
+    # ── queries (bounded memory) ─────────────────────────────────────────
+    def iter_spans(self, **constraints) -> "Iterator[SpanEvent]":
+        """See TraceStore.iter_spans for the constraints (order, pid, tid,
+        lane, categories, window, has_stack, gpu_model, filt)."""
+        return self.store.iter_spans(**constraints)
+
+    def iter_instants(self) -> "Iterator[InstantEvent]":
+        return self.store.iter_instants()
+
+    def iter_counters(self, order: str = "seq") -> "Iterator[CounterEvent]":
+        return self.store.iter_counters(order=order)
+
+    def span_count(self) -> int:
+        return self.store.span_count()
+
+    def event_by_id(self, eid: int) -> AnyEvent | None:
+        return self.store.event_by_id(eid)
+
+    def events_in_window(self, start_ns: int, end_ns: int, *, lanes=None, filt=None) -> "Iterator[SpanEvent]":
+        """Spans overlapping [start_ns, end_ns] (of the given lanes), in
+        (start, arrival) order."""
+        return self.store.events_in_window(start_ns, end_ns, lanes=lanes, filt=filt)
+
+    def lanes_in_window(self, start_ns: int, end_ns: int, *, filt=None,
+                        limit_per_lane: int | None = None) -> dict[str, list[SpanEvent]]:
+        return self.store.lanes_in_window(start_ns, end_ns, filt=filt, limit_per_lane=limit_per_lane)
+
+    def lane_infos(self) -> "list[LaneInfo]":
+        return self.store.lane_infos()
+
+    def aggregate_stats(self) -> list[dict]:
+        """Per (category, name) span statistics, computed by the store."""
+        return self.store.aggregate_stats()
+
+    def counter_values(self) -> dict[str, float]:
+        """Last value of each counter by name (what the summaries show)."""
+        out: dict[str, float] = {}
+        for c in self.store.iter_counters():
+            out[c.name] = c.value
+        return out
+
+    def finalize(self) -> None:
+        """Build the store's indexes and derived tables, persist metadata."""
+        self.save()
+        self.store.finalize()
+
+    def save(self) -> None:
+        """Write metadata/disasm/devices into the store (disk stores keep
+        them; a no-op in effect for memory stores)."""
+        from . import trace_io
+        trace_io.save_trace_meta(self)
+
+    def close(self) -> None:
+        self.store.close()
 
     @property
     def duration_ns(self) -> int:
-        if not self._events:
+        if not self.store.span_count() and not self.store.instant_count() \
+                and not self.store.counter_count():
             return 0
         end = self.metadata.end_time_ns or time.monotonic_ns()
         return end - self.metadata.start_time_ns
 
     def spans_by_category(self) -> dict[Category, list[SpanEvent]]:
         result: dict[Category, list[SpanEvent]] = defaultdict(list)
-        for s in self.spans:
+        for s in self.iter_spans():
             result[s.category].append(s)
         return dict(result)
 
     def top_spans(self, n: int = 20) -> list[SpanEvent]:
-        return heapq.nlargest(n, self.spans, key=lambda s: s.duration_ns)
+        return heapq.nlargest(n, self.iter_spans(), key=lambda s: s.duration_ns)
 
     def aggregated_stats(self) -> list[dict]:
         """Group spans by name, return sorted by total time desc."""
-        totals: dict[str, dict] = defaultdict(lambda: {
-            "name": "", "category": "", "count": 0,
-            "total_ns": 0, "min_ns": float("inf"), "max_ns": 0
-        })
-        for s in self.spans:
-            key = f"{s.category.value}::{s.name}"
-            r = totals[key]
-            r["name"] = s.name
-            r["category"] = s.category.value
-            r["count"] += 1
-            r["total_ns"] += s.duration_ns
-            r["min_ns"] = min(r["min_ns"], s.duration_ns)
-            r["max_ns"] = max(r["max_ns"], s.duration_ns)
-
-        rows = list(totals.values())
-        for r in rows:
-            r["avg_ns"] = r["total_ns"] / r["count"] if r["count"] else 0
-            if r["min_ns"] == float("inf"):
-                r["min_ns"] = 0
-
-        total_time = sum(r["total_ns"] for r in rows) or 1
-        for r in rows:
-            r["pct"] = 100.0 * r["total_ns"] / total_time
-
-        return sorted(rows, key=lambda r: r["total_ns"], reverse=True)
+        return self.store.aggregate_stats()
 
     def cct(self) -> "CCT":  # type: ignore[name-defined]
         """Build and return a Calling Context Tree from all stacked spans."""
@@ -171,8 +239,10 @@ class Trace:
         """Return spans grouped into display lanes (parse names with
         parse_lane_name()).
 
-        CUDA/ROCm spans with a 'stream' tag -- and event-timed async copies
-        (type=memcpy_async) -- get a per-stream lane (cuda/stream-N) so the
+        Host API calls (side=cpu) always stay on their thread's lane.
+        Device spans with a 'stream' tag -- CUDA/ROCm device work (side=gpu,
+        including copies/memsets in the memory category) and pre-split
+        CUDA/ROCm spans -- get a per-stream lane (cuda/stream-N) so the
         Timeline shows kernel/memcpy overlap across streams. Device-timed
         spans with no stream (OpenCL side=gpu, *_gpu transfers) get a
         category/device lane: their tid is whichever driver callback thread
@@ -186,30 +256,7 @@ class Trace:
         rank's kernels were drawn in ONE lane. Single-process traces keep
         the unsuffixed names.
         """
-        def base(s: SpanEvent) -> tuple[str, str, Any]:
-            cat = s.category.value
-            if "stream" in s.tags and (cat in ("cuda", "rocm") or s.tags.get("type") == "memcpy_async"):
-                return (cat, "stream", s.tags["stream"])
-            if s.tags.get("side") == "gpu" or s.name.endswith("_gpu"):
-                return (cat, "device", "")
-            if s.tid:
-                return (cat, "thread", s.tid)
-            return (cat, "", "")
-
-        spans = self.spans
-        bases = [base(s) for s in spans]
-        pids: dict[tuple[str, str, Any], set[int]] = defaultdict(set)
-        for b, s in zip(bases, spans):
-            pids[b].add(s.pid)
-
-        lanes: dict[str, list[SpanEvent]] = defaultdict(list)
-        for (cat, kind, ident), s in zip(bases, spans):
-            key = f"{cat}/{kind}-{ident}" if kind in ("stream", "thread") else (
-                f"{cat}/device" if kind == "device" else cat)
-            if len(pids[(cat, kind, ident)]) > 1:
-                key += f"@{s.pid}"
-            lanes[key].append(s)
-        return dict(lanes)
+        return {ln.name: list(self.store.iter_spans(lane=ln.name)) for ln in self.store.lane_infos()}
 
 
 def parse_lane_name(name: str) -> tuple[str, str, str, int | None]:

@@ -10,6 +10,43 @@ Four layers:
   python3 -m unittest discover tests
   ```
 
+  - `test_causal_compare.py` -- the structure- and causality-aware run
+    comparison (`src/analysis/projection.py`, `causal_compare.py`) on
+    before/after pairs with one known difference (`compare_scenarios.py`):
+    identical names under different call paths, reordered independent work
+    (no false regression), inserted/removed iterations, changed stream
+    overlap (lost overlap), MPI wait propagation (traced to the slower
+    sender's compute), a non-critical kernel becoming critical; plus renamed
+    functions matched by source location, relabeled pids/tids/streams/
+    communicators/clocks, phase detection, the aggregate fallback, memory/
+    disk parity, JSON and the `hprofiler compare` CLI.
+  - `test_gui_compare_interaction.py` -- the populated Compare tab driven by
+    synthesized clicks in its own process (`gui_compare_driver.py`):
+    contributor details, Show in Timeline (zoom to the range), Open in
+    Source, phase navigation, thresholds, zero QML warnings.
+  - `test_trace_store_parity.py` -- the same synthetic trace (several
+    processes/threads, nesting, perf samples, CUDA host/device and legacy GPU
+    spans, MPI p2p/collectives/requests incl. wildcards and Waitall
+    `rmatches`, OpenMP barriers, stacks, NVTX, instants, counters, JSON-typed
+    tags) written into `MemoryTraceStore` and `DiskTraceStore`
+    (`src/core/store/`): every consumer must give identical answers -- events,
+    lanes, windows (also vs brute force), aggregates, exclusive time (also vs
+    the original `ExclusiveTime`), activity bins, lightweight scans, text
+    summary, dashboard numbers, call tree, critical path (also vs the
+    dict-based `build_dependency_graph` pipeline), multi-node merge, GUI
+    timeline answers, byte-identical JSON export and reload, metadata after
+    save/reopen. Plus schema-version refusal, derived-table rebuild, edge
+    invalidation, concurrent appends, source-annotation write-back and the
+    JSON-to-store reuse rules (`open_trace`).
+  - `test_gpu_activity.py` -- the CUDA/ROCm host/device model
+    (`src/core/gpu_activity.py`) and its consumers, fed synthetic native
+    records in the exact wire format the CUPTI / ROCprofiler-SDK decoders
+    emit: concurrent streams, async copies, missing correlations, reused
+    correlation ids, dropped records, out-of-order delivery, proxy/native
+    de-duplication, never mixing proxy and device intervals for GPU-active
+    time, JSON round trip, lanes/buckets, and the critical-path launch /
+    stream / sync / cross-stream edges (incl. the tie-break that routes the
+    path through the work that actually gated a wait).
   - `test_runner_stack_correlation.py` -- regression test for the cross-hook
     `stk:` correlation race fixed in `src/core/runner.py`
     (`_remember_recent_span`/`_find_recent_span`): two different LD_PRELOAD
@@ -135,6 +172,32 @@ Four layers:
   the mutex+`send()` pattern it's designed to replace.
 
 - **Integration tests** (`tests/integration/`):
+
+  - `test_store_stress.py` -- 2M synthetic spans (`HPROFILER_STRESS_EVENTS`
+    to change) captured into a `DiskTraceStore` through `Trace.add`,
+    finalized, then reopened and explored in fresh subprocesses (GUI
+    `TimelineModel` window queries, TUI timeline windows, aggregates,
+    overview numbers, call tree). Asserts bounded peak RSS that does not
+    scale versus a 200k-span baseline, interactive window latency, a
+    bins/spans switch between zoom levels, and exact answers against the
+    generator. ~1 min.
+
+    ```bash
+    python3 -m unittest tests.integration.test_store_stress
+    ```
+
+  - `test_native_gpu_records.py` -- compiles `tests/native/*.c` against the
+    REAL CUPTI / ROCprofiler-SDK headers with the hook's own decoder
+    (`cupti_trace.c` / `rocprof_trace.c`) and feeds synthetic activity
+    records and Callback-API data through it (incomplete/corrupt/truncated
+    records, drops, clock offset, correlation capture). No GPU needed;
+    skips without headers (`HPROFILER_ROCPROFILER_SDK_INCLUDE=<rocm>/include`
+    for ROCm).
+  - `test_cuda_native_activity.py` -- `tests/fixtures/cuda_streams.cu` on a
+    real CUDA GPU in `HPROFILER_DEVICE_ACTIVITY=auto|off|both` mode and as a
+    static-runtime build: correlation, stream attribution, ordering
+    invariants, de-duplication, critical path. Functional checks, not a
+    timing-accuracy comparison. Skips without nvcc / a GPU / CUPTI.
 
   - `run_matrix.sh` -- crash-safety matrix: builds the small per-backend
     fixture programs in `tests/fixtures/` (skipping any whose toolchain

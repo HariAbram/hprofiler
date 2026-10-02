@@ -22,8 +22,12 @@ from typing import Any
 from PySide6.QtCore import QObject, Property, Signal, Slot
 
 from ..core.trace import Trace
+from ..core import gpu_activity as ga
 from ..analysis import dashboard as dash
 from . import clipboard
+
+
+_SAMPLE = 50_000
 
 
 def _field(label: str, value: str, kind: str = "measured", reason: str = "") -> dict[str, str]:
@@ -100,26 +104,42 @@ class InspectorBridge(QObject):
         else:
             summary.append(_field("Total time", "", "unavailable", "no matching spans in this trace"))
 
-        threads = sorted({
-            (s.pid, s.tid) for s in self._trace.spans
-            if s.category.value == category and s.name == name
-        })
-        if threads:
-            # GPU spans get a synthetic tid far above any real OS tid
-            # (chrome_trace.py's _GPU_BASE_TID, so GPU streams get their
-            # own lanes in Perfetto/chrome://tracing) -- showing that raw
-            # number here ("tid 2000000000") would be technically correct
-            # but meaningless, so GPU categories are labeled by stream
-            # instead of a fake thread id.
-            if category in dash._GPU_CATS:
-                shown = ", ".join(f"pid {p} (GPU stream {i})" for i, (p, t) in enumerate(threads[:5]))
-            else:
-                shown = ", ".join(f"pid {p} / tid {t}" for p, t in threads[:5])
-            if len(threads) > 5:
-                shown += f"  (+{len(threads) - 5} more)"
+        # A bounded sample (first _SAMPLE occurrences in arrival order) --
+        # one name can have millions of spans in a large trace; totals above
+        # come from the store's aggregates, not from this sample.
+        from ..core.store import SpanFilter
+        here = []
+        for s in self._trace.iter_spans(filt=SpanFilter(names=frozenset({name}),
+                                                       categories=frozenset({category}))):
+            here.append(s)
+            if len(here) >= _SAMPLE:
+                break
+        sampled = len(here) >= _SAMPLE
+
+        # Device-side spans (a kernel/copy on the GPU) ran on a stream, not
+        # on the thread that launched them; host calls -- including CUDA/
+        # HIP launch calls and OpenCL enqueues -- ran on their thread.
+        def _on_device(s) -> bool:
+            side = s.tags.get("side")
+            return side == "gpu" or (side is None and category in dash._GPU_CATS)
+
+        places = sorted({
+            (s.pid, "stream " + str(s.tags["stream"]) if "stream" in s.tags else "device")
+            if _on_device(s) else (s.pid, f"tid {s.tid}")
+            for s in here
+        }, key=str)
+        if places:
+            shown = ", ".join(f"pid {p} / {where}" for p, where in places[:5])
+            if len(places) > 5:
+                shown += f"  (+{len(places) - 5} more)"
             context.append(_field("Runs on", shown))
         else:
             context.append(_field("Runs on", "", "unavailable", "no matching spans in this trace"))
+
+        self._gpu_timing_fields(here, metrics, relationships)
+        if sampled:
+            metrics.append(_field("Sample", f"first {_SAMPLE:,} occurrences", "derived",
+                                  "per-span details above use a sample; totals use every span"))
 
         call_path = self._selection.selectedCallPath
         if call_path:
@@ -186,6 +206,52 @@ class InspectorBridge(QObject):
             "relationships": relationships, "recommendations": recommendations,
         }
         self.contentChanged.emit()
+
+    def _gpu_timing_fields(self, here: list, metrics: list, relationships: list) -> None:
+        """Where a GPU span's numbers come from: device-measured (CUPTI /
+        ROCprofiler-SDK), a host-side proxy, or the host call itself --
+        plus the host-call / queueing / execution split when measured."""
+        device = [s for s in here if s.tags.get("side") == "gpu" or ga.is_device_kernel(s)]
+        if device:
+            sources = {ga.timing_source(s) for s in device}
+            if sources == {"device"}:
+                tracer = sorted({s.tags.get("src", "native") for s in device})
+                metrics.append(_field("Device timing", "measured on the device (" + ", ".join(tracer) + ")"))
+            elif sources <= {"proxy_event"}:
+                metrics.append(_field(
+                    "Device timing", "duration from GPU events; start = submission time", "estimated",
+                    "no CUPTI / ROCprofiler-SDK records: queued work appears to start early"))
+            elif sources <= ga.PROXY_TIMINGS:
+                metrics.append(_field(
+                    "Device timing", "host-side proxy only (no device measurement)", "estimated",
+                    "GPU event timing was unavailable for these launches"))
+            elif "host" in sources and len(sources) == 1:
+                metrics.append(_field("Wait timing", "host wait recorded by the native tracer"))
+            else:
+                metrics.append(_field("Device timing", "mixed: " + ", ".join(sorted(sources)), "estimated"))
+
+            def _median(key: str) -> int | None:
+                vals = sorted(int(s.tags[key]) for s in device if key in s.tags)
+                return vals[len(vals) // 2] if vals else None
+            api, queue = _median("api_ns"), _median("queue_ns")
+            if api is not None:
+                metrics.append(_field("Host call (median)", dash.fmt_ns(api)))
+            if queue is not None:
+                metrics.append(_field("Queued before start (median)", dash.fmt_ns(queue), "derived"))
+            if api is not None or queue is not None:
+                dur = sorted(s.duration_ns for s in device)
+                metrics.append(_field("Device execution (median)", dash.fmt_ns(dur[len(dur) // 2])))
+            linked = sum(1 for s in device if s.parent_span_id)
+            if any(ga.is_device_span(s) for s in device):
+                relationships.append(_field("Submitted by", f"{linked} of {len(device)} correlated to a host call",
+                                            "derived"))
+        hosts = [s for s in here if ga.is_host_submission(s)]
+        if hosts:
+            sids = {s.span_id for s in hosts if s.span_id}
+            n_dev = sum(1 for s in self._trace.iter_spans(gpu_model=True)
+                        if s.parent_span_id in sids and ga.is_device_span(s))
+            relationships.append(_field("Device work", f"{n_dev} device span(s) from {len(hosts)} call(s)",
+                                        "derived"))
 
     @Property('QVariantMap', notify=contentChanged)
     def content(self) -> dict[str, list]:

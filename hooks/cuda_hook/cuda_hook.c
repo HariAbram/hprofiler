@@ -14,9 +14,16 @@
  *      cudaMallocHost/FreeHost, cuMemAllocManaged, cuMemAllocAsync/FreeAsync.
  *      Pinned host memory tracked separately as pinned_memory_bytes.
  *
+ *   6. Host submission vs. device execution (see the "Host submission /
+ *      device activity" block below and cupti_trace.c): every launch/copy/
+ *      memset/graph call emits a host API span (side=cpu) plus a device span
+ *      (side=gpu) -- measured by CUPTI when available, otherwise the
+ *      cudaEvent-pair proxy, labelled timing=proxy_*.
+ *
  * Wire protocol (newline-delimited ASCII):
  *   span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<tag=val,...>]
  *   ctr:<cat>:<pid>:<ts_ns>:<name>:<value>:<unit>
+ *   gpuact:<pid>:cupti:<k=v,...>     native tracer status (cupti_trace.c)
  */
 
 #define _GNU_SOURCE
@@ -52,8 +59,12 @@ static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pid_t           g_pid         = 0;
 static void           *g_cudart_handle = NULL;
 
-/* Thread-local recursion guard: prevents profiling our own CUDA event calls */
-static __thread int in_hook = 0;
+/* Thread-local recursion guard: prevents profiling our own CUDA event calls.
+ * Shared (hidden) with cupti_trace.c, whose CUPTI callbacks must ignore the
+ * hook's own CUDA calls and which sets it around buffer processing. */
+#include "hp_cupti.h"
+__thread int hp_cuda_in_hook HP_HIDDEN = 0;
+#define in_hook hp_cuda_in_hook
 
 /* Span ID of the innermost active NVTX range on this thread (0 = none).
  * Set/cleared by nvtxRangePushA / nvtxRangePop.
@@ -175,6 +186,72 @@ static void emit_ctr(const char *cat, const char *name,
         if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
     }
     pthread_mutex_unlock(&g_sock_mutex);
+}
+
+/* Entry points for cupti_trace.c (see hp_cupti.h). */
+void hp_cuda_emit_span(const char *cat, pid_t tid, uint64_t start_ns,
+                       uint64_t dur_ns, const char *name, const char *extra) {
+    emit_span(cat, tid, start_ns, dur_ns, name, extra);
+}
+
+void hp_cuda_emit_line(const char *line) {
+    pthread_mutex_lock(&g_sock_mutex);
+    ensure_connected();
+    if (g_sock >= 0) send_all(line, (int)strlen(line));
+    pthread_mutex_unlock(&g_sock_mutex);
+}
+
+/* ── Host submission / device activity bookkeeping ──────────────────────────
+ * Every intercepted call that submits device work emits a HOST span (the
+ * call itself: side=cpu, timing=host) carrying a per-process launch id
+ * (lid=) and the CUPTI correlation ids captured during the call (corr=/
+ * corr2=). The device work is a separate side=gpu span: from CUPTI activity
+ * records when native tracing is active (cupti_trace.c), otherwise the
+ * pre-existing cudaEvent-pair measurement, labelled as a proxy
+ * (timing=proxy_event / proxy_host / proxy_flush).
+ *
+ * HPROFILER_DEVICE_ACTIVITY: auto (default: CUPTI if available, else proxy)
+ *                            off  (proxy only -- the pre-CUPTI behaviour)
+ *                            both (CUPTI and proxy, for comparing them; the
+ *                                  analysis keeps the CUPTI span per launch) */
+static uint64_t g_lid_counter = 0;
+static pthread_once_t g_native_once = PTHREAD_ONCE_INIT;
+static int g_device_mode = 0;     /* 0 auto, 1 off, 2 both */
+static int g_native_active = 0;
+
+static unsigned g_native_extra = 0;   /* extra hp_cupti_start() flags */
+
+static void native_init_once(void) {
+    const char *m = getenv("HPROFILER_DEVICE_ACTIVITY");
+    if (m && !strcmp(m, "off")) {
+        g_device_mode = 1;
+        char line[128];
+        snprintf(line, sizeof(line), "gpuact:%d:cupti:status=disabled,reason=env_off\n", (int)getpid());
+        hp_cuda_emit_line(line);
+        return;
+    }
+    if (m && !strcmp(m, "both")) g_device_mode = 2;
+    int saved = in_hook;
+    in_hook = 1;
+    g_native_active = (hp_cupti_start(HP_CUPTI_ACTIVITY | g_native_extra) & HP_CUPTI_ACTIVITY) != 0;
+    in_hook = saved;
+}
+
+/* Lazily, on the first intercepted CUDA call -- not in the constructor, so
+ * libcupti is never loaded into the shells/launchers (mpirun, srun) that
+ * inherit LD_PRELOAD but never touch CUDA. */
+static void native_ensure(void) { pthread_once(&g_native_once, native_init_once); }
+static int want_proxy(void) { return !g_native_active || g_device_mode == 2; }
+
+/* Stable small id for an opaque handle (stream, event): same hash as
+ * get_stream_id() below, so ids agree across hooks with no shared state. */
+static int handle_id(const void *h) {
+    if (!h) return 0;
+    uint64_t v = (uint64_t)(uintptr_t)h;
+    v ^= v >> 33; v *= 0xff51afd7ed558ccdULL;
+    v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL;
+    v ^= v >> 33;
+    return (int)(v % 999983) + 1;
 }
 
 /* ── Kernel name table (cuModuleGetFunction → name) ─────────────────────── */
@@ -299,14 +376,7 @@ static void pin_track_rem(void *ptr) {
  * two streams share a small display ID (rare for realistic stream counts),
  * not any correctness issue. This also removes the previous STREAM_MAP_CAP
  * overflow behavior (silently collapsing to stream=-1 past 256 streams). */
-static int get_stream_id(const void *stream) {
-    if (!stream) return 0;
-    uint64_t v = (uint64_t)(uintptr_t)stream;
-    v ^= v >> 33; v *= 0xff51afd7ed558ccdULL;
-    v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL;
-    v ^= v >> 33;
-    return (int)(v % 999983) + 1;
-}
+static int get_stream_id(const void *stream) { return handle_id(stream); }
 
 /* ── GPU-accurate timing via cudaEvent pairs ──────────────────────────────── */
 #define MAX_PENDING 512
@@ -471,18 +541,16 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
         f_evDestroy(l->ev_s);
         f_evDestroy(l->ev_e);
         if (ok) {
-            char final_extra[300];
-            if (has_xs) {
-                if (l->extra[0])
-                    snprintf(final_extra, sizeof(final_extra), "%s,xs=%llu",
-                             l->extra, (unsigned long long)xs_ns);
-                else
-                    snprintf(final_extra, sizeof(final_extra), "xs=%llu",
-                             (unsigned long long)xs_ns);
-            } else {
-                strncpy(final_extra, l->extra, sizeof(final_extra) - 1);
-                final_extra[sizeof(final_extra) - 1] = '\0';
-            }
+            /* timing=proxy_event: the duration is GPU-measured (event pair)
+             * but the span starts at the host submission time t0. */
+            char final_extra[340];
+            const char *sep = l->extra[0] ? "," : "";
+            if (has_xs)
+                snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event,xs=%llu",
+                         l->extra, sep, (unsigned long long)xs_ns);
+            else
+                snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event",
+                         l->extra, sep);
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
                       l->kname, final_extra);
         } else {
@@ -492,32 +560,16 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
              * simply vanish from the trace. Fall back to wall-clock time
              * from launch to this flush as an (upper-bound) approximation,
              * clearly marked as such -- distinct from the launch-time
-             * "timing=cpu" fallback since this interval can include time
+             * "timing=proxy_host" fallback since this interval can include time
              * for OTHER kernels queued after this one, not just this one's
              * own launch overhead. */
             char marked[300];
             if (l->extra[0])
-                snprintf(marked, sizeof(marked), "%s,timing=cpu_flush", l->extra);
+                snprintf(marked, sizeof(marked), "%s,timing=proxy_flush", l->extra);
             else
-                snprintf(marked, sizeof(marked), "timing=cpu_flush");
+                snprintf(marked, sizeof(marked), "timing=proxy_flush");
             emit_span(l->cat, l->tid, l->t0, now_ns() - l->t0, l->kname, marked);
         }
-    }
-}
-
-/* Appends "timing=cpu" (or ",timing=cpu" if extra already has tags) to mark
- * a span that fell back to CPU-side (launch-call wall-clock) timing instead
- * of GPU-accurate cudaEvent timing -- e.g. because the event pool/pending
- * queue was under pressure. Without this marker a launch-overhead-only
- * measurement (microseconds) is indistinguishable from a real GPU kernel
- * duration (which could be milliseconds) in the emitted span, silently
- * misrepresenting it as GPU-accurate. */
-static void mark_cpu_fallback(char *extra, size_t cap) {
-    size_t len = strlen(extra);
-    if (len == 0) {
-        snprintf(extra, cap, "timing=cpu");
-    } else if (len + 12 < cap) {
-        snprintf(extra + len, cap - len, ",timing=cpu");
     }
 }
 
@@ -563,9 +615,9 @@ static void pk_commit(cudaEvent_t ev_s, cudaEvent_t ev_e,
         PendingKernel *pk = &g_pk[g_pk_n++];
         pk->ev_start = ev_s; pk->ev_end = ev_e;
         pk->stream = stream; pk->cpu_start_ns = t0; pk->tid = tid;
-        strncpy(pk->cat,   cat,   31);  pk->cat[31]   = '\0';
-        strncpy(pk->kname, kname, 255); pk->kname[255] = '\0';
-        strncpy(pk->extra, extra, 255); pk->extra[255] = '\0';
+        snprintf(pk->cat,   sizeof(pk->cat),   "%s", cat);
+        snprintf(pk->kname, sizeof(pk->kname), "%s", kname);
+        snprintf(pk->extra, sizeof(pk->extra), "%s", extra);
         pthread_mutex_unlock(&g_pk_mutex);
     } else {
         pthread_mutex_unlock(&g_pk_mutex);
@@ -576,11 +628,88 @@ static void pk_commit(cudaEvent_t ev_s, cudaEvent_t ev_e,
          * measurement. */
         char marked[300];
         if (extra && *extra)
-            snprintf(marked, sizeof(marked), "%s,timing=cpu", extra);
+            snprintf(marked, sizeof(marked), "%s,timing=proxy_host", extra);
         else
-            snprintf(marked, sizeof(marked), "timing=cpu");
+            snprintf(marked, sizeof(marked), "timing=proxy_host");
         emit_span(cat, tid, t0, now_ns() - t0, kname, marked);
     }
+}
+
+/* One intercepted submission: sub_begin() before the real call, sub_end()
+ * right after it, then sub_host() and sub_proxy(). */
+typedef struct {
+    uint64_t    lid, t0, t1;
+    pid_t       tid;
+    uint32_t    corr, corr2;
+    int         proxy, gpu_ok;
+    cudaEvent_t ev_s, ev_e;
+} Sub;
+
+/* device_work: the call submits GPU work that a proxy span should time. */
+static void sub_begin(Sub *u, cudaStream_t stream, int device_work) {
+    native_ensure();
+    u->lid   = __atomic_add_fetch(&g_lid_counter, 1, __ATOMIC_RELAXED);
+    u->tid   = gettid_compat();
+    u->corr  = u->corr2 = 0;
+    u->proxy = device_work && want_proxy();
+    u->gpu_ok = u->proxy ? pk_try_begin(stream, &u->ev_s, &u->ev_e) : 0;
+    hp_cupti_arm();            /* after pk_try_begin: its CUDA calls aren't ours to correlate */
+    u->t0 = now_ns();
+}
+
+static void sub_end(Sub *u) {
+    u->t1 = now_ns();
+    hp_cupti_disarm(&u->corr, &u->corr2);
+}
+
+/* Host API span. `tags` starts with type=...,op=... */
+static void sub_host(const Sub *u, const char *cat, const char *api,
+                     const char *tags, int ret) {
+    char x[512];
+    int n = snprintf(x, sizeof(x), "%s,side=cpu,rt=cuda,timing=host,lid=%llu,sid=%llu",
+                     tags, (unsigned long long)u->lid,
+                     (unsigned long long)(((uint64_t)(uint32_t)getpid() << 32) | (u->lid & 0xffffffffULL)));
+    if (u->corr && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",corr=%u", u->corr);
+    if (u->corr2 && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",corr2=%u", u->corr2);
+    if (tls_nvtx_span_id && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",psid=%llu", (unsigned long long)tls_nvtx_span_id);
+    if (ret != 0 && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",err=%d", ret);
+    emit_span(cat, u->tid, u->t0, u->t1 - u->t0, api, x);
+}
+
+/* Proxy device span (only when native tracing is off/unavailable, or in
+ * "both" mode). `tags` starts with type=...,op=... */
+static void sub_proxy(Sub *u, cudaStream_t stream, const char *cat,
+                      const char *name, const char *tags) {
+    if (!u->proxy) return;
+    char x[256];
+    int n = snprintf(x, sizeof(x), "%s,side=gpu,rt=cuda,lid=%llu", tags, (unsigned long long)u->lid);
+    if (u->corr && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",corr=%u", u->corr);
+    if (u->corr2 && n > 0 && n < (int)sizeof(x))
+        snprintf(x + n, sizeof(x) - (size_t)n, ",corr2=%u", u->corr2);
+    if (u->gpu_ok) {
+        pk_commit(u->ev_s, u->ev_e, stream, cat, name, x, u->t0, u->tid);
+    } else {
+        /* No GPU timing possible: the host call's own interval. */
+        char y[300];
+        snprintf(y, sizeof(y), "%s,timing=proxy_host", x);
+        emit_span(cat, u->tid, u->t0, u->t1 - u->t0, name, y);
+    }
+}
+
+/* A failed submission produced no device work: release the proxy events
+ * (if any) instead of reporting a phantom device span. */
+static void sub_abort(Sub *u) {
+    if (u->gpu_ok) { f_evDestroy(u->ev_s); f_evDestroy(u->ev_e); u->gpu_ok = 0; }
+}
+
+static const char *memcpy_dir(cudaMemcpyKind kind) {
+    static const char *names[] = {"HtoH", "HtoD", "DtoH", "DtoD", "Default"};
+    return kind <= 4 ? names[kind] : "Unknown";
 }
 
 /* ── CUDA Runtime API wrappers ──────────────────────────────────────────── */
@@ -597,31 +726,19 @@ cudaError_t cudaLaunchKernel(
     in_hook = 1;
 
     const char *kname = resolve_kernel_name(func);
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[256];
-    if (tls_nvtx_span_id)
-        snprintf(extra, sizeof(extra),
-                 "type=kernel,grid=%ux%ux%u,block=%ux%ux%u,stream=%d,psid=%llu",
-                 gridDim.x, gridDim.y, gridDim.z,
-                 blockDim.x, blockDim.y, blockDim.z, sid,
-                 (unsigned long long)tls_nvtx_span_id);
-    else
-        snprintf(extra, sizeof(extra),
-                 "type=kernel,grid=%ux%ux%u,block=%ux%ux%u,stream=%d",
-                 gridDim.x, gridDim.y, gridDim.z,
-                 blockDim.x, blockDim.y, blockDim.z, sid);
+    char host[64], dev[160];
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u",
+             sid, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, stream, 1);
     cudaError_t ret = real(func, gridDim, blockDim, args, sharedMem, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "cuda", kname, extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("cuda", tid, t0, now_ns() - t0, kname, extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "cuda", "cudaLaunchKernel", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "cuda", kname, dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -639,18 +756,17 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count,
     /* Synchronous memcpy implies all prior GPU work is complete — flush pending */
     pk_flush(NULL, 1);
 
-    const char *names[] = {"HtoH","HtoD","DtoH","DtoD","Default"};
-    const char *dir = (kind <= 4) ? names[kind] : "Unknown";
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=memcpy,dir=%s,bytes=%zu", dir, count);
-    uint64_t t0 = now_ns();
+    /* Blocking: the host call spans the transfer itself, so it is
+     * type=memcpy ("Memory transfer"), not a launch. "memory", not
+     * "cuda", so its bytes count in the Memory tab. The device-side copy
+     * comes from CUPTI when native tracing is active. */
+    char host[128];
+    snprintf(host, sizeof(host), "type=memcpy,op=memcpy,dir=%s,bytes=%zu", memcpy_dir(kind), count);
+    Sub u;
+    sub_begin(&u, NULL, 0);
     cudaError_t ret = real(dst, src, count, kind);
-    /* "memory", not "cuda" -- matches cudaMemcpyAsync/cuMemcpyAsync below
-     * (both already "memory") so a blocking vs. async memcpy of the same
-     * data lands in the same category; being "cuda" meant this transfer's
-     * bytes/duration were silently excluded from the Memory tab's
-     * bandwidth accounting and miscounted as compute time instead. */
-    emit_span("memory", gettid_compat(), t0, now_ns() - t0, "cudaMemcpy", extra);
+    sub_end(&u);
+    sub_host(&u, "memory", "cudaMemcpy", host, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -665,25 +781,20 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
     if (in_hook) return real(dst, src, count, kind, stream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[192];
-    if (tls_nvtx_span_id)
-        snprintf(extra, sizeof(extra), "type=memcpy_async,bytes=%zu,stream=%d,psid=%llu",
-                 count, sid, (unsigned long long)tls_nvtx_span_id);
-    else
-        snprintf(extra, sizeof(extra), "type=memcpy_async,bytes=%zu,stream=%d", count, sid);
+    const char *dir = memcpy_dir(kind);
+    char host[128], dev[128], dname[32];
+    snprintf(host, sizeof(host), "type=launch,op=memcpy,dir=%s,bytes=%zu,stream=%d", dir, count, sid);
+    snprintf(dev, sizeof(dev), "type=memcpy_async,op=memcpy,dir=%s,bytes=%zu,stream=%d", dir, count, sid);
+    snprintf(dname, sizeof(dname), "memcpy %s", dir);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, stream, 1);
     cudaError_t ret = real(dst, src, count, kind, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "memory", "cudaMemcpyAsync", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("memory", tid, t0, now_ns() - t0, "cudaMemcpyAsync", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "memory", "cudaMemcpyAsync", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "memory", dname, dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -852,11 +963,14 @@ cudaError_t cudaDeviceSynchronize(void) {
     if (in_hook) return real();
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=device");
+    Sub u;
+    sub_begin(&u, NULL, 0);
     cudaError_t ret = real();
+    sub_end(&u);
     pk_flush(NULL, 1);
-    emit_span("sync", gettid_compat(), t0, now_ns() - t0,
-              "cudaDeviceSynchronize", "type=sync");
+    sub_host(&u, "sync", "cudaDeviceSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -870,13 +984,14 @@ cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
     if (in_hook) return real(stream);
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=stream,stream=%d", get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
     cudaError_t ret = real(stream);
+    sub_end(&u);
     pk_flush(stream, 0);
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=sync,stream=%d", get_stream_id(stream));
-    emit_span("sync", gettid_compat(), t0, now_ns() - t0,
-              "cudaStreamSynchronize", extra);
+    sub_host(&u, "sync", "cudaStreamSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -890,12 +1005,14 @@ cudaError_t cudaEventSynchronize(cudaEvent_t event) {
     if (in_hook) return real(event);
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=event,event=%d", handle_id(event));
+    Sub u;
+    sub_begin(&u, NULL, 0);
     cudaError_t ret = real(event);
-    /* Can't know which stream the event was recorded on; flush all pending */
-    pk_flush(NULL, 1);
-    emit_span("sync", gettid_compat(), t0, now_ns() - t0,
-              "cudaEventSynchronize", "type=sync");
+    sub_end(&u);
+    pk_flush(NULL, 1);   /* proxy pending list isn't keyed by event: flush all */
+    sub_host(&u, "sync", "cudaEventSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -909,13 +1026,105 @@ cudaError_t cudaDeviceReset(void) {
     if (in_hook) return real();
     in_hook = 1;
 
-    /* Flush before reset — device state is destroyed after */
-    pk_flush(NULL, 1);
-    uint64_t t0 = now_ns();
+    pk_flush(NULL, 1);   /* device state is destroyed by the call */
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=device");
+    Sub u;
+    sub_begin(&u, NULL, 0);
     cudaError_t ret = real();
-    emit_span("sync", gettid_compat(), t0, now_ns() - t0,
-              "cudaDeviceReset", "type=sync");
+    sub_end(&u);
+    sub_host(&u, "sync", "cudaDeviceReset", tags, (int)ret);
 
+    in_hook = 0;
+    return ret;
+}
+
+/* Event record / stream wait: no device work of their own, but they define
+ * which stream an event sync or a cross-stream wait refers to -- the
+ * critical path resolves those through these spans (event= is the same
+ * handle hash as cudaEventSynchronize's). */
+cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
+    typedef cudaError_t (*fn_t)(cudaEvent_t, cudaStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)find_cuda_sym("cudaEventRecord");
+    if (!real) return -1;
+    if (in_hook) return real(event, stream);
+    in_hook = 1;
+
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=event_record,op=event_record,event=%d,stream=%d",
+             handle_id(event), get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    cudaError_t ret = real(event, stream);
+    sub_end(&u);
+    sub_host(&u, "cuda", "cudaEventRecord", tags, (int)ret);
+
+    in_hook = 0;
+    return ret;
+}
+
+cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags) {
+    typedef cudaError_t (*fn_t)(cudaStream_t, cudaEvent_t, unsigned int);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)find_cuda_sym("cudaStreamWaitEvent");
+    if (!real) return -1;
+    if (in_hook) return real(stream, event, flags);
+    in_hook = 1;
+
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=stream_wait,op=stream_wait,event=%d,stream=%d",
+             handle_id(event), get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    cudaError_t ret = real(stream, event, flags);
+    sub_end(&u);
+    sub_host(&u, "cuda", "cudaStreamWaitEvent", tags, (int)ret);
+
+    in_hook = 0;
+    return ret;
+}
+
+static cudaError_t memset_common(const char *api, cudaError_t (*call)(void*, int, size_t, cudaStream_t),
+                                 void *ptr, int value, size_t count, cudaStream_t stream) {
+    int sid = get_stream_id(stream);
+    char host[96], dev[96];
+    snprintf(host, sizeof(host), "type=launch,op=memset,bytes=%zu,stream=%d", count, sid);
+    snprintf(dev, sizeof(dev), "type=memset,op=memset,bytes=%zu,stream=%d", count, sid);
+    Sub u;
+    sub_begin(&u, stream, 1);
+    cudaError_t ret = call(ptr, value, count, stream);
+    sub_end(&u);
+    sub_host(&u, "memory", api, host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "memory", "memset", dev);
+    else          sub_abort(&u);
+    return ret;
+}
+
+static cudaError_t (*g_real_memset)(void*, int, size_t) = NULL;
+static cudaError_t call_memset(void *p, int v, size_t n, cudaStream_t s) { (void)s; return g_real_memset(p, v, n); }
+
+cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+    if (!g_real_memset) g_real_memset = (cudaError_t (*)(void*, int, size_t))find_cuda_sym("cudaMemset");
+    if (!g_real_memset) return -1;
+    if (in_hook) return g_real_memset(devPtr, value, count);
+    in_hook = 1;
+    /* Asynchronous w.r.t. the host (except for pinned host targets), on the
+     * legacy default stream. */
+    cudaError_t ret = memset_common("cudaMemset", call_memset, devPtr, value, count, NULL);
+    in_hook = 0;
+    return ret;
+}
+
+cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t stream) {
+    typedef cudaError_t (*fn_t)(void*, int, size_t, cudaStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)find_cuda_sym("cudaMemsetAsync");
+    if (!real) return -1;
+    if (in_hook) return real(devPtr, value, count, stream);
+    in_hook = 1;
+
+    cudaError_t ret = memset_common("cudaMemsetAsync", real, devPtr, value, count, stream);
     in_hook = 0;
     return ret;
 }
@@ -1037,30 +1246,25 @@ CUresult cuLaunchKernel(
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_cuda_sym("cuLaunchKernel");
     if (!real) return -1;
-    if (in_hook) return real(f, gx,gy,gz, bx,by,bz, sharedMem, hStream,
-                             kernelParams, extra_params);
+    if (in_hook) return real(f, gx,gy,gz, bx,by,bz, sharedMem, hStream, kernelParams, extra_params);
     in_hook = 1;
 
     const char *kname = resolve_kernel_name(f);
-    pid_t tid = gettid_compat();
     cudaStream_t stream = (cudaStream_t)hStream;
     int sid = get_stream_id(stream);
-    char extra[256];
-    snprintf(extra, sizeof(extra),
-             "type=kernel,grid=%ux%ux%u,block=%ux%ux%u,stream=%d",
-             gx,gy,gz, bx,by,bz, sid);
+    char host[64], dev[160];
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u",
+             sid, gx, gy, gz, bx, by, bz);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, stream, 1);
     CUresult ret = real(f, gx,gy,gz, bx,by,bz, sharedMem, hStream,
                         kernelParams, extra_params);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "cuda", kname, extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("cuda", tid, t0, now_ns() - t0, kname, extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "cuda", "cuLaunchKernel", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "cuda", kname, dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -1075,22 +1279,19 @@ CUresult cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
     if (in_hook) return real(dst, src, bytes, stream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     cudaStream_t cstream = (cudaStream_t)stream;
     int sid = get_stream_id(cstream);
-    char extra[128];
-    snprintf(extra, sizeof(extra), "type=memcpy_async,bytes=%zu,stream=%d", bytes, sid);
+    char host[128], dev[128];
+    snprintf(host, sizeof(host), "type=launch,op=memcpy,dir=Default,bytes=%zu,stream=%d", bytes, sid);
+    snprintf(dev, sizeof(dev), "type=memcpy_async,op=memcpy,dir=Default,bytes=%zu,stream=%d", bytes, sid);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(cstream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, cstream, 1);
     CUresult ret = real(dst, src, bytes, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, cstream, "memory", "cuMemcpyAsync", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("memory", tid, t0, now_ns() - t0, "cuMemcpyAsync", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "memory", "cuMemcpyAsync", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, cstream, "memory", "memcpy Default", dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -1105,22 +1306,19 @@ CUresult cuMemcpyHtoDAsync(CUdeviceptr dst, const void *src,
     if (in_hook) return real(dst, src, bytes, stream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     cudaStream_t cstream = (cudaStream_t)stream;
     int sid = get_stream_id(cstream);
-    char extra[128];
-    snprintf(extra, sizeof(extra), "type=HtoD,bytes=%zu,stream=%d", bytes, sid);
+    char host[128], dev[128];
+    snprintf(host, sizeof(host), "type=launch,op=memcpy,dir=HtoD,bytes=%zu,stream=%d", bytes, sid);
+    snprintf(dev, sizeof(dev), "type=memcpy_async,op=memcpy,dir=HtoD,bytes=%zu,stream=%d", bytes, sid);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(cstream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, cstream, 1);
     CUresult ret = real(dst, src, bytes, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, cstream, "memory", "cuMemcpyHtoD", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("memory", tid, t0, now_ns() - t0, "cuMemcpyHtoD", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "memory", "cuMemcpyHtoDAsync", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, cstream, "memory", "memcpy HtoD", dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -1135,22 +1333,19 @@ CUresult cuMemcpyDtoHAsync(void *dst, CUdeviceptr src,
     if (in_hook) return real(dst, src, bytes, stream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     cudaStream_t cstream = (cudaStream_t)stream;
     int sid = get_stream_id(cstream);
-    char extra[128];
-    snprintf(extra, sizeof(extra), "type=DtoH,bytes=%zu,stream=%d", bytes, sid);
+    char host[128], dev[128];
+    snprintf(host, sizeof(host), "type=launch,op=memcpy,dir=DtoH,bytes=%zu,stream=%d", bytes, sid);
+    snprintf(dev, sizeof(dev), "type=memcpy_async,op=memcpy,dir=DtoH,bytes=%zu,stream=%d", bytes, sid);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(cstream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    Sub u;
+    sub_begin(&u, cstream, 1);
     CUresult ret = real(dst, src, bytes, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, cstream, "memory", "cuMemcpyDtoH", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("memory", tid, t0, now_ns() - t0, "cuMemcpyDtoH", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "memory", "cuMemcpyDtoHAsync", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, cstream, "memory", "memcpy DtoH", dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -1262,13 +1457,14 @@ CUresult cuStreamSynchronize(CUstream stream) {
     if (in_hook) return real(stream);
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=stream,stream=%d", get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
     CUresult ret = real(stream);
+    sub_end(&u);
     pk_flush((cudaStream_t)stream, 0);
-    char extra[64];
-    snprintf(extra, sizeof(extra), "type=sync,stream=%d", get_stream_id(stream));
-    emit_span("sync", gettid_compat(), t0, now_ns() - t0,
-              "cuStreamSynchronize", extra);
+    sub_host(&u, "sync", "cuStreamSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -1282,11 +1478,14 @@ CUresult cuCtxSynchronize(void) {
     if (in_hook) return real();
     in_hook = 1;
 
-    uint64_t t0 = now_ns();
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=device");
+    Sub u;
+    sub_begin(&u, NULL, 0);
     CUresult ret = real();
+    sub_end(&u);
     pk_flush(NULL, 1);
-    emit_span("sync", gettid_compat(), t0, now_ns() - t0,
-              "cuCtxSynchronize", "type=sync");
+    sub_host(&u, "sync", "cuCtxSynchronize", tags, (int)ret);
 
     in_hook = 0;
     return ret;
@@ -1426,21 +1625,20 @@ cudaError_t cudaGraphLaunch(void *graphExec, cudaStream_t stream) {
     if (in_hook) return real(graphExec, stream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     int sid = get_stream_id(stream);
-    char extra[128];
-    snprintf(extra, sizeof(extra), "type=graph_launch,stream=%d", sid);
+    char host[64], dev[64];
+    snprintf(host, sizeof(host), "type=launch,op=graph,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=graph_launch,op=graph,stream=%d", sid);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    /* Native tracing reports each node's kernel/copy (all with this call's
+     * correlation id); the proxy can only time the graph as a whole. */
+    Sub u;
+    sub_begin(&u, stream, 1);
     cudaError_t ret = real(graphExec, stream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "cuda", "cudaGraphLaunch", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("cuda", tid, t0, now_ns() - t0, "cudaGraphLaunch", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "cuda", "cudaGraphLaunch", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "cuda", "graph", dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -1455,22 +1653,21 @@ CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
     if (in_hook) return real(hGraphExec, hStream);
     in_hook = 1;
 
-    pid_t tid = gettid_compat();
     cudaStream_t stream = (cudaStream_t)hStream;
     int sid = get_stream_id(stream);
-    char extra[128];
-    snprintf(extra, sizeof(extra), "type=graph_launch,stream=%d", sid);
+    char host[64], dev[64];
+    snprintf(host, sizeof(host), "type=launch,op=graph,stream=%d", sid);
+    snprintf(dev, sizeof(dev), "type=graph_launch,op=graph,stream=%d", sid);
 
-    cudaEvent_t ev_s, ev_e;
-    int gpu_ok = pk_try_begin(stream, &ev_s, &ev_e);
-    uint64_t t0 = now_ns();
+    /* Native tracing reports each node's kernel/copy (all with this call's
+     * correlation id); the proxy can only time the graph as a whole. */
+    Sub u;
+    sub_begin(&u, stream, 1);
     CUresult ret = real(hGraphExec, hStream);
-    if (gpu_ok) {
-        pk_commit(ev_s, ev_e, stream, "cuda", "cuGraphLaunch", extra, t0, tid);
-    } else {
-        mark_cpu_fallback(extra, sizeof(extra));
-        emit_span("cuda", tid, t0, now_ns() - t0, "cuGraphLaunch", extra);
-    }
+    sub_end(&u);
+    sub_host(&u, "cuda", "cuGraphLaunch", host, (int)ret);
+    if (ret == 0) sub_proxy(&u, stream, "cuda", "graph", dev);
+    else          sub_abort(&u);
 
     in_hook = 0;
     return ret;
@@ -1537,11 +1734,45 @@ static int                g_cupti_nfuncs  = 0;
 static _CuptiSampleEntry *g_cupti_samples = NULL;
 static int                g_cupti_nsamples = 0;
 static pthread_mutex_t    g_cupti_mutex   = PTHREAD_MUTEX_INITIALIZER;
+static int                g_cupti_pc_via_trace = 0;
 
 static void _cupti_buf_req(uint8_t **buf, size_t *sz, size_t *max_rec) {
     *buf = (uint8_t *)malloc(CUPTI_BUF_SIZE);
     *sz  = CUPTI_BUF_SIZE;
     *max_rec = 0;
+}
+
+/* One PC-sampling or function record into the tables (caller holds
+ * g_cupti_mutex). */
+static void _cupti_pc_store(const _CuptiActivity *rec) {
+    if (rec->kind == _CUPTI_KIND_PC_SAMPLING) {
+        const _CuptiPCSample *ps = (const _CuptiPCSample *)rec;
+        if (g_cupti_nsamples < CUPTI_MAX_SAMPLES) {
+            g_cupti_samples[g_cupti_nsamples].func_id   = ps->functionId;
+            g_cupti_samples[g_cupti_nsamples].pc_offset = ps->pcOffset;
+            g_cupti_samples[g_cupti_nsamples].stall     = (uint8_t)ps->stallReason;
+            g_cupti_samples[g_cupti_nsamples].count     = ps->samples;
+            g_cupti_nsamples++;
+        }
+    } else if (rec->kind == _CUPTI_KIND_FUNCTION) {
+        const _CuptiFunction *fn = (const _CuptiFunction *)rec;
+        if (g_cupti_nfuncs < CUPTI_MAX_FUNCS && fn->name) {
+            g_cupti_funcs[g_cupti_nfuncs].id = fn->id;
+            strncpy(g_cupti_funcs[g_cupti_nfuncs].name, fn->name,
+                    sizeof(g_cupti_funcs[0].name) - 1);
+            g_cupti_nfuncs++;
+        }
+    }
+}
+
+/* Called by cupti_trace.c's buffer callback when it owns the CUPTI
+ * registration (built with CUPTI headers). */
+void hp_cuda_pc_record(const void *record, uint32_t kind) {
+    (void)kind;
+    if (!g_cupti_samples || !record) return;
+    pthread_mutex_lock(&g_cupti_mutex);
+    _cupti_pc_store((const _CuptiActivity *)record);
+    pthread_mutex_unlock(&g_cupti_mutex);
 }
 
 static void _cupti_buf_done(void *ctx, uint32_t stream_id,
@@ -1550,26 +1781,8 @@ static void _cupti_buf_done(void *ctx, uint32_t stream_id,
     (void)ctx; (void)stream_id; (void)total_sz;
     _CuptiActivity *rec = NULL;
     pthread_mutex_lock(&g_cupti_mutex);
-    while (g_cuptiGetNext(buf, valid_sz, &rec) == _CUPTI_SUCCESS) {
-        if (rec->kind == _CUPTI_KIND_PC_SAMPLING) {
-            _CuptiPCSample *ps = (_CuptiPCSample *)rec;
-            if (g_cupti_nsamples < CUPTI_MAX_SAMPLES) {
-                g_cupti_samples[g_cupti_nsamples].func_id   = ps->functionId;
-                g_cupti_samples[g_cupti_nsamples].pc_offset = ps->pcOffset;
-                g_cupti_samples[g_cupti_nsamples].stall     = (uint8_t)ps->stallReason;
-                g_cupti_samples[g_cupti_nsamples].count     = ps->samples;
-                g_cupti_nsamples++;
-            }
-        } else if (rec->kind == _CUPTI_KIND_FUNCTION) {
-            _CuptiFunction *fn = (_CuptiFunction *)rec;
-            if (g_cupti_nfuncs < CUPTI_MAX_FUNCS && fn->name) {
-                g_cupti_funcs[g_cupti_nfuncs].id = fn->id;
-                strncpy(g_cupti_funcs[g_cupti_nfuncs].name, fn->name,
-                        sizeof(g_cupti_funcs[0].name) - 1);
-                g_cupti_nfuncs++;
-            }
-        }
-    }
+    while (g_cuptiGetNext(buf, valid_sz, &rec) == _CUPTI_SUCCESS)
+        _cupti_pc_store(rec);
     pthread_mutex_unlock(&g_cupti_mutex);
     free(buf);
 }
@@ -1582,6 +1795,14 @@ static void _cupti_init(void) {
     if (!g_cupti_funcs || !g_cupti_samples) {
         free(g_cupti_funcs);   g_cupti_funcs   = NULL;
         free(g_cupti_samples); g_cupti_samples = NULL;
+        return;
+    }
+    /* CUPTI accepts one buffer-callback registration per process. When
+     * cupti_trace.c was built with CUPTI headers it owns that registration
+     * (for device activity too) and hands PC-sampling records back through
+     * hp_cuda_pc_record(); otherwise use the self-contained path below. */
+    if (hp_cupti_compiled()) {
+        g_cupti_pc_via_trace = (hp_cupti_start(HP_CUPTI_PCSAMPLING) & HP_CUPTI_PCSAMPLING) != 0;
         return;
     }
     /* Try to load libcupti.so at runtime */
@@ -1610,8 +1831,10 @@ static void _cupti_init(void) {
 
 static void _cupti_flush_and_send(int sock_fd) {
     const char *env = getenv("HPROFILER_GPU_PCSAMPLING");
-    if (!env || env[0] != '1' || !g_cuptiFlush) return;
-    g_cuptiFlush(0);
+    if (!env || env[0] != '1' || !g_cupti_samples) return;
+    if (g_cupti_pc_via_trace) hp_cupti_flush();
+    else if (g_cuptiFlush)    g_cuptiFlush(0);
+    else                      return;
     if (sock_fd < 0) return;
 
     pthread_mutex_lock(&g_cupti_mutex);
@@ -1650,6 +1873,14 @@ static void hprofiler_cuda_init(void) {
     ensure_connected();
     pthread_mutex_unlock(&g_sock_mutex);
     _cupti_init();
+    /* Statically linked CUDA runtime (the Runner detects it and sets this):
+     * no wrapper will ever run, so start CUPTI now -- its callbacks then
+     * report the host calls and its activity records the device work. */
+    const char *eager = getenv("HPROFILER_CUPTI_EAGER");
+    if (eager && eager[0] == '1') {
+        g_native_extra = HP_CUPTI_CB_SYNCS;
+        native_ensure();
+    }
     cs_init();
     static const char *candidates[] = {
         "libcudart.so.12", "libcudart.so.11", "libcudart.so",
@@ -1664,8 +1895,14 @@ static void hprofiler_cuda_init(void) {
 
 __attribute__((destructor))
 static void hprofiler_cuda_fini(void) {
+    /* Native activity records were force-flushed by cupti_trace.c's atexit
+     * handler (before libcupti's own teardown); this catches the case
+     * where no atexit ran yet. */
+    hp_cupti_flush();
     _cupti_flush_and_send(g_sock);
+    in_hook = 1;               /* the flush's own CUDA calls are not app calls */
     pk_flush(NULL, 1);
+    in_hook = 0;
 
     /* Report leaked GPU allocations (cudaMalloc without matching cudaFree). */
     pthread_mutex_lock(&g_alloc_mutex);

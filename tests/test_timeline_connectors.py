@@ -64,11 +64,13 @@ class TestConnectorComputation(unittest.TestCase):
         self.assertEqual(pred_lane, "mpi/thread-101")
         self.assertEqual(succ_lane, "mpi/thread-201")
         self.assertEqual(confidence, "medium")
-        self.assertEqual(pred_sid, id(send))
-        self.assertEqual(succ_sid, id(recv))
+        # Span identity is the store's event id (stable across window
+        # queries, unlike the id of a fetched object).
+        self.assertEqual(pred_sid, send.eid)
+        self.assertEqual(succ_sid, recv.eid)
         # Precomputed hover-text link-count index (on_mouse_move's "⇄N" hint).
-        self.assertEqual(w._connector_count[id(send)], 1)
-        self.assertEqual(w._connector_count[id(recv)], 1)
+        self.assertEqual(w._connector_count[send.eid], 1)
+        self.assertEqual(w._connector_count[recv.eid], 1)
 
     def test_same_lane_edges_produce_no_connector(self):
         # Both spans on the SAME thread -- already visually adjacent in one
@@ -112,7 +114,7 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 30)):
             widget = app.query_one(TimelineWidget)
             self.assertEqual(len(widget._connectors), 1)
-            widget._hover_span_id = id(send)
+            widget._hover_span_id = send.eid
             plain = widget.render().plain
             self.assertGreater(_braille_count(plain), 0,
                               "expected connector overlay characters once an endpoint is hovered")
@@ -130,7 +132,7 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 30)):
             widget = app.query_one(TimelineWidget)
             self.assertEqual(len(widget._connectors), 1)
-            self.assertEqual(widget._hover_span_id, 0)  # nothing hovered yet
+            self.assertEqual(widget._hover_span_id, -1)  # nothing hovered yet
             plain = widget.render().plain
             self.assertEqual(_braille_count(plain), 0)
 
@@ -143,7 +145,7 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
         app = _HarnessApp(_mk_trace([send, recv, unrelated]))
         async with app.run_test(size=(120, 30)):
             widget = app.query_one(TimelineWidget)
-            widget._hover_span_id = id(unrelated)
+            widget._hover_span_id = unrelated.eid
             plain = widget.render().plain
             self.assertEqual(_braille_count(plain), 0)
 
@@ -167,7 +169,7 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
         app = _HarnessApp(_mk_trace([send, recv]))
         async with app.run_test(size=(120, 30)):
             widget = app.query_one(TimelineWidget)
-            widget._hover_span_id = id(send)  # exercise the overlay path, not just computation
+            widget._hover_span_id = send.eid  # exercise the overlay path, not just computation
             # Zoom/pan far enough that both endpoints fall outside [0,
             # width) -- must not raise, just render without that connector
             # (or clipped) rather than crash on out-of-range dot coordinates.

@@ -253,3 +253,64 @@ def _ct_build(spans: list[SpanEvent]) -> list[_CTNode]:
             children=sorted(children, key=lambda n: -n.total_ns),
         ))
     return sorted(all_roots, key=lambda n: -n.total_ns)
+
+
+def build_call_tree(trace) -> list[_CTNode]:
+    """_ct_build() for a trace of any size: stacked spans (a subset) when
+    any exist; otherwise per-thread containment, one thread's spans in
+    memory at a time, plus a span_id -> thread map for the cross-thread
+    links. Same result as _ct_build(trace.spans). Built once per trace
+    content and shared (the Call Tree and Flame Graph views both use it;
+    callers must not mutate the returned nodes)."""
+    return trace.store.memo("call_tree", lambda: _build_call_tree(trace))
+
+
+def _build_call_tree(trace) -> list[_CTNode]:
+    stacked = [s for s in trace.iter_spans(has_stack=True) if s.duration_ns > 0]
+    if stacked:
+        return _ct_build_from_stacks(stacked)
+    del stacked
+    # Only spans carrying ids take part in cross-thread links: one pass
+    # over that subset (arrival order) instead of every span.
+    sid_to_thread: dict[str, tuple[int, int]] = {}
+    linked: list[SpanEvent] = []
+    for s in trace.iter_spans(with_ids=True):
+        if s.duration_ns <= 0:
+            continue
+        if s.span_id:
+            sid_to_thread[s.span_id] = (s.pid, s.tid)
+        if s.parent_span_id:
+            linked.append(s)
+    # Containment needs timing, names and ids only: light spans (no tag
+    # or stack decoding), one thread at a time.
+    store = trace.store
+    threads = [(pid, tid) for pid, tid in store.threads()
+               if next((True for s in store.iter_spans_light(pid=pid, tid=tid) if s.duration_ns > 0), False)]
+    if not threads:
+        return []
+    if len(threads) == 1:
+        pid, tid = threads[0]
+        return _ct_aggregate(_ct_build_raw(
+            [s for s in store.iter_spans_light(pid=pid, tid=tid) if s.duration_ns > 0]))
+    cross_thread_children: dict[tuple[int, int], list[SpanEvent]] = defaultdict(list)
+    for s in linked:
+        parent_thread = sid_to_thread.get(s.parent_span_id)
+        if parent_thread and parent_thread != (s.pid, s.tid):
+            cross_thread_children[parent_thread].append(s)
+    del linked
+    all_roots: list[_CTNode] = []
+    for pid, tid in sorted(threads):
+        children = _ct_aggregate(_ct_build_raw(
+            [s for s in store.iter_spans_light(pid=pid, tid=tid) if s.duration_ns > 0]))
+        total_ns = sum(c.total_ns for c in children)
+        extra = cross_thread_children.get((pid, tid), [])
+        if extra:
+            children = children + _ct_aggregate(_ct_build_raw(extra))
+            total_ns = sum(c.total_ns for c in children)
+        all_roots.append(_CTNode(
+            name=f"Thread {tid} (pid {pid})",
+            category="other",
+            total_ns=total_ns, count=1, self_ns=0,
+            children=sorted(children, key=lambda n: -n.total_ns),
+        ))
+    return sorted(all_roots, key=lambda n: -n.total_ns)

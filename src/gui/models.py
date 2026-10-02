@@ -83,7 +83,12 @@ class TimelineModel(QObject):
         super().__init__(parent)
         self._trace = trace
         self._theme = theme
-        self._lanes = trace.lanes()
+        self._store = trace.store
+        # Lane metadata only (name, pid, count, extent, longest span) -- the
+        # spans themselves stay in the store and are fetched per visible
+        # window (visibleSpans/laneView).
+        self._infos = {ln.name: ln for ln in self._store.lane_infos()}
+        self._lanes = self._infos
         parsed = {ln: parse_lane_name(ln) for ln in self._lanes}
 
         # T1, T2, ... numbering per (pid, tid) -- the same tid from two
@@ -102,19 +107,15 @@ class TimelineModel(QObject):
         # rank for any lane whose process made MPI calls -- labels
         # pid-disambiguated GPU stream lanes ("cuda S0 r2") too.
         pid_rank: dict[int, str] = {}
-        for spans in self._lanes.values():
-            for s in spans:
-                if s.category.value == "mpi" and s.pid not in pid_rank and s.tags.get("rank") is not None:
-                    pid_rank[s.pid] = s.tags["rank"]
-
         lane_rank: dict[str, str] = {}
-        for lane_name, spans in self._lanes.items():
+        for lane_name, info in self._infos.items():
             if not lane_name.startswith("mpi/"):
                 continue
-            for s in spans:
+            for s in self._store.iter_spans(lane=lane_name):
                 rank = s.tags.get("rank")
                 if rank is not None:
                     lane_rank[lane_name] = rank
+                    pid_rank.setdefault(info.pid, rank)
                     break
         self._lane_rank = lane_rank
 
@@ -130,8 +131,8 @@ class TimelineModel(QObject):
         self._lane_pid: dict[str, int] = {}
         self._lane_tid: dict[str, int | None] = {}
         self._lane_stream: dict[str, str | None] = {}
-        for lane_name, spans in self._lanes.items():
-            self._lane_pid[lane_name] = spans[0].pid if spans else 0
+        for lane_name, info in self._infos.items():
+            self._lane_pid[lane_name] = info.pid
             _cat, kind, ident, _pid = parsed[lane_name]
             tid = None
             stream = None
@@ -183,21 +184,16 @@ class TimelineModel(QObject):
                 "name": lane_name,
                 "label": label,
                 "color": self._theme.categoryColor(cat),
-                "count": len(self._lanes[lane_name]),
+                "count": self._infos[lane_name].count,
             })
 
         # Filter state (applyFilters()/clearFilters()) -- empty dict means
-        # "no active filter", so _rebuild_rows() below (called before
-        # _sorted_spans/_starts/_ends exist -- it only needs lane metadata)
-        # can run safely with self._event_mask empty: every lane's
-        # filteredCount just falls back to its full count until a real
-        # filter is applied later, well after __init__ completes.
+        # "no active filter"; every lane's filteredCount is then its full
+        # count.
         self._filters: dict[str, Any] = {}
-        self._event_mask: dict[str, np.ndarray] = {}
+        self._span_filt = None          # SpanFilter for the event-level filters
 
-        # Grouping/hide/isolate/reorder state (Phase B3) -- also needs no
-        # span data, safe to initialize before _sorted_spans/_starts/
-        # _ends exist, same reasoning as the filter state just above.
+        # Grouping/hide/isolate/reorder state (Phase B3) -- lane metadata only.
         self._grouping: str = "none"
         self._group_collapsed: dict[str, bool] = {}
         self._hidden_lanes: set[str] = set()
@@ -213,8 +209,8 @@ class TimelineModel(QObject):
         self._rows: list[dict[str, Any]] = []
         self._rebuild_rows()
 
-        distinct_names = [s.name for spans in self._lanes.values() for s in spans]
-        self._func_colors = _assign_span_colors(distinct_names)
+        stats = self._store.aggregate_stats()          # store-side, one row per (category, name)
+        self._func_colors = _assign_span_colors([r["name"] for r in stats])
         # Precomputed once here (not per-repaint, unlike the cheap
         # frozenset-membership bucket_of_span() lookup itself) since
         # Theme.bucketColor()/categoryColor() do a palette dict lookup --
@@ -226,49 +222,15 @@ class TimelineModel(QObject):
         self._bucket_colors: dict[str, str] = {
             b: self._theme.bucketColor(b) for b in activity_buckets.BUCKETS
         }
-        distinct_categories = {s.category.value for spans in self._lanes.values() for s in spans}
         self._category_colors: dict[str, str] = {
-            c: self._theme.categoryColor(c) for c in distinct_categories
+            c: self._theme.categoryColor(c) for c in {r["category"] for r in stats}
         }
-
-        self._sorted_spans: dict[str, list] = {
-            lane: sorted(spans, key=lambda s: s.start_ns)
-            for lane, spans in self._lanes.items()
-        }
-        self._starts: dict[str, np.ndarray] = {}
-        self._ends: dict[str, np.ndarray] = {}
-        self._max_dur: dict[str, int] = {}
-        for lane, slist in self._sorted_spans.items():
-            if slist:
-                self._starts[lane] = np.array([s.start_ns for s in slist], dtype=np.int64)
-                self._ends[lane] = np.array([s.end_ns for s in slist], dtype=np.int64)
-                # Longest INDIVIDUAL span in this lane -- the look-back margin
-                # visibleSpans() needs so a span starting just before the
-                # viewport but extending into it isn't missed. NOT the lane's
-                # overall first-to-last time range (ends.max()-starts.min()),
-                # which for a lane whose spans are spread across most of the
-                # trace pins searchsorted's lower bound near index 0
-                # regardless of how far into the trace the viewport actually
-                # is -- flooding candidates with spans nowhere near the
-                # visible window (see visibleSpans()'s docstring).
-                self._max_dur[lane] = int((self._ends[lane] - self._starts[lane]).max())
-            else:
-                self._starts[lane] = np.empty(0, dtype=np.int64)
-                self._ends[lane] = np.empty(0, dtype=np.int64)
-                self._max_dur[lane] = 0
-
-        # (category, name) -> [(laneIndex, spanIdx), ...], built once here
-        # so both findByName() and search() below stop being O(total
-        # spans) linear scans -- iterating this index's KEYS (one per
-        # distinct (category,name) pair, typically far fewer than the
-        # trace's total span count) instead. Occurrence order within each
-        # list matches _sorted_spans' time order (lanes visited in
-        # _lane_names order, spans in time order within each), so
-        # findByName()'s existing output ordering is unchanged.
-        self._name_index: dict[tuple[str, str], list[tuple[int, int]]] = {}
-        for lane_idx, lane in enumerate(self._lane_names):
-            for span_idx, s in enumerate(self._sorted_spans[lane]):
-                self._name_index.setdefault((s.category.value, s.name), []).append((lane_idx, span_idx))
+        # (pid, lane base) -> lane index, to place a span found by a name
+        # query (findByName/search) on its lane.
+        from ..core.store.common import lane_base
+        self._lane_base = lane_base
+        self._lane_of_key = {(info.pid, (info.cat, info.kind, info.ident)): i
+                             for i, info in ((self._lane_index[n], self._infos[n]) for n in self._lane_names)}
 
         # Search state (Phase B4) -- also safe to init before anything
         # else below needs it, same reasoning as filter/grouping state.
@@ -276,6 +238,7 @@ class TimelineModel(QObject):
         self._search_matches: list[tuple[int, int]] = []
         self._search_match_set: set[tuple[int, int]] = set()
         self._search_cursor: int = -1
+        self._search_starts: dict[tuple[int, int], int] = {}
 
         # Bookmarks / named ranges (Phase B5) -- Timeline-specific view
         # state, lives here rather than on Nav (cross-tab selection), same
@@ -285,10 +248,9 @@ class TimelineModel(QObject):
         self._next_bookmark_id: int = 1
         self._next_range_id: int = 1
 
-        timed = [s for s in trace.spans if s.duration_ns > 0]
-        if timed:
-            self._view_start = min(s.start_ns for s in timed)
-            self._view_end = max(s.end_ns for s in timed)
+        ext = self._store.span_extent(timed_only=True)
+        if ext is not None:
+            self._view_start, self._view_end = ext
         else:
             self._view_start = trace.metadata.start_time_ns
             self._view_end = self._view_start + 1
@@ -299,39 +261,46 @@ class TimelineModel(QObject):
         # different rendering (a real Canvas line here, not Braille dots).
         self._connectors: list[dict[str, Any]] = []
         try:
-            cp_spans, cp_preds = _cp.build_dependency_graph(trace)
-            span_lane: dict[int, str] = {
-                id(s): lane for lane, spans in self._lanes.items() for s in spans
-            }
-            span_idx_in_lane: dict[int, int] = {}
-            for lane, slist in self._sorted_spans.items():
-                for i, s in enumerate(slist):
-                    span_idx_in_lane[id(s)] = i
-            for succ_idx, edges in cp_preds.items():
-                succ = cp_spans[succ_idx]
-                if succ.category.value not in ("mpi", "nccl"):
-                    continue
-                succ_lane = span_lane.get(id(succ))
-                if succ_lane is None:
-                    continue
-                for pred_idx, kind, confidence in edges:
-                    if kind not in ("p2p", "arrival"):
-                        continue
-                    pred = cp_spans[pred_idx]
-                    pred_lane = span_lane.get(id(pred))
-                    if pred_lane is None or pred_lane == succ_lane:
-                        continue
-                    self._connectors.append({
-                        "predLane": self._lane_names.index(pred_lane),
-                        "predSpanIdx": span_idx_in_lane.get(id(pred), -1),
-                        "predMidNs": (pred.start_ns + pred.end_ns) / 2.0,
-                        "succLane": self._lane_names.index(succ_lane),
-                        "succSpanIdx": span_idx_in_lane.get(id(succ), -1),
-                        "succMidNs": (succ.start_ns + succ.end_ns) / 2.0,
-                        "color": _CONFIDENCE_HEX.get(confidence, "#8b949e"),
-                    })
+            self._connectors = self._build_connectors()
         except Exception:
             self._connectors = []
+
+    # Building the dependency graph for connectors costs a pass over every
+    # span; above this size it is only done when the store already holds
+    # persisted edges (e.g. after `hprofiler critical-path`).
+    CONNECTOR_SPAN_LIMIT = 500_000
+
+    def _build_connectors(self) -> list[dict[str, Any]]:
+        if not ({"mpi", "nccl"} & {info.cat for info in self._infos.values()}):
+            return []
+        graph = _cp.load_comm_graph(self._trace, max_build_spans=self.CONNECTOR_SPAN_LIMIT)
+        if graph is None or not len(graph.edges):
+            return []
+        edges = graph.edges
+        comm = graph.endpoints(set(edges["dst"].tolist()) | set(edges["src"].tolist()),
+                               categories=("mpi", "nccl"))
+        out = []
+        for succ_idx, pred_idx, kind, conf in edges.tolist():
+            succ, pred = comm.get(succ_idx), comm.get(pred_idx)
+            if succ is None or pred is None:
+                continue
+            succ_lane = self._lane_of_span(succ)
+            pred_lane = self._lane_of_span(pred)
+            if succ_lane is None or pred_lane is None or pred_lane == succ_lane:
+                continue
+            out.append({
+                "predLane": pred_lane,
+                "predSpanIdx": pred.eid,
+                "predMidNs": (pred.start_ns + pred.end_ns) / 2.0,
+                "succLane": succ_lane,
+                "succSpanIdx": succ.eid,
+                "succMidNs": (succ.start_ns + succ.end_ns) / 2.0,
+                "color": _CONFIDENCE_HEX.get(_cp.EDGE_CONFS[conf], "#8b949e"),
+            })
+        return out
+
+    def _lane_of_span(self, span) -> int | None:
+        return self._lane_of_key.get((span.pid, self._lane_base(span)))
 
     # ── Constant properties ─────────────────────────────────────────────
     @Property('QVariantList', constant=True)
@@ -357,7 +326,7 @@ class TimelineModel(QObject):
         span in a lane shares them), so a lane either passes entirely or
         is dropped from `rows` entirely. Event-level dimensions (name/
         duration/time-range/bucket) are handled separately by
-        `_event_mask`, since individual spans within a passing lane can
+        `_span_filt`, since individual spans within a passing lane can
         still differ on those."""
         f = self._filters
         if f.get("ranks") and self._lane_rank.get(lane_name) not in f["ranks"]:
@@ -400,8 +369,8 @@ class TimelineModel(QObject):
         grouping) and grouped row-building paths in `_rebuild_rows()`."""
         i = self._lane_index[lane]
         m = self._lane_meta[i]
-        mask = self._event_mask.get(lane)
-        filtered_count = int(mask.sum()) if mask is not None else m["count"]
+        filtered_count = (self._store.lane_count(lane, self._span_filt)
+                          if self._span_filt is not None else m["count"])
         if self._filters.get("activeOnly") and filtered_count == 0:
             return None
         return {
@@ -563,58 +532,23 @@ class TimelineModel(QObject):
         return sum(m["count"] for m in self._lane_meta)
 
     def _recompute_event_mask(self) -> None:
-        """Per-lane boolean mask (True = this span passes every active
-        EVENT-level filter) -- computed once here, on filter change, not
-        per repaint frame. visibleSpans() ANDs the relevant slice of this
-        into its own numpy mask (cheap, vectorized); `_rebuild_rows()`
-        sums a lane's full mask for its `filteredCount`."""
+        """The active EVENT-level filters (name / duration / time range /
+        bucket) as one store SpanFilter, applied store-side by every window
+        and count query; None when there are none."""
+        from ..core.store import SpanFilter
         f = self._filters
         name_query = f.get("nameQuery") or ""
         is_regex = bool(f.get("nameIsRegex"))
         min_dur = float(f.get("minDurationNs") or 0)
-        buckets = set(f.get("buckets") or [])
+        buckets = frozenset(f.get("buckets") or [])
         time_range_only = bool(f.get("timeRangeOnly"))
-        range_start = float(f.get("rangeStartNs") or 0)
-        range_end = float(f.get("rangeEndNs") or 0)
-
-        regex = None
-        if is_regex and name_query:
-            try:
-                regex = re.compile(name_query, re.IGNORECASE)
-            except re.error:
-                regex = None
-        name_query_lower = name_query.lower()
-
-        needs_per_event = bool(name_query) or bool(buckets)
-
-        self._event_mask = {}
-        if not (min_dur > 0 or needs_per_event or time_range_only):
-            return
-
-        for lane in self._lane_names:
-            slist = self._sorted_spans[lane]
-            n = len(slist)
-            if n == 0:
-                continue
-            mask = np.ones(n, dtype=bool)
-            if min_dur > 0:
-                mask &= (self._ends[lane] - self._starts[lane]) >= min_dur
-            if time_range_only:
-                mask &= (self._ends[lane] > range_start) & (self._starts[lane] < range_end)
-            if needs_per_event:
-                for i, s in enumerate(slist):
-                    if not mask[i]:
-                        continue
-                    if regex is not None:
-                        if not regex.search(s.name):
-                            mask[i] = False
-                            continue
-                    elif name_query_lower and name_query_lower not in s.name.lower():
-                        mask[i] = False
-                        continue
-                    if buckets and activity_buckets.bucket_of_span(s) not in buckets:
-                        mask[i] = False
-            self._event_mask[lane] = mask
+        filt = SpanFilter(
+            name_query=name_query, name_is_regex=is_regex, min_dur_ns=int(min_dur),
+            buckets=buckets,
+            range_start_ns=int(float(f.get("rangeStartNs") or 0)) if time_range_only else None,
+            range_end_ns=int(float(f.get("rangeEndNs") or 0)) if time_range_only else None,
+        )
+        self._span_filt = None if filt.is_empty() else filt
 
     @Slot('QVariantMap')
     def applyFilters(self, spec: dict) -> None:
@@ -635,7 +569,7 @@ class TimelineModel(QObject):
     @Slot()
     def clearFilters(self) -> None:
         self._filters = {}
-        self._event_mask = {}
+        self._span_filt = None
         self._rebuild_rows()
         self.filtersChanged.emit()
 
@@ -679,47 +613,30 @@ class TimelineModel(QObject):
     @Slot('QVariantList', float, float, int, result='QVariantList')
     def groupCoverage(self, lane_indexes: list, view_start_ns: float, view_end_ns: float,
                        n_buckets: int) -> list[float]:
-        """Fraction (0..1) of each of `n_buckets` equal-width time
-        buckets across [view_start_ns, view_end_ns) covered by ANY span
-        across every lane in `lane_indexes` -- a collapsed group row's
-        aggregated activity strip. Same bucket-coverage TECHNIQUE
-        dash.bucket_coverage() already uses for Overview's
-        execution-timeline preview, reimplemented here in numpy: that
-        Python version is fine to run once at Overview's startup, but
-        this can run on every pan/zoom frame while a group stays
-        collapsed, over potentially many lanes' spans at once. Boolean
-        coverage (covered or not), not a duration-weighted density --
-        matches what a collapsed row can honestly show at a glance."""
+        """Fraction-free coverage (1.0 = some span of some lane in
+        `lane_indexes` is active in that bucket) of `n_buckets` equal
+        buckets across [view_start_ns, view_end_ns) -- a collapsed group
+        row's activity strip, from each lane's occupancy bins
+        (_lane_occupancy) rather than from individual spans."""
         if n_buckets <= 0 or view_end_ns <= view_start_ns:
             return []
-        width = (view_end_ns - view_start_ns) / n_buckets
         covered = np.zeros(n_buckets, dtype=bool)
         for lane_idx in lane_indexes:
             if lane_idx < 0 or lane_idx >= len(self._lane_names):
                 continue
-            lane = self._lane_names[lane_idx]
-            starts = self._starts.get(lane)
-            ends = self._ends.get(lane)
-            if starts is None or len(starts) == 0:
-                continue
-            max_dur = self._max_dur.get(lane, 0)
-            lo = int(np.searchsorted(starts, view_start_ns - max_dur, side="left"))
-            hi = int(np.searchsorted(starts, view_end_ns, side="right"))
-            if lo >= hi:
-                continue
-            s = starts[lo:hi]
-            e = ends[lo:hi]
-            overlap = e > view_start_ns
-            if not overlap.any():
-                continue
-            s = np.clip(s[overlap], view_start_ns, view_end_ns)
-            e = np.clip(e[overlap], view_start_ns, view_end_ns)
-            b0 = np.clip(np.floor((s - view_start_ns) / width).astype(np.int64), 0, n_buckets - 1)
-            b1 = np.clip(np.ceil((e - view_start_ns) / width).astype(np.int64), 0, n_buckets)
-            for a, b in zip(b0.tolist(), b1.tolist()):
-                if b > a:
-                    covered[a:b] = True
+            occ = self._lane_occupancy(self._lane_names[lane_idx], view_start_ns, view_end_ns, n_buckets)
+            covered |= occ > 0
         return covered.astype(float).tolist()
+
+    def _lane_occupancy(self, lane: str, view_start_ns: float, view_end_ns: float, n: int) -> np.ndarray:
+        """Occupancy per bin: the precomputed multiresolution index when no
+        event filter is active and it resolves this zoom, else binned from
+        the window's spans (streamed, never all materialized)."""
+        if self._span_filt is None:
+            occ = self._store.occupancy(lane, view_start_ns, view_end_ns, n)
+            if occ is not None:
+                return occ
+        return self._store.occupancy_exact(lane, view_start_ns, view_end_ns, n, self._span_filt)
 
     # ── Hide / isolate / reorder ─────────────────────────────────────
     @Property('QVariantList', notify=rowsChanged)
@@ -806,64 +723,67 @@ class TimelineModel(QObject):
     def visibleSpans(self, lane_index: int, view_start_ns: float, view_end_ns: float,
                      max_spans: int = 2000) -> list[dict[str, Any]]:
         """Spans in `lane_index` truly overlapping [view_start_ns,
-        view_end_ns), via the same numpy searchsorted spatial-index trick
-        TimelineWidget._density_row uses (src/ui/app.py) -- cheap even
-        for a lane with tens of thousands of spans, since only the
-        visible slice is ever materialized into Python dicts. Capped at
-        `max_spans`: past that, the caller is zoomed out far enough that
-        individual rectangles would be sub-pixel anyway (a coarse
-        bucketed fallback, like the Overview preview's, is a possible
-        future improvement, not implemented for this first pass).
-
-        `lo` uses `max_dur` (the longest INDIVIDUAL span in this lane, not
-        the lane's overall time range -- see its computation in __init__)
-        as a look-back margin, then `mask` narrows the [lo:hi) candidate
-        window down to spans that genuinely END after view_start_ns --
-        without this, a span starting well before the window but NOT
-        actually reaching into it (there can be many between `lo` and the
-        first truly-visible span, once `lo` only needs to look back one
-        span's worth of margin rather than the whole lane) would still be
-        returned, and at high zoom/deep offsets could dominate decimation's
-        `max_spans` budget with spans nowhere near the viewport."""
+        view_end_ns), from the store's per-lane time index (only the visible
+        window is read). Past `max_spans` the result is decimated (every
+        k-th span) -- the Timeline itself calls laneView(), which switches
+        to occupancy bins instead; this method stays for callers that want
+        individual spans regardless. `spanIdx` is the span's store event
+        id (spanAt() takes it back)."""
         if lane_index < 0 or lane_index >= len(self._lane_names):
             return []
         lane = self._lane_names[lane_index]
-        starts = self._starts[lane]
-        if len(starts) == 0:
-            return []
-        max_dur = self._max_dur[lane]
-        lo = int(np.searchsorted(starts, view_start_ns - max_dur, side="left"))
-        hi = int(np.searchsorted(starts, view_end_ns, side="right"))
-        if lo >= hi:
-            return []
-        ends = self._ends[lane]
-        mask = ends[lo:hi] > view_start_ns
-        event_mask = self._event_mask.get(lane)
-        if event_mask is not None:
-            mask = mask & event_mask[lo:hi]
-        overlap_idx = (np.nonzero(mask)[0] + lo).tolist()
-        if len(overlap_idx) > max_spans:
-            step = len(overlap_idx) // max_spans + 1
-            overlap_idx = overlap_idx[::step]
-        slist = self._sorted_spans[lane]
-        result = []
-        for i in overlap_idx:
-            s = slist[i]
-            d = {
-                "startNs": float(s.start_ns),
-                "durNs": float(max(s.duration_ns, 1)),
-                "name": s.name,
-                "color": self._span_color(s),
-                "spanIdx": i,
-            }
-            # "matched" only exists on this dict while a search is
-            # active (see search()'s own docstring) -- not a permanent
-            # per-span key, so a caller not using search pays nothing
-            # extra per repaint frame.
-            if self._search_active:
-                d["matched"] = (lane_index, i) in self._search_match_set
-            result.append(d)
-        return result
+        a, b = int(view_start_ns), int(view_end_ns)
+        n = self._store.count_window(lane, a, b, filt=self._span_filt)
+        step = n // max_spans + 1 if n > max_spans else 1
+        out = []
+        for i, s in enumerate(self._store.iter_spans(order="start", lane=lane, window=(a, b),
+                                                     filt=self._span_filt)):
+            if i % step == 0:
+                out.append(self._span_dict(lane_index, s))
+        return out
+
+    def _span_dict(self, lane_index: int, s) -> dict[str, Any]:
+        d = {
+            "startNs": float(s.start_ns),
+            "durNs": float(max(s.duration_ns, 1)),
+            "name": s.name,
+            "color": self._span_color(s),
+            "spanIdx": s.eid,
+        }
+        # "matched" only exists on this dict while a search is
+        # active (see search()'s own docstring) -- not a permanent
+        # per-span key, so a caller not using search pays nothing
+        # extra per repaint frame.
+        if self._search_active:
+            d["matched"] = (lane_index, s.eid) in self._search_match_set
+        return d
+
+    @Slot(int, float, float, int, int, result='QVariantMap')
+    def laneView(self, lane_index: int, view_start_ns: float, view_end_ns: float,
+                 pixel_width: int, max_spans: int = 2000) -> dict[str, Any]:
+        """What the Timeline paints for one lane: {"mode": "spans", "spans":
+        [...]} when the window holds at most `max_spans` spans (fetched
+        exactly), else {"mode": "bins", "bins": [occupancy 0..1 per pixel
+        column], "color": lane color} from the activity index built at
+        finalization -- zoomed-out views never create one object per
+        event."""
+        if lane_index < 0 or lane_index >= len(self._lane_names) or view_end_ns <= view_start_ns:
+            return {"mode": "spans", "spans": []}
+        lane = self._lane_names[lane_index]
+        a, b = int(view_start_ns), int(view_end_ns)
+        n_px = max(1, min(int(pixel_width), 4096))
+        many = False
+        if self._span_filt is None:
+            est = self._store.estimate_starts(lane, a, b)
+            many = est is not None and est > 4 * max_spans
+        if not many:
+            many = self._store.count_window(lane, a, b, filt=self._span_filt, cap=max_spans) > max_spans
+        if not many:
+            return {"mode": "spans", "spans": [self._span_dict(lane_index, s) for s in self._store.iter_spans(
+                order="start", lane=lane, window=(a, b), filt=self._span_filt)]}
+        occ = self._lane_occupancy(lane, view_start_ns, view_end_ns, n_px)
+        return {"mode": "bins", "bins": [round(float(v), 3) for v in occ],
+                "color": self._lane_meta[lane_index]["color"]}
 
     def _span_color(self, span) -> str:
         """The color visibleSpans() paints `span` with, per the active
@@ -876,18 +796,15 @@ class TimelineModel(QObject):
             return self._category_colors.get(span.category.value, "#9ca3af")
         return self._func_colors.get(span.name, "#9ca3af")
 
-    @Slot(int, int, result='QVariantMap')
-    def spanAt(self, lane_index: int, span_idx: int) -> dict[str, Any]:
-        """Full detail for one span (hover tooltip) by its index within
-        the lane's time-sorted list -- the same index visibleSpans()
-        returns per row, avoiding a second linear search."""
+    @Slot(int, float, result='QVariantMap')
+    def spanAt(self, lane_index: int, span_idx: float) -> dict[str, Any]:
+        """Full detail for one span (hover tooltip) by the `spanIdx` (store
+        event id) visibleSpans()/laneView() returned."""
         if lane_index < 0 or lane_index >= len(self._lane_names):
             return {}
-        lane = self._lane_names[lane_index]
-        slist = self._sorted_spans[lane]
-        if span_idx < 0 or span_idx >= len(slist):
+        s = self._store.event_by_id(int(span_idx)) if span_idx is not None and span_idx >= 0 else None
+        if s is None or not hasattr(s, "duration_ns"):
             return {}
-        s = slist[span_idx]
         return {
             "name": s.name,
             "category": s.category.value,
@@ -904,24 +821,29 @@ class TimelineModel(QObject):
 
     @Slot(str, str, int, result='QVariantList')
     def findByName(self, category: str, name: str, max_results: int = 50) -> list[dict[str, Any]]:
-        """All spans matching (category, name) across every lane --
+        """Spans matching (category, name) across every lane --
         "occurrences of this kernel/function" for cross-tab navigation
         (see src/gui/nav.py's docstring for why (category,name) is the
-        correlation key rather than a true per-instance id). Backed by
-        `_name_index` (built once in __init__): an O(1) dict lookup
-        followed by a slice, not a scan over every span in the trace.
-        Capped at `max_results` so a name appearing thousands of times (a
-        worker-thread loop body, say) doesn't build a huge QML list.
-        startNs is ABSOLUTE (matching visibleSpans()'s convention), NOT
-        relative to viewStartNs the way spanAt()'s own startNs field is
-        -- a real, deliberate asymmetry between these two methods (see
-        spanAt()'s docstring); callers jumping the view to a match need
-        an absolute timestamp to assign directly to viewStartNs."""
-        occurrences = self._name_index.get((category, name), [])
-        out = []
-        for lane_idx, span_idx in occurrences[:max_results]:
-            s = self._sorted_spans[self._lane_names[lane_idx]][span_idx]
-            out.append({"laneIndex": lane_idx, "spanIdx": span_idx, "startNs": float(s.start_ns)})
+        correlation key rather than a true per-instance id). A store query
+        (name/category filter), stopping after `max_results`, in lane
+        order then time order. startNs is ABSOLUTE (matching
+        visibleSpans()'s convention), NOT relative to viewStartNs the way
+        spanAt()'s own startNs field is."""
+        out = self._occurrences(frozenset({name}), category, max_results)
+        return [{"laneIndex": li, "spanIdx": eid, "startNs": float(start)} for li, eid, start in out]
+
+    def _occurrences(self, names: frozenset, category: str | None, limit: int) -> list[tuple[int, int, int]]:
+        from ..core.store import SpanFilter
+        filt = SpanFilter(names=names, categories=frozenset({category}) if category else frozenset())
+        out: list[tuple[int, int, int]] = []
+        for lane_idx, lane in enumerate(self._lane_names):
+            info = self._infos[lane]
+            if category and info.cat != category:
+                continue
+            for s in self._store.iter_spans(order="start", lane=lane, filt=filt):
+                out.append((lane_idx, s.eid, s.start_ns))
+                if len(out) >= limit:
+                    return out
         return out
 
     # ── Color mode (Phase B4) ────────────────────────────────────────
@@ -943,15 +865,16 @@ class TimelineModel(QObject):
     def searchCursor(self) -> int:
         return self._search_cursor
 
+    # Matches beyond this are not collected (the count says so).
+    SEARCH_LIMIT = 10_000
+
     @Slot(str, bool, result=int)
     def search(self, query: str, is_regex: bool = False) -> int:
         """Matches `query` (substring, case-insensitive, unless
-        `is_regex`) against every DISTINCT (category,name) key in
-        `_name_index` -- not a scan of every span -- then flattens
-        matched keys' occurrence lists into `_search_matches`, sorted by
-        (laneIndex, spanIdx) for a stable, meaningful "next match" order
-        (dict-iteration order is stable in Python but not meaningful to
-        a user stepping through results). Returns the match count. An
+        `is_regex`) against every DISTINCT name in the trace (the store's
+        name dictionary -- not a scan of every span), then collects the
+        matching spans lane by lane in time order, at most SEARCH_LIMIT,
+        into `_search_matches` ((laneIndex, spanIdx) pairs, sorted). An
         empty `query` clears the search (same effect as clearSearch())."""
         query = query or ""
         self._search_active = bool(query)
@@ -973,16 +896,12 @@ class TimelineModel(QObject):
                 self.searchChanged.emit()
                 return 0
         query_lower = query.lower()
-
-        matches: list[tuple[int, int]] = []
-        for (_category, name), occurrences in self._name_index.items():
-            if regex is not None:
-                if not regex.search(name):
-                    continue
-            elif query_lower not in name.lower():
-                continue
-            matches.extend(occurrences)
-        matches.sort()
+        names = frozenset(r["name"] for r in self._store.aggregate_stats()
+                          if (regex.search(r["name"]) if regex is not None
+                              else query_lower in r["name"].lower()))
+        found = self._occurrences(names, None, self.SEARCH_LIMIT) if names else []
+        self._search_starts = {(li, eid): start for li, eid, start in found}
+        matches = sorted((li, eid) for li, eid, _ in found)
 
         self._search_matches = matches
         self._search_match_set = set(matches)
@@ -1000,9 +919,9 @@ class TimelineModel(QObject):
 
     def _match_result(self) -> dict[str, Any]:
         lane_idx, span_idx = self._search_matches[self._search_cursor]
-        s = self._sorted_spans[self._lane_names[lane_idx]][span_idx]
+        start = self._search_starts.get((lane_idx, span_idx), 0)
         return {
-            "laneIndex": lane_idx, "spanIdx": span_idx, "startNs": float(s.start_ns),
+            "laneIndex": lane_idx, "spanIdx": span_idx, "startNs": float(start),
             "matchIndex": self._search_cursor, "matchCount": len(self._search_matches),
         }
 
@@ -1034,7 +953,7 @@ class TimelineModel(QObject):
         enabled for this run) -- same "no data" convention as the Call
         Tree tab, not an error."""
         visible = [
-            s for s in self._trace.spans
+            s for s in self._trace.iter_spans(window=(int(view_start_ns), int(view_end_ns)), has_stack=True)
             if s.duration_ns > 0 and s.start_ns < view_end_ns
             and s.start_ns + s.duration_ns > view_start_ns
         ]

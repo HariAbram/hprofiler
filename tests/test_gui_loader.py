@@ -112,6 +112,11 @@ class TestProfileLoadWorkerSynchronous(unittest.TestCase):
         self.assertEqual(len(finished), 1)
         self.assertIsNotNone(finished[0].trace_b)
         self.assertEqual(len(finished[0].trace_b.spans), 3)
+        # the comparison itself runs on the worker thread too
+        self.assertIn(LoadStage.COMPUTING_COMPARISON.value, [s for s, _ in stages])
+        data = finished[0].comparison_data
+        self.assertIsNotNone(data)
+        self.assertEqual(len(data["projections"]), 2)
 
     def test_no_compare_path_leaves_trace_b_none(self):
         _, stages, _, finished, _, _ = self._run()

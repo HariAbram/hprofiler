@@ -33,17 +33,24 @@ def _category_color(cat: str) -> str:
     return colors.get(cat, "generic_work")
 
 
-def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
-    """Write trace as a Perfetto-compatible JSON file."""
-    events = []
-    meta = trace.metadata
+# First line of the streaming layout write() produces: one JSON value per
+# line (metadata, then one trace event per line), so a reader can process a
+# huge file line by line instead of json.load()-ing all of it. Still a plain
+# JSON object -- Perfetto, chrome://tracing and json.load read it as is.
+JSON_LAYOUT_LINE = '{"hprofilerJsonLayout": 1,'
 
-    # Metadata process/thread names
-    events.append({
+_GPU_CATS = frozenset({"cuda", "rocm", "opencl"})
+_GPU_BASE_TID = 2_000_000_000  # far above any realistic OS tid
+
+
+def _iter_trace_events(trace: Trace, extra_args=None):
+    """The Chrome trace events of a trace, streamed from its store."""
+    meta = trace.metadata
+    yield {
         "ph": "M", "pid": meta.pid, "tid": 0,
         "name": "process_name",
         "args": {"name": meta.command or "profiled-process"},
-    })
+    }
 
     # GPU categories whose spans cover async GPU execution time (from CPU launch
     # to GPU completion).  If emitted on the same tid as CPU spans they will
@@ -51,20 +58,22 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
     # them with SLICE_DROP_OVERLAPPING_COMPLETE_EVENT.
     # Fix: assign each (category, stream) pair its own virtual tid so Perfetto
     # renders them on a dedicated GPU row that never conflicts with CPU rows.
-    _GPU_CATS = frozenset({"cuda", "rocm", "opencl"})
-    _GPU_BASE_TID = 2_000_000_000  # far above any realistic OS tid
-    _gpu_tid_map: dict[tuple[str, str], int] = {}
+    gpu_tid_map: dict[tuple[str, str], int] = {}
 
     def _gpu_tid(cat: str, stream: str) -> int:
         key = (cat, stream)
-        if key not in _gpu_tid_map:
-            _gpu_tid_map[key] = _GPU_BASE_TID + len(_gpu_tid_map)
-        return _gpu_tid_map[key]
+        if key not in gpu_tid_map:
+            gpu_tid_map[key] = _GPU_BASE_TID + len(gpu_tid_map)
+        return gpu_tid_map[key]
 
-    for span in trace.spans:
+    for span in trace.iter_spans():
         cat = span.category.value
         args = {**span.tags, **({"_stack": span.stack_frames} if span.stack_frames else {})}
-        if cat in _GPU_CATS:
+        side = span.tags.get("side")
+        # Device rows: device-side spans (side=gpu, including CUDA/ROCm
+        # copies/memsets in the memory category) and pre-split GPU spans.
+        # Host API calls (side=cpu) stay on their real thread's row.
+        if side == "gpu" or (cat in _GPU_CATS and side != "cpu"):
             stream = span.tags.get("stream", "")
             tid = _gpu_tid(cat, stream)
             # The virtual tid only exists for Perfetto's track layout; the
@@ -80,7 +89,11 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             args["sid"] = span.span_id
         if span.parent_span_id:
             args["psid"] = span.parent_span_id
-        events.append({
+        if extra_args is not None:
+            more = extra_args.get(span.eid)
+            if more:
+                args.update(more)
+        yield {
             "ph": "X",
             "name": span.name,
             "cat": cat,
@@ -90,17 +103,17 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
             "tid": tid,
             "cname": _category_color(cat),
             "args": args,
-        })
+        }
 
     # Emit thread-name metadata for each virtual GPU track so Perfetto labels them.
-    for (cat, stream), vtid in _gpu_tid_map.items():
+    for (cat, stream), vtid in gpu_tid_map.items():
         label = f"GPU/{cat}" + (f"/stream-{stream}" if stream else "")
-        events.append({
+        yield {
             "ph": "M", "pid": meta.pid, "tid": vtid,
             "name": "thread_name", "args": {"name": label},
-        })
+        }
 
-    for inst in trace.instants:
+    for inst in trace.iter_instants():
         ev = {
             "ph": "i",
             "name": inst.name,
@@ -112,84 +125,81 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False) -> None:
         }
         if inst.tags:
             ev["args"] = dict(inst.tags)
-        events.append(ev)
+        yield ev
 
-    counters_by_name: dict[str, list] = {}
-    counter_units: dict[str, str] = {}
-    for ctr in trace.counters:
-        counters_by_name.setdefault(ctr.name, []).append(ctr)
-        if ctr.unit:
-            counter_units[ctr.name] = ctr.unit
-
-    for name, ctrs in counters_by_name.items():
-        for ctr in sorted(ctrs, key=lambda c: c.timestamp_ns):
-            events.append({
-                "ph": "C",
-                "name": name,
-                "cat": ctr.category.value,
-                "ts": ctr.timestamp_ns / 1_000,
-                "pid": ctr.pid or meta.pid,
-                "tid": 0,
-                "args": {name: ctr.value},
-            })
-
-    payload = {
-        "traceEvents": events,
-        "displayTimeUnit": "ms",
-        "metadata": {
-            "command": meta.command,
-            "args": meta.args,
-            "backends": meta.backends_used,
-            "hostname": meta.hostname,
-            "cwd": meta.cwd,
-            "duration_ms": trace.duration_ns / 1_000_000,
-            "devices": [d.to_dict() for d in trace.devices],
-            "captureTime": meta.capture_time_iso,
-            # CLOCK_MONOTONIC ns, same domain as every event timestamp.
-            # Without these a reloaded trace's duration_ns was "time since
-            # the file was loaded" (TraceMetadata's default start).
-            "startTimeNs": meta.start_time_ns,
-            "endTimeNs": meta.end_time_ns,
-            "pid": meta.pid,
-            # A counter event's own args are its plotted series in
-            # Perfetto, so units live here instead of on each event.
-            "counterUnits": counter_units,
-        },
-    }
-
-    if trace.disasm:
-        payload["disasm"] = {
-            name: {
-                "arch": kd.arch,
-                "source": kd.source,
-                "mangledName": kd.mangled_name,
-                "ptxasDerived": kd.ptxas_derived,
-                "lines": [
-                    {
-                        "addr": ln.addr,
-                        "mnemonic": ln.mnemonic,
-                        "operands": ln.operands,
-                        "itype": ln.itype.value,
-                        "comment": ln.comment,
-                        "raw": ln.raw,
-                        "sourceFile": ln.source_file,
-                        "sourceLine": ln.source_line,
-                        "samplePct": ln.sample_pct,
-                        "stallCycles": ln.stall_cycles,
-                        "stallReason": ln.stall_reason,
-                    }
-                    for ln in kd.lines
-                ],
-            }
-            for name, kd in trace.disasm.items()
+    for ctr in trace.iter_counters(order="name"):
+        yield {
+            "ph": "C",
+            "name": ctr.name,
+            "cat": ctr.category.value,
+            "ts": ctr.timestamp_ns / 1_000,
+            "pid": ctr.pid or meta.pid,
+            "tid": 0,
+            "args": {ctr.name: ctr.value},
         }
 
-    indent = 2 if pretty else None
+
+def _metadata_json(trace: Trace) -> dict:
+    meta = trace.metadata
+    counter_units: dict[str, str] = {}
+    for ctr in trace.iter_counters(order="name"):
+        if ctr.unit:
+            counter_units[ctr.name] = ctr.unit
+    return {
+        "command": meta.command,
+        "args": meta.args,
+        "backends": meta.backends_used,
+        "hostname": meta.hostname,
+        "cwd": meta.cwd,
+        "duration_ms": trace.duration_ns / 1_000_000,
+        "devices": [d.to_dict() for d in trace.devices],
+        "captureTime": meta.capture_time_iso,
+        # CLOCK_MONOTONIC ns, same domain as every event timestamp.
+        # Without these a reloaded trace's duration_ns was "time since
+        # the file was loaded" (TraceMetadata's default start).
+        "startTimeNs": meta.start_time_ns,
+        "endTimeNs": meta.end_time_ns,
+        "pid": meta.pid,
+        # A counter event's own args are its plotted series in
+        # Perfetto, so units live here instead of on each event.
+        "counterUnits": counter_units,
+        # CUDA/ROCm native-tracer status, clock mapping and
+        # correlation/de-duplication counts (src/core/gpu_activity.py).
+        "deviceActivity": meta.device_activity,
+    }
+
+
+def write(trace: Trace, out: Path | str | IO, pretty: bool = False,
+          extra_args: dict[int, dict] | None = None) -> None:
+    """Write trace as a Perfetto-compatible JSON file, streamed from the
+    trace's store one event per line (see JSON_LAYOUT_LINE) -- memory use
+    does not grow with the number of events. `pretty` indents the metadata
+    block only. `extra_args` ({span eid: {key: value}}) adds args to
+    individual spans in the output without changing the trace (critical-path
+    --export)."""
     if isinstance(out, (str, Path)):
         with open(out, "w") as f:
-            json.dump(payload, f, indent=indent)
+            _write_stream(trace, f, pretty, extra_args)
     else:
-        json.dump(payload, out, indent=indent)
+        _write_stream(trace, out, pretty, extra_args)
+
+
+def _write_stream(trace: Trace, f: IO, pretty: bool, extra_args=None) -> None:
+    from ..core.trace_io import disasm_to_json
+    dumps = json.dumps
+    f.write(JSON_LAYOUT_LINE + "\n")
+    f.write('"metadata": ' + dumps(_metadata_json(trace), indent=2 if pretty else None) + ",\n")
+    f.write('"displayTimeUnit": "ms",\n')
+    f.write('"traceEvents": [')
+    first = True
+    for ev in _iter_trace_events(trace, extra_args):
+        f.write(("\n" if first else ",\n") + dumps(ev))
+        first = False
+    f.write("\n]")
+    disasm = trace.disasm
+    if disasm:
+        f.write(',\n"disasm": ' + dumps({name: disasm_to_json(kd) for name, kd in disasm.items()}))
+    f.write("\n}\n")
 
 
 def _us_to_ns(us: float) -> int:
@@ -212,109 +222,169 @@ def load_trace_from_json(
     *,
     progress_cb: Callable[[int, int], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    into: Trace | None = None,
 ) -> Trace:
     """Reconstruct a Trace from a Chrome Trace JSON file written by write()
-    above -- the read side of this module's format, moved here from
-    src/ui/app.py (which re-exports this name for backward compatibility)
-    so loading a trace doesn't require importing the whole Textual-based
-    TUI module; every UI (TUI, GUI, `hprofiler compare`/`export`/etc.)
-    needs this regardless of which viewer it ends up using, if any.
+    above (or by any earlier hprofiler version) -- the read side of this
+    module's format.
 
-    `progress_cb`/`cancel_check` are optional and additive -- every
-    existing caller passes neither and sees byte-identical behavior.
-    Both exist for the GUI's async-loading worker (src/gui/loader.py),
-    which runs this on a background thread and needs SOME way to report
-    "N of M events processed" and check "has the user asked to cancel"
-    during the one genuinely large loop below (the event-parsing loop --
-    the dominant cost for a large trace, confirmed by direct profiling:
-    a single blocking json.load() followed by one Python object per
-    event). Deliberately plain callables, not Qt Signals -- this module
-    has no Qt dependency and must not gain one just for this."""
+    Files in the streaming layout (JSON_LAYOUT_LINE) are read line by line,
+    so memory stays bounded when `into` is a disk-backed Trace (see
+    core/trace_io.open_trace); older single-line files are json.load()ed.
+    By default events go into a new in-memory Trace.
+
+    `progress_cb(done, total)` / `cancel_check()` are optional and additive
+    -- the GUI's async loader (src/gui/loader.py) uses them to report
+    progress and to stop a load the user cancelled (LoadCancelled).
+    Deliberately plain callables, not Qt Signals -- this module has no Qt
+    dependency. In the streaming layout done/total are bytes read / file
+    size; otherwise events processed / total events."""
+    path = Path(path)
+    trace = into if into is not None else Trace(TraceMetadata())
     with open(path) as f:
-        data = json.load(f)
+        first = f.readline()
+        if first.strip() == JSON_LAYOUT_LINE:
+            meta_raw, disasm_raw = _load_streaming(f, trace, path.stat().st_size,
+                                                   len(first), progress_cb, cancel_check)
+        else:
+            f.seek(0)
+            data = json.load(f)
+            meta_raw = data.get("metadata", {})
+            disasm_raw = data.get("disasm")
+            events = data.get("traceEvents", [])
+            counter_units: dict[str, str] = meta_raw.get("counterUnits") or {}
+            total_events = len(events)
+            for i, ev in enumerate(events):
+                if progress_cb is not None and (i % _PROGRESS_STRIDE == 0 or i == total_events - 1):
+                    progress_cb(i + 1, total_events)
+                if cancel_check is not None and i % _PROGRESS_STRIDE == 0 and cancel_check():
+                    raise LoadCancelled(f"Cancelled while parsing event {i}/{total_events}")
+                _add_event(trace, ev, counter_units)
+    _finish_load(trace, meta_raw, disasm_raw, collect_disasm)
+    return trace
 
-    meta_raw = data.get("metadata", {})
-    metadata = TraceMetadata(
-        command=meta_raw.get("command", ""),
-        args=meta_raw.get("args", []),
-        backends_used=meta_raw.get("backends", []),
-        hostname=meta_raw.get("hostname", ""),
-        cwd=meta_raw.get("cwd", ""),
-        # "" for any trace saved before this field existed -- the GUI
-        # renders that as "unavailable", not a guessed/fake time.
-        capture_time_iso=meta_raw.get("captureTime", ""),
-        pid=meta_raw.get("pid", 0) or 0,
-    )
-    counter_units: dict[str, str] = meta_raw.get("counterUnits") or {}
-    trace = Trace(metadata)
 
-    events = data.get("traceEvents", [])
-    total_events = len(events)
-    # Every 5000 events, not every single one -- calling back into
-    # Python (and, transitively, emitting a Qt signal across the thread
-    # boundary) has real per-call overhead; this keeps that overhead
-    # negligible relative to the parse itself while still giving
-    # "measurable progress" many times over the course of a large trace.
-    _PROGRESS_STRIDE = 5000
+# Every 5000 events, not every single one -- calling back into Python (and,
+# transitively, emitting a Qt signal across the thread boundary) has real
+# per-call overhead; this keeps it negligible relative to the parse itself.
+_PROGRESS_STRIDE = 5000
 
-    for i, ev in enumerate(events):
-        if progress_cb is not None and (i % _PROGRESS_STRIDE == 0 or i == total_events - 1):
-            progress_cb(i + 1, total_events)
-        if cancel_check is not None and i % _PROGRESS_STRIDE == 0 and cancel_check():
-            raise LoadCancelled(f"Cancelled while parsing event {i}/{total_events}")
 
-        ph      = ev.get("ph", "")
-        cat_str = ev.get("cat", "other")
-        try:
-            cat = Category(cat_str)
-        except ValueError:
-            cat = Category.OTHER
-
-        if ph == "X":
-            args = ev.get("args", {})
-            stack = args.pop("_stack", [])
-            span_id = args.pop("sid", "")
-            parent_span_id = args.pop("psid", "")
-            tid = args.pop("_tid", ev.get("tid", 0))
-            start_ns = _us_to_ns(ev.get("ts", 0))
-            trace.add(SpanEvent(
-                name=ev.get("name", ""),
-                category=cat,
-                start_ns=start_ns,
-                # Derived from the rounded END, not rounded separately, so
-                # start+dur always lands on the originally-written end.
-                duration_ns=max(_us_to_ns(ev.get("ts", 0) + ev.get("dur", 0)) - start_ns, 0),
-                pid=ev.get("pid", 0),
-                tid=tid,
-                tags=args,
-                stack_frames=stack if isinstance(stack, list) else [],
-                span_id=str(span_id),
-                parent_span_id=str(parent_span_id),
-            ))
-        elif ph == "i":
-            trace.add(InstantEvent(
-                name=ev.get("name", ""),
-                category=cat,
-                timestamp_ns=_us_to_ns(ev.get("ts", 0)),
-                pid=ev.get("pid", 0),
-                tid=ev.get("tid", 0),
-                tags=dict(ev.get("args") or {}),
-            ))
-        elif ph == "C":
-            args = ev.get("args", {})
-            name = ev.get("name", "counter")
-            if not args:
-                # No sampled value at all -- skip rather than invent a 0.
+def _load_streaming(f, trace: Trace, total_bytes: int, done_bytes: int,
+                    progress_cb, cancel_check) -> tuple[dict, dict | None]:
+    meta_raw: dict = {}
+    disasm_raw = None
+    counter_units: dict[str, str] = {}
+    in_events = False
+    n = 0
+    meta_lines: list[str] = []
+    for line in f:
+        done_bytes += len(line)
+        if in_events:
+            if line.startswith("]"):
+                in_events = False
                 continue
-            val = list(args.values())[0]
-            trace.add(CounterEvent(
-                name=name,
-                category=cat,
-                timestamp_ns=_us_to_ns(ev.get("ts", 0)),
-                value=float(val),
-                unit=counter_units.get(name, ""),
-                pid=ev.get("pid", 0),
-            ))
+            body = line.rstrip("\n")
+            if body.endswith(","):
+                body = body[:-1]
+            if not body:
+                continue
+            if n % _PROGRESS_STRIDE == 0:
+                if progress_cb is not None:
+                    progress_cb(done_bytes, total_bytes)
+                if cancel_check is not None and cancel_check():
+                    raise LoadCancelled(f"Cancelled after {n} events")
+            _add_event(trace, json.loads(body), counter_units)
+            n += 1
+            continue
+        if line.startswith('"traceEvents": ['):
+            in_events = True
+            continue
+        if line.startswith('"metadata": ') or meta_lines:
+            meta_lines.append(line)
+            text = "".join(meta_lines)
+            try:
+                meta_raw = json.loads(text[len('"metadata": '):].rstrip().rstrip(","))
+            except json.JSONDecodeError:
+                continue            # pretty-printed metadata spans lines
+            meta_lines = []
+            counter_units = meta_raw.get("counterUnits") or {}
+            continue
+        if line.startswith('"disasm": '):
+            disasm_raw = json.loads(line[len('"disasm": '):].rstrip().rstrip(","))
+    if progress_cb is not None:
+        progress_cb(total_bytes, total_bytes)
+    return meta_raw, disasm_raw
+
+
+def _add_event(trace: Trace, ev: dict, counter_units: dict[str, str]) -> None:
+    ph = ev.get("ph", "")
+    cat_str = ev.get("cat", "other")
+    try:
+        cat = Category(cat_str)
+    except ValueError:
+        cat = Category.OTHER
+    if ph == "X":
+        args = ev.get("args", {})
+        stack = args.pop("_stack", [])
+        span_id = args.pop("sid", "")
+        parent_span_id = args.pop("psid", "")
+        tid = args.pop("_tid", ev.get("tid", 0))
+        start_ns = _us_to_ns(ev.get("ts", 0))
+        trace.add(SpanEvent(
+            name=ev.get("name", ""),
+            category=cat,
+            start_ns=start_ns,
+            # Derived from the rounded END, not rounded separately, so
+            # start+dur always lands on the originally-written end.
+            duration_ns=max(_us_to_ns(ev.get("ts", 0) + ev.get("dur", 0)) - start_ns, 0),
+            pid=ev.get("pid", 0),
+            tid=tid,
+            tags=args,
+            stack_frames=stack if isinstance(stack, list) else [],
+            span_id=str(span_id),
+            parent_span_id=str(parent_span_id),
+        ))
+    elif ph == "i":
+        trace.add(InstantEvent(
+            name=ev.get("name", ""),
+            category=cat,
+            timestamp_ns=_us_to_ns(ev.get("ts", 0)),
+            pid=ev.get("pid", 0),
+            tid=ev.get("tid", 0),
+            tags=dict(ev.get("args") or {}),
+        ))
+    elif ph == "C":
+        args = ev.get("args", {})
+        name = ev.get("name", "counter")
+        if not args:
+            # No sampled value at all -- skip rather than invent a 0.
+            return
+        val = list(args.values())[0]
+        trace.add(CounterEvent(
+            name=name,
+            category=cat,
+            timestamp_ns=_us_to_ns(ev.get("ts", 0)),
+            value=float(val),
+            unit=counter_units.get(name, ""),
+            pid=ev.get("pid", 0),
+        ))
+
+
+def _finish_load(trace: Trace, meta_raw: dict, disasm_raw: dict | None, collect_disasm: bool) -> None:
+    from ..core.trace_io import restore_devices, restore_disasm
+    trace.store.flush()
+    metadata = trace.metadata
+    metadata.command = meta_raw.get("command", "")
+    metadata.args = meta_raw.get("args", [])
+    metadata.backends_used = meta_raw.get("backends", [])
+    metadata.hostname = meta_raw.get("hostname", "")
+    metadata.cwd = meta_raw.get("cwd", "")
+    # "" for any trace saved before this field existed -- the GUI
+    # renders that as "unavailable", not a guessed/fake time.
+    metadata.capture_time_iso = meta_raw.get("captureTime", "")
+    metadata.pid = meta_raw.get("pid", 0) or 0
+    metadata.device_activity = dict(meta_raw.get("deviceActivity") or {})
 
     # Profiling window. Files written before startTimeNs/endTimeNs existed
     # fall back to the event extent -- never TraceMetadata's default
@@ -325,55 +395,14 @@ def load_trace_from_json(
         metadata.start_time_ns = start_raw
         metadata.end_time_ns = end_raw
     else:
-        starts = [s.start_ns for s in trace.spans] + [i.timestamp_ns for i in trace.instants] \
-            + [c.timestamp_ns for c in trace.counters]
-        ends = [s.end_ns for s in trace.spans] + [i.timestamp_ns for i in trace.instants] \
-            + [c.timestamp_ns for c in trace.counters]
-        metadata.start_time_ns = min(starts) if starts else 0
-        metadata.end_time_ns = max(ends) if ends else 0
+        ext = trace.store.event_extent()
+        metadata.start_time_ns = ext[0] if ext else 0
+        metadata.end_time_ns = ext[1] if ext else 0
 
-    # Restore device peaks saved at profile time
-    for d in meta_raw.get("devices", []):
-        try:
-            from ..analysis.device import DevicePeak
-            trace.set_devices([DevicePeak.from_dict(x) for x in meta_raw["devices"]])
-            break
-        except Exception:
-            pass
-
-    # Restore serialized disasm if present in the JSON.
-    disasm_raw = data.get("disasm")
-    if disasm_raw:
-        try:
-            from ..disasm.extractor import KernelDisasm, DisasmLine
-            from ..disasm.classifier import InsnType
-            for name, kd_raw in disasm_raw.items():
-                lines = [
-                    DisasmLine(
-                        addr=ln.get("addr", 0),
-                        mnemonic=ln.get("mnemonic", ""),
-                        operands=ln.get("operands", ""),
-                        itype=InsnType(ln.get("itype", "other")),
-                        comment=ln.get("comment", ""),
-                        raw=ln.get("raw", ""),
-                        source_file=ln.get("sourceFile", ""),
-                        source_line=ln.get("sourceLine", 0),
-                        sample_pct=ln.get("samplePct", 0.0),
-                        stall_cycles=ln.get("stallCycles", -1),
-                        stall_reason=ln.get("stallReason", ""),
-                    )
-                    for ln in kd_raw.get("lines", [])
-                ]
-                trace.add_disasm(KernelDisasm(
-                    name=name,
-                    arch=kd_raw.get("arch", ""),
-                    source=kd_raw.get("source", ""),
-                    mangled_name=kd_raw.get("mangledName", ""),
-                    ptxas_derived=kd_raw.get("ptxasDerived", False),
-                    lines=lines,
-                ))
-        except Exception:
-            pass
+    # Restore device peaks / disassembly saved at profile time
+    restore_devices(trace, meta_raw.get("devices"))
+    restore_disasm(trace, disasm_raw)
+    trace.save()
 
     if collect_disasm and not trace.disasm:
         import threading as _threading
@@ -384,5 +413,3 @@ def load_trace_from_json(
             except Exception:
                 pass
         _threading.Thread(target=_bg_disasm, daemon=True).start()
-
-    return trace

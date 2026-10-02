@@ -18,7 +18,7 @@ RowLayout {
         Layout.alignment: Qt.AlignTop
         spacing: AppTheme.spacingXs
         Text {
-            text: "Baseline"
+            text: "Baseline (--compare)"
             color: AppTheme.textMuted
             font.bold: true
             font.pixelSize: AppTheme.typeLabel
@@ -36,7 +36,7 @@ RowLayout {
         Layout.alignment: Qt.AlignTop
         spacing: AppTheme.spacingXs
         Text {
-            text: "Comparison"
+            text: "Candidate (this trace)"
             color: AppTheme.textMuted
             font.bold: true
             font.pixelSize: AppTheme.typeLabel

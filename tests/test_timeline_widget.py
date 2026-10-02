@@ -106,7 +106,7 @@ class TestIdleRendering(unittest.TestCase):
         # visible "·" dot (which read as noise/static on sparse traces).
         a = _span(1, 101, Category.CPU, 0, 10, "brief_work")
         w = TimelineWidget(_mk_trace([a]))
-        chars, styles, _util = w._density_row("cpu/thread-101", width=50, _unused="")
+        chars, styles, _util = w._density_row("cpu/thread-101", width=50, lane_color="")
         # The span itself is tiny relative to the trace window (only view
         # start/end are seeded from this one span, so it may fill more
         # than expected) -- the real invariant is just that wherever it

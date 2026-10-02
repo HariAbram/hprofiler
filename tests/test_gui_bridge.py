@@ -883,6 +883,51 @@ class TestGuiBridge(unittest.TestCase):
         inspector = InspectorBridge(trace, selection, kernels, call_tree, roofline, source, timeline)
         return selection, inspector
 
+    def _gpu_trace(self, native=True):
+        from src.core.runner import _parse_record
+        from src.core import gpu_activity as ga
+        host = ("span:cuda:1:100:1000:50:cudaLaunchKernel:type=launch,op=kernel,stream=11,"
+                "side=cpu,rt=cuda,timing=host,lid=1,sid=4294967297,corr=101")
+        if native:
+            dev = ("span:cuda:1:0:1200:4000:_Z4bigv:type=kernel,side=gpu,rt=cuda,op=kernel,"
+                   "timing=device,src=cupti,corr=101,dev=0,ctx=1,nstream=7")
+        else:
+            dev = ("span:cuda:1:100:1000:4000:_Z4bigv:type=kernel,op=kernel,stream=11,side=gpu,"
+                   "rt=cuda,lid=1,timing=proxy_event")
+        trace = _mk_trace([_parse_record(host), _parse_record(dev)], backends=["cuda"])
+        ga.assemble(trace)
+        return trace
+
+    def test_inspector_gpu_device_span_provenance(self):
+        from src.analysis import dashboard as dash
+        selection, inspector = self._inspector(self._gpu_trace())
+        selection.selectFunction("cuda", "_Z4bigv")
+        metrics = {f["label"]: f for f in inspector.content["metrics"]}
+        self.assertEqual(metrics["Device timing"]["kind"], "measured")
+        self.assertIn("cupti", metrics["Device timing"]["value"])
+        self.assertEqual(metrics["Host call (median)"]["value"], dash.fmt_ns(50))
+        self.assertEqual(metrics["Queued before start (median)"]["kind"], "derived")
+        self.assertEqual(metrics["Queued before start (median)"]["value"], dash.fmt_ns(150))
+        context = {f["label"]: f for f in inspector.content["context"]}
+        self.assertEqual(context["Runs on"]["value"], "pid 1 / stream 11")
+        rel = {f["label"]: f for f in inspector.content["relationships"]}
+        self.assertEqual(rel["Submitted by"]["value"], "1 of 1 correlated to a host call")
+
+    def test_inspector_gpu_host_call_and_proxy(self):
+        selection, inspector = self._inspector(self._gpu_trace())
+        selection.selectFunction("cuda", "cudaLaunchKernel")
+        context = {f["label"]: f for f in inspector.content["context"]}
+        self.assertEqual(context["Runs on"]["value"], "pid 1 / tid 100")
+        rel = {f["label"]: f for f in inspector.content["relationships"]}
+        self.assertEqual(rel["Device work"]["value"], "1 device span(s) from 1 call(s)")
+
+        selection, inspector = self._inspector(self._gpu_trace(native=False))
+        selection.selectFunction("cuda", "_Z4bigv")
+        metrics = {f["label"]: f for f in inspector.content["metrics"]}
+        self.assertEqual(metrics["Device timing"]["kind"], "estimated")
+        self.assertIn("submission time", metrics["Device timing"]["value"])
+        self.assertNotIn("Queued before start (median)", metrics)
+
     def test_inspector_empty_selection_yields_empty_content(self):
         _selection, inspector = self._inspector(_mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")]))
         for section in ("summary", "context", "metrics", "relationships", "recommendations"):
@@ -1149,8 +1194,12 @@ class TestComparisonBridge(unittest.TestCase):
         return Theme(dark=True)
 
     def _bridge(self, trace_a, trace_b):
+        """trace_a = baseline (BEFORE), trace_b = candidate (AFTER): the
+        GUI's opened trace is the candidate, --compare names the baseline."""
         from src.gui.comparison import ComparisonBridge
-        return ComparisonBridge(trace_a, trace_b, self._theme())
+        if trace_b is None:
+            return ComparisonBridge(trace_a, None, self._theme())
+        return ComparisonBridge(trace_b, trace_a, self._theme())
 
     def test_unavailable_when_no_comparison_trace(self):
         trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
@@ -1160,13 +1209,15 @@ class TestComparisonBridge(unittest.TestCase):
         self.assertEqual(bridge.bucketDeltas, [])
         self.assertEqual(bridge.topImprovements, [])
         self.assertEqual(bridge.topRegressions, [])
-        for field in bridge.comparisonFields:
+        # The opened trace is the candidate: without --compare only the
+        # BASELINE side is unavailable.
+        for field in bridge.baselineFields:
             self.assertEqual(field["kind"], "unavailable")
             self.assertTrue(field["reason"])
-        # Baseline fields must still be fully populated -- unavailability
-        # is a property of the COMPARISON side only.
-        for field in bridge.baselineFields:
+        for field in bridge.comparisonFields:
             self.assertEqual(field["kind"], "measured")
+        self.assertFalse(bridge.causalAvailable)
+        self.assertEqual(bridge.contributors, [])
 
     def test_export_methods_fail_cleanly_when_unavailable(self):
         trace_a = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
@@ -1230,6 +1281,57 @@ class TestComparisonBridge(unittest.TestCase):
         from src.analysis import compare as cmp
         self.assertEqual(comp["Computation"], cmp.classify(15_000_000.0, 13_800_000.0,
                                                             noise_pct=1.0, noise_ns=100_000.0)[0])
+
+    def _mpi_pair(self):
+        from tests import compare_scenarios as S
+        return self._bridge(S.mpi_wait(False), S.mpi_wait(True))
+
+    def test_causal_layer_ranks_contributors_and_explains_them(self):
+        b = self._mpi_pair()
+        self.assertTrue(b.causalAvailable)
+        v = b.verdict
+        self.assertEqual(v["method"], "phase-aligned")
+        self.assertEqual(v["wallStatus"], "regressed")
+        self.assertIn("confidence", b.verdict["confidenceText"] + " confidence")
+        top = b.contributors[0]
+        self.assertEqual((top["label"], top["cause"]), ("compute", "increased_work"))
+        self.assertTrue(any(r["label"] == "MPI_Recv" and r["propagated"] for r in b.propagated))
+        d = b.contributorDetail(top["id"])
+        self.assertEqual(d["rawName"], "compute")
+        self.assertTrue(d["hasTimeline"])
+        self.assertLess(d["timelineStartNs"], d["timelineEndNs"])
+        kinds = {r["label"]: r["kind"] for r in d["rows"]}
+        self.assertEqual(kinds["self time"], "measured")
+        self.assertEqual(kinds["critical-path time"], "derived")
+        self.assertEqual(b.contributorDetail(10**6), {})
+
+    def test_phase_selection_filters_contributors_and_critical_path(self):
+        b = self._mpi_pair()
+        self.assertGreater(len(b.phasePairs), 1)
+        self.assertEqual(b.selectedPhase, -1)
+        b.selectPhase(1)
+        self.assertEqual(b.selectedPhase, 1)
+        self.assertEqual([c["label"] for c in b.contributors], ["compute"])
+        self.assertTrue(b.criticalAfter)
+        self.assertAlmostEqual(sum(c["frac"] for c in b.criticalAfter), 1.0, places=6)
+        r = b.phaseRange(1)
+        self.assertLess(r["startNs"], r["endNs"])
+        b.selectPhase(999)
+        self.assertEqual(b.selectedPhase, -1)
+
+    def test_export_includes_causal_report_and_thresholds_recompute_it(self):
+        import json, tempfile, os
+        b = self._mpi_pair()
+        fd, path = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        try:
+            self.assertTrue(b.exportReport(path))
+            data = json.loads(Path(path).read_text())
+        finally:
+            os.unlink(path)
+        self.assertEqual(data["causal"]["contributors"][0]["label"], "compute")
+        self.assertIn("aggregates", data)
+        b.setChangeThresholds(1e15, 5.0)
+        self.assertEqual(b.contributors, [])
 
     def test_missing_side_is_nan_not_zero(self):
         import math
@@ -1331,6 +1433,22 @@ class TestComparisonBridge(unittest.TestCase):
         self.assertTrue(bridge.hasComparison)
         self.assertEqual(len(bridge.comparisonTopChanges), 1)
         self.assertEqual(bridge.comparisonTopChanges[0]["name"], "k")
+
+
+
+
+class TestNavFocusRange(unittest.TestCase):
+    def test_focus_requests_are_serialized_and_select_the_range(self):
+        app = QGuiApplication.instance() or QGuiApplication([])  # noqa: F841
+        from src.gui.nav import Selection
+        nav = Selection()
+        fired = []
+        nav.focusRangeChanged.connect(lambda: fired.append(dict(nav.focusRange)))
+        self.assertEqual(nav.focusRange, {})
+        nav.focusTimeRange(10.0, 20.0)
+        nav.focusTimeRange(10.0, 20.0)       # the same range again is a new request
+        self.assertEqual([f["serial"] for f in fired], [1, 2])
+        self.assertEqual(nav.selectedTimeRange, {"startNs": 10.0, "endNs": 20.0})
 
 
 if __name__ == "__main__":

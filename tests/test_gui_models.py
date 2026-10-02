@@ -119,7 +119,8 @@ class TestTimelineModel(unittest.TestCase):
         a = _span(1, 1, Category.CPU, 0, 500, "a")
         b = _span(1, 1, Category.CPU, 1_000_000, 30, "b")
         m = self._model(_mk_trace([a, b]))
-        self.assertEqual(m._max_dur["cpu/thread-1"], 500)
+        # the window look-back is the store lane's longest single span
+        self.assertEqual(m._infos["cpu/thread-1"].max_dur, 500)
 
     def test_visible_spans_respects_max_spans_cap(self):
         spans = [_span(1, 1, Category.CPU, i * 100, 50, f"s{i}") for i in range(500)]

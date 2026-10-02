@@ -132,25 +132,38 @@ def annotate_trace(trace: "Trace", binary: str | None = None) -> int:
     if not binary or not Path(binary).exists():
         return 0
 
+    # Spans are streamed from the store and resolved in bounded chunks
+    # (changes written back per chunk), so a huge trace is never held at once.
+    annotated = 0
+    chunk: list = []
+    for span in trace.iter_spans(categories=("cpu", "openmp", "sync")):
+        if "file" in span.tags or not span.tags.get("offset"):
+            continue   # already annotated / nothing to resolve
+        chunk.append(span)
+        if len(chunk) >= _ANNOTATE_CHUNK:
+            annotated += _annotate_chunk(trace, tool, binary, chunk)
+            chunk = []
+    if chunk:
+        annotated += _annotate_chunk(trace, tool, binary, chunk)
+    return annotated
+
+
+_ANNOTATE_CHUNK = 50_000
+
+
+def _annotate_chunk(trace, tool, binary, spans) -> int:
     # Collect (lib_path, hex_offset) pairs that need resolution
     lookup: dict[str, list[tuple[str, object]]] = {}  # lib -> [(hex_addr, span)]
-
-    for span in trace.spans:
-        if span.category not in (Category.CPU, Category.OPENMP, Category.SYNC):
-            continue
-        if "file" in span.tags:
-            continue   # already annotated
-
+    for span in spans:
         lib  = span.tags.get("lib", binary)
-        off_s = span.tags.get("offset", "")
-        if off_s:
-            try:
-                hex_addr = hex(int(off_s, 16))
-            except ValueError:
-                continue
-            lookup.setdefault(lib, []).append((hex_addr, span))
+        try:
+            hex_addr = hex(int(span.tags.get("offset", ""), 16))
+        except ValueError:
+            continue
+        lookup.setdefault(lib, []).append((hex_addr, span))
 
     annotated = 0
+    changed = []
     for lib, pairs in lookup.items():
         if not Path(lib).exists():
             continue
@@ -176,5 +189,7 @@ def annotate_trace(trace: "Trace", binary: str | None = None) -> int:
                 span.tags["file"] = file_
                 span.tags["line"] = line_
                 annotated += 1
-
+                changed.append(span)
+    if changed:
+        trace.update_spans(changed)
     return annotated

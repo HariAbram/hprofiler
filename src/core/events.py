@@ -44,6 +44,12 @@ class SpanEvent:
     stack_frames: list[str] = field(default_factory=list)  # innermost→outermost (backtrace order)
     span_id: str = ""         # hook-assigned unique ID (uint64 decimal string from C)
     parent_span_id: str = ""  # parent's span_id; empty = root span
+    # Store identity (src/core/store): `eid` is the store's event id
+    # (event_by_id), `seq` the global arrival order. -1 = not stored yet.
+    # Excluded from equality/repr: two events with the same content are the
+    # same event wherever they are stored.
+    eid: int = field(default=-1, compare=False, repr=False)
+    seq: int = field(default=-1, compare=False, repr=False)
 
     @property
     def end_ns(self) -> int:
@@ -71,6 +77,8 @@ class InstantEvent:
     pid: int = 0
     tid: int = 0
     tags: dict[str, Any] = field(default_factory=dict)
+    eid: int = field(default=-1, compare=False, repr=False)
+    seq: int = field(default=-1, compare=False, repr=False)
 
 
 @dataclass
@@ -82,6 +90,8 @@ class CounterEvent:
     value: float
     unit: str = ""
     pid: int = 0
+    eid: int = field(default=-1, compare=False, repr=False)
+    seq: int = field(default=-1, compare=False, repr=False)
 
 
 from typing import Union

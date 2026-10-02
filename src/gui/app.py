@@ -2,7 +2,7 @@
 Qt/QML GUI bootstrap -- run as a SEPARATE PROCESS by launch.py (see that
 module's docstring for why: isolating a GLX crash from the CLI process).
 
-Usage: python3 app.py <trace.json> [--compare <trace_b.json>] [--disasm]
+Usage: python3 app.py <trace.json> [--compare <baseline.json>] [--disasm]
 
 Exit code 0 means the window opened and closed normally (the user closed
 it) -- launch.py's caller treats that as "the GUI was shown", not
@@ -64,7 +64,7 @@ def _parse_argv(argv: list[str]) -> tuple[str, str | None, bool]:
     """argv[0] is this script's own path (sys.argv convention) -- returns
     (trace_path, compare_path, disasm)."""
     if len(argv) < 2:
-        raise SystemExit("usage: app.py <trace.json> [--compare <trace_b.json>] [--disasm]")
+        raise SystemExit("usage: app.py <trace.json> [--compare <baseline.json>] [--disasm]")
     trace_path = argv[1]
     rest = argv[2:]
     disasm = "--disasm" in rest
@@ -174,7 +174,7 @@ def main() -> int:
 
     theme = Theme(dark=dark)
     theme.themeChanged.connect(lambda: settings.save_theme(theme.dark))
-    comparison = ComparisonBridge(trace, trace_b, theme)
+    comparison = ComparisonBridge(trace, trace_b, theme, precomputed=result.comparison_data)
     dashboard = DashboardBridge(trace, theme, comparison=comparison, precomputed=result.dashboard_data)
     timeline = TimelineModel(trace, theme)
     kernels = KernelsBridge(trace, theme)

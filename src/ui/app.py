@@ -37,6 +37,7 @@ Keyboard shortcuts:
 
 from __future__ import annotations
 import json
+import itertools
 import math
 import re
 import zlib
@@ -331,7 +332,7 @@ class SystemWidget(Static):
         # ── GPU utilisation (rocm-smi / nvidia-smi polling) ───────────────
         gpu_util_peak: dict[str, float] = {}
         gpu_mem_peak:  dict[str, float] = {}
-        for c in trace.counters:
+        for c in trace.iter_counters():
             if c.name.startswith("gpu_utilization_pct"):
                 gpu_util_peak[c.name] = max(gpu_util_peak.get(c.name, 0.0), c.value)
             elif c.name.startswith("gpu_mem_used_bytes"):
@@ -358,7 +359,7 @@ class SystemWidget(Static):
                 _kv(gid, parts)
 
         # ── CPU microarch ─────────────────────────────────────────────────
-        ctrs: dict[str, float] = {c.name: c.value for c in trace.counters}
+        ctrs: dict[str, float] = trace.counter_values()
         ipc   = ctrs.get("ipc", 0.0)
         cmiss = ctrs.get("cache_miss_pct", -1.0)
         bmiss = ctrs.get("branch_miss_pct", -1.0)
@@ -393,7 +394,6 @@ class ProfileWidget(Static):
 
     def render(self) -> Any:  # noqa: ANN401
         trace  = self._trace
-        spans  = trace.spans
         wall_ns = _trace_wall_ns(trace)
         L: list[str] = []
 
@@ -404,17 +404,19 @@ class ProfileWidget(Static):
                 L.append("")
 
         # ── GPU activity ──────────────────────────────────────────────────
+        from ..core import gpu_activity as _ga
         for cat_val, label in (("cuda", "CUDA"), ("rocm", "ROCm")):
-            kspans = [s for s in spans
-                      if s.category.value == cat_val and s.tags.get("type") == "kernel"]
-            if not kspans:
+            # One timing source (device-measured, else proxy) -- never both.
+            ka = _ga.kernel_activity(trace.iter_spans(categories=(cat_val,)))
+            if not ka.used:
                 continue
-            kern_ns  = _merged_ns(kspans)
-            kern_acc = sum(s.duration_ns for s in kspans)
-            sync_ns  = _merged_ns([s for s in spans if s.category.value == "sync"])
+            kern_ns  = _ga.merged_length(ka.intervals)
+            kern_acc = sum(hi - lo for lo, hi in ka.intervals)
+            sync_ns  = _merged_ns([s for s in trace.iter_spans(categories=("sync",))
+                                   if s.tags.get("side") != "gpu"])
             pct      = 100.0 * kern_ns / wall_ns
             sync_pct = 100.0 * sync_ns / wall_ns
-            avg_ns   = kern_acc / len(kspans)
+            avg_ns   = kern_acc / ka.used
             eff      = pct / (pct + sync_pct) * 100 if (pct + sync_pct) > 0 else 0
             color    = _cat_color(cat_val)
             grade, gc = _grade(pct)
@@ -438,21 +440,25 @@ class ProfileWidget(Static):
             )
             L.append("")
             L.append(
-                f"  [dim]{len(kspans)} kernel launches"
+                f"  [dim]{ka.used} kernel launches"
                 f"  ·  {_fmt_ns(avg_ns)} average"
                 f"  ·  {_fmt_ns(kern_acc)} total[/dim]"
             )
+            L.append(f"  [dim]Timing source    {_ga.SOURCE_LABELS.get(ka.source, ka.source)}[/dim]")
+            if ka.excluded:
+                L.append(f"  [dim]                 {ka.excluded} kernel span(s) excluded -- "
+                         f"{ka.excluded_reason}[/dim]")
 
         # ── Time breakdown ────────────────────────────────────────────────
         # Exclusive (innermost-span) time per category, same attribution
         # as the GUI's breakdown -- raw sums counted nested spans (a
         # barrier inside a parallel region) twice.
-        from ..analysis.activity_buckets import exclusive_totals
         by_cat: dict[str, dict] = defaultdict(lambda: {"ns": 0, "n": 0})
-        for cat, ns in exclusive_totals(spans, lambda s: s.category.value).items():
+        excl = trace.store.exclusive_aggregate()     # store-side
+        for cat, ns in excl.totals(lambda pid, tid, cat, name, b, dev: cat).items():
             by_cat[cat]["ns"] = ns
-        for s in spans:
-            by_cat[s.category.value]["n"] += 1
+        for r in trace.aggregate_stats():
+            by_cat[r["category"]]["n"] += r["count"]
         grand = sum(v["ns"] for v in by_cat.values()) or 1
 
         _sep("TIME BREAKDOWN")
@@ -514,7 +520,7 @@ class ProfileWidget(Static):
         # "Top findings" panel -- no import needed, it's a module global by
         # the time any widget actually renders.
         try:
-            ctrs_d = {c.name: c.value for c in trace.counters}
+            ctrs_d = trace.counter_values()
             ctr_sub: dict[str, float] = {
                 k: ctrs_d[k]
                 for k in ("ipc", "cache_miss_pct", "branch_miss_pct")
@@ -557,31 +563,16 @@ class ProfileWidget(Static):
 _TUI_SHADE = {"green": "bright_green"}
 
 
-def _mini_row(spans: list, width: int, view_start: int, view_dur: float, color: str) -> Text:
+def _mini_row(chunks, width: int, view_start: int, view_dur: float, color: str) -> Text:
     """Coarse fixed-width density row for the Dashboard's timeline preview:
-    a simplified, loop-based cousin of TimelineWidget._density_row. Fine at
-    preview width/span-count — the numpy-vectorised path in TimelineWidget
-    exists specifically for that widget's full interactive zoom/pan over
-    potentially far more spans."""
+    a column is drawn when any timed span touches it. `chunks` yields
+    (start_ns, end_ns) arrays (TraceStore.interval_arrays), binned with
+    numpy chunk by chunk -- no per-span Python loop, no span objects."""
     row = Text()
     if view_dur <= 0 or width <= 0:
         return row
-    cov = [0.0] * width
-    scale = width / view_dur
-    for s in spans:
-        if s.duration_ns <= 0:
-            continue
-        x0 = max(0.0, min(float(width), (s.start_ns - view_start) * scale))
-        x1 = max(0.0, min(float(width), (s.start_ns + s.duration_ns - view_start) * scale))
-        if x1 <= x0:
-            ix = min(int(x0), width - 1)
-            if ix >= 0:
-                cov[ix] = max(cov[ix], 0.2)
-            continue
-        i0, i1 = int(x0), min(int(x1), width - 1)
-        for i in range(i0, i1 + 1):
-            cov[i] = 1.0
-    for c in cov:
+    from ..analysis.dashboard import coverage_from_chunks
+    for c in coverage_from_chunks(chunks, width, view_start, view_dur):
         row.append("█" if c > 0.05 else " ", style=color if c > 0.05 else "")
     return row
 
@@ -679,7 +670,7 @@ class DashboardWidget(Widget):
         self.query_one("#stat-wait", Static).update(Text.from_markup(
             f"[dim]{wait_label}[/dim]\n[bold {wcol}]{wait_pct:.0f}%[/bold {wcol}]"))
 
-        ctrs = {c.name: c.value for c in trace.counters}
+        ctrs = trace.counter_values()
         rss  = ctrs.get("process_max_rss_bytes", 0.0)
         if rss > 0:
             mem_str = _fmt_bytes(rss)
@@ -692,14 +683,14 @@ class DashboardWidget(Widget):
         # ── Execution timeline preview: top-3 categories by accumulated time ──
         tl_panel = self.query_one("#dash-timeline", Static)
         tl_panel.border_title = "Execution timeline"
-        by_cat: dict[str, list] = defaultdict(list)
-        for s in trace.spans:
-            if s.duration_ns > 0:
-                by_cat[s.category.value].append(s)
-        top_cats = sorted(by_cat.items(), key=lambda kv: -sum(s.duration_ns for s in kv[1]))[:3]
-        timed = [s for s in trace.spans if s.duration_ns > 0]
-        view_start = min((s.start_ns for s in timed), default=0)
-        view_end   = max((s.end_ns for s in timed), default=1)
+        cat_totals: dict[str, int] = {}
+        for r in trace.aggregate_stats():
+            if r["total_ns"] > 0:
+                cat_totals[r["category"]] = cat_totals.get(r["category"], 0) + r["total_ns"]
+        top_cats = [(c, trace.store.interval_arrays(categories=(c,)))
+                    for c in sorted(cat_totals, key=lambda c: -cat_totals[c])[:3]]
+        ext = trace.store.span_extent(timed_only=True) or (0, 1)
+        view_start, view_end = ext
         view_dur   = max(view_end - view_start, 1)
         width = max(10, self.size.width // 2 - 12) if self.size.width else 40
 
@@ -801,11 +792,11 @@ class TimelineWidget(Widget):
     view_y: reactive[int]   = reactive(0)
     zoom:   reactive[float] = reactive(1.0)
     _hover: reactive[str]   = reactive("")   # hover info shown in status bar
-    # id() of the span currently under the cursor, or 0 for none -- gates
-    # which connector lines render() actually draws (see _connectors):
-    # drawing every MPI/NCCL edge at once on a busy trace is a hairball,
-    # so only the hovered span's own edges are shown, on demand.
-    _hover_span_id: reactive[int] = reactive(0)
+    # Store event id (SpanEvent.eid) of the span under the cursor, or -1
+    # for none -- gates which connector lines render() actually draws (see
+    # _connectors): drawing every MPI/NCCL edge at once on a busy trace is
+    # a hairball, so only the hovered span's own edges are shown, on demand.
+    _hover_span_id: reactive[int] = reactive(-1)
 
     # label column: "omp  T12  (120)" = up to 17 chars
     _LABEL_W = 17
@@ -821,11 +812,17 @@ class TimelineWidget(Widget):
         super().__init__(**kwargs)
         self.border_title = "Timeline view"
         self.trace        = trace
-        self._lanes       = trace.lanes()
-        self._lane_counts = {k: len(v) for k, v in self._lanes.items()}
+        store             = trace.store
+        self._store       = store
+        # Lane list and per-lane counts come from the trace store (built
+        # once at finalization for disk stores); span data is fetched only
+        # for the visible window, per render (see _lane_columns) -- a
+        # multi-million-event trace is never loaded into memory.
+        self._infos       = {ln.name: ln for ln in store.lane_infos()}
+        self._lane_counts = {name: info.count for name, info in self._infos.items()}
 
         from ..core.trace import parse_lane_name
-        self._parsed_lanes = {ln: parse_lane_name(ln) for ln in self._lanes}
+        self._parsed_lanes = {ln: parse_lane_name(ln) for ln in self._infos}
 
         # Assign stable sequential numbers T1, T2, … per (pid, tid): the
         # same tid in two processes (merge-nodes) is two different threads.
@@ -840,28 +837,23 @@ class TimelineWidget(Widget):
         # rank2" reads far more meaningfully than a generic "mpi T3"
         # sequential thread number, since rank is what a user actually
         # thinks in terms of. Every span on one OS thread within one MPI
-        # process reports the same rank, so the first one found suffices.
-        # Falls back to the generic thread-sequence label (via
-        # _lane_label's existing logic) for any mpi lane where no span
-        # happens to carry a rank= tag (e.g. collectives use rank= too, but
-        # a lane with zero mpi spans somehow wouldn't be a /mpi lane at
-        # all, so this is only a defensive fallback, not an expected case).
+        # process reports the same rank, so the first one found suffices
+        # (only the lane's first spans are probed). Falls back to the
+        # generic thread-sequence label (via _lane_label's existing logic)
+        # for any mpi lane where no span carries a rank= tag.
         self._lane_rank: dict[str, str] = {}
-        for lane_name, lane_spans in self._lanes.items():
+        for lane_name in self._infos:
             if not lane_name.startswith("mpi/"):
                 continue
-            for s in lane_spans:
+            for s in itertools.islice(store.iter_spans(order="start", lane=lane_name), 1000):
                 rank = s.tags.get("rank")
                 if rank is not None:
                     self._lane_rank[lane_name] = rank
                     break
 
-        # Build span_id → name lookup for hover parent annotation.
-        self._sid_name: dict[str, str] = {
-            s.span_id: s.name
-            for s in trace.spans
-            if s.span_id
-        }
+        # span_id -> name for the hover's parent annotation, filled lazily
+        # from the store (see _parent_name).
+        self._sid_name: dict[str, str] = {}
 
         # Sort: group by thread first, then by category within the thread.
         # CUDA stream lanes are sorted together by stream ID.
@@ -878,17 +870,14 @@ class TimelineWidget(Widget):
                 return (20000, pid or 0, cat)
             return (0, pid or 0, cat)
 
-        self._lane_names = sorted(self._lanes.keys(), key=_sort_key)
+        self._lane_names = sorted(self._infos.keys(), key=_sort_key)
 
-        all_spans = trace.spans
         # Anchor the visible window to timed spans only; CPU sample spans
         # (duration_ns=0) may use a different clock base (e.g. CLOCK_BOOTTIME
         # vs CLOCK_MONOTONIC on suspended machines) and would bloat the window.
-        timed_spans = [s for s in all_spans if s.duration_ns > 0]
-        anchor = timed_spans if timed_spans else all_spans
-        if anchor:
-            self._view_start = min(s.start_ns for s in anchor)
-            self._view_end   = max(s.end_ns   for s in anchor)
+        ext = store.span_extent(timed_only=True) or store.span_extent(timed_only=False)
+        if ext:
+            self._view_start, self._view_end = ext
         else:
             self._view_start = trace.metadata.start_time_ns
             self._view_end   = trace.metadata.end_time_ns or self._view_start + 1
@@ -914,7 +903,7 @@ class TimelineWidget(Widget):
         # genuinely crowded (more distinct functions than colors), and
         # which names collide (not WHETHER any do) is itself a
         # deterministic function of the name set, not of render order.
-        distinct_names = sorted({s.name for s in (all_spans if all_spans else [])})
+        distinct_names = sorted({r["name"] for r in store.aggregate_stats()})
         assigned: dict[str, int] = {}
         taken: set[int] = set()
         for name in distinct_names:
@@ -929,77 +918,31 @@ class TimelineWidget(Widget):
         # Integer palette index per function — used by the numpy render path.
         self._func_color_idx: dict[str, int] = assigned
 
-        # ── Spatial index + numpy column arrays ──────────────────────────────
-        # Sort each lane once by start_ns; keep numpy arrays of start, end, and
-        # palette-index so _density_row can run loop-free over visible spans.
-        self._sorted_spans: dict[str, list] = {
-            lane: sorted(spans_list, key=lambda s: s.start_ns)
-            for lane, spans_list in self._lanes.items()
-        }
-        cidx_map = self._func_color_idx   # name → int palette index
-        self._starts_arr: dict[str, np.ndarray] = {}
-        self._ends_arr:   dict[str, np.ndarray] = {}
-        self._cidx_arr:   dict[str, np.ndarray] = {}
-        self._max_dur:    dict[str, int]         = {}
-        for lane, slist in self._sorted_spans.items():
-            if slist:
-                self._starts_arr[lane] = np.array(
-                    [s.start_ns for s in slist], dtype=np.int64)
-                self._ends_arr[lane]   = np.array(
-                    [s.end_ns   for s in slist], dtype=np.int64)
-                self._cidx_arr[lane]   = np.array(
-                    [cidx_map.get(s.name, 0) for s in slist], dtype=np.int32)
-                self._max_dur[lane]    = int(
-                    self._ends_arr[lane].max() - self._starts_arr[lane].min())
-            else:
-                self._starts_arr[lane] = np.empty(0, dtype=np.int64)
-                self._ends_arr[lane]   = np.empty(0, dtype=np.int64)
-                self._cidx_arr[lane]   = np.empty(0, dtype=np.int32)
-                self._max_dur[lane]    = 0
+        # Visible-window data per lane, valid for one (start, end, width)
+        # view: hover-driven re-renders don't re-query the store.
+        self._win_key: tuple | None = None
+        self._win_cache: dict[str, tuple] = {}
 
         # ── Cross-rank communication connectors (MPI/NCCL) ────────────────
         # Reuses criticalpath.py's dependency-graph edges directly (resolved
         # wildcard matching, commid=-scoped rendezvous, confidence tiers --
         # see its module docstring) rather than re-deriving send/recv or
         # collective-participant matching here. Computed once at
-        # construction, same as every other precomputed structure above --
-        # TimelineWidget is built once per loaded/completed trace (see
-        # ProfilerApp.compose), not live-refreshed as new events stream in.
+        # construction -- TimelineWidget is built once per loaded/completed
+        # trace (see ProfilerApp.compose), not live-refreshed as new events
+        # stream in.
         #
         # Drawing EVERY connector simultaneously on a busy trace produces a
         # hairball of overlapping lines -- render() only actually draws the
         # ones touching the currently-hovered span (see _hover_span_id),
-        # so pred_span_id/succ_span_id are kept alongside the lane/time
-        # data specifically to make that O(1)-per-connector filter possible
-        # without re-walking the dependency graph on every mouse move.
+        # so pred_span_id/succ_span_id (store event ids) are kept alongside
+        # the lane/time data specifically to make that O(1)-per-connector
+        # filter possible without re-walking the dependency graph on every
+        # mouse move.
         # (pred_lane, pred_mid_ns, succ_lane, succ_mid_ns, confidence, pred_span_id, succ_span_id)
         self._connectors: list[tuple[str, float, str, float, str, int, int]] = []
         try:
-            from ..analysis import criticalpath as _cp
-            cp_spans, cp_preds = _cp.build_dependency_graph(trace)
-            span_lane: dict[int, str] = {
-                id(s): lane for lane, spans_list in self._lanes.items() for s in spans_list
-            }
-            for succ_idx, edges in cp_preds.items():
-                succ = cp_spans[succ_idx]
-                if succ.category.value not in ("mpi", "nccl"):
-                    continue
-                succ_lane = span_lane.get(id(succ))
-                if succ_lane is None:
-                    continue
-                succ_mid = (succ.start_ns + succ.end_ns) / 2.0
-                for pred_idx, kind, confidence in edges:
-                    if kind not in ("p2p", "arrival"):
-                        continue
-                    pred = cp_spans[pred_idx]
-                    pred_lane = span_lane.get(id(pred))
-                    # Same-lane edges need no cross-lane connector -- the
-                    # spans are already visually adjacent in one row.
-                    if pred_lane is None or pred_lane == succ_lane:
-                        continue
-                    pred_mid = (pred.start_ns + pred.end_ns) / 2.0
-                    self._connectors.append(
-                        (pred_lane, pred_mid, succ_lane, succ_mid, confidence, id(pred), id(succ)))
+            self._connectors = self._build_connectors()
         except Exception:
             # Connector lines are a display enhancement layered on an
             # otherwise-independent, already-working Timeline -- a failure
@@ -1016,6 +959,83 @@ class TimelineWidget(Widget):
         for _pl, _pn, _sl, _sn, _conf, pred_sid, succ_sid in self._connectors:
             self._connector_count[pred_sid] += 1
             self._connector_count[succ_sid] += 1
+
+    # Building the dependency graph costs a pass over every span; above this
+    # size connectors are only drawn when the store already holds persisted
+    # edges (e.g. after `hprofiler critical-path`), so opening a huge trace
+    # stays fast. Same rule as the GUI timeline (src/gui/models.py).
+    CONNECTOR_SPAN_LIMIT = 500_000
+
+    def _build_connectors(self) -> list[tuple[str, float, str, float, str, int, int]]:
+        from ..analysis import criticalpath as _cp
+        from ..core.store.common import lane_base
+        if not ({"mpi", "nccl"} & {info.cat for info in self._infos.values()}):
+            return []
+        graph = _cp.load_comm_graph(self.trace, max_build_spans=self.CONNECTOR_SPAN_LIMIT)
+        if graph is None or not len(graph.edges):
+            return []
+        edges = graph.edges
+        comm = graph.endpoints(set(edges["dst"].tolist()) | set(edges["src"].tolist()),
+                               categories=("mpi", "nccl"))
+        lane_of = {(info.pid, (info.cat, info.kind, info.ident)): name for name, info in self._infos.items()}
+        out = []
+        for succ_idx, pred_idx, _kind, conf in edges.tolist():
+            succ, pred = comm.get(succ_idx), comm.get(pred_idx)
+            if succ is None or pred is None:
+                continue
+            succ_lane = lane_of.get((succ.pid, lane_base(succ)))
+            pred_lane = lane_of.get((pred.pid, lane_base(pred)))
+            # Same-lane edges need no cross-lane connector -- the spans are
+            # already visually adjacent in one row.
+            if succ_lane is None or pred_lane is None or pred_lane == succ_lane:
+                continue
+            out.append((pred_lane, (pred.start_ns + pred.end_ns) / 2.0,
+                        succ_lane, (succ.start_ns + succ.end_ns) / 2.0,
+                        _cp.EDGE_CONFS[conf], pred.eid, succ.eid))
+        return out
+
+    def _parent_name(self, parent_span_id: str) -> str:
+        name = self._sid_name.get(parent_span_id)
+        if name is None:
+            parent = self._store.span_by_span_id(parent_span_id)
+            name = parent.name if parent is not None else parent_span_id[:8]
+            self._sid_name[parent_span_id] = name
+        return name
+
+    # Above this many spans in a lane's visible window the row is drawn
+    # from the store's activity index (occupancy per column, in the lane's
+    # category color) instead of from individual spans; zooming in far
+    # enough brings back exact spans and per-function colors.
+    SPAN_LIMIT = 20_000
+
+    def _lane_columns(self, lane_name: str, vis_start: float, vis_end: float, width: int) -> tuple:
+        """("spans", starts, ends, palette idx) for the spans overlapping
+        the visible window, or ("bins", occupancy per column) when there
+        are more than SPAN_LIMIT of them."""
+        key = (vis_start, vis_end, width)
+        if key != self._win_key:
+            self._win_key, self._win_cache = key, {}
+        hit = self._win_cache.get(lane_name)
+        if hit is not None:
+            return hit
+        store = self._store
+        a, b = int(vis_start), int(math.ceil(vis_end))
+        est = store.estimate_starts(lane_name, a, b)
+        many = est is not None and est > 4 * self.SPAN_LIMIT
+        if not many:
+            many = store.count_window(lane_name, a, b, cap=self.SPAN_LIMIT) > self.SPAN_LIMIT
+        if many:
+            occ = store.occupancy(lane_name, vis_start, vis_end, width)
+            if occ is None:
+                occ = store.occupancy_exact(lane_name, vis_start, vis_end, width)
+            hit = ("bins", np.asarray(occ, dtype=np.float32))
+        else:
+            starts, ends, names = store.window_columns(lane_name, a, b)
+            cidx = self._func_color_idx
+            hit = ("spans", starts, ends,
+                   np.fromiter((cidx.get(n, 0) for n in names), dtype=np.int32, count=len(names)))
+        self._win_cache[lane_name] = hit
+        return hit
 
     def _lane_label(self, lane_name: str) -> str:
         cat, kind, ident, pid = self._parsed_lanes.get(lane_name) or ("", "", "", None)
@@ -1055,7 +1075,7 @@ class TimelineWidget(Widget):
         return f"{label:<{self._LABEL_W}}"
 
     def _density_row(self, lane_name: str, width: int,
-                     _unused: str) -> tuple[list[str], list[str], float]:
+                     lane_color: str) -> tuple[list[str], list[str], float]:
         """
         Return (per-column chars, per-column styles, visible-window
         utilisation %) -- raw, not yet RLE-encoded into a Text; pass to
@@ -1063,7 +1083,9 @@ class TimelineWidget(Widget):
         characters onto specific columns) to get the final Text row.
 
         Fully vectorised — no Python loop over spans:
-          1. Spatial index  : np.searchsorted clips to only the visible spans O(log n)
+          1. Store window   : only the spans overlapping the view (indexed
+                              query, cached per view); above SPAN_LIMIT the
+                              store's occupancy index instead
           2. Numpy broadcast: pixel positions computed for all spans at once
           3. Diff + cumsum  : interior pixel activity accumulated without loops
           4. searchsorted   : dominant-function color assigned to pixels in O(width)
@@ -1078,19 +1100,22 @@ class TimelineWidget(Widget):
         vis_start  = self._view_start + offset_ns
         vis_end    = vis_start + visible_ns
 
-        # ── 1. Spatial index ──────────────────────────────────────────────
-        starts  = self._starts_arr[lane_name]
-        max_dur = self._max_dur[lane_name]
-
-        lo = int(np.searchsorted(starts, vis_start - max_dur, side="left"))
-        hi = int(np.searchsorted(starts, vis_end,             side="right"))
-
-        if lo >= hi:
+        # ── 1. Visible window from the store ──────────────────────────────
+        data = self._lane_columns(lane_name, vis_start, vis_end, width)
+        if data[0] == "bins":
+            # Dense window: union occupancy per column from the activity
+            # index, drawn in the lane's category color.
+            occ = np.clip(data[1], 0.0, 1.0)
+            util_pct = float(occ.sum()) / width * 100.0
+            chars = ["█" if v > 0 else " " for v in occ.tolist()]
+            return chars, [lane_color or "white" if c != " " else "" for c in chars], util_pct
+        _kind, starts, ends, cidx = data
+        if not len(starts):
             return [" "] * width, [""] * width, 0.0
 
-        s_ns = self._starts_arr[lane_name][lo:hi].astype(np.float64)
-        e_ns = self._ends_arr[lane_name][lo:hi].astype(np.float64)
-        c_np = self._cidx_arr[lane_name][lo:hi]          # int32 palette indices
+        s_ns = starts.astype(np.float64)
+        e_ns = ends.astype(np.float64)
+        c_np = cidx                                       # int32 palette indices
 
         # ── 2. Pixel positions — all spans at once ────────────────────────
         scale = width * self.zoom / self._trace_dur
@@ -1226,7 +1251,7 @@ class TimelineWidget(Widget):
         lane_row = y - 2
         if lane_row < 0 or x < 0 or x >= width:
             self._hover = ""
-            self._hover_span_id = 0
+            self._hover_span_id = -1
             return
 
         visible_ns = self._trace_dur / self.zoom
@@ -1243,32 +1268,26 @@ class TimelineWidget(Widget):
         actual_lane = lo + lane_idx
         if actual_lane >= hi:
             self._hover = ""
-            self._hover_span_id = 0
+            self._hover_span_id = -1
             return
 
         lane_name   = self._lane_names[actual_lane]
-        sorted_spans = self._sorted_spans[lane_name]
-        if not sorted_spans:
+        if not self._lane_counts.get(lane_name):
             self._hover = ""
-            self._hover_span_id = 0
+            self._hover_span_id = -1
             return
 
         # Time position the mouse is pointing at (absolute trace time)
         cursor_abs = int(self._view_start + offset_ns + x * ns_per_px)
 
-        # Spatial index: narrow to spans that could contain cursor_abs
-        starts  = self._starts_arr[lane_name]
-        max_dur = self._max_dur[lane_name]
-        lo_s = int(np.searchsorted(starts, cursor_abs - max_dur, side="left"))
-        hi_s = int(np.searchsorted(starts, cursor_abs,           side="right"))
-        candidates = sorted_spans[lo_s:hi_s]
-
-        # Only show hover when cursor is inside a span's actual time range
+        # Indexed store query for the spans containing cursor_abs (end
+        # inclusive): start <= cursor and end > cursor - 1.
+        candidates = self._store.window(lane_name, cursor_abs - 1, cursor_abs, limit=4096)
         containing = [s for s in candidates
                       if s.start_ns <= cursor_abs <= s.end_ns]
         if not containing:
             self._hover = ""
-            self._hover_span_id = 0
+            self._hover_span_id = -1
             return
 
         # If multiple spans overlap here, prefer the shortest (most specific)
@@ -1278,17 +1297,17 @@ class TimelineWidget(Widget):
         cat   = self._parsed_lanes.get(lane_name, (lane_name.split("/")[0],))[0]
         hover = f"{span.name}  [{cat}]  @{start}  dur {dur}"
         if span.parent_span_id:
-            parent_name = self._sid_name.get(span.parent_span_id, span.parent_span_id[:8])
+            parent_name = self._parent_name(span.parent_span_id)
             hover += f"  ↑{parent_name}"
-        n_links = self._connector_count.get(id(span), 0)
+        n_links = self._connector_count.get(span.eid, 0)
         if n_links:
             hover += f"  ⇄{n_links}"
         self._hover = hover
-        self._hover_span_id = id(span)
+        self._hover_span_id = span.eid
 
     def on_leave(self, _event: Any) -> None:
         self._hover = ""
-        self._hover_span_id = 0
+        self._hover_span_id = -1
 
     def render(self) -> Any:  # noqa: ANN401
         UTIL_W = 6
@@ -1346,7 +1365,7 @@ class TimelineWidget(Widget):
         # than information. Hovering a specific send/recv or collective
         # call reveals just what that call was waiting on, on demand.
         canvas: BrailleCanvas | None = None
-        if self._connectors and lanes_drawn and self._hover_span_id:
+        if self._connectors and lanes_drawn and self._hover_span_id >= 0:
             lane_row: dict[str, int] = {name: i for i, name in enumerate(visible_lanes)}
             canvas = BrailleCanvas(cols=width, rows=lanes_drawn * 2)
             scale = width * self.zoom / self._trace_dur
@@ -1557,11 +1576,9 @@ class HotspotsWidget(Widget):
         bar_w     = 24
 
         # Build source-location lookup from annotated spans (file/line tags)
-        src_loc: dict[str, str] = {}
-        for s in self.trace.spans:
-            if s.name not in src_loc and s.tags.get("file"):
-                f = Path(s.tags["file"]).name
-                src_loc[s.name] = f"{f}:{s.tags.get('line', '?')}"
+        src_loc: dict[str, str] = {
+            name: f"{Path(s.tags['file']).name}:{s.tags.get('line', '?')}"
+            for name, s in self.trace.store.first_with_tag("file").items()}
 
         for row in stats:
             if flt and flt not in row["name"].lower():
@@ -1885,9 +1902,8 @@ class FlameGraphWidget(Widget):
     def __init__(self, trace: Trace, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.border_title = "Flame Graph"
-        from ..analysis.flamegraph_tree import build_flame_tree
-        spans = [s for s in trace.spans if s.duration_ns > 0]
-        self._tree = build_flame_tree(spans)
+        from ..analysis.flamegraph_tree import build_flame_tree_for
+        self._tree = build_flame_tree_for(trace)
 
     def compose(self) -> ComposeResult:
         yield Input(placeholder="  search (regex)…", id="fg-search")
@@ -1955,14 +1971,13 @@ class CallTreeWidget(Widget):
         tree: Tree = self.query_one("#ct-tree", Tree)  # type: ignore[type-arg]
         tree.clear()
         wall_ns = max(_trace_wall_ns(self._trace), 1)
-        spans = [s for s in self._trace.spans if s.duration_ns > 0]
-
-        if not spans:
+        from ..analysis.call_tree import build_call_tree
+        roots = build_call_tree(self._trace)
+        if not roots:
             tree.root.add_leaf("[dim]No duration spans captured.[/dim]")
             tree.root.expand()
             return
 
-        roots = _ct_build(spans)
         for node in roots:
             self._add_node(tree.root, node, wall_ns)
         tree.root.expand()
@@ -2168,7 +2183,7 @@ class DisasmWidget(Widget):
             # always-the-same "install objdump" tip was actively
             # misleading when the actual fix was "rebuild and re-capture".
             tag_info: tuple[str, str] | None = None
-            for s in self._trace.spans:
+            for s in self._trace.iter_spans():      # streamed; stops at the first match
                 if s.name != name:
                     continue
                 if s.tags.get("sym"):
@@ -2512,9 +2527,12 @@ class TopBar(Horizontal):
     def _right_text(self) -> Text:
         trace = self._trace
         parts: list[str] = []
+        # Every MPI span of one process reports that process's rank: probe
+        # each process's first MPI spans instead of scanning all of them.
         n_ranks = len({
-            s.tags.get("rank") for s in trace.spans
-            if s.category.value == "mpi" and s.tags.get("rank") is not None
+            s.tags.get("rank") for pid in trace.store.pids()
+            for s in itertools.islice(trace.iter_spans(pid=pid, categories=("mpi",)), 64)
+            if s.tags.get("rank") is not None
         })
         if n_ranks > 1:
             parts.append(f"{n_ranks} ranks")

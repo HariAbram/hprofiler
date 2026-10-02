@@ -95,17 +95,18 @@ def _wall_ns(trace: "Trace") -> int:
     # original run's start, making trace.duration_ns meaningless for a saved
     # trace (see the same fix/note in criticalpath.py's _wall_ns). Only
     # reachable here for a trace with no timed spans at all.
-    timed = [s for s in trace.spans if s.duration_ns > 0]
-    if not timed:
+    ext = trace.store.span_extent(timed_only=True)
+    if ext is None:
         return 1
-    lo = min(s.start_ns for s in timed)
-    hi = max(s.start_ns + s.duration_ns for s in timed)
-    return max(hi - lo, 1)
+    return max(ext[1] - ext[0], 1)
 
 
 # ── Load Balance / Communication Efficiency (exact) ────────────────────────────
 
-_DATA_MOVEMENT_TYPES = frozenset({"memcpy", "memcpy_async", "alloc", "free", "HtoD", "DtoH"})
+_DATA_MOVEMENT_TYPES = frozenset({"memcpy", "memcpy_async", "alloc", "free", "HtoD", "DtoH", "memset"})
+# CUDA/HIP host submission calls -- API overhead on the launching thread;
+# the device work they submit is its own span and is what counts.
+_SUBMISSION_TYPES = frozenset({"launch", "event_record", "stream_wait"})
 
 
 def useful_time_by_pid(trace: "Trace") -> dict[int, int]:
@@ -115,14 +116,27 @@ def useful_time_by_pid(trace: "Trace") -> dict[int, int]:
     "useful computation" is specifically non-communication, non-data-movement
     time, so counting a large H2D/D2H transfer as "useful" would inflate
     Load Balance / Communication Efficiency for transfer-heavy GPU codes."""
-    by_pid: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    for s in trace.spans:
-        if s.duration_ns <= 0 or s.category.value not in _USEFUL_CATS:
-            continue
-        if s.tags.get("type") in _DATA_MOVEMENT_TYPES:
-            continue
-        by_pid[s.pid].append((s.start_ns, s.start_ns + s.duration_ns))
-    return {pid: _merge_intervals(ivs) for pid, ivs in by_pid.items()}
+    # Streamed per process in start order from the store (O(1) state,
+    # intervals only), computed once per trace content.
+    from ..core.store.common import union_length
+    store = trace.store
+
+    def compute() -> dict[int, int]:
+        out: dict[int, int] = {}
+        excluded = _DATA_MOVEMENT_TYPES | _SUBMISSION_TYPES
+        for pid in store.pids():
+            seen = False
+
+            def intervals():
+                nonlocal seen
+                for iv in store.iter_intervals(pid=pid, categories=_USEFUL_CATS, exclude_types=excluded):
+                    seen = True
+                    yield iv
+            n = union_length(intervals())
+            if seen:
+                out[pid] = n
+        return out
+    return dict(store.memo("useful_time_by_pid", compute))
 
 
 def load_balance(useful_by_pid: dict[int, int]) -> float | None:
@@ -146,11 +160,8 @@ def comm_efficiency(useful_by_pid: dict[int, int], wall_ns: int) -> float | None
 def _comm_spans_with_bytes(trace: "Trace") -> list["SpanEvent"]:
     """mpi/nccl spans that carry a bytes= tag -- suitable for the
     alpha/beta size-vs-duration fit, which needs a size per point."""
-    out = []
-    for s in trace.spans:
-        if s.category.value in _COMM_CATS and s.duration_ns > 0 and "bytes" in s.tags:
-            out.append(s)
-    return out
+    return [s for s in trace.iter_spans(categories=_COMM_CATS)
+            if s.duration_ns > 0 and "bytes" in s.tags]
 
 
 def _all_comm_spans(trace: "Trace") -> list["SpanEvent"]:
@@ -173,9 +184,8 @@ def _all_comm_spans(trace: "Trace") -> list["SpanEvent"]:
     (PMPI's profiling-interface convention doesn't produce a wrapper span
     like this for any MPI call)."""
     return [
-        s for s in trace.spans
-        if s.category.value in _COMM_CATS and s.duration_ns > 0
-        and s.tags.get("type") != "group"
+        s for s in trace.iter_spans(categories=_COMM_CATS)
+        if s.duration_ns > 0 and s.tags.get("type") != "group"
     ]
 
 
@@ -277,7 +287,7 @@ def nccl_bus_bandwidth_gbs(trace: "Trace") -> float | None:
     """Achieved NCCL bus bandwidth using the standard ring-allreduce formula
     busBW = 2*(n-1)/n * bytes/time (same metric nccl-tests reports)."""
     samples = []
-    for s in trace.spans:
+    for s in trace.iter_spans(categories=("nccl",)):
         if s.category.value != "nccl" or s.duration_ns <= 0:
             continue
         if s.tags.get("type") != "allreduce":
@@ -341,7 +351,7 @@ def gpu_efficiency(trace: "Trace") -> float | None:
 
 def computational_scaling(trace: "Trace", baseline: "Trace") -> float | None:
     def _mean_ipc(t: "Trace") -> float | None:
-        vals = [c.value for c in t.counters if c.name == "ipc"]
+        vals = [c.value for c in t.iter_counters() if c.name == "ipc"]
         return sum(vals) / len(vals) if vals else None
 
     ipc_now = _mean_ipc(trace)
@@ -418,7 +428,7 @@ def analyze(
 
     report.gpu_efficiency = gpu_efficiency(trace)
     if report.gpu_efficiency is None and any(
-        s.category.value in ("cuda", "rocm") for s in trace.spans
+        True for _s in trace.iter_spans(categories=("cuda", "rocm"))
     ):
         report.notes.append(
             "gpu_efficiency requires disassembly data (record/view with --disasm) -- omitted."

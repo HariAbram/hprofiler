@@ -64,13 +64,16 @@ _SYNCHRONIZATION_TYPES = frozenset({
     "testany", "testsome", "cancel", "critical", "sync",
     "win_fence", "win_flush", "win_flush_all",
     "win_lock", "win_lock_all", "win_unlock", "win_unlock_all",
+    # CUPTI synchronization activity record (a host-side wait, reported
+    # by the native tracer; device-side lane, never host time).
+    "sync_wait",
 })
 
 # Host<->device (and SVM) byte-copy transfers -- pop_efficiency.py's
 # _DATA_MOVEMENT_TYPES minus alloc/free, which belong in Runtime overhead
 # below (allocation bookkeeping, not a data transfer).
 _MEMORY_TRANSFER_TYPES = frozenset({
-    "DtoH", "HtoD", "memcpy", "memcpy_async", "svm_memcpy",
+    "DtoH", "HtoD", "memcpy", "memcpy_async", "svm_memcpy", "memset",
 })
 
 # API/administrative bookkeeping around real work: memory management,
@@ -82,6 +85,10 @@ _OVERHEAD_TYPES = frozenset({
     "alloc", "alloc_async", "alloc_managed", "alloc_pinned",
     "free", "free_async", "free_pinned",
     "graph_launch", "jit_compile", "jit_load",
+    # CUDA/HIP host submission calls (kernel launch, async copy/memset,
+    # graph launch) and stream/event bookkeeping. The device work they
+    # submit is a separate side=gpu span.
+    "launch", "event_record", "stream_wait",
     "comm_init", "comm_init_all", "comm_destroy", "group", "task_create",
 })
 

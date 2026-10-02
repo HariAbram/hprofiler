@@ -127,7 +127,7 @@ class NodeTrace:
     label: str = ""   # e.g. hostname -- diagnostics only, not load-bearing
 
 
-def merge_traces(nodes: list[NodeTrace]) -> tuple["Trace", list[str]]:
+def merge_traces(nodes: list[NodeTrace], into: "Trace | None" = None) -> tuple["Trace", list[str]]:
     """Combines several per-node traces into one Trace on a common
     timeline -- see module docstring for the offset/pid-remapping/rank-
     tag-preservation rules. Returns (merged_trace, warnings); a node with
@@ -137,7 +137,11 @@ def merge_traces(nodes: list[NodeTrace]) -> tuple["Trace", list[str]]:
     missing measurement)."""
     from ..core.trace import Trace, TraceMetadata
 
-    merged = Trace(TraceMetadata(command="(multi-node merge)"))
+    # Streams every node's events into `into` (e.g. a disk-backed Trace),
+    # one event at a time -- no node is ever fully materialized.
+    merged = into if into is not None else Trace(TraceMetadata(command="(multi-node merge)"))
+    if into is not None:
+        merged.metadata.command = merged.metadata.command or "(multi-node merge)"
     warnings: list[str] = []
 
     for node_idx, node in enumerate(nodes):
@@ -149,18 +153,22 @@ def merge_traces(nodes: list[NodeTrace]) -> tuple["Trace", list[str]]:
                 f"are not meaningfully comparable to other nodes unless this node "
                 f"genuinely is the reference clock"
             )
-        for s in node.trace.spans:
+        for s in node.trace.iter_spans():
             merged.add(replace(s, pid=s.pid + pid_offset,
                                start_ns=s.start_ns + node.offset_ns,
                                tags={**s.tags, "node": str(node_idx)}))
-        for i in node.trace.instants:
+        for i in node.trace.iter_instants():
             merged.add(replace(i, pid=i.pid + pid_offset,
                                timestamp_ns=i.timestamp_ns + node.offset_ns,
                                tags={**i.tags, "node": str(node_idx)}))
-        for c in node.trace.counters:
+        for c in node.trace.iter_counters():
             merged.add(replace(c, pid=c.pid + pid_offset,
                                timestamp_ns=c.timestamp_ns + node.offset_ns))
 
+    merged.store.flush()
+    ext = merged.store.event_extent()
+    if ext is not None:
+        merged.metadata.start_time_ns, merged.metadata.end_time_ns = ext
     return merged, warnings
 
 
@@ -176,19 +184,24 @@ def validate_causality(trace: "Trace") -> list[str]:
     blame across the false ordering."""
     from ..analysis import criticalpath as cp
 
-    spans, preds = cp.build_dependency_graph(trace)
+    # Persisted/streamed edges; only the p2p edges' endpoint spans are
+    # fetched (one streaming pass over the MPI spans).
+    graph = cp.load_or_build_graph(trace)
+    edges = graph.edges[graph.edges["kind"] == cp.EDGE_KINDS.index("p2p")]
+    if not len(edges):
+        return []
+    needed = set(edges["dst"].tolist()) | set(edges["src"].tolist())
+    ends = graph.endpoints(needed, categories=("mpi",))
     problems: list[str] = []
-    for v, edges in preds.items():
-        for (u, kind, conf) in edges:
-            if kind != "p2p":
-                continue
-            send, recv = spans[u], spans[v]
-            if send.start_ns > recv.end_ns:
-                problems.append(
-                    f"causality violation ({conf} confidence match): send on "
-                    f"pid={send.pid} starts at {send.start_ns}ns, AFTER its "
-                    f"matched receive on pid={recv.pid} already ended at "
-                    f"{recv.end_ns}ns -- clock offset estimate is likely wrong "
-                    f"for one of these nodes"
-                )
+    for v, u, _kind_code, conf_code in edges.tolist():
+        conf = cp.EDGE_CONFS[conf_code]
+        send, recv = ends.get(u) or graph.spans[u], ends.get(v) or graph.spans[v]
+        if send.start_ns > recv.end_ns:
+            problems.append(
+                f"causality violation ({conf} confidence match): send on "
+                f"pid={send.pid} starts at {send.start_ns}ns, AFTER its "
+                f"matched receive on pid={recv.pid} already ended at "
+                f"{recv.end_ns}ns -- clock offset estimate is likely wrong "
+                f"for one of these nodes"
+            )
     return problems
