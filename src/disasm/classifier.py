@@ -136,15 +136,14 @@ _SASS_CTL  = re.compile(r'^(BRA|CAL|RET|EXIT|BRX|JCAL|SYNC|SSY|BREAK|PRET|LONGJM
 _SASS_FP_FMA = re.compile(r'^(FFMA|DFMA|HFMA|FMUL|FADD|FDIV|DMUL|DADD)\b')
 # Integer multiply/multiply-add: the dominant SASS idiom for 64-bit
 # global-memory address computation on Volta+, present in nearly every
-# kernel. These were previously lumped in with the FP ops above, silently
-# inflating est_flops (and therefore achieved_tflops / arithmetic_intensity
+# kernel. Kept separate from the FP ops above: counting them as FLOPs would
+# inflate est_flops (and therefore achieved_tflops / arithmetic_intensity
 # / the compute-vs-memory-bound verdict) for purely memory-bound kernels
 # with normal address arithmetic.
 _SASS_INT_MAD = re.compile(r'^(IMAD|IMUL|XMAD)\b')
 # Tensor-core matrix-multiply-accumulate: ONE instruction computes a whole
-# MxNxK tile (e.g. 16x8x16), not a single scalar op -- charging it the same
-# 2.0 FLOPs as a scalar FFMA (the previous behavior, via the same bucket as
-# the FP ops above) undercounted real tensor-core throughput by ~100x+.
+# MxNxK tile (e.g. 16x8x16), not a single scalar op -- charging it the 2.0
+# FLOPs of a scalar FFMA would undercount tensor-core throughput by ~100x+.
 _SASS_TENSOR = re.compile(r'^(HMMA|BMMA|IMMA|DMMA)\b')
 _SASS_SYNC = re.compile(r'^(BAR|MEMBAR|CCTL|DEPBAR|SETLMEMBASE)\b')
 
@@ -205,7 +204,7 @@ _PTX_FMA    = re.compile(r'^(fma|mad|mul|add|div)\b', re.I)
 # (mad.lo.s32 vs fma.rn.f32) rather than a different prefix like SASS, so
 # fma/mad/mul/add/div must be split by that suffix -- mad.lo.s32/s64 (very
 # common for PTX array-indexing arithmetic, the PTX equivalent of SASS
-# IMAD) was previously charged the same FLOPs as a real fma.rn.f32.
+# IMAD) must not be charged FLOPs like a real fma.rn.f32.
 _PTX_FP_TYPE  = re.compile(r'\.(f16|f32|f64|bf16)\b')
 _PTX_INT_TYPE = re.compile(r'\.(s8|s16|s32|s64|u8|u16|u32|u64|b8|b16|b32|b64)\b')
 

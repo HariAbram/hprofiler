@@ -97,11 +97,7 @@ def launch_gui(trace_path: str, verbose: bool = True, disasm: bool = False,
     `disasm`: forwarded to the GUI subprocess as `--disasm` so it starts
     background disassembly collection for any function whose call site
     resolved (sym=/lib= tag) but wasn't already disassembled in the trace
-    file -- mirrors `hprofiler view --disasm`'s TUI behavior. Previously
-    this flag existed on the `hprofiler gui`/`run --gui` CLI commands but
-    was silently dropped whenever the GUI actually launched (only used on
-    the TUI-fallback path), so `--disasm` had no effect on a working GUI
-    -- a real bug, not by design.
+    file -- mirrors `hprofiler view --disasm`'s TUI behavior.
 
     `compare_path`: a second trace JSON to load as the Compare tab's
     comparison run. Appended as `--compare <path>` BEFORE `--disasm`,

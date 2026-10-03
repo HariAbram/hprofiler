@@ -3,10 +3,9 @@ import Hprofiler 1.0
 import "../components"
 
 // GUI equivalent of the TUI's HotspotsWidget -- a sortable/filterable
-// function table built on the shared DataTable component (real Qt
-// model/view: Kernels.table is a TableBundle backed by a
-// QAbstractListModel + QSortFilterProxyModel, see src/gui/tablemodel.py),
-// not the hand-rolled JS sort/filter this screen used before this round.
+// function table built on the shared DataTable component (Kernels.table
+// is a TableBundle backed by a QAbstractListModel +
+// QSortFilterProxyModel, see src/gui/tablemodel.py).
 DataTable {
     id: root
     anchors.fill: parent

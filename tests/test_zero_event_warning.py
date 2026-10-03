@@ -5,17 +5,12 @@ backend, a much stronger signal than any one backend's own zero-event
 check that the hooks never connected to the collector socket at all for
 that run.
 
-A real user hit exactly this profiling GROMACS via `srun` (SLURM): the
-run completed normally (full GROMACS performance summary printed) but
-captured zero spans of any kind across both active backends (mpi,
-openmp), then the IDENTICAL command captured 60381 events on the very
-next invocation with no code change in between -- consistent with `srun`
-not propagating HPROFILER_SOCKET/LD_PRELOAD to the spawned job step on
-that particular invocation (a launcher/site environment-export issue,
-not a hprofiler hook race: every hook's ensure_connected() retries on
-every single emit call, so a transient "listener not ready yet" race
-would only lose the first few events, not literally all of them across a
-24-second run).
+Typical cause: a launcher (e.g. `srun`) not propagating HPROFILER_SOCKET/
+LD_PRELOAD to the spawned job step -- the run completes normally but no
+hook ever connects, while the identical command can capture tens of
+thousands of events on the next invocation. A hook's connection retries
+on every emit, so a transient "listener not ready" race would lose only
+the first few events, not all of them.
 """
 import sys
 import unittest

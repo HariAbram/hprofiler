@@ -5,11 +5,10 @@ import Hprofiler 1.0
 import "../components"
 
 // Mirrors the TUI's DashboardWidget (src/ui/app.py) -- same underlying
-// data (Dashboard context property, from src/gui/bridge.py's
-// DashboardBridge), different presentation. Wrapped in a ScrollView
-// (not a bare ColumnLayout like before the cross-tab-navigation round)
-// since the run-summary/breakdown/investigate-next sections added then
-// pushed the total content past a typical window's height.
+// data (the Dashboard singleton, src/gui/bridge.py's DashboardBridge),
+// different presentation. Wrapped in a ScrollView since the
+// run-summary/breakdown/investigate-next sections exceed a typical
+// window's height.
 ScrollView {
     id: root
     clip: true
@@ -60,6 +59,49 @@ ScrollView {
                             font.pixelSize: AppTheme.typeBody
                             elide: Text.ElideRight
                             width: Math.min(implicitWidth, 260)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Capture warnings (only when the trace is incomplete or partly
+        //    estimated: dropped/lost events, no final drain or GPU flush,
+        //    proxy device timing) ─────────────────────────────────────────
+        Panel {
+            id: warningsPanel
+            objectName: "captureWarningsPanel"
+            visible: Dashboard.captureWarnings.length > 0
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? warningsCol.implicitHeight + AppTheme.spacingMd * 2 +
+                                              AppTheme.typeTitle + AppTheme.spacingSm : 0
+            title: "Capture warnings"
+            Accessible.name: "Capture warnings"
+            Accessible.description: Dashboard.captureWarnings.join("\n")
+
+            Column {
+                id: warningsCol
+                width: parent.width
+                spacing: AppTheme.spacingXs
+
+                Repeater {
+                    model: Dashboard.captureWarnings
+                    delegate: Row {
+                        width: warningsCol.width
+                        spacing: AppTheme.spacingSm
+                        Text {
+                            id: warnMark
+                            text: "!"
+                            font.bold: true
+                            color: AppTheme.warningColor
+                            font.pixelSize: AppTheme.typeBody
+                        }
+                        Text {
+                            text: modelData
+                            color: AppTheme.text
+                            font.pixelSize: AppTheme.typeBody
+                            wrapMode: Text.Wrap
+                            width: warningsCol.width - warnMark.width - AppTheme.spacingSm
                         }
                     }
                 }

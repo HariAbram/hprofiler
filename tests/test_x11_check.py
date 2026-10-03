@@ -68,10 +68,9 @@ class TestCheckX11(unittest.TestCase):
         # sshd sets DISPLAY=localhost:N.0 and proxies X11 over a plain
         # TCP listener on 127.0.0.1:(6000+N) -- there is no
         # /tmp/.X11-unix/XN file at all, since no real X server is
-        # involved. Bug: _socket_reachable used to check ONLY the Unix
-        # socket for a "local" (host=None) display and never tried the
-        # TCP loopback fallback, so it reported a perfectly-working
-        # SSH-forwarded display as unreachable.
+        # involved. _socket_reachable must therefore try the TCP loopback
+        # fallback for a "local" (host=None) display, not only the Unix
+        # socket, or a working SSH-forwarded display reads as unreachable.
         num = 9876
         sock_path = f"/tmp/.X11-unix/X{num}"
         self.assertFalse(

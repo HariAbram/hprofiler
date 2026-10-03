@@ -1,303 +1,311 @@
-# hprofiler — Heterogeneous Profiler
+# hprofiler
 
-Multi-device CPU/GPU profiler for Linux. Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI simultaneously — with a terminal UI (and an optional native Qt GUI, see [GUI Viewer](#gui-viewer) below), a live Flame Graph tab and a native TUI roofline viewer, and cross-layer causal attribution: one dependency graph over every backend active in a run, with a confidence-graded, formally-computed critical path instead of a single-runtime or heuristic one (see [Cross-Layer Causal Attribution](#cross-layer-causal-attribution) below). CPU sampling is provided via Linux `perf`.
+A CPU/GPU profiler for Linux that records CUDA, ROCm/HIP, OpenCL, OpenMP,
+NCCL and MPI activity — plus `perf` CPU samples — from one run into one
+trace, and explains it: a cross-runtime critical path, POP-style efficiency
+metrics, and a structure-aware comparison of two runs. Traces open in a
+terminal UI, an optional Qt GUI, text reports, or Perfetto.
 
-## Requirements
+This README covers installation, a first run, the common workflows and how
+to read the output. [DOCUMENTATION.md](DOCUMENTATION.md) is the reference
+manual; `hprofiler <command> --help` gives exact option syntax.
 
-- Python 3.10+, CMake 3.16+, GCC/Clang
-- `pip install click textual rich numpy capstone` (or `pip install -r requirements.txt`)
-- Optional GUI: `pip install "hprofiler[gui]"` (PySide6) plus the system library `libxcb-cursor0` / `xcb-util-cursor` — see [DOCUMENTATION.md](DOCUMENTATION.md#requirements)
-- TUI roofline viewer: `pip install plotly "kaleido==0.2.1"` (0.2.1 specifically — later versions require Chrome and break on clusters); the Flame Graph tab needs neither
-- Optional, for device-measured GPU timing: CUPTI (CUDA toolkit) and ROCprofiler-SDK (ROCm ≥ 6.2) — headers at build time, libraries loaded at run time; without them GPU device timing falls back to event-based proxies
-- Backend-specific: CUDA toolkit, a `libamdhip64` (ROCm/HIP) runtime, LLVM `libomp` or GNU `libgomp`, an MPI implementation (`mpicc`, or a Cray Programming Environment `cc` wrapper), or `perf` — see [DOCUMENTATION.md](DOCUMENTATION.md#requirements) for exact search paths
+## 1. What it does
 
-## Build
+- **Captures** host API calls and device work for every backend active in a
+  run, through hook libraries injected with `LD_PRELOAD` (and the OpenMP
+  tools interface). No recompilation is needed; nothing is linked into
+  your program.
+- **Separates host from device time**: a CUDA/HIP launch is a host span on
+  the calling thread *and* a device span on its stream, with the device
+  span measured by CUPTI / ROCprofiler-SDK when available.
+- **Labels provenance**: every value is measured, a proxy, derived, or a
+  heuristic estimate, and every capture reports what it lost.
+- **Explains** the run: one dependency graph across all runtimes, each
+  edge graded by how directly the data proves it, and a formal
+  critical path with blame for idle time; POP-style efficiency; ranked
+  causes when comparing two runs.
+- **Scales**: events stream into an indexed on-disk store (`.hpstore`)
+  while the program runs; viewers read only the visible window.
+
+## 2. Install and requirements
+
+- Linux, Python ≥ 3.10, CMake ≥ 3.16, GCC or Clang.
+- Python packages: `pip install -r requirements.txt` (click, textual, rich,
+  capstone, numpy).
+- Optional GUI: `pip install "hprofiler[gui]"` (PySide6 ≥ 6.5) **and** the
+  system library `libxcb-cursor0` / `xcb-util-cursor`. Without them every
+  GUI command falls back to the terminal UI.
+- Optional roofline TUI: `pip install plotly "kaleido==0.2.1"` (exactly
+  0.2.1 — newer versions need Chrome).
+
+What each backend needs at run time:
+
+| Backend | Needs |
+|---|---|
+| `cpu` | `perf`, with `kernel.perf_event_paranoid` ≤ 1 |
+| `cuda` | NVIDIA driver; for device-measured timing, `libcupti` (CUDA toolkit) and CUPTI headers at build time |
+| `rocm` | `libamdhip64`; for device-measured timing, ROCprofiler-SDK (ROCm ≥ 6.2) |
+| `opencl` | any OpenCL ICD loader |
+| `openmp` | a program linked against LLVM `libomp` or GNU `libgomp` |
+| `nccl` | `libnccl` + the CUDA runtime |
+| `mpi` | an MPI implementation (`mpicc`, or a Cray PE `cc`) when building |
+| `likwid` | `likwid-perfctr` with PMU access |
+
+Exact search paths, remote-display (VNC) setup and troubleshooting are in
+[DOCUMENTATION.md → Installation](DOCUMENTATION.md#1-installation-and-build).
+
+## 3. Build
 
 ```bash
+cd hprofiler
 pip install -r requirements.txt
-python3 hprofiler build
+./hprofiler build        # compiles build/lib/libhprofiler_*.so with CMake
+./hprofiler backends     # shows which backends are usable on this machine
 ```
 
-Produces `build/lib/libhprofiler_{cuda,opencl,ompt,gomp,rocm,nccl,mpi}.so`.
+`hprofiler` runs from the repository without installation; the examples
+below call it as `hprofiler` (add the directory to your `PATH`, or use
+`./hprofiler`). The build picks up optional inputs automatically:
+libunwind (accurate `--call-tree` stacks), CUPTI and ROCprofiler-SDK
+headers (device-measured GPU timing), and MPI. Rebuild after pulling new
+hook code.
 
-## Quick Start
+## 4. Quick start and workflows
+
+Always put `--` between hprofiler's options and your program.
+
+### First run
 
 ```bash
-# Profile with auto-detected backends
-python3 hprofiler run -- ./my_program
-
-# Specific backends
-python3 hprofiler run --backend cuda,cpu      -- ./cuda_app
-python3 hprofiler run --backend openmp        -- ./omp_app     # LLVM libomp or GNU libgomp
-python3 hprofiler run --backend rocm          -- ./hip_app
-python3 hprofiler run --backend cuda,nccl     -- ./multi_gpu_app
-python3 hprofiler run --backend mpi           -- mpirun -np 4 ./mpi_app
-
-# Call tree (adds Call Tree tab; compile with -fno-omit-frame-pointer -rdynamic)
-python3 hprofiler run --call-tree --backend cuda -- ./app
-
-# Per-kernel disassembly (adds Source tab)
-python3 hprofiler run --backend cuda --disasm -- ./app
-
-# Instruction-level GPU heat map + stall annotation (CUDA, libcupti.so loaded at runtime)
-python3 hprofiler run --backend cuda --disasm --gpu-pc-sampling -- ./app
-
-# Instruction-level CPU heat (OpenCL CPU runtime via ACPP)
-ACPP_VISIBILITY_MASK=ocl python3 hprofiler run --backend opencl,cpu --disasm -- ./app
-
-# Save trace, skip TUI (writes trace.hpstore + trace.json)
-python3 hprofiler run --no-ui -o trace.json -- ./app
-
-# Very long run: indexed store only, no JSON export
-python3 hprofiler run --no-json -o big.hpstore -- ./app
-
-# Open a saved trace (a .hpstore, or JSON -- the store next to it is used)
-python3 hprofiler view trace.json
-
-# Text summary only
-python3 hprofiler summary trace.json
-
-# What changed between two runs, and why (text or --format json)
-python3 hprofiler compare before.json after.json
-
-# Native Qt GUI instead of the TUI (falls back to the TUI automatically
-# if PySide6/X11 aren't available — see GUI Viewer below)
-python3 hprofiler run --gui --backend cuda -- ./cuda_app
-python3 hprofiler gui trace.json
-
-# Flame graph — populates the Flame Graph tab in both the TUI and the GUI
-python3 hprofiler run --perf-callgraph dwarf -- ./my_program
-python3 hprofiler run --backend cuda --perf-callgraph dwarf --call-tree -- ./cuda_app  # + GPU API overhead
-
-# Roofline chart — opens TUI viewer by default (requires plotly + kaleido)
-python3 hprofiler roofline --backend cuda    -- ./cuda_app
-python3 hprofiler roofline --backend cpu     -- ./cpu_app
-python3 hprofiler roofline --backend rocm    -- ./hip_app
-python3 hprofiler roofline --html --backend cuda -- ./cuda_app  # write HTML + open browser
-
-# Hardware PMU counters via LIKWID
-HPROFILER_LIKWID_GROUP=MEM python3 hprofiler run --backend likwid -- ./app
-
-# List available backends on this machine
-python3 hprofiler backends
+hprofiler run -- ./app
 ```
 
-Always separate hprofiler options from the target program with `--`.
+This enables every available backend, runs `./app`, prints a summary and
+opens the terminal UI. The trace is saved as `app.hprofiler.hpstore` (the
+indexed store) and `app.hprofiler.json` (Chrome Trace JSON). If
+`likwid-perfctr` is installed but cannot access the PMUs, auto-detection
+still selects it and the program never starts — pass `--backend` explicitly
+in that case.
 
-## Backends
-
-| Name | Alias | Injection | What is traced |
-|------|-------|-----------|----------------|
-| `cpu` | `perf` | `perf record` subprocess | CPU samples, optional DWARF/fp/lbr call-graph |
-| `cuda` | — | LD_PRELOAD + CUPTI | Host API calls (launches, copies, memsets, syncs, events), device-measured kernels/copies/memsets via CUPTI, NVTX ranges, memory counters; statically linked runtimes via CUPTI callbacks |
-| `opencl` | `cl` | LD_PRELOAD | Kernel enqueues (host side) and device execution, buffer transfers, JIT compile time |
-| `openmp` | `omp` | `OMP_TOOL_LIBRARIES` (OMPT, LLVM `libomp`) and LD_PRELOAD (`GOMP_*`, GNU `libgomp`) | Parallel regions with each thread's share, loops, tasks, barriers, critical sections — whichever runtime the binary links is covered |
-| `rocm` | `hip` | LD_PRELOAD + ROCprofiler-SDK | Host API calls, device-measured kernel dispatches and copies via ROCprofiler-SDK, memory counters |
-| `nccl` | — | LD_PRELOAD | Collectives (AllReduce, Broadcast, …), point-to-point — GPU-accurate timing |
-| `mpi` | — | PMPI / LD_PRELOAD | Send/Recv, collectives, one-sided ops — wall-clock timing |
-| `likwid` | `hwc` | `likwid-perfctr` wrapper | Hardware PMU counters: FLOPS, DRAM bandwidth, cache rates, CPI |
-
-## TUI Viewer
-
-Opens automatically after `hprofiler run`. Tabs:
-
-| Tab | When shown | Contents |
-|-----|-----------|---------|
-| Overview | Always | Diagnosis, wall time, GPU active %, MPI/sync wait %, peak memory, top findings, hot kernels, source correlation |
-| Timeline | Always | Gantt view: per-thread lanes, per-stream CUDA/ROCm lanes, per-process lanes when processes share an id |
-| Kernels | Always | Filterable/sortable function table |
-| Call Tree | Only with `--call-tree` and/or `--perf-callgraph fp\|dwarf\|lbr` | Stack-frame tree from captured call graphs |
-| Flame Graph | Same condition as Call Tree | Proportional icicle chart of the same call-stack data — see [Flame Graph Tab Controls](#flame-graph-tab-controls) |
-| Roofline | Only when kernel metrics are available | Kernels on the device's roofline |
-| Source | With `--disasm`, or a saved trace that contains disassembly | Per-kernel assembly with instruction-type color coding, runtime heat % and stall columns (CPU via perf, CUDA via `--gpu-pc-sampling`), and static optimization hints |
-| System | Always | Device specs, FP16/32/64/Tensor TFLOP/s, bandwidth, IPC, LLC/branch miss rates, RSS |
-| Profile | Always | GPU activity %, time breakdown by category, top hotspots, bottleneck advisor |
-
-## GUI Viewer
-
-An optional native Qt/QML desktop GUI (`pip install "hprofiler[gui]"`) covering the same tabs as the TUI (including Flame Graph), plus GUI-specific additions: smooth wheel-zoom/drag-pan, filtering, grouping/collapsing, event search, and bookmarks/named ranges on the Timeline; real sortable/filterable/exportable tables (Kernels, System, Call Tree, Overview) instead of hand-rolled lists; a 10th **Compare** tab that explains what changed between two runs (structure-aware matching, ranked causal contributors, phase navigation, before/after critical paths, click-through to the Timeline and source; the `(category,name)` table is kept as a compatibility view; a disclosed noise-floor threshold — not a statistical test — decides improved/regressed); an idle-time overlay so a span blocked at a nested barrier/sync call visibly shows that within its own bar instead of looking continuously busy; and a 3-panel Source tab with instruction-mix/static-advisor analysis alongside the assembly.
+### Choosing backends
 
 ```bash
-hprofiler run --gui --backend cuda -- ./cuda_app
-hprofiler gui trace.hprofiler.json
-hprofiler run --gui --perf-callgraph dwarf -- ./app   # + populate the Flame Graph tab
-hprofiler gui after.hprofiler.json --compare before.hprofiler.json   # Compare tab (opened trace = candidate)
+hprofiler run --backend openmp -- ./omp_app        # LLVM libomp (OMPT) or GNU libgomp, detected automatically
+hprofiler run --backend cuda   -- ./cuda_app       # host API + device activity (CUPTI)
+hprofiler run --backend opencl -- ./ocl_app
+hprofiler run --backend rocm   -- ./hip_app        # not runnable on the development machine (no AMD GPU)
+hprofiler run --backend cuda,nccl -- ./multi_gpu_app   # not runnable on the development machine (no NCCL)
+OMP_NUM_THREADS=4 hprofiler run --backend mpi,openmp -o hybrid.json -- mpirun -np 2 ./hybrid
 ```
 
-- **Loading** happens on a background thread before the window opens, with stage and percentage progress in the terminal. **Ctrl+C cancels it** (exit code 130). A trace that can't be loaded gets a short, classified error message plus the path to the GUI log (`~/.local/share/hprofiler/hprofiler/hprofiler-gui.log`) instead of a traceback.
-- **File → Open Profile… (Ctrl+O)** opens another trace in a new GUI process; the current window stays usable and only closes once the new one is open. If opening fails, the current workspace is untouched and the error is shown with *Show technical details*, *Copy diagnostics* and *Open log* actions.
-- **Command palette (Ctrl+K)** — jump to a tab, run a command, or find a function/kernel by name. **F1** (Help → Keyboard Shortcuts) lists every shortcut.
-- Tabs without data show an explicit empty/unsupported state rather than a blank panel; icon-only controls have tooltips and accessible names; the Timeline has a dismissible first-use tip and a collapsible activity-colour legend.
-- Window geometry, theme, the legend state and dismissed tips persist (`~/.config/hprofiler/hprofiler.conf`). Timeline view state (filters, zoom, bookmarks) and table layouts are **not** restored yet. The profiled command line is never written to that file.
+Names: `cpu`, `cuda`, `opencl`, `rocm`, `openmp`, `nccl`, `mpi`, `likwid`
+(aliases `perf`, `cl`, `hip`, `omp`, `hwc`). For complete CUDA detail build
+your program with the shared runtime (`nvcc -cudart shared`); statically
+linked runtimes are recorded through CUPTI with less detail.
 
-Falls back to the TUI automatically — no error shown — if PySide6 isn't installed, X11 isn't reachable, or GPU-rendered Qt Quick fails over indirect/forwarded X11 (retried once with software rendering first). See [DOCUMENTATION.md](DOCUMENTATION.md) §20 for the full tab reference (Timeline exploration, Tables, Comparison mode, menus and shortcuts) and §2 for install/troubleshooting (including the `libxcb-cursor0` system-library requirement and a VNC fallback for machines where installing it isn't an option).
+### MPI jobs and launchers
 
-## Flame Graph Tab Controls
+Put the launcher after `--`, and name the output (the default name comes
+from the first word of the command — `mpirun.hprofiler.json`):
 
-Works in any terminal — plain character-cell rendering, no inline-image protocol required (unlike the roofline viewer below). Same controls in the GUI's Flame Graph tab, mouse-driven there too.
+```bash
+hprofiler run --backend mpi -o app.json -- mpirun -np 4 ./mpi_app
+hprofiler run --backend mpi -o gmx.json -- srun --export=ALL -n 4 gmx_mpi mdrun -s topol.tpr   # SLURM: not available on the development machine
+```
 
-| Action | TUI | GUI |
-|--------|-----|-----|
-| Zoom into a frame | Click | Click |
-| Zoom out one level | Right-click or Backspace | Right-click |
-| Reset to full view | Escape | Escape / Reset button |
-| Search — regex-highlight matching frames | Type in the search box | Type in the search box |
+Every rank must inherit `LD_PRELOAD`, `HPROFILER_SOCKET` and
+`OMP_TOOL_LIBRARIES`. MPICH/Hydra and Open MPI pass the environment to
+local ranks; otherwise use `mpirun -x LD_PRELOAD -x HPROFILER_SOCKET -x
+OMP_TOOL_LIBRARIES …` (Open MPI) or `srun --export=ALL` (SLURM). The
+collector only reaches ranks on its own node: for multi-node jobs, capture
+each node separately and merge:
 
-## Roofline TUI Controls
+```bash
+hprofiler merge-nodes node0.json node1.json -o merged.json
+```
 
-| Key | Action |
-|-----|--------|
-| `n` / `p` | Cycle through kernels (shows crosshairs with headroom annotation) |
-| Esc | Deselect kernel / hide crosshairs |
-| `+` / `=` | Zoom in |
-| `-` | Zoom out |
-| `←` `→` `↑` `↓` | Pan |
-| `r` | Reset zoom |
-| `w` | Open HTML version in browser |
-| `q` | Quit |
+A run that captures nothing at all prints a warning naming the launcher as
+the likely cause.
 
-## Output Files
+### Saving without the UI, reopening later
 
-| File | Viewer |
-|------|--------|
-| `<prog>.hprofiler.hpstore/` | Every hprofiler command (`view`, `gui`, `summary`, `critical-path`, …) |
-| `<prog>.hprofiler.json` | [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`, and every hprofiler command (skip with `--no-json`) |
-| `<prog>.roofline.html` | Any browser (self-contained) |
+```bash
+hprofiler run --backend openmp --no-ui -o run1.json -- ./app   # writes run1.hpstore + run1.json
+hprofiler run --backend openmp --no-ui --no-json -o big.hpstore -- ./app   # store only
+hprofiler view run1.hpstore        # terminal UI
+hprofiler gui  run1.hpstore        # Qt GUI (falls back to the terminal UI)
+hprofiler summary run1.json        # text report; a run's JSON opens its store
+```
 
-Events are written to the indexed trace store (`.hpstore`, SQLite) in bounded batches while the program runs, so memory does not grow with the trace. The viewers then read only the visible time window, plus aggregates precomputed when the run ends. Opening the JSON uses the store next to it; other large JSON files are imported into a cached store once. Both formats are lossless: span/request ids, real GPU thread ids, the profiling window, tags and stacks. Schema, versioning and measured scale (2M–5M spans) are in [DOCUMENTATION.md](DOCUMENTATION.md) §21.
+Every command accepts a `.hpstore` or any JSON hprofiler wrote; `--no-json`
+saves time and disk on very large captures.
 
-## How Time Is Attributed
+### Terminal UI and GUI
 
-The Overview/Profile time breakdowns, the one-line diagnosis ("openmp-bound", …) and "*f* dominates" findings count **exclusive** time: on each thread, every instant belongs to the innermost instrumented call covering it, so a barrier inside a parallel region counts once, as synchronization. GPU/device work is never counted against the thread that launched it; perf samples only count when their thread isn't inside an instrumented call; shares are relative to available thread-time (threads × wall), so a program that spends 2% of its run in MPI is not called "mpi-bound". The MPI/sync **wait %** is averaged per rank/thread (the old union across threads read ~80% for threads that waited ~38%). The Kernels/Hotspots tables still show inclusive per-function totals. Details: [DOCUMENTATION.md](DOCUMENTATION.md) §5 (Overview Tab).
+```bash
+hprofiler run --gui --backend cuda -- ./cuda_app   # open the GUI instead of the TUI after the run
+hprofiler gui run1.hpstore
+```
 
-## GPU Device Timing
+The TUI works over any SSH session: tabs are numbered (`1`–`9` jump),
+the Timeline zooms with `+`/`-` and scrolls with the arrow keys, and
+hovering an MPI/NCCL span draws its communication partners. The GUI adds
+Timeline filtering, grouping, search and bookmarks, sortable/exportable
+tables, a Compare tab, a command palette (Ctrl+K) and a shortcut list (F1).
+It runs in its own process and prints its rendering tier and load progress
+to the terminal; Ctrl+C cancels a load.
 
-CUDA and HIP work is recorded as two linked spans: the **host API call** (`cudaLaunchKernel`, `hipMemcpyAsync`, …, on its thread) and the **device work** it submitted (kernel, copy, memset, on its stream). Device spans come from CUPTI (CUDA) or ROCprofiler-SDK (ROCm) when available, and from the older GPU-event interception otherwise, labelled as a host-side proxy:
+### Comparing two runs
 
-| Quantity | With CUPTI / ROCprofiler-SDK | Without (proxy) |
-|---|---|---|
-| Host call start and duration | measured | measured |
-| Device start / end | measured on the GPU, mapped to the hooks' clock | start **estimated** (= submission time) |
-| Device execution time | measured | measured by GPU events (incl. event overhead) or unavailable (`proxy_host`) |
-| Queueing delay (`queue_ns`: call end → device start) | derived | unavailable |
+The first trace is the **baseline**, the second the **candidate**:
 
-Each device span carries its correlation id, device, context, stream/queue, operation type and timing source, plus `timing=` (`device`, `proxy_event`, `proxy_host`, `proxy_flush`). GPU-active time uses device-measured intervals when a trace has any and proxies otherwise, never both. When both observers see a launch, the measured span wins. The critical path links each call to its device work, orders work within streams, and connects every sync call to the work it actually waited for, including event syncs and cross-stream waits. Binaries with the static CUDA runtime, which LD_PRELOAD can't intercept, are now recorded through CUPTI. `HPROFILER_DEVICE_ACTIVITY=auto|off|both` selects the mode. `hprofiler summary` and the GUI Inspector say which source each number came from. CUDA was checked functionally on a real GPU (GeForce MX550). The ROCm path is compiled against the real ROCprofiler-SDK headers and tested with synthetic records, but has not run on an AMD GPU. Details: [DOCUMENTATION.md](DOCUMENTATION.md) §4 ("CUDA and ROCm: host calls, device work, and where each timestamp comes from") and §17.
+```bash
+hprofiler compare baseline.hpstore candidate.hpstore            # BEFORE = baseline, AFTER = candidate
+hprofiler compare baseline.json candidate.json --format json -o diff.json
+hprofiler gui candidate.hpstore --compare baseline.hpstore      # GUI: the opened trace is the candidate
+```
 
-## Measurement Accuracy
+Runs are aligned by structure (repeated phases, call paths, roles), each
+regression gets a cause (more work, more calls, queueing, synchronization,
+communication, lost overlap, a changed dependency, moving onto the critical
+path), and contributors are ranked by the critical-path time they account
+for. Changes must exceed a disclosed noise floor (5 % and 1 ms by default;
+`--min-pct`, `--min-ns`) — single runs carry no variance, so this is not a
+significance test.
 
-Validated against small ground-truth programs that log their own `CLOCK_MONOTONIC` timestamps (`tests/fixtures/*_truth.c`), 10 trials each on a laptop CPU:
+### Analyses
 
-| Workload | Slowdown of the program | Missing events | Start-time error (median / p95) |
+```bash
+hprofiler summary --top 10 run1.hpstore                    # hotspots, GPU activity, capture warnings
+hprofiler critical-path run1.hpstore                        # cross-runtime critical path and blame
+hprofiler critical-path run1.hpstore --export path.json     # spans tagged on_critical_path=1 for Perfetto
+hprofiler efficiency run1.hpstore                           # POP metrics: load balance, communication, …
+```
+
+**Call trees and flame graphs** (Call Tree and Flame Graph tabs):
+
+```bash
+hprofiler run --backend openmp --call-tree -- ./app        # stacks at every intercepted call; build with -fno-omit-frame-pointer -rdynamic
+hprofiler run --perf-callgraph dwarf -- ./app              # perf-sampled CPU stacks; needs perf access (not available on the development machine)
+```
+
+**Disassembly** (Source tab), including call sites of OpenMP and MPI
+events:
+
+```bash
+hprofiler run --backend openmp --disasm -o dis.json -- ./app
+hprofiler disasm dis.hpstore --list
+hprofiler disasm dis.hpstore -k omp_barrier
+```
+
+**Roofline:**
+
+```bash
+hprofiler roofline --backend cuda -- ./cuda_app     # hardware counters (ncu / rocprof / LIKWID / perf stat), re-runs the program
+hprofiler roofline --html cuda_dis.hpstore          # estimates from a trace recorded with --disasm; writes cuda_dis.roofline.html
+```
+
+On a machine without counter access the first form stops with the command
+that grants it.
+
+### Warnings, logs, dropped events and timing provenance
+
+hprofiler reports everything it lost or could only approximate — at the
+end of `run`, at the top of `summary`, and in the Overview of both UIs:
+
+```
+[hprofiler][warn] gomp hook, pid 1524292: 55389 dropped (ring full after waiting)
+[hprofiler][warn] CUDA pid 1555103: cupti unavailable (enable_kernel_activity_failed_14) -- device times are host-side proxies, not device measurements
+```
+
+- **Dropped events**: each hook counts records it dropped because a
+  thread's buffer stayed full or could not be delivered; raise
+  `HPROFILER_RING_KB` if you see drops.
+- **Timing provenance**: `hprofiler summary` states the source of GPU
+  activity (`timing source : device-measured (CUPTI / ROCprofiler-SDK)`, or
+  a proxy), and the GUI inspector shows it per span.
+- **Errors**: a damaged or truncated trace prints one line and exits with
+  status 2; `HPROFILER_DEBUG=1` shows the traceback. The GUI logs to
+  `~/.local/share/hprofiler/hprofiler/hprofiler-gui.log`.
+- hprofiler does not report your program's exit status — check its own
+  output if a run has fewer events than expected.
+
+## 5. Understanding the output
+
+| Output | What it is |
+|---|---|
+| `<name>.hpstore/` | Indexed SQLite trace store; what every command reads |
+| `<name>.json` | Chrome Trace JSON for [Perfetto](https://ui.perfetto.dev) (timestamps in µs); lossless, reopens in hprofiler |
+| summary on stdout | Events by category, hotspots, GPU timeline analysis, CPU counters, capture warnings |
+| `<name>.roofline.html` | Self-contained roofline chart |
+
+**Host vs. device.** For CUDA and ROCm, every launch, copy or memset is two
+spans: the API call on its CPU thread (`side=cpu`) and the work on the GPU
+(`side=gpu`), drawn on the stream's Timeline lane. Device time is never
+counted as CPU-thread time, and GPU-active time is computed from one timing
+source only.
+
+**Measured, proxy, derived.**
+
+| Kind | Example |
+|---|---|
+| measured | host call durations; device start/end from CUPTI or ROCprofiler-SDK |
+| proxy | GPU-event duration placed at the submission time (`timing=proxy_event`) when no native tracer is available |
+| derived | queueing delay = device start − host call end |
+| heuristic | phase alignment in `compare`; disassembly-based roofline estimates |
+
+**How time is attributed.** Breakdowns and the one-line diagnosis use
+*exclusive* time: each instant on a thread belongs to the innermost
+instrumented call, so a barrier inside a parallel region counts once, as
+synchronization. The Kernels table shows *inclusive* totals. The critical
+path labels each hop `certain`, `high` or `medium` by how directly it is
+proven.
+
+## 6. Backends and limitations
+
+| Backend | Attached via | Records | Verified on |
 |---|---|---|---|
-| OpenMP, LLVM libomp (OMPT) | +0.2 % … +1.1 % | 0 / 240 | 1.9 µs / 4.7 µs |
-| OpenMP, GNU libgomp | +0.08 % | 0 / 240 | 0.25 µs / 1.4 µs |
-| MPI (single rank) | +1.2 % | 0 / 240 | 0.22 µs / 1.7 µs |
-| OpenCL (Intel CPU device) | within noise | 0 / 50 | device kernel time matches `CL_PROFILING` exactly |
+| `cpu` | `perf record` | CPU samples, optional call graphs | parser only (perf blocked on the development machine) |
+| `cuda` | `LD_PRELOAD` + CUPTI | API calls, kernels/copies/memsets, NVTX, memory | a GeForce MX550 (functional checks) |
+| `rocm` | `LD_PRELOAD` + ROCprofiler-SDK | API calls, dispatches, copies | decoder tests only — never run on an AMD GPU |
+| `opencl` | `LD_PRELOAD` | enqueues, device execution, transfers, builds | Intel CPU OpenCL device, against ground truth |
+| `openmp` | OMPT + `GOMP_*` interposition | regions, per-thread work, loops, tasks, barriers, critical sections | ground truth for both runtimes; GROMACS on an HPC cluster |
+| `nccl` | `LD_PRELOAD` | collectives, send/recv, groups | not run |
+| `mpi` | `LD_PRELOAD` (PMPI) | point-to-point, requests, collectives, RMA sync, communicators | one process (multi-rank not available on the development machine) |
+| `likwid` | `likwid-perfctr` wrapper | PMU counter groups | not run |
 
-About 5 µs per intercepted call on call-bound loops; no events dropped at 200 000 MPI calls. GPU timing is covered in [GPU Device Timing](#gpu-device-timing): it was checked for correctness, not measured against vendor profilers. ROCm, NCCL, real multi-rank MPI and perf sampling could not be validated on the development machine. Known artifacts (e.g. proxy GPU device spans start at the host launch time) are listed in [DOCUMENTATION.md](DOCUMENTATION.md) §13 "Measured accuracy".
+Limitations to know before trusting a number (all of them, with
+workarounds, are in [Known limitations](DOCUMENTATION.md#known-limitations)):
 
-## OpenTelemetry Export
+- The collector is node-local; multi-node traces need per-node captures
+  and `merge-nodes`, whose clock alignment is unverified on real clusters.
+- Without CUPTI / ROCprofiler-SDK, GPU device spans are proxies that start
+  at the launch time.
+- NCCL wrappers wait for each operation to finish (serializing it with the
+  host), and NCCL timing has never run on real hardware.
+- NVTX v3 (header-only) ranges are not visible, and `schedule(static)`
+  loops under GNU libgomp get no loop span.
+- `--gpu-pc-sampling` disabled native device timing on the one GPU tested.
+- Roofline from a saved trace works only with `--html` at the moment;
+  `view`/`gui --disasm` do not add disassembly to a `.hpstore`.
 
-Export spans and metrics to any [OTLP](https://opentelemetry.io/docs/specs/otlp/)-compatible collector. No extra Python dependencies — uses stdlib only.
-
-```bash
-# Send live to a local collector (Grafana Alloy, otelcol, Jaeger ≥ 1.35, Tempo, …)
-python3 hprofiler run --backend cuda --otlp-endpoint http://localhost:4318 -- ./app
-
-# Write OTLP JSON to file (replay later with curl)
-python3 hprofiler run --backend cuda --otlp-file trace.otlp.json -- ./app
-
-# Export from a saved trace
-python3 hprofiler view --otlp-endpoint http://localhost:4318 app.hprofiler.json
-python3 hprofiler view --otlp-file trace.otlp.json app.hprofiler.json
-
-# Replay a saved OTLP file to a collector
-curl -X POST http://localhost:4318/v1/traces \
-     -H 'Content-Type: application/json' -d @trace.otlp.json
-```
-
-OTLP mapping: each `SpanEvent` becomes an OTLP span (all root-level, no parent inference); `CounterEvent` values (IPC, bandwidth, memory usage) become OTLP gauge metrics sent to `/v1/metrics`; hprofiler category, tags, PID, and TID become span attributes.
-
-## Disassembly
-
-Pass `--disasm` to collect post-run per-kernel disassembly (runs in background, TUI opens immediately):
-
-| Backend | Tool needed |
-|---------|-------------|
-| CUDA AoT | `cuobjdump` (CUDA toolkit) |
-| CUDA JIT (ACPP) | Built-in PTX parser |
-| ROCm | `llvm-objdump` (`apt install llvm`) |
-| CPU / OpenMP | `capstone` (`pip install capstone`) or `objdump` |
-| OpenCL JIT (ACPP SSCP generic) | `objdump` on the `.jit.so` emitted by ACPP SSCP |
-| OpenCL CPU (Intel CPU OCL) | `objdump` on x86-64 ELF extracted via `clGetProgramInfo` |
-
-## Cross-Layer Causal Attribution
-
-hprofiler's core contribution: for programs combining several backends at
-once (e.g. MPI+OpenMP+CUDA), it builds one dependency graph over every
-captured span — CUDA, ROCm, OpenCL, OpenMP, MPI, NCCL together, not a
-separate per-runtime trace to merge — using each programming model's real
-synchronization semantics (resolved MPI wildcard matching, real
-communicator identity, stream/device-sync ordering, OpenMP barriers), and
-finds the true critical path via a formal DAG longest-path computation,
-not a heuristic walk. Every edge in that graph is tagged with how directly
-the underlying data proves it (`certain`/`high`/`medium` — see
-[DOCUMENTATION.md](DOCUMENTATION.md) §17), so the result never presents a
-call-order guess with the same confidence as a hardware-enforced ordering.
+## 7. Testing and documentation
 
 ```bash
-# POP-style parallel efficiency breakdown (Load Balance, Communication
-# Efficiency, GPU/NCCL efficiency, ...) computed from a single trace
-python3 hprofiler efficiency trace.json
-
-# N-way cross-runtime critical path + blame attribution across every
-# backend active in the trace (generalizes CASITA/HPCToolkit-style
-# critical-path analysis beyond MPI+CUDA-only or CPU+GPU-only), with a
-# per-hop confidence breakdown
-python3 hprofiler critical-path trace.json
-
-# Multi-node: profile each node separately, then merge onto one timeline
-# before running critical-path/efficiency across node boundaries
-python3 hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
-python3 hprofiler critical-path merged.json
-```
-
-See [DOCUMENTATION.md](DOCUMENTATION.md) §16–19 for the exact formulas,
-edge-confidence model, formal critical-path algorithm, multi-node clock
-synchronization, and what's approximate vs. exact vs. still
-hardware-unverified on this development machine (documented honestly, not
-glossed over — see §13's Known Limitations table).
-
-## Tests
-
-```bash
-# Unit tests (~12 s)
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p 'test_*.py'
-
-# Integration tests: real programs through the real hooks (skipped when a
-# toolchain is missing). Not found by discovery -- run them by name.
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p 'test_*.py'   # unit tests
 python3 -m unittest tests.integration.test_profiling_accuracy \
     tests.integration.test_gomp_hook tests.integration.test_mpi_protocol \
-    tests.integration.test_mpi_rma tests.integration.test_gui_cancel \
-    tests.integration.test_native_gpu_records \
-    tests.integration.test_cuda_native_activity    # needs nvcc + a CUDA GPU
-python3 -m unittest tests.integration.test_store_stress    # 2M-span trace store: memory, latency (~1 min)
-bash tests/integration/run_matrix.sh                        # CLI end-to-end, per backend
-python3 tests/integration/accuracy_report.py --trials 10    # accuracy statistics
+    tests.integration.test_mpi_rma tests.integration.test_callsite_e2e \
+    tests.integration.test_gui_cancel tests.integration.test_native_gpu_records \
+    tests.integration.test_cuda_native_activity          # real programs through the hooks; skip without toolchains
+python3 -m unittest tests.integration.test_store_stress  # 2M-span trace store (~1 min)
+bash tests/integration/run_matrix.sh                      # CLI end to end, per backend
+python3 tests/integration/accuracy_report.py --trials 10  # repeated-trial accuracy statistics
 ```
 
-## Recent Changes
-
-- **Run comparison:** `hprofiler compare BEFORE AFTER` (text or JSON) and the GUI's Compare tab now match runs by structure instead of by function name: repeated phases are detected and aligned (inserted or removed iterations are tolerated), and work is matched by call path, source location, roles (rank, stream, device, communicator) and dependency neighbourhood. Each regression is attributed to increased work, more invocations, queueing, synchronization, communication, lost overlap, a changed dependency edge or a move onto the critical path. Waits are traced back to the work that caused them, contributors are ranked by critical-path impact, and every value is labeled measured, graph-derived, heuristic or unavailable. With low alignment confidence the comparison falls back to the old (category, name) view, which is also still shown. The Compare tab adds phase navigation, before/after critical paths, and "Show in Timeline" / "Open in Source" click-through. In the GUI, the opened trace is now the candidate and `--compare` names the baseline. See DOCUMENTATION.md §22.
-- **Large traces:** events now go into an on-disk, indexed trace store while the program runs, instead of being held in Python memory. The TUI and GUI timelines fetch only the visible time window; zoomed-out views are drawn from a precomputed activity index. Summaries, tables and the overview read store-side aggregates, and the critical path streams the trace and saves its dependency edges for reuse. In tests, a 5M-span trace was captured with +29 MB peak memory and window queries took 0.7 ms median. New `--no-json` option and `.hpstore` output; JSON export and older JSON files still work.
-- **Native GPU device activity:** CUPTI (CUDA) and ROCprofiler-SDK (ROCm) tracing, both loaded at run time. Host calls and device work are now separate spans linked by correlation ids. Measured device start times replace launch-time starts, and the queueing delay is reported. The critical path gains launch, stream-order and sync-wait edges, statically linked CUDA programs are recorded through CUPTI, and proxy timing is labelled as such and never mixed with measured intervals.
-- **Removed:** the LLM/AI performance analysis (`hprofiler analyze`, and `--analyze`/`--llm*`/`--analysis-report` on `run`) and `setup_llm.sh`.
-- **Trace files are now lossless** — span/request ids, real GPU thread ids, the profiling window, instant tags and counter units were previously dropped on save, so `critical-path` on a saved MPI trace lost every communication dependency, and "Total time" after reloading was the time since the file was opened.
-- **Consistent time accounting** (see [How Time Is Attributed](#how-time-is-attributed)): the same OpenMP program was previously diagnosed "sync-bound" under LLVM libomp and "openmp-bound" under GNU libgomp; the OMPT tool now also records each thread's share of a parallel region.
-- **Critical path** no longer breaks at nested spans (it explained only 28% of a busy OpenMP program's run time).
-- **Timeline** gives each process its own lane when processes share a stream or thread id (every MPI rank's default CUDA stream used to be drawn in one lane).
-- **Compare tab:** a comparison row can no longer be matched twice; changing thresholds updates every panel and the export; missing values show "—" instead of 0.
-- **GUI:** background loading with progress and Ctrl+C cancellation, classified errors with diagnostics and a log file, Open Profile in a new process, command palette, shortcuts reference, menus, first-use tip, collapsible legend, accessibility names, and persisted window/theme settings.
-- **Accuracy test suite** against ground-truth programs, with explicit tolerances (see [Measurement Accuracy](#measurement-accuracy)).
-
-See [DOCUMENTATION.md](DOCUMENTATION.md) for the full CLI reference, backend details, wire protocol, and how to extend the profiler.
+| Where | What |
+|---|---|
+| [DOCUMENTATION.md](DOCUMENTATION.md) | Reference: capture options and environment variables, backend timing semantics, every analysis, trace format and architecture, overhead, [verification status](DOCUMENTATION.md#verification-status), limitations, experimental validation |
+| `hprofiler <command> --help` | Exact command-line syntax |
+| [tests/README.md](tests/README.md) | Map of the test suite |

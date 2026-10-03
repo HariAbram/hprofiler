@@ -1,22 +1,17 @@
 """
 QObject bridges exposing Trace/analysis data to QML. Each bridge computes
-once at construction (a loaded trace never changes afterwards, same
-assumption the TUI's widgets already make) and exposes `constant=True`
-Properties -- no change notification machinery needed for data that's
-fixed for the lifetime of the window. SourceBridge is the one exception
-(see its own docstring): background disassembly collection can still be
-running when the window opens, so its kernel list needs real change
-notification, polled the same way the TUI's DisasmWidget does.
+once at construction (a loaded trace never changes afterwards, as the
+TUI's widgets also assume) and exposes `constant=True` Properties.
+SourceBridge is the exception (see its docstring): background disassembly
+collection can still be running when the window opens, so its kernel list
+needs change notification, polled like the TUI's DisasmWidget.
 
 Reuses analysis/dashboard.py (shared with the TUI's Overview tab) and the
-existing analysis modules directly -- this file's job is turning that
-data into QML-consumable shapes, not computing anything new. Kernels/
-Call Tree data is a small QVariantList here (aggregated by function name/
-call-tree node, not per-span -- even a trace with tens of thousands of
-spans typically aggregates to a few hundred distinct rows at most, well
-within what a plain list + QML-side sort/filter handles fine); see
-models.py for the Timeline's per-span data instead, which genuinely does
-need on-demand/viewport-culled fetching.
+analysis modules directly -- this file turns that data into
+QML-consumable shapes rather than computing anything new. Kernels/Call
+Tree data is aggregated by function name/call-tree node, not per span, so
+it stays a few hundred rows even for large traces; see models.py for the
+Timeline's per-span data, which needs viewport-culled fetching.
 """
 from __future__ import annotations
 
@@ -56,7 +51,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     wall_ns = dash.trace_wall_ns(trace)
     result: dict[str, Any] = {}
     # One exclusive-time pass shared by diagnosis, findings, wait % and
-    # the time breakdown (each used to redo it: 2.8x slower at 1M spans).
+    # the time breakdown (recomputing it per use is ~2.8x slower at 1M spans).
     et = trace.store.exclusive_aggregate()       # store-side, computed once
     findings = dash.top_findings(trace, et)
 
@@ -143,7 +138,7 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
         result["source_hot_line"] = -1
         result["source_lines"] = []
 
-    # ── Overview redesign: run summary, breakdown, "investigate next" ──
+    # ── Overview: run summary, breakdown, "investigate next" ──
     result["executable"] = meta.command
     result["host"] = meta.hostname or "—"
     result["backends"] = list(meta.backends_used or [])
@@ -152,6 +147,14 @@ def compute_dashboard_data(trace: Trace, dark: bool) -> dict[str, Any]:
     result["thread_count"] = len(trace.store.threads())
     result["profiling_duration"] = result["wall_time"]
     result["capture_time"] = meta.capture_time_iso
+    # Incomplete capture / degraded device tracing (dropped or lost events,
+    # a run that ended without its final drain or GPU flush, proxy device
+    # timing) -- the same list `hprofiler run` and `summary` print.
+    from ..core.receiver import run_warnings
+    try:
+        result["capture_warnings"] = run_warnings(meta)
+    except Exception as exc:          # never hide the Overview over this
+        result["capture_warnings"] = [f"capture health could not be evaluated: {exc!r}"]
 
     # Same merged-interval technique as waitPct/gpuActivePct above -- a
     # plain sum would double-count overlapping spans on different CPU
@@ -234,23 +237,18 @@ class DashboardBridge(QObject):
         super().__init__(parent)
         self._trace = trace
         self._theme = theme
-        # Optional, additive -- every existing caller passes nothing here
-        # and gets byte-identical behavior to before this parameter
-        # existed (asserted directly in tests, not just assumed). When
-        # given, `comparison` is a ComparisonBridge (already computed its
-        # own topImprovements/topRegressions; this bridge just surfaces
-        # them for Overview's "largest improvements/regressions" ranking
-        # instead of recomputing anything).
+        # Optional. When given, `comparison` is a ComparisonBridge whose
+        # topImprovements/topRegressions this bridge surfaces for Overview's
+        # "largest improvements/regressions" ranking; without it the
+        # Overview is unchanged (asserted in tests).
         self._comparison = comparison
         self._compute(precomputed)
 
     def _compute(self, precomputed: dict[str, Any] | None = None) -> None:
-        # `precomputed`: the async-loading worker already ran
-        # compute_dashboard_data() off-thread; every existing caller
-        # (including every test) still computes it right here instead,
-        # unchanged. Either way, every value lands on `self` via the same
-        # `_<key>` attribute-name convention the Property getters below
-        # already expect.
+        # `precomputed`: compute_dashboard_data() already run off-thread by
+        # the async-loading worker; when None it is computed here. Either
+        # way every value lands on `self` as `_<key>`, which the Property
+        # getters below read.
         data = precomputed if precomputed is not None else compute_dashboard_data(self._trace, self._theme.dark)
         for key, value in data.items():
             setattr(self, f"_{key}", value)
@@ -322,7 +320,7 @@ class DashboardBridge(QObject):
     def sourceLines(self) -> list[dict[str, Any]]:
         return self._source_lines
 
-    # ── Overview redesign: run summary, breakdown, "investigate next" ──────
+    # ── Overview: run summary, breakdown, "investigate next" ──────────────
     @Property(str, constant=True)
     def executable(self) -> str:
         return self._executable
@@ -360,6 +358,10 @@ class DashboardBridge(QObject):
         return self._cpu_util_pct
 
     @Property('QVariantList', constant=True)
+    def captureWarnings(self) -> list[str]:
+        return self._capture_warnings
+
+    @Property('QVariantList', constant=True)
     def timeBreakdown(self) -> list[dict[str, Any]]:
         return self._time_breakdown
 
@@ -387,8 +389,7 @@ class DashboardBridge(QObject):
     def comparisonTopChanges(self) -> list[dict[str, Any]]:
         """The largest improvements/regressions from Compare mode, for
         Overview's own ranking -- empty (not an error) when no comparison
-        trace is loaded, same "additive, no comparison" case
-        hasComparison covers."""
+        trace is loaded."""
         if not self.hasComparison:
             return []
         return list(self._comparison.topImprovements) + list(self._comparison.topRegressions)
@@ -396,10 +397,9 @@ class DashboardBridge(QObject):
 
 class KernelsBridge(QObject):
     """Backs the Kernels screen -- the GUI's equivalent of the TUI's
-    HotspotsWidget (src/ui/app.py). Sort/filter happen client-side in
-    QML over this one full list (aggregated by function name, so even a
-    trace with tens of thousands of spans is at most a few hundred rows
-    here -- no server-side pagination needed)."""
+    HotspotsWidget (src/ui/app.py). Rows are aggregated by function name,
+    so even a trace with tens of thousands of spans yields at most a few
+    hundred rows; sorting/filtering is done by the TableBundle proxy."""
 
     def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -503,20 +503,17 @@ def compute_call_tree_data(trace: Trace, dark: bool) -> list[dict[str, Any]]:
 class CallTreeBridge(QObject):
     """Backs the Call Tree screen. Reuses analysis/call_tree.py's _ct_build
     (stack-based when HPROFILER_CALLSTACK data is present, temporal-
-    containment fallback otherwise -- see that function's own docstring)
-    directly rather than re-deriving call-tree construction here; this
-    class's only job is reshaping _CTNode's dataclass tree into plain
-    nested dicts a QML recursive component can walk. Also used by the
-    TUI's CallTreeWidget (src/ui/app.py, via a re-export) -- extracted to
-    analysis/call_tree.py specifically so importing it here doesn't pull
-    in the whole Textual-based TUI module.
+    containment fallback otherwise -- see that function's docstring); this
+    class only reshapes _CTNode's dataclass tree into nested dicts a QML
+    recursive component can walk. call_tree.py is shared with the TUI's
+    CallTreeWidget and kept separate so importing it here doesn't pull in
+    the Textual-based TUI module.
 
-    Deliberately NOT rebuilt on DataTable/TableBundle -- flattening a call
-    TREE into a flat table would destroy the hierarchy that's the entire
-    point of it. `roots` is now live (filter/sort applied) instead of
-    `constant=True`; `allRoots` stays the permanently-unfiltered tree so
-    InspectorBridge's "appears in the call tree" relationship can never be
-    silently flipped to "unavailable" by an unrelated text filter here."""
+    Deliberately NOT built on DataTable/TableBundle -- flattening a call
+    TREE into a table would destroy the hierarchy. `roots` is live
+    (filter/sort applied); `allRoots` stays the unfiltered tree so
+    InspectorBridge's "appears in the call tree" relationship is never
+    flipped to "unavailable" by an unrelated text filter here."""
 
     rootsChanged = Signal()
 
@@ -593,15 +590,12 @@ class CallTreeBridge(QObject):
 
 def _flame_node_with_color(node: dict[str, Any], dark: bool) -> dict[str, Any]:
     """analysis/flamegraph_tree.py's build_flame_tree() already returns
-    the exact {name, value, category, children} shape the Flame Graph
-    screen needs -- this just adds a theme-resolved "color" field
-    (recursively), the same pattern _ct_node_to_dict above uses for Call
-    Tree, so the two tabs share one color language (category -> hex)
-    instead of the flame graph introducing its own separate per-function
-    hash-coloring scheme the way the now-removed standalone
-    `hprofiler flamegraph --gui` popup did in isolation. `dark: bool`,
-    not a Theme QObject -- see theme.py's category_color() docstring for
-    why (this runs on the async-loading worker thread)."""
+    the {name, value, category, children} shape the Flame Graph screen
+    needs -- this adds a theme-resolved "color" field (recursively), as
+    _ct_node_to_dict does for Call Tree, so both tabs share one
+    category -> hex color language. `dark: bool`, not a Theme QObject --
+    see theme.py's category_color() docstring for why (this runs on the
+    async-loading worker thread)."""
     return {
         "name": node["name"],
         "value": node["value"],
@@ -638,11 +632,9 @@ class FlameGraphBridge(QObject):
 
     @Property(int, constant=True)
     def totalNs(self) -> int:
-        """Inclusive nanoseconds at the tree's root -- NOT a raw sample
-        count (unlike the removed standalone popup's own totalSamples,
-        which counted perf-collected folded-stack samples directly; this
-        tree's "value" is real time, from build_flame_tree()'s reuse of
-        _ct_build's inclusive-time accumulation)."""
+        """Inclusive nanoseconds at the tree's root -- real time from
+        build_flame_tree()'s reuse of _ct_build's inclusive-time
+        accumulation, NOT a sample count."""
         return self._tree.get("value", 0)
 
 
@@ -748,10 +740,9 @@ _ITYPE_HEX = {
     "compute": "#60a5fa", "int_compute": "#3b82f6", "tensor": "#c084fc", "other": "#9ca3af",
 }
 
-# Fuller labels than the TUI's ITYPE_LABEL (classifier.py) -- that one is
-# terse (3 chars: "vsp", "mem", ...) to fit the TUI's narrow bar; this
-# panel has room for real words. Same instruction-type set as _ITYPE_HEX
-# (classifier.py's ITYPE_LABEL is missing int_compute/tensor entirely).
+# Fuller labels than the TUI's terse 3-char ITYPE_LABEL (classifier.py),
+# which also lacks int_compute/tensor. Same instruction-type set as
+# _ITYPE_HEX.
 _ITYPE_MIX_LABEL = {
     "vec_sp": "Vector (FP32)", "vec_dp": "Vector (FP64)", "vec_mem": "Vector load/store",
     "vector": "Vector (int/misc)", "scalar": "Scalar", "memory": "Memory",
@@ -767,23 +758,19 @@ _ITYPE_MIX_ORDER = [
 class SourceBridge(QObject):
     """Backs the Source screen -- the GUI's equivalent of the TUI's
     DisasmWidget (src/ui/app.py). Kernel list is small (one row per
-    profiled/disassembled function); each kernel's actual instruction
-    lines are fetched on demand via disasmLines() so a trace with many
-    disassembled kernels doesn't pay to reshape all of them upfront.
+    profiled/disassembled function); each kernel's instruction lines are
+    fetched on demand via disasmLines() so a trace with many disassembled
+    kernels doesn't pay to reshape all of them upfront.
 
     Unlike this file's other bridges, `kernels` is NOT a constant
     Property: `hprofiler gui --disasm` (or `run --gui --disasm`) starts
-    disassembly collection as a background thread (see
+    disassembly collection on a background thread (see
     output/chrome_trace.py's load_trace_from_json) that can still be
-    running when this window opens -- a real trace's disasm often isn't
-    fully resolved yet at load time. A constant snapshot from __init__
-    would permanently show "disassembly still failed" for any function
-    that resolves a few seconds later, which is exactly the bug a user
-    reported (disasm worked in the TUI -- which polls -- but never
-    appeared in the GUI, which didn't poll at all). Mirrors the TUI's
-    DisasmWidget._poll_disasm_ready: a 0.5s QTimer watches
-    trace._disasm_version (bumped by Trace.add_disasm) and rebuilds/
-    re-emits only when it actually changes."""
+    running when this window opens. A constant snapshot would permanently
+    show "disassembly failed" for any function that resolves a few seconds
+    later. Like the TUI's DisasmWidget._poll_disasm_ready, a 0.5s QTimer
+    watches trace._disasm_version (bumped by Trace.add_disasm) and
+    rebuilds/re-emits only when it changes."""
 
     kernelsChanged = Signal()
 
@@ -879,12 +866,11 @@ class SourceBridge(QObject):
 
     @Slot(str, result=str)
     def noDisasmReason(self, raw_name: str) -> str:
-        """Mirrors the TUI's smarter "No disassembly available" message
-        (src/ui/app.py's DisasmWidget._show_disasm): distinguishes a
-        genuinely-missing call-site tag (stale trace / unrebuilt hooks)
-        from a tag that resolved but disassembly still failed (missing
-        objdump/nm) -- see that method's own comment for why this
-        distinction matters (a real user report)."""
+        """Mirrors the TUI's "No disassembly available" message
+        (src/ui/app.py's DisasmWidget._show_disasm): distinguishes a missing
+        call-site tag (stale trace / unrebuilt hooks) from a tag that
+        resolved but whose disassembly failed (missing objdump/nm), since
+        the two need different fixes."""
         from ..core.store import SpanFilter
         for s in self._trace.iter_spans(filt=SpanFilter(names=frozenset({raw_name}))):
             if s.name != raw_name:
@@ -907,11 +893,8 @@ class SourceBridge(QObject):
     @Slot(str, result='QVariantList')
     def instructionMix(self, raw_name: str) -> list[dict[str, Any]]:
         """Instruction-type breakdown (vector/memory/scalar/control/...)
-        for the disassembled kernel -- the GUI's equivalent of the TUI's
-        DisasmWidget._show_mix. KernelDisasm.itype_counts() already
-        existed and was already used by the TUI; the GUI's Source screen
-        never called it at all, so this was blank-but-should-have-been-
-        computed, not a new metric being invented here."""
+        for the disassembled kernel, from KernelDisasm.itype_counts() --
+        the GUI's equivalent of the TUI's DisasmWidget._show_mix."""
         kd = self._trace.disasm.get(raw_name)
         if kd is None or not kd.lines:
             return []
@@ -934,13 +917,11 @@ class SourceBridge(QObject):
     @Slot(str, result='QVariantList')
     def advisorHints(self, raw_name: str) -> list[dict[str, Any]]:
         """Static-analysis hints for the disassembled kernel (missed
-        vectorization, register spills, memory-bound sections, ...) --
-        the GUI's equivalent of the TUI's DisasmWidget._show_hints.
-        analysis/asm_advisor.py already existed, already purely static
-        (no runtime data needed) and already used by the TUI; the GUI
-        never called it at all. No LLM/network call involved -- pure
-        pattern analysis of the instruction stream, same as the TUI,
-        so this works identically on an air-gapped HPC compute node."""
+        vectorization, register spills, memory-bound sections, ...) -- the
+        GUI's equivalent of the TUI's DisasmWidget._show_hints, via
+        analysis/asm_advisor.py. Pure pattern analysis of the instruction
+        stream (no runtime data, no network), so it works on an air-gapped
+        compute node."""
         kd = self._trace.disasm.get(raw_name)
         if kd is None or not kd.lines:
             return []
@@ -990,7 +971,11 @@ class SystemBridge(QObject):
                 "backend": dev.backend, "name": dev.name, "computeCap": dev.compute_cap,
                 "smCount": dev.sm_count, "clockGhz": dev.core_clock_ghz,
                 "peaks": "  ".join(peaks),
-                "bandwidth": f"{dev.bandwidth_gbs:.0f} GB/s" if dev.bandwidth_gbs else "",
+                # with where the number came from: computed from the driver's
+                # memory clock/bus width, a datasheet value, or a fallback
+                "bandwidth": (f"{dev.bandwidth_gbs:.0f} GB/s"
+                              + (f" ({dev.source_of('bandwidth_gbs')})" if dev.source_of("bandwidth_gbs") else ""))
+                             if dev.bandwidth_gbs else "",
                 "vram": f"{dev.vram_gb:.1f} GB" if dev.vram_gb > 0 else "",
                 "ridgeHint": ridge_hint,
             })
@@ -1004,9 +989,8 @@ class SystemBridge(QObject):
 
         self._device_table = TableBundle(self._devices, columns.DEVICE_COLUMNS, self)
 
-        # Field-shaped rows -- an absent PMU counter becomes an honest
-        # "unavailable" row instead of the old `visible: System.ipc > 0`-
-        # style silent disappearance (same style QML used to gate these).
+        # Field-shaped rows -- an absent PMU counter becomes an explicit
+        # "unavailable" row rather than a silently hidden one.
         no_perf_reason = "no PMU counters captured -- run with `perf` available, or --no-perf wasn't used"
         metric_rows = [
             {"label": "IPC", "value": f"{self._ipc:.2f}" if self._ipc > 0 else "",

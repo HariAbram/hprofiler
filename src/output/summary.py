@@ -35,6 +35,15 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
     print(f"  Backends    : {', '.join(meta.backends_used) or '(none)'}")
     print(f"  Total spans : {trace.span_count()}")
 
+    # What makes this trace incomplete or partly estimated -- up front, so
+    # nothing below is read as the whole story.
+    from ..core.receiver import run_warnings
+    _warnings = run_warnings(meta)
+    if _warnings:
+        print(f"\n  Capture warnings:")
+        for _w in _warnings:
+            print(f"    ! {_w}")
+
     # ── CPU microarch + memory stats from counter events ───────────────────
     ctrs: dict[str, float] = {}
     for c in trace.iter_counters():

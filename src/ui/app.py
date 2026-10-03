@@ -100,11 +100,8 @@ _CAT_RICH: dict[str, str] = {
 def _cat_color(cat: str) -> str:
     return _CAT_RICH.get(cat, "grey70")
 
-# Connector-line style per criticalpath.py edge confidence tier (see its
-# module docstring's "Edge confidence" section) -- lets a communication
-# line's own color signal how directly it's proven, the same distinction
-# `hprofiler critical-path`'s "Path evidence strength" breakdown surfaces
-# in the CLI, now visible directly in the live Timeline.
+# Connector-line style per critical-path edge confidence tier, so a line's
+# color shows how directly the dependency is proven.
 _CONNECTOR_STYLE: dict[str, str] = {
     "certain": "bold bright_white",
     "high":    "bold bright_cyan",
@@ -285,11 +282,9 @@ class SystemWidget(Static):
         if len(cmd) > 50: cmd = cmd[:47] + "…"
         _kv("Command", f"[cyan]{cmd}[/cyan]")
         _kv("Host",    f"[dim]{meta.hostname or '—'}[/dim]")
-        # _trace_wall_ns, not trace.duration_ns -- the latter is meaningless
-        # for a trace reconstructed by load_trace_from_json (see
-        # tests/README.md's "A real bug this test suite caught"); every
-        # other tab already derives wall time from the spans themselves,
-        # so this was the one remaining place that could disagree with them.
+        # _trace_wall_ns (from the spans), like every other tab -- not
+        # trace.duration_ns, which an old JSON without a profiling window
+        # cannot provide.
         _kv("Duration", f"[yellow]{_fmt_ns(_trace_wall_ns(trace))}[/yellow]")
         _kv("Backend",  "  ".join(
             f"[{_cat_color(b)}]{b}[/{_cat_color(b)}]"
@@ -317,7 +312,9 @@ class SystemWidget(Static):
                 _kv("Tensor peak", f"[cyan]{_fmt_tf(dev.tensor_tflops)}/s[/cyan]")
             L.append("")
             if dev.bandwidth_gbs:
-                _kv("Bandwidth", f"[bright_cyan]{dev.bandwidth_gbs:.0f} GB/s[/bright_cyan]")
+                src = dev.source_of("bandwidth_gbs")
+                _kv("Bandwidth", f"[bright_cyan]{dev.bandwidth_gbs:.0f} GB/s[/bright_cyan]"
+                                 + (f" [dim]({src})[/dim]" if src else ""))
             if dev.vram_gb > 0:
                 _kv("VRAM", f"[blue]{dev.vram_gb:.1f} GB[/blue]")
             if dev.ridge_point > 0:
@@ -450,9 +447,8 @@ class ProfileWidget(Static):
                          f"{ka.excluded_reason}[/dim]")
 
         # ── Time breakdown ────────────────────────────────────────────────
-        # Exclusive (innermost-span) time per category, same attribution
-        # as the GUI's breakdown -- raw sums counted nested spans (a
-        # barrier inside a parallel region) twice.
+        # Exclusive (innermost-span) time per category, as in the GUI: raw
+        # sums would count nested spans (a barrier in a region) twice.
         by_cat: dict[str, dict] = defaultdict(lambda: {"ns": 0, "n": 0})
         excl = trace.store.exclusive_aggregate()     # store-side
         for cat, ns in excl.totals(lambda pid, tid, cat, name, b, dev: cat).items():
@@ -515,10 +511,8 @@ class ProfileWidget(Static):
                 )
 
         # ── Insight ───────────────────────────────────────────────────────
-        # _bottleneck_analysis is defined further down in this module (see
-        # "Dashboard analysis helpers") and shared with DashboardWidget's
-        # "Top findings" panel -- no import needed, it's a module global by
-        # the time any widget actually renders.
+        # _bottleneck_analysis (analysis/dashboard.py) is shared with the
+        # Overview's "Top findings".
         try:
             ctrs_d = trace.counter_values()
             ctr_sub: dict[str, float] = {
@@ -553,13 +547,9 @@ class ProfileWidget(Static):
 
 # ── Dashboard analysis helpers ──────────────────────────────────────────────
 #
-# _bottleneck_analysis/_diagnose/_top_findings/_GPU_CATS live in
-# analysis/dashboard.py now (shared with the Qt/QML GUI) -- imported at
-# the top of this file under their original names for every existing
-# call site here to keep working unchanged. _diagnose's color is now a
-# UI-agnostic severity family ("red"/"yellow"/"green"/"cyan"); _TUI_SHADE
-# maps "green" to the brighter "bright_green" this tab always used for
-# its one happy-path case, so the Rich-rendered result is unchanged.
+# _bottleneck_analysis/_diagnose/_top_findings/_GPU_CATS come from
+# analysis/dashboard.py (shared with the GUI). _diagnose returns a severity
+# family; _TUI_SHADE maps it to the Rich color used here.
 _TUI_SHADE = {"green": "bright_green"}
 
 
@@ -606,6 +596,8 @@ class DashboardWidget(Widget):
 
     DEFAULT_CSS = """
     DashboardWidget { height: 1fr; }
+    #dash-warnings { height: auto; max-height: 8; border: round $warning; padding: 0 1;
+                     margin: 0 0 1 0; display: none; }
     #dash-stats { height: 5; margin: 0 0 1 0; }
     .stat-card {
         width: 1fr; height: 100%;
@@ -623,6 +615,7 @@ class DashboardWidget(Widget):
         self.trace = trace
 
     def compose(self) -> ComposeResult:
+        yield Static(id="dash-warnings")
         with Horizontal(id="dash-stats"):
             yield Static(id="stat-diag", classes="stat-card")
             yield Static(id="stat-wall", classes="stat-card")
@@ -642,6 +635,25 @@ class DashboardWidget(Widget):
         trace   = self.trace
         wall_ns = _trace_wall_ns(trace)
         meta    = trace.metadata
+
+        # Incomplete capture / degraded device tracing -- same list as
+        # `hprofiler run`, `summary` and the GUI Overview.
+        from ..core.receiver import run_warnings
+        try:
+            warnings = run_warnings(meta)
+        except Exception as exc:
+            warnings = [f"capture health could not be evaluated: {exc!r}"]
+        if warnings:
+            wpanel = self.query_one("#dash-warnings", Static)
+            wpanel.border_title = "Capture warnings"
+            wtext = Text()
+            for i, w in enumerate(warnings):
+                if i:
+                    wtext.append("\n")
+                wtext.append("! ", style="bold yellow")
+                wtext.append(w)
+            wpanel.update(wtext)
+            wpanel.display = True
 
         diag_label, diag_severity = _diagnose(trace)
         diag_color = _TUI_SHADE.get(diag_severity, diag_severity)
@@ -792,10 +804,8 @@ class TimelineWidget(Widget):
     view_y: reactive[int]   = reactive(0)
     zoom:   reactive[float] = reactive(1.0)
     _hover: reactive[str]   = reactive("")   # hover info shown in status bar
-    # Store event id (SpanEvent.eid) of the span under the cursor, or -1
-    # for none -- gates which connector lines render() actually draws (see
-    # _connectors): drawing every MPI/NCCL edge at once on a busy trace is
-    # a hairball, so only the hovered span's own edges are shown, on demand.
+    # Store event id of the span under the cursor (-1: none). Only the hovered
+    # span's connectors are drawn: all of them at once is unreadable.
     _hover_span_id: reactive[int] = reactive(-1)
 
     # label column: "omp  T12  (120)" = up to 17 chars
@@ -833,14 +843,8 @@ class TimelineWidget(Widget):
         })
         self._tid_seq: dict[tuple[int, int], int] = {k: i + 1 for i, k in enumerate(all_tids)}
 
-        # MPI lane -> that rank's own rank= tag value, when known -- "mpi
-        # rank2" reads far more meaningfully than a generic "mpi T3"
-        # sequential thread number, since rank is what a user actually
-        # thinks in terms of. Every span on one OS thread within one MPI
-        # process reports the same rank, so the first one found suffices
-        # (only the lane's first spans are probed). Falls back to the
-        # generic thread-sequence label (via _lane_label's existing logic)
-        # for any mpi lane where no span carries a rank= tag.
+        # MPI lane -> the rank= tag of its first spans ("mpi rank2" rather
+        # than a thread number); lanes without one keep the thread label.
         self._lane_rank: dict[str, str] = {}
         for lane_name in self._infos:
             if not lane_name.startswith("mpi/"):
@@ -872,6 +876,28 @@ class TimelineWidget(Widget):
 
         self._lane_names = sorted(self._infos.keys(), key=_sort_key)
 
+        # Thread lane -> the same thread's sync lane (barrier/lock waits),
+        # whose waits are drawn as idle on the thread lane: spans such as
+        # omp_parallel_region cover the waits too. Lanes get an @pid suffix
+        # only where a tid collides, so the two lanes of one thread may differ
+        # in that: exact (tid, pid) match first, else the only sync lane with
+        # that tid.
+        sync_by_thread: dict[tuple, str] = {}
+        sync_by_tid: dict[str, list[str]] = {}
+        for ln, (cat, kind, ident, pid) in self._parsed_lanes.items():
+            if cat == "sync" and kind == "thread":
+                sync_by_thread[(ident, pid)] = ln
+                sync_by_tid.setdefault(ident, []).append(ln)
+        self._wait_lane: dict[str, str] = {}
+        for ln, (cat, kind, ident, pid) in self._parsed_lanes.items():
+            if kind != "thread" or cat == "sync":
+                continue
+            pair = sync_by_thread.get((ident, pid))
+            if pair is None and len(sync_by_tid.get(ident, ())) == 1:
+                pair = sync_by_tid[ident][0]
+            if pair is not None:
+                self._wait_lane[ln] = pair
+
         # Anchor the visible window to timed spans only; CPU sample spans
         # (duration_ns=0) may use a different clock base (e.g. CLOCK_BOOTTIME
         # vs CLOCK_MONOTONIC on suspended machines) and would bloat the window.
@@ -883,26 +909,11 @@ class TimelineWidget(Widget):
             self._view_end   = trace.metadata.end_time_ns or self._view_start + 1
         self._trace_dur = max(self._view_end - self._view_start, 1)
 
-        # Per-function color map — stable hash-based assignment: the same
-        # function name gets the same color across DIFFERENT traces/runs,
-        # not just within one. The previous scheme assigned colors by
-        # first-seen (encounter) order, which depends on arbitrary thread-
-        # scheduling order and so gave the same function a different color
-        # from one run to the next -- bad for building muscle memory
-        # across repeated profiling sessions of the same program.
-        #
-        # A function's PREFERRED palette slot is crc32(name) % palette size
-        # (crc32, not Python's builtin hash() -- the latter is randomly
-        # salted per-process for strings by default, defeating the whole
-        # point of a stable assignment). If two distinct names in THIS
-        # trace prefer the same slot, the one that sorts later probes
-        # forward (open addressing) to the next free slot -- so up to
-        # len(_SPAN_PALETTE) distinct functions still always get visually
-        # distinct colors within one trace, matching the old guarantee;
-        # a name only shifts off its preferred slot when the palette is
-        # genuinely crowded (more distinct functions than colors), and
-        # which names collide (not WHETHER any do) is itself a
-        # deterministic function of the name set, not of render order.
+        # Per-function colors, stable across traces and runs: a name's
+        # preferred palette slot is crc32(name) % palette size (not hash(),
+        # which is salted per process). Names that prefer a taken slot probe
+        # forward in sorted order, so up to len(_SPAN_PALETTE) functions get
+        # distinct colors and the assignment depends only on the name set.
         distinct_names = sorted({r["name"] for r in store.aggregate_stats()})
         assigned: dict[str, int] = {}
         taken: set[int] = set()
@@ -924,37 +935,20 @@ class TimelineWidget(Widget):
         self._win_cache: dict[str, tuple] = {}
 
         # ── Cross-rank communication connectors (MPI/NCCL) ────────────────
-        # Reuses criticalpath.py's dependency-graph edges directly (resolved
-        # wildcard matching, commid=-scoped rendezvous, confidence tiers --
-        # see its module docstring) rather than re-deriving send/recv or
-        # collective-participant matching here. Computed once at
-        # construction -- TimelineWidget is built once per loaded/completed
-        # trace (see ProfilerApp.compose), not live-refreshed as new events
-        # stream in.
-        #
-        # Drawing EVERY connector simultaneously on a busy trace produces a
-        # hairball of overlapping lines -- render() only actually draws the
-        # ones touching the currently-hovered span (see _hover_span_id),
-        # so pred_span_id/succ_span_id (store event ids) are kept alongside
-        # the lane/time data specifically to make that O(1)-per-connector
-        # filter possible without re-walking the dependency graph on every
-        # mouse move.
+        # Taken from criticalpath.py's dependency edges (resolved wildcards,
+        # commid-scoped rendezvous, confidence tiers), computed once per
+        # widget. Only the hovered span's connectors are drawn, so each
+        # keeps its endpoint store ids for an O(1) filter.
         # (pred_lane, pred_mid_ns, succ_lane, succ_mid_ns, confidence, pred_span_id, succ_span_id)
         self._connectors: list[tuple[str, float, str, float, str, int, int]] = []
         try:
             self._connectors = self._build_connectors()
         except Exception:
-            # Connector lines are a display enhancement layered on an
-            # otherwise-independent, already-working Timeline -- a failure
-            # here (e.g. an unusual trace shape criticalpath.py doesn't
-            # handle) must not take down the whole tab. Falls back to no
-            # connectors, same as before this feature existed.
+            # Connectors are optional decoration: a failure here (an
+            # unusual trace shape) must not take down the Timeline.
             self._connectors = []
 
-        # span id -> how many connectors touch it, precomputed once so the
-        # hover-text "(N links)" hint (on_mouse_move) is an O(1) lookup
-        # instead of a linear scan of self._connectors on every pixel of
-        # mouse movement.
+        # span id -> number of connectors, for the hover hint.
         self._connector_count: dict[int, int] = defaultdict(int)
         for _pl, _pn, _sl, _sn, _conf, pred_sid, succ_sid in self._connectors:
             self._connector_count[pred_sid] += 1
@@ -1078,22 +1072,14 @@ class TimelineWidget(Widget):
                      lane_color: str) -> tuple[list[str], list[str], float]:
         """
         Return (per-column chars, per-column styles, visible-window
-        utilisation %) -- raw, not yet RLE-encoded into a Text; pass to
-        _row_from_columns (optionally after overlaying connector-line
-        characters onto specific columns) to get the final Text row.
+        utilisation %), not yet RLE-encoded, so connector characters can be
+        overlaid before _row_from_columns builds the Text row.
 
-        Fully vectorised — no Python loop over spans:
-          1. Store window   : only the spans overlapping the view (indexed
-                              query, cached per view); above SPAN_LIMIT the
-                              store's occupancy index instead
-          2. Numpy broadcast: pixel positions computed for all spans at once
-          3. Diff + cumsum  : interior pixel activity accumulated without loops
-          4. searchsorted   : dominant-function color assigned to pixels in O(width)
-
-        Renders each pixel as:
-          █  solid block colored by the function dominating that column
-             blank (unstyled space) for idle (no span coverage) -- quieter
-             than a visible dot, which read as noise on sparse traces
+        Vectorised, no Python loop over spans: the store window (indexed,
+        cached per view; above SPAN_LIMIT the occupancy index instead), numpy
+        pixel positions, diff + cumsum for interior coverage, searchsorted
+        for each column's dominant function. A covered column is a block in
+        that function's color; idle columns are blank.
         """
         visible_ns = self._trace_dur / self.zoom
         offset_ns  = self._trace_dur * self.view_x / (width * self.zoom)
@@ -1150,31 +1136,16 @@ class TimelineWidget(Widget):
             np.add.at(diff, ix1m,     -1.0)
             activity += np.cumsum(diff[:width])
 
-        # KNOWN LIMITATION: this accumulates per-pixel coverage as a SUM of
-        # each span's overlap fraction (scatter-add above), then clips to
-        # [0,1] -- not a true interval union. When two+ spans overlap the
-        # SAME sub-pixel time window on the same lane (e.g. OMPT's nested
-        # parallel-region + work/barrier spans on one thread, which share
-        # one `openmp/thread-TID` lane per Trace.lanes()) their fractions
-        # sum first and are clipped after, so a genuinely-partially-covered
-        # pixel can read as more covered than it truly is (only a sum that
-        # reaches >=1.0 gets corrected by the clip; a sum that overlaps but
-        # stays <1.0 does not). A fully correct fix needs real per-pixel
-        # interval-union math, which is a materially bigger rewrite of this
-        # vectorized routine (documented as a deliberately hand-tuned,
-        # performance-critical path -- ~8ms at 250k spans) than the size of
-        # this bug warrants; not attempted here to avoid risking a
-        # correctness or performance regression in exchange for a display
-        # metric that is only skewed under same-lane overlap, never crashes
-        # or produces a wildly wrong value (bounded to [0,1] either way).
+        # Known limitation: coverage is the SUM of overlap fractions, clipped
+        # to [0,1], not an interval union -- overlapping sub-pixel spans on
+        # one lane (nested OMPT spans) can read as more covered than they are.
+        # Bounded to [0,1]; a true union would cost this hot path more.
         np.clip(activity, 0.0, 1.0, out=activity)
         util_pct = float(activity.sum()) / width * 100.0
 
-        # Minimum visibility: sub-pixel spans contribute << 0.05 to activity
-        # and render as invisible dots.  Boost any pixel actually touched by a
-        # span to just above the IDLE threshold (0.05) so it always draws as a
-        # coloured block.  util_pct is computed before this expansion so it
-        # reflects the real GPU utilisation, not the inflated render width.
+        # Minimum visibility: a column touched by any span draws as a block
+        # even if its coverage is tiny. util_pct is computed before this, so
+        # it is not inflated.
         cov = np.zeros(width + 1, dtype=np.int32)
         np.add.at(cov, ix0, 1)
         np.add.at(cov, np.minimum(ix1 + 1, width), -1)
@@ -1191,15 +1162,8 @@ class TimelineWidget(Widget):
         dom_idx  = np.where(covered, c_np[sp_safe].astype(np.int32), -1)
 
         # ── Per-column char/style arrays ───────────────────────────────────
-        # Returned raw (not yet RLE-encoded into a Text) so a caller can
-        # overlay connector-line characters (see _ConnectorOverlay /
-        # TimelineWidget.render) onto specific columns before the final
-        # Text is built via _row_from_columns -- splicing arbitrary
-        # characters into an already-built Rich Text is awkward with its
-        # API, but overwriting entries in a plain list is trivial. width is
-        # terminal columns (rarely more than a few hundred), so this
-        # per-column Python loop is negligible next to the numpy work above
-        # over however many thousand spans are actually in view.
+        # Plain lists (callers overlay connector characters before the Text
+        # is built); width is terminal columns, so this loop is cheap.
         IDLE = 0.05
         chars:  list[str] = [" "] * width
         styles: list[str] = [""] * width
@@ -1210,6 +1174,27 @@ class TimelineWidget(Widget):
                 styles[i] = _SPAN_PALETTE[ci] if ci >= 0 else "white"
 
         return chars, styles, util_pct
+
+    def _activity_row(self, lane_name: str, width: int,
+                      lane_color: str) -> tuple[list[str], list[str], float, bool]:
+        """_density_row plus waiting: on a thread lane paired with the same
+        thread's sync lane (see _wait_lane), columns where the thread waits
+        (barrier/lock) are drawn as idle "░" instead of a solid block, and
+        the utilisation excludes that wait time -- waits are nested inside
+        spans such as omp_parallel_region, which otherwise make a waiting
+        thread read as continuously busy. Returns (chars, styles, util %,
+        any wait drawn)."""
+        chars, styles, util_pct = self._density_row(lane_name, width, lane_color)
+        wait_lane = self._wait_lane.get(lane_name)
+        if wait_lane is None:
+            return chars, styles, util_pct, False
+        wchars, _ws, wait_pct = self._density_row(wait_lane, width, "")
+        waited = False
+        for i, wc in enumerate(wchars):
+            if wc != " " and chars[i] != " ":
+                chars[i], styles[i] = "░", "grey50"
+                waited = True
+        return chars, styles, max(0.0, util_pct - wait_pct), waited
 
     @staticmethod
     def _row_from_columns(chars: list[str], styles: list[str]) -> Text:
@@ -1349,21 +1334,10 @@ class TimelineWidget(Widget):
         lanes_drawn   = len(visible_lanes)
 
         # ── Cross-rank communication connectors ───────────────────────────
-        # A Braille sub-cell canvas (src/ui/braille_canvas.py) covering
-        # exactly the visible lanes' 2 rows each x the content width.
-        # Endpoints outside the visible time window are clipped to the
-        # nearest edge (matching how _density_row already clips spans
-        # themselves) rather than hidden — a connector with one end
-        # scrolled off-screen still shows as a line running to that edge,
-        # which is more informative than vanishing entirely; a connector
-        # with BOTH ends off the same side is skipped since nothing about
-        # it would be visible anyway.
-        #
-        # Only the HOVERED span's own connectors are drawn, not every one
-        # at once — on a busy trace, rendering all of them simultaneously
-        # is a hairball of overlapping lines that reads as noise rather
-        # than information. Hovering a specific send/recv or collective
-        # call reveals just what that call was waiting on, on demand.
+        # Braille sub-cell canvas over the visible lanes (2 rows each). An
+        # endpoint outside the time window is clipped to the edge; a
+        # connector with both ends off the same side is skipped. Only the
+        # hovered span's connectors are drawn.
         canvas: BrailleCanvas | None = None
         if self._connectors and lanes_drawn and self._hover_span_id >= 0:
             lane_row: dict[str, int] = {name: i for i, name in enumerate(visible_lanes)}
@@ -1383,19 +1357,11 @@ class TimelineWidget(Widget):
                 pred_col = max(0.0, min(float(width), pred_col))
                 succ_col = max(0.0, min(float(width), succ_col))
                 style = _CONNECTOR_STYLE.get(confidence, "grey58")
-                # Elbow routing (vertical - horizontal - vertical), not a
-                # raw diagonal: a straight line from one lane's data row to
-                # another's sweeps across every column AND every
-                # intermediate row along the way, painting over whatever
-                # span data happens to be there. Routing the long
-                # horizontal traversal through the SOURCE lane's own
-                # spacer row (never a data row) means only the final short
-                # vertical drop/rise into the target actually crosses
-                # other lanes' content — as a single thin vertical line at
-                # one column, not a diagonal smear across the whole width.
-                # (row*8 = that lane's starting dot-row, 2 char rows x 4
-                # dots each; +2 = data row's own vertical center; +6 =
-                # its adjacent spacer row's center.)
+                # Elbow routing (vertical - horizontal - vertical): the long
+                # horizontal run uses the source lane's spacer row, so only a
+                # short vertical segment crosses other lanes' data rows.
+                # (row*8 = the lane's first dot-row, 2 char rows x 4 dots;
+                # +2 = its data row's center; +6 = its spacer row's center.)
                 pred_data_y   = pred_row * 8 + 2
                 pred_spacer_y = pred_row * 8 + 6
                 succ_data_y   = succ_row * 8 + 2
@@ -1404,13 +1370,15 @@ class TimelineWidget(Widget):
                 canvas.line(x0, pred_spacer_y, x1, pred_spacer_y, style=style)
                 canvas.line(x1, pred_spacer_y, x1, succ_data_y, style=style)
 
+        waits_shown = False
         for row_idx, lane_name in enumerate(visible_lanes):
             cat   = self._parsed_lanes.get(lane_name, (lane_name.split("/")[0],))[0]
             color = _cat_color(cat)
 
             # Data row
             out.append(f"{self._lane_label(lane_name)} ", style=f"bold {color}")
-            chars, styles, util_pct = self._density_row(lane_name, width, color)
+            chars, styles, util_pct, waited = self._activity_row(lane_name, width, color)
+            waits_shown = waits_shown or waited
             if canvas is not None:
                 self._apply_overlay(chars, styles, canvas, row_idx * 2, width)
             out.append(self._row_from_columns(chars, styles))
@@ -1420,10 +1388,8 @@ class TimelineWidget(Widget):
             out.append(f" {util_pct:4.0f}%", style=f"dim {util_col}")
             out.append("\n")
 
-            # Blank spacer row — gives visual breathing room between lanes,
-            # and (when a connector's routed path passes through it) now
-            # also carries the connector line's continuation between two
-            # non-adjacent lanes.
+            # Spacer row between lanes; also carries routed connector
+            # segments.
             if canvas is not None:
                 spacer_chars: list[str]  = [" "] * width
                 spacer_styles: list[str] = [""] * width
@@ -1453,6 +1419,8 @@ class TimelineWidget(Widget):
                 f"    [←→] scroll  [↑↓] pan  [+/-] zoom  [r] reset",
                 style="dim italic",
             )
+            if waits_shown:
+                out.append("   ░ = waiting (barrier/lock)", style="grey50")
         return out
 
     def action_scroll_right(self) -> None:
@@ -1525,10 +1493,7 @@ class HotspotsWidget(Widget):
     def compose(self) -> ComposeResult:
         yield Input(placeholder="  / filter by name…", id="hs-filter")
         yield DataTable(id="hs-table", cursor_type="row")
-        # NOTE: the literal brackets below must be escaped (\[) -- unescaped
-        # "[s]"/"[/]" collide with Rich markup (strikethrough-open /
-        # close-most-recent-tag), which silently struck through and
-        # truncated this exact hint text before this fix.
+        # Brackets must be escaped (\[): "[s]"/"[/]" are Rich markup.
         yield Static(
             "  [dim]\\[s] cycle sort   \\[/] filter   \\[j/k ↑↓] navigate[/dim]",
             id="hs-sort-hint",
@@ -1611,10 +1576,8 @@ class HotspotsWidget(Widget):
 # ── Roofline widget ───────────────────────────────────────────────────────────
 
 def _has_roofline_data(trace: Trace) -> bool:
-    """Cheap existence check used by ProfilerApp.compose() to decide
-    whether the Roofline tab is worth showing at all — mirrors the
-    trace._has_stacks / trace.disasm checks already used for the Call
-    Tree / Disasm tabs' own conditional visibility."""
+    """Whether the Roofline tab has anything to show (at least one kernel
+    with metrics), like the Call Tree / Source visibility checks."""
     try:
         from ..analysis.roofline import analyze_trace
         pts = analyze_trace(trace)
@@ -1625,13 +1588,10 @@ def _has_roofline_data(trace: Trace) -> bool:
 
 class RooflineWidget(Widget):
     """
-    Log-log roofline scatter — one dot per profiled GPU kernel — drawn with
-    the same Braille sub-cell canvas Timeline uses for its communication
-    connectors (src/ui/braille_canvas.py). Reuses analysis/roofline.py's
-    existing per-kernel arithmetic-intensity / achieved-TFLOP/s estimates
-    (hardware-counter based when available, disassembly-based estimate
-    otherwise — see KernelMetrics.data_source) rather than computing
-    anything new here; this widget's job is only to plot them.
+    Log-log roofline scatter, one dot per profiled GPU kernel, drawn with the
+    Braille canvas (src/ui/braille_canvas.py). Plots analysis/roofline.py's
+    per-kernel metrics (hardware counters when available, else disassembly
+    estimates -- KernelMetrics.data_source).
     """
 
     DEFAULT_CSS = """
@@ -1733,18 +1693,10 @@ class RooflineWidget(Widget):
 # ── Flame graph widget ────────────────────────────────────────────────────────
 
 class _FlameCanvas(Widget):
-    """The icicle-chart rendering surface for FlameGraphWidget -- split
-    out from it so this can implement render() directly (Textual calls
-    render() only after layout has settled, so self.size is reliable
-    there; the old dead FlameGraphWidget's replacement needed exactly
-    this, not an early .update() call from on_mount() before the
-    widget's real size is known). Root ("all") is pinned to the bottom
-    row; shallower trees get blank padding rows ABOVE the frames, not
-    below -- the same bottom-anchoring fix the GUI's own flame graph
-    needed (see FlameGraphWindow.qml's canvas.y binding) applies equally
-    here: without it, a shallow tree would render stuck at the TOP of
-    the widget with dead space below instead of the root sitting at the
-    bottom where "the ground" is expected to be."""
+    """Icicle-chart rendering surface for FlameGraphWidget. A separate widget
+    so it can draw in render(), where self.size is final. The root ("all") is
+    pinned to the bottom row: shallow trees get blank padding rows above the
+    frames, not below."""
 
     can_focus = True
 
@@ -1882,13 +1834,9 @@ class _FlameCanvas(Widget):
 
 class FlameGraphWidget(Widget):
     """
-    Proportional-width flame graph (icicle chart), root ("all") at the
-    bottom row, callees stacked upward -- built from
-    analysis/flamegraph_tree.py's build_flame_tree(), the SAME
-    underlying _ct_build tree the Call Tree tab uses (same data,
-    complementary rendering: indented list there, proportional icicle
-    here -- reuses rather than re-derives, so the two tabs can never
-    disagree about the call structure).
+    Proportional-width flame graph (icicle chart), root ("all") at the bottom
+    row, callees stacked upward. Built by analysis/flamegraph_tree.py from the
+    same _ct_build tree as the Call Tree tab, so the two always agree.
     Keys: click zoom in · right-click/backspace zoom out · esc reset
     """
 
@@ -1908,9 +1856,7 @@ class FlameGraphWidget(Widget):
     def compose(self) -> ComposeResult:
         yield Input(placeholder="  search (regex)…", id="fg-search")
         yield _FlameCanvas(self._tree, id="fg-canvas")
-        # NOTE: literal brackets must be escaped (\[) -- see HotspotsWidget's
-        # #hs-sort-hint for why an unescaped bracketed hint collides with
-        # Rich markup and silently vanishes from the rendered text.
+        # Brackets must be escaped (\[): bracketed hints are Rich markup.
         yield Static(
             "  [dim]click zoom in  ·  right-click/\\[backspace] zoom out  ·  \\[esc] reset[/dim]",
             id="fg-hint",
@@ -1923,10 +1869,8 @@ class FlameGraphWidget(Widget):
 
 # ── Call tree widget ─────────────────────────────────────────────────────────
 
-# Construction logic lives in analysis/call_tree.py (pure trace analysis, no
-# Textual dependency) so the GUI can reuse it without importing this whole
-# Textual-based module -- re-exported here under the original names so every
-# existing call site/test in this file keeps working unchanged.
+# Call-tree construction lives in analysis/call_tree.py (no Textual
+# dependency, shared with the GUI); re-exported under the original names.
 from ..analysis.call_tree import (  # noqa: E402
     _CTNode, _RawNode, _ct_build_raw, _ct_aggregate, _StackNode,
     _ct_build_from_stacks, _ct_build,
@@ -1954,11 +1898,7 @@ class CallTreeWidget(Widget):
 
     def compose(self) -> ComposeResult:
         yield Tree("Call Tree", id="ct-tree")
-        # NOTE: literal brackets must be escaped (\[) -- see HotspotsWidget's
-        # #hs-sort-hint for why an unescaped "[u]"/"[e]"/"[enter/space]"
-        # collides with Rich markup (u = underline shorthand; anything else
-        # bracketed is still consumed as an unrecognised style tag and
-        # silently vanishes from the rendered text either way).
+        # Brackets must be escaped (\[): "[u]"/"[e]" are Rich markup.
         yield Static(
             "  [dim]\\[↑↓] navigate  \\[enter/space] expand  \\[e] expand all  \\[u] collapse all[/dim]",
             id="ct-hint",
@@ -2015,17 +1955,10 @@ class CallTreeWidget(Widget):
 
 class DisasmWidget(Widget):
     """
-    Split-pane disassembly viewer.
-
-    Left  — kernel list (from profiled spans); ↑↓ to select.
-    Right — annotated assembly coloured by instruction type.
-    Bottom — instruction-mix bar (vector / scalar / memory / control).
-
-    Supports all backends:
-      cpu / opencl-cpu  x86-64 from .jit.so or the main binary
-      cuda (AoT)        SASS from cuobjdump
-      cuda (JIT)        cubin captured by the hook, disassembled with nvdisasm
-      rocm              AMDGCN from llvm-objdump
+    Split-pane disassembly viewer: kernel list (↑↓ to select), annotated
+    assembly colored by instruction type, instruction-mix bar. Covers CPU /
+    OpenCL-CPU (x86-64 from .jit.so or the binary), CUDA AoT (SASS via
+    cuobjdump), CUDA JIT (captured PTX/cubin), ROCm (AMDGCN via llvm-objdump).
     """
 
     DEFAULT_CSS = """
@@ -2172,16 +2105,10 @@ class DisasmWidget(Widget):
             msg = Text()
             msg.append(name, style="bold")
 
-            # Distinguish two very different failure points that both land
-            # here, so the message doesn't send someone chasing a missing
-            # objdump/cuobjdump install when the real issue is that no
-            # call-site symbol was ever captured for this event in the
-            # first place (e.g. a trace captured before the hooks were
-            # rebuilt with codeptr resolution, or a construct that
-            # genuinely doesn't resolve one yet -- point-to-point MPI,
-            # omp_critical_hold). A real user hit exactly this: the old,
-            # always-the-same "install objdump" tip was actively
-            # misleading when the actual fix was "rebuild and re-capture".
+            # Two different failures land here: no call-site symbol was
+            # captured for this event (e.g. a trace from hooks built without
+            # call-site resolution -- rebuild and re-capture), or a symbol was
+            # captured but disassembly failed (missing tools).
             tag_info: tuple[str, str] | None = None
             for s in self._trace.iter_spans():      # streamed; stops at the first match
                 if s.name != name:
@@ -2255,15 +2182,9 @@ class DisasmWidget(Widget):
             hdr.append(f"   {_fmt_ns(stat['total_ns'])}", style="yellow")
             hdr.append(f"  {stat['count']}×  {stat['pct']:.1f}%", style="dim")
         if kd.mangled_name:
-            # `name` (this row's label) is an event label hprofiler itself
-            # invents ("omp_barrier", "MPI_Bcast") -- there's no ELF symbol
-            # by that name. This is the real resolved call site that got
-            # disassembled: for an OpenMP/MPI event, the function in the
-            # PROFILED PROGRAM's own code that triggered it (never the
-            # runtime library's own implementation -- see
-            # hooks/common/codeptr_resolve.h). A real user asked "what does
-            # 'omp_barrier assembly' even mean" with no way to tell from
-            # this screen -- this answers it.
+            # Event labels ("omp_barrier", "MPI_Bcast") are not ELF symbols:
+            # show the resolved call-site function that was disassembled
+            # (the profiled program's code, not the runtime's).
             from ..analysis.dashboard import demangle as _demangle
             hdr.append(f"\ncall site: {_demangle(kd.mangled_name)}", style="cyan")
 
@@ -2494,13 +2415,9 @@ class DisasmWidget(Widget):
 
 class TopBar(Horizontal):
     """
-    Replaces Textual's default `Header()` (a generic app-title + clock bar
-    that doesn't carry any profiler-specific context). Left: app name +
-    command. Right: whatever run context actually applies to this trace
-    (rank count, device, wall time) -- fields that don't apply (e.g. no
-    MPI spans, no GPU device) are simply omitted rather than shown as a
-    fake "n/a", since a single-process CPU-only trace has no "rank" concept
-    to begin with.
+    Top bar replacing Textual's Header(): app name and command on the left,
+    the run context that applies to this trace (rank count, device, wall
+    time) on the right; inapplicable fields are omitted.
     """
 
     DEFAULT_CSS = """
@@ -2546,10 +2463,8 @@ class TopBar(Horizontal):
 
 class BottomBar(Static):
     """
-    Replaces Textual's default `Footer()` (reverse-video key chips) with a
-    plain "key  description" hint row. Text is swapped per active tab (see
-    ProfilerApp.on_tabbed_content_tab_activated / _TAB_HINTS) so the hints
-    shown are always ones that actually do something on the current tab.
+    Bottom bar replacing Textual's Footer(): plain "key  description" hints
+    for the active tab (_TAB_HINTS).
     """
 
     DEFAULT_CSS = "BottomBar { height: 1; background: $boost; padding: 0 1; }"
@@ -2611,12 +2526,8 @@ class ProfilerApp(App):
         Binding("5", "goto_tab(5)", "5", show=False),
         Binding("6", "goto_tab(6)", "6", show=False),
         Binding("7", "goto_tab(7)", "7", show=False),
-        # 8/9, not just up to 7: up to 3 conditional tabs (Call Tree,
-        # Flame Graph, Roofline) can now all be present alongside Source
-        # plus the 5 always-present ones, so as many as 9 tabs can exist
-        # at once -- 7 bindings already under-covered the pre-existing
-        # maximum of 8 (Call Tree+Roofline+Source all present together),
-        # a real pre-existing gap this just happened to make one worse.
+        # Up to 9 tabs can exist (5 fixed + Call Tree, Flame Graph,
+        # Roofline, Source).
         Binding("8", "goto_tab(8)", "8", show=False),
         Binding("9", "goto_tab(9)", "9", show=False),
     ]
@@ -2627,10 +2538,8 @@ class ProfilerApp(App):
         super().__init__(**kwargs)
         self.trace = trace
         self._collect_disasm = collect_disasm
-        # Populated by compose(), in display order -- lets action_goto_tab
-        # map digit keys to whichever tabs actually got composed (Call
-        # Tree/Roofline/Source are conditional), instead of hardcoding ids
-        # that could shift depending on what this trace contains.
+        # Tab ids in display order (filled by compose()), so digit keys map to
+        # the tabs this trace actually has.
         self._tab_ids: list[str] = []
 
     def compose(self) -> ComposeResult:
@@ -2656,12 +2565,8 @@ class ProfilerApp(App):
                     yield CallTreeWidget(self.trace)
                 self._tab_ids.append("tab-calltree")
 
-                # Same visibility condition as Call Tree -- deliberately:
-                # this tab shows the SAME underlying data (whatever spans
-                # carry stack_frames, from --perf-callgraph and/or
-                # --call-tree), just as a proportional icicle instead of
-                # an indented list, so the two should appear/disappear
-                # together, never one without the other.
+                # Same data and visibility as Call Tree (spans with
+                # stack_frames, from --perf-callgraph and/or --call-tree).
                 n += 1
                 with TabPane(f"{n} Flame Graph", id="tab-flamegraph"):
                     yield FlameGraphWidget(self.trace)
@@ -2736,8 +2641,5 @@ def launch_viewer(trace: Trace, collect_disasm: bool = False) -> None:
     ProfilerApp(trace, collect_disasm=collect_disasm).run()
 
 
-# Moved to output/chrome_trace.py (the read side of the format write()
-# there produces) so loading a trace doesn't require importing this whole
-# Textual-based module -- re-exported here so existing call sites/tests
-# using `from src.ui.app import load_trace_from_json` keep working.
+# Re-exported from output/chrome_trace.py for existing imports.
 from ..output.chrome_trace import load_trace_from_json  # noqa: E402

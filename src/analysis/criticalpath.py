@@ -62,22 +62,20 @@ a caller can see how much of it rests on strong vs. weaker evidence, not
 just accept a single number silently built on a mix of both.
 
 ── Formal critical path (DAG longest-path DP) ──────────────────────────────
-compute_critical_path replaces what was previously a greedy backward walk
-(at each step, picking the single locally-tightest predecessor and
-recursing) with a textbook dynamic program over the dependency DAG:
+compute_critical_path runs a dynamic program over the dependency DAG:
 `accounted[v] = max over causally-valid (u,v) of accounted[u] + gap + dur(v)`,
 computed in topological order, then reconstructed by tracing the argmax
 choices back from the node achieving the global maximum. This is provably
 optimal for "which chain of observed dependencies accounts for the most
 wall-clock time" (longest path in a DAG is solvable exactly in O(V+E) time,
-unlike general-graph longest path, which is NP-hard) -- the greedy walk's
-local "tightest gate" choice at each step is not guaranteed to reach the
-same node the DP proves is globally best when two predecessors compete. The
-DAG is acyclic by construction (every edge builder only ever points from an
-earlier-enabling event to a later-gated one), but the DP still verifies this
-via topological sort and falls back to the old greedy walk (robust to
-cycles by construction, via its `visited` set) with a report note if a
-cycle is ever detected -- defensive, not silently assumed.
+unlike general-graph longest path, which is NP-hard); a greedy backward
+walk picking the locally-tightest predecessor at each step is not
+guaranteed to reach the node the DP proves globally best when two
+predecessors compete. The DAG is acyclic by construction (every edge builder
+only points from an earlier-enabling event to a later-gated one), but the
+DP still verifies this via topological sort and, if a cycle is ever
+detected, falls back to that greedy walk (cycle-safe via its `visited` set)
+with a report note -- defensive, not silently assumed.
 """
 
 from __future__ import annotations
@@ -265,12 +263,12 @@ def _add_program_order_edges(preds: dict[int, list[tuple[int, str, str]]], spans
             continue
         by_thread[(s.pid, s.tid)].append(i)
     # Predecessor = the most recently COMPLETED span on the thread (latest
-    # end <= b.start; ties -> the outermost). Linking to the previous span
-    # by start time broke the chain at every nested span: a barrier inside
-    # a parallel region / implicit task has the ENCLOSING span as its
+    # end <= b.start; ties -> the outermost). Linking by start time instead
+    # would break the chain at every nested span: a barrier inside a
+    # parallel region / implicit task has the ENCLOSING span as its
     # start-order predecessor, whose end gate it can never satisfy, so the
-    # edge was dropped and nothing after it connected back -- on a
-    # continuously busy OpenMP program the path explained 28% of wall time.
+    # edge would be dropped and nothing after it would connect back (on a
+    # continuously busy OpenMP program, only ~28% of wall time explained).
     import heapq
     for key, idxs in by_thread.items():
         idxs.sort(key=lambda i: spans[i].start_ns)
@@ -553,22 +551,18 @@ def _add_mpi_p2p_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list
     precondition would silently miss the dependency entirely for the
     common "post an early receive, then block" pattern.
 
-    Two things this generalizes beyond the original version:
-      1. Non-blocking MPI_Isend/MPI_Irecv pairs, previously not connected
-         across ranks at all (only the same-rank Isend->Wait
-         "explicit_span_id" link existed, which says nothing about *when
-         the remote sender's data arrived* -- the actual reason a Wait
-         call takes as long as it does). The edge now lands on the
-         *completer* (Wait/Waitall/Waitany/Waitsome), not the Irecv call
-         itself, since the Irecv returns almost instantly and isn't what
-         blocks.
+    This covers:
+      1. Non-blocking MPI_Isend/MPI_Irecv pairs across ranks (the same-rank
+         Isend->Wait "explicit_span_id" link says nothing about *when the
+         remote sender's data arrived* -- the reason a Wait takes as long
+         as it does). The edge lands on the *completer*
+         (Wait/Waitall/Waitany/Waitsome), not the Irecv call itself,
+         since the Irecv returns almost instantly and isn't what blocks.
       2. Wildcard (MPI_ANY_SOURCE/MPI_ANY_TAG) receives, matched using the
          *resolved* real peer/tag from MPI_Status (mpi_hook.c resolves
-         this on every completion path) instead of being unmatchable or
-         matched against a meaningless sentinel value.
+         this on every completion path) rather than a sentinel value.
     Confidence is "high" when the match used resolved wildcard status data,
-    "medium" for ordinary exact-tag call-order matching (the same class of
-    evidence this module always had).
+    "medium" for ordinary exact-tag call-order matching.
     """
     sends: dict[tuple, list[int]] = defaultdict(list)
     for i, s in _items(spans):
@@ -659,14 +653,13 @@ def _add_rendezvous_edges(
     """Cluster collective calls into rendezvous groups per (type, commid)
     when a real communicator id is available (mpi_hook.c's MPI_Comm_dup/
     split/create bootstrap -- see its file header), falling back to
-    per-type-only clustering (the only option before that existed) when it
+    per-type-only clustering when it
     isn't (commid absent, or the sentinel -1 "unregistered": MPI_COMM_SELF
     or a communicator created via an API mpi_hook.c doesn't intercept).
-    NCCL has no equivalent identity mechanism yet, so it always uses the
+    NCCL has no equivalent identity mechanism, so it always uses the
     per-type-only fallback. commid-scoped clusters are "high" confidence
-    (a real, cross-rank-agreed identity backs the grouping, not just
-    overlapping timestamps of the same call type); unscoped ones stay
-    "medium", same as before this mechanism existed.
+    (a cross-rank-agreed identity backs the grouping, not just overlapping
+    timestamps of the same call type); unscoped ones are "medium".
     """
     by_type: dict[tuple[str, str | None], list[tuple[int, int, int]]] = defaultdict(list)
     for i, s in _items(spans):
@@ -748,8 +741,8 @@ def _effective_end_ns(s: "SpanEvent") -> int:
 
 
 def _edge_gap_and_gate(spans: list["SpanEvent"], u: int, v: int, kind: str) -> tuple[int, int, int]:
-    """Returns (gate, limit, gap): gate<=limit is the causality condition
-    (same check the old greedy walk used); gap is the idle time between u
+    """Returns (gate, limit, gap): gate<=limit is the causality condition;
+    gap is the idle time between u
     and v this edge implies should be credited to the path (0 for
     START_GATED/rendezvous edges, since the wait is already inside v's own
     duration -- see the module docstring).

@@ -8,8 +8,7 @@ re-deriving matching logic in the UI layer.
 
 Uses Textual's headless run_test() harness (App.run_test()) since
 TimelineWidget.render() reads self.size, which is only meaningfully set
-inside a mounted widget context -- this project's first UI-level test,
-previously everything exercised only the analysis/hook layers directly.
+inside a mounted widget context.
 """
 import sys
 import time
@@ -120,10 +119,9 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
                               "expected connector overlay characters once an endpoint is hovered")
 
     async def test_connectors_present_but_nothing_hovered_renders_no_braille(self):
-        # The headline change from the raw always-on version: connectors
-        # existing is no longer sufficient to draw them -- a span must
-        # actually be hovered, to avoid a hairball of every edge at once
-        # on a busy trace.
+        # Connectors existing is not sufficient to draw them -- a span must
+        # be hovered, to avoid a hairball of every edge at once on a busy
+        # trace.
         send = _span(100, 101, Category.MPI, 1_000_000, 50_000, "MPI_Send",
                      tags={"type": "send", "rank": "0", "peer": "1", "tag": "7"})
         recv = _span(200, 201, Category.MPI, 1_100_000, 80_000, "MPI_Recv",
@@ -151,8 +149,7 @@ class TestConnectorRendering(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_connectors_means_no_braille_chars_rendered(self):
         # Regression guard: a trace with nothing to connect must render
-        # IDENTICALLY to how TimelineWidget behaved before this feature
-        # existed -- zero Braille characters anywhere in the output.
+        # with zero Braille characters anywhere in the output.
         a = _span(1, 101, Category.CPU, 0, 100, "work")
         app = _HarnessApp(_mk_trace([a]))
         async with app.run_test(size=(120, 30)):

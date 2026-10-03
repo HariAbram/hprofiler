@@ -1,6 +1,6 @@
 """
 Tests for src/gui/models.py's TimelineModel -- the Timeline screen's data
-layer (Phase 4). Skipped if PySide6 isn't installed. See
+layer. Skipped if PySide6 isn't installed. See
 tests/test_gui_bridge.py's docstring for why these run headless/offscreen.
 """
 import os
@@ -82,16 +82,12 @@ class TestTimelineModel(unittest.TestCase):
         self.assertEqual(m.visibleSpans(-1, 0, 1000, 100), [])
 
     def test_visible_spans_lo_bound_uses_per_span_duration_not_lane_span(self):
-        # Regression test for a real bug: _max_dur used to be the lane's
-        # FULL first-to-last time range (ends.max()-starts.min()), not the
-        # longest INDIVIDUAL span's own duration -- so searchsorted's
-        # look-back margin was wildly oversized for any lane whose spans
-        # spread across most of the trace, pinning `lo` near index 0
-        # regardless of how far into the trace the query window actually
-        # was. One long early span (duration 1000) followed by a cluster
+        # The searchsorted look-back margin must be the longest INDIVIDUAL
+        # span's duration, not the lane's full first-to-last time range
+        # (which would pin `lo` near index 0 for any lane spread across the
+        # trace). One long early span (duration 1000) followed by a cluster
         # of short spans far later -- querying a window that starts well
-        # after the early span's TRUE end (but still within the old,
-        # bogus, whole-lane-range look-back) must not resurrect it.
+        # after the early span's TRUE end must not resurrect it.
         early = _span(1, 1, Category.OPENMP, 0, 1000, "early_long_span")
         late = [_span(1, 1, Category.OPENMP, 10_000_000 + i * 100, 50, f"late{i}")
                 for i in range(5)]
@@ -198,8 +194,7 @@ class TestTimelineModel(unittest.TestCase):
         self.assertEqual(result["nodes"], [])
         self.assertEqual(result["edges"], [])
 
-    # ── rows (table/timeline-upgrade round: the visual row list that
-    #    replaces `lanes` in TimelineScreen.qml's ListView) ──────────────
+    # ── rows (the visual row list TimelineScreen.qml's ListView iterates) ──
 
     def test_rows_is_1_to_1_with_lanes_before_any_filter_or_grouping(self):
         spans = [_span(1, i, Category.CPU, 0, 100, f"fn{i}") for i in range(1, 5)]
@@ -226,9 +221,8 @@ class TestTimelineModel(unittest.TestCase):
 
     def test_many_lanes_scale_without_error(self):
         # 60 lanes -- far more than a typical viewport shows at once
-        # (the row-virtualization case a plain Repeater-per-lane would
-        # have instantiated eagerly and unconditionally before this
-        # round). Just confirms the model scales cleanly; the QML-side
+        # (the row-virtualization case). Just confirms the model scales
+        # cleanly; the QML-side
         # ListView delegate recycling itself is verified via the real
         # shared-engine interaction test in test_gui_timeline_hover.py
         # (Repeater/ListView-created delegates aren't reliably reachable
@@ -241,7 +235,7 @@ class TestTimelineModel(unittest.TestCase):
         self.assertEqual(len(m.rows), 60)
         self.assertEqual(len({r["laneIndex"] for r in m.rows}), 60)
 
-    # ── Filtering (Phase B2) ─────────────────────────────────────────
+    # ── Filtering ──────────────────────────────────────────────────────
 
     def _filter_trace(self):
         # Two MPI ranks (each its own lane), one CUDA stream lane, and a
@@ -392,15 +386,15 @@ class TestTimelineModel(unittest.TestCase):
     def test_apply_filters_never_renumbers_lanes(self):
         # Regression guard: filtering must never change laneIndex
         # addressing -- spanAt/findByName/visibleSpans all key off the
-        # ORIGINAL lane index, and Round 16's cross-tab nav depends on
-        # that staying stable regardless of filter state.
+        # ORIGINAL lane index, and cross-tab navigation depends on that
+        # staying stable regardless of filter state.
         m = self._model(self._filter_trace())
         before = {l["name"]: i for i, l in enumerate(m.lanes)}
         m.applyFilters({"ranks": ["0"]})
         for r in m.rows:
             self.assertEqual(before[r["name"]], r["laneIndex"])
 
-    # ── Grouping / collapse (Phase B3) ──────────────────────────────
+    # ── Grouping / collapse ───────────────────────────────────────────
 
     def test_set_grouping_by_runtime_creates_group_rows(self):
         m = self._model(self._filter_trace())
@@ -491,7 +485,7 @@ class TestTimelineModel(unittest.TestCase):
         m = self._model(self._filter_trace())
         self.assertEqual(m.groupCoverage([0], 0, 1_000_000, 0), [])
 
-    # ── Hide / isolate / reorder (Phase B3) ─────────────────────────
+    # ── Hide / isolate / reorder ──────────────────────────────────────
 
     def test_hide_lane_removes_it_from_rows(self):
         m = self._model(self._filter_trace())
@@ -563,7 +557,7 @@ class TestTimelineModel(unittest.TestCase):
         self.assertEqual(m.rows[pos]["kind"], "lane")
         self.assertEqual(m.rows[pos]["laneIndex"], cuda_idx)
 
-    # ── Color mode (Phase B4) ────────────────────────────────────────
+    # ── Color mode ─────────────────────────────────────────────────────
 
     def test_color_mode_defaults_to_function(self):
         m = self._model(self._filter_trace())
@@ -597,7 +591,7 @@ class TestTimelineModel(unittest.TestCase):
         m.setColorMode("bogus")
         self.assertEqual(m.colorMode, "function")
 
-    # ── Search (Phase B4) ────────────────────────────────────────────
+    # ── Search ─────────────────────────────────────────────────────────
 
     def test_search_returns_match_count_and_sets_matched_flag(self):
         m = self._model(self._filter_trace())
@@ -683,7 +677,7 @@ class TestTimelineModel(unittest.TestCase):
         m = self._model(_mk_trace(spans))
         self.assertEqual(len(m.findByName("cpu", "hot_fn", 3)), 3)
 
-    # ── Time ruler / bookmarks / named ranges (Phase B5) ────────────
+    # ── Time ruler / bookmarks / named ranges ─────────────────────────
 
     def test_time_ticks_returns_nice_round_numbers(self):
         m = self._model(self._filter_trace())

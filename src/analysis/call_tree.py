@@ -149,21 +149,13 @@ def _ct_build_from_stacks(spans: list[SpanEvent]) -> list[_CTNode]:
     Walks each span's full root-first path -- its reversed stack_frames
     (the caller chain) PLUS its own name appended as the definite final
     leaf -- in one pass, with one dict key per level (the bare function
-    name). This used to be two separate steps: a frame-only path walk
-    keyed by bare name, then a second "add the span's own name as a
-    leaf" step keyed by f"__leaf__{name}" -- a DIFFERENT key for what is
-    often the SAME logical node. Any function that is both an
-    intermediate ancestor frame for some spans and its own separately-
-    measured leaf span for others (an extremely common pattern: a
-    function that does direct work AND calls sub-functions, e.g. a
-    driving loop that also does some work inline) never merged, and
-    showed up as two same-named sibling nodes at the same tree level
-    instead of one aggregated node -- contradicting _CTNode's own
-    docstring ("N spans with the same name at the same tree level").
-    Found via the Qt/QML GUI's Call Tree screen using a deliberately
-    two-level-deep synthetic trace; the TUI's Call Tree tab shares this
-    exact function, so it had the same bug whenever real profiled code
-    hit this shape, not just the GUI.
+    name). A function that is both an intermediate ancestor frame for some
+    spans and its own separately-measured leaf span for others (common: a
+    driving loop that does work inline AND calls sub-functions) therefore
+    aggregates into ONE node per tree level, as _CTNode's docstring
+    promises ("N spans with the same name at the same tree level"), rather
+    than two same-named siblings (which a separate leaf key such as
+    f"__leaf__{name}" would produce). Shared by the TUI and GUI Call Tree.
     """
     roots: dict[str, _StackNode] = {}
 

@@ -1,10 +1,9 @@
 """
-Regression test for a self-audit finding: fp16_tflops was computed as a
-uniform fp32_tflops * 2 for every CUDA architecture. Pascal (cc 6.1/6.2,
-consumer/mobile GTX 10-series and Jetson TX2) has crippled packed-FP16
-throughput roughly on par with FP32, not the real 2x every later
-architecture (and Pascal's own datacenter part, cc 6.0 P100) achieves --
-overstating the FP16 roofline ceiling by ~2x for those specific parts.
+FP16 peak per CUDA architecture: Pascal consumer/mobile parts (cc 6.1/6.2,
+GTX 10-series, Jetson TX2) have packed-FP16 throughput roughly on par with
+FP32, not the 2x of later architectures (and of Pascal's datacenter P100,
+cc 6.0), so a uniform fp32_tflops * 2 would overstate their FP16 roofline
+ceiling by ~2x.
 """
 import sys
 import unittest

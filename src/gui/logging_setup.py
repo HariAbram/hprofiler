@@ -1,16 +1,12 @@
 """
-Logging setup for the GUI (Phase 2 of the usability/persistence/loading
-overhaul) -- the first use of Python's `logging` module anywhere in this
-codebase (confirmed via a repo-wide grep before writing this: zero prior
-usage). Backs the Help menu's "Open Log File" action and gives every
-HprofilerLoadError (src/gui/errors.py) a durable record beyond whatever
-was visible in the GUI at the moment it happened.
+Logging setup for the GUI. Backs the Help menu's "Open Log File" action and
+gives every HprofilerLoadError (src/gui/errors.py) a durable record beyond
+what was visible in the GUI at the time.
 
 Uses QStandardPaths.AppDataLocation (~/.local/share/hprofiler on Linux),
-deliberately SEPARATE from QSettings' own config-file location
-(~/.config/hprofiler, see settings.py) -- matches platform convention
-(config vs. data/log directories) and keeps "open the log" pointing at
-exactly one unambiguous file.
+SEPARATE from QSettings' config-file location (~/.config/hprofiler, see
+settings.py) -- platform convention (config vs. data/log directories), and
+"open the log" points at exactly one file.
 """
 from __future__ import annotations
 

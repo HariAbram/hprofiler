@@ -16,7 +16,8 @@
  * correlation id), lid= (the hook's id, pushed as the EXTERNAL correlation
  * id around each intercepted HIP call -- exact host/device matching), dev=
  * (agent handle), queue=, dispatch=, and the launching thread as tid.
- * Status: `gpuact:<pid>:rocprofiler:...` (status, clock, dropped).
+ * Status: `gpuact:<pid>:rocprofiler:...` (status, clock, dropped, and
+ * final_flush=1 after the forced flush at SDK finalization).
  *
  * Buffer policy is DISCARD: if the buffer fills faster than it is drained,
  * the SDK drops records and reports how many (dropped= in the status line)
@@ -28,8 +29,8 @@
  *
  * Compatibility: records carry their own size; fields beyond what the
  * running SDK wrote are never read. The buffer-tracing kind values compiled
- * in are checked against the running SDK's own names before use. Not
- * validated against an AMD GPU on the development machine.
+ * in are checked against the running SDK's own names before use. Never run
+ * on an AMD GPU (decoder tested with synthetic records only).
  */
 #define _GNU_SOURCE
 #include "hp_rocprof.h"
@@ -358,16 +359,23 @@ static int tool_init(rocprofiler_client_finalize_t fini, void *tool_data) {
     char f[200];
     if (g_clock_ok)
         snprintf(f, sizeof(f), "status=active,clock=offset,offset_ns=%lld,clock_err_ns=%llu,"
-                 "correlation=external", (long long)g_offset_ns, (unsigned long long)g_offset_err_ns);
+                 "correlation=external,final_marker=1", (long long)g_offset_ns, (unsigned long long)g_offset_err_ns);
     else
-        snprintf(f, sizeof(f), "status=active,clock=unmapped,correlation=external");
+        snprintf(f, sizeof(f), "status=active,clock=unmapped,correlation=external,final_marker=1");
     emit_status(f);
     return 0;
 }
 
+/* Forced final flush at SDK finalization. The final_flush=1 status after
+ * it is the collector's evidence that buffered device records were
+ * delivered: an active tracer whose process ends without it (crash,
+ * _exit, kill) is reported as possibly missing device records. */
 static void tool_fini(void *tool_data) {
     (void)tool_data;
-    if (hp_roc_active()) p.flush_buffer(g_buffer);
+    if (hp_roc_active()) {
+        p.flush_buffer(g_buffer);
+        emit_status("final_flush=1");
+    }
     __atomic_store_n(&g_active, 0, __ATOMIC_RELEASE);
 }
 

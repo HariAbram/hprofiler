@@ -124,10 +124,9 @@ def scenario_mpi_wildcard_match() -> Scenario:
 def scenario_async_mpi_wait() -> Scenario:
     # _index_mpi_completers (criticalpath.py) specifically matches on the
     # real MPI_Wait/Waitall/Waitany/Waitsome names -- a generically-named
-    # "wait" span (as an earlier version of this scenario used) would
-    # never be recognized as a completer at all, silently producing a
-    # false negative that looked like an algorithm bug but was actually a
-    # scenario-construction mistake. Use the real names throughout.
+    # "wait" span would never be recognized as a completer, producing a
+    # false negative caused by the scenario, not the algorithm. Use the
+    # real names throughout.
     isend = _span(0, 1, Category.MPI, 0, 10, "MPI_Isend", label="isend",
                   tags={"type": "isend", "rank": "0", "peer": "1", "tag": "9"})
     irecv = _span(1, 1, Category.MPI, 0, 3, "MPI_Irecv", label="irecv", span_id="req1",

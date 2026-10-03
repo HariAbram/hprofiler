@@ -1,8 +1,8 @@
 """
 Integration test for the MPI protocol-semantics work in hooks/mpi_hook/mpi_hook.c
 (wildcard MPI_ANY_SOURCE/MPI_ANY_TAG resolution, MPI_Waitany/Waitsome/Test*/
-Cancel wrappers, and MPI_Comm_split commid= tagging) -- see the file's header
-comment and project_full_audit_fixes / MEMORY.md for the design this verifies.
+Cancel wrappers, and MPI_Comm_split commid= tagging) -- see that file's header
+comment for the design this verifies.
 
 This builds the real libhprofiler_mpi.so, LD_PRELOADs it into the
 tests/fixtures/mpi_proto_self.c fixture, and captures the *actual* wire
@@ -13,7 +13,7 @@ resolved semantics, not just "did it crash".
 Why "_self": this development machine's MPICH/Hydra cannot form a real
 multi-rank MPI_COMM_WORLD -- `mpirun -np N` (N>1) has every rank
 independently observe MPI_Comm_size() == 1, reproducible with the
-pre-existing mpi_mini.c fixture too and confirmed via UCX_LOG_LEVEL=info
+mpi_mini.c fixture too and confirmed via UCX_LOG_LEVEL=info
 to be a PMI/KVS rank-discovery failure in this machine's MPICH/UCX/PMIx
 setup, unrelated to hprofiler. mpi_proto_self.c exercises the same
 PMPI_Isend/Irecv/Waitany/Waitsome/Test/Cancel completion semantics via
@@ -269,7 +269,7 @@ class TestMpiProtocolSemantics(unittest.TestCase):
         )
 
     def test_no_events_silently_dropped_by_inst_tag_parsing(self):
-        # Regression guard for the _parse_record inst: fix in runner.py:
+        # Guards runner.py's _parse_record inst: tag handling:
         # every inst: line this fixture's run produces must carry a
         # non-empty tags dict, since every emit_instant() call site in
         # mpi_hook.c always builds a non-trivial "type=..." extra string.

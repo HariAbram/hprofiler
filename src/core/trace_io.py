@@ -129,6 +129,14 @@ def open_store_trace(path: str | os.PathLike, *, finalize: bool = True) -> Trace
     store = DiskTraceStore(path, create=False)
     trace = Trace(store=store)
     load_trace_meta(trace)
+    health = trace.metadata.capture_health
+    if health.get("state") == "running":
+        # The capture that wrote this store never completed (the collector
+        # was killed, or the store is still being written): say so.
+        trace.metadata.capture_health = {**health, "state": "interrupted"}
+        import sys
+        print(f"[hprofiler][warn] {path}: the capture did not complete -- events after the last "
+              "stored batch and the run's final metadata may be missing", file=sys.stderr)
     if finalize and not store.is_finalized():
         store.finalize()
     return trace

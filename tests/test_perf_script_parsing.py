@@ -1,18 +1,13 @@
 """
-Regression tests for src/core/runner.py's _parse_perf_script() -- no
-tests existed for this function at all before (a real pre-existing gap).
-Covers the rewrite that makes --perf-callgraph-enabled CPU sampling
-produce ONE SpanEvent per sample (name=leaf frame, stack_frames=ancestor
-chain, duration_ns=a nominal per-sample weight) instead of the old shape
-(one span per stack FRAME per sample, duration_ns=0, stack_frames never
-set, the whole stack redundantly duplicated as a string in
-tags["stack"]) -- the old shape was structurally invisible to
-analysis/call_tree.py's _ct_build (Call Tree tab / Flame Graph tab),
-which requires duration_ns>0 AND stack_frames truthy.
+Tests for src/core/runner.py's _parse_perf_script(): with
+--perf-callgraph, CPU sampling must produce ONE SpanEvent per sample
+(name=leaf frame, stack_frames=ancestor chain, duration_ns=a nominal
+per-sample weight) -- analysis/call_tree.py's _ct_build (Call Tree and
+Flame Graph tabs) requires duration_ns>0 AND stack_frames truthy, so one
+span per stack FRAME with duration 0 would be invisible to it.
 
-Can't run real `perf record`/`perf script` in this sandbox (same
-documented perf_event_paranoid limitation as the rest of this project's
-perf-dependent work) -- mocks subprocess.run to return synthetic `perf
+Real `perf record`/`perf script` is blocked where perf_event_paranoid > 2,
+so this mocks subprocess.run to return synthetic `perf
 script` text in the exact format the real tool produces, verified
 against the _HDR/_FRAME regexes' own documented format comments.
 """

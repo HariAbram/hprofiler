@@ -8,8 +8,7 @@ import "../components"
 // viewer. Left: kernel list. Middle: annotated assembly (instruction
 // type colored, matching disasm/classifier.py's scheme). Right:
 // instruction-mix breakdown + static analysis hints (analysis/
-// asm_advisor.py) -- both already existed and were already shown in the
-// TUI (_show_mix/_show_hints); this screen just never called them.
+// asm_advisor.py), as in the TUI's _show_mix/_show_hints.
 Item {
     id: sourceRoot
 
@@ -248,16 +247,12 @@ Item {
             ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
             ColumnLayout {
-                // NOT parent.width -- inside a ScrollView, the direct
-                // child's "parent" is an internal Flickable whose own
-                // width is sized to CONTENT, not the visible viewport
-                // (that's the whole mechanism that lets it scroll) -- so
-                // binding to it is circular and settles wider than the
-                // panel, which is why wrapMode: Text.WordWrap below had
-                // no effect (a Text never wraps until something gives it
-                // a real bounded width to wrap AT). availableWidth is
-                // ScrollView's own documented "content area, viewport-
-                // bounded" property, made for exactly this.
+                // NOT parent.width -- inside a ScrollView, the direct child's
+                // "parent" is an internal Flickable sized to CONTENT, not the
+                // visible viewport, so binding to it is circular and settles wider
+                // than the panel (and wrapMode: Text.WordWrap below never wraps
+                // without a bounded width). availableWidth is ScrollView's
+                // viewport-bounded content width.
                 width: analysisScroll.availableWidth
                 spacing: AppTheme.spacingLg
 

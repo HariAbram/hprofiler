@@ -1,29 +1,15 @@
 /*
- * CUDA Runtime + Driver API + NVTX LD_PRELOAD hook.
+ * CUDA Runtime + Driver API + NVTX hook (LD_PRELOAD).
  *
- * Changes over initial version:
- *   1. Thread-local recursion guard (in_hook) — prevents profiling our own
- *      profiling calls (e.g. cudaEventCreate/Record inside the hook).
- *   2. GPU-accurate async memcpy timing — cudaMemcpyAsync and driver async
- *      copies now use event pairs instead of CPU-only timing.
- *   3. More sync hooks — cudaEventSynchronize and cudaDeviceReset now flush
- *      pending GPU spans. cudaMemcpy (sync) flushes before the real call.
- *   4. cuModuleGetFunction — maps CUfunction handles to kernel names so
- *      cuLaunchKernel shows real names instead of <jit-kernel>.
- *   5. More memory hooks — cudaMallocAsync/FreeAsync, cudaHostAlloc,
- *      cudaMallocHost/FreeHost, cuMemAllocManaged, cuMemAllocAsync/FreeAsync.
- *      Pinned host memory tracked separately as pinned_memory_bytes.
- *
- *   6. Host submission vs. device execution (see the "Host submission /
- *      device activity" block below and cupti_trace.c): every launch/copy/
- *      memset/graph call emits a host API span (side=cpu) plus a device span
- *      (side=gpu) -- measured by CUPTI when available, otherwise the
- *      cudaEvent-pair proxy, labelled timing=proxy_*.
- *
- * Wire protocol (newline-delimited ASCII):
- *   span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<tag=val,...>]
- *   ctr:<cat>:<pid>:<ts_ns>:<name>:<value>:<unit>
- *   gpuact:<pid>:cupti:<k=v,...>     native tracer status (cupti_trace.c)
+ * Every call that submits device work (launch, copy, memset, graph launch)
+ * emits a host span (side=cpu) and a device span (side=gpu): from CUPTI
+ * activity records when native tracing is active (cupti_trace.c), otherwise
+ * from a cudaEvent pair around the call (timing=proxy_*). Also recorded:
+ * sync calls, event record / stream wait (to resolve event syncs),
+ * allocations (device and pinned_memory_bytes counters), NVTX v1/v2 ranges
+ * (libnvToolsExt is replaced), module loads (kernel names for
+ * cuLaunchKernel; JIT blobs saved for disassembly), optional CUPTI PC
+ * sampling.
  */
 
 #define _GNU_SOURCE
@@ -54,9 +40,6 @@ typedef void*            CUmodule_t;
 typedef struct { unsigned int x, y, z; } dim3_t;
 
 /* ── Globals ────────────────────────────────────────────────────────────── */
-static int             g_sock        = -1;
-static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static pid_t           g_pid         = 0;
 static void           *g_cudart_handle = NULL;
 
 /* Thread-local recursion guard: prevents profiling our own CUDA event calls.
@@ -78,9 +61,6 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-static pid_t gettid_compat(void) {
-    return (pid_t)syscall(SYS_gettid);
-}
 
 static void *find_cuda_sym(const char *name) {
     void *sym = dlsym(RTLD_NEXT, name);
@@ -91,101 +71,30 @@ static void *find_cuda_sym(const char *name) {
     return NULL;
 }
 
-/* Must be called with g_sock_mutex held. */
-static void ensure_connected(void) {
-    if (g_sock >= 0) return;
-    const char *path = getenv("HPROFILER_SOCKET");
-    if (!path) return;
-    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return;
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        g_sock = s;
-        g_pid  = getpid();
-    } else {
-        close(s);
-    }
-}
-
-/* send_all: write all n bytes; close socket on EPIPE/error so next call
- * reconnects rather than spinning on a broken socket. Caller holds mutex. */
-static void send_all(const char *buf, int n) {
-    while (n > 0) {
-        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
-        if (r < 0) { close(g_sock); g_sock = -1; return; }
-        buf += r; n -= (int)r;
-    }
-}
-
+#include "../common/hp_transport.h"
 #include "../common/callstack.h"
 
+static pid_t gettid_compat(void) { return hp_tx_tid(); }
+
+/* Records up to the transport's 64 KiB limit go out intact -- templated
+ * Kokkos/RAJA/Thrust kernel names included. */
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) {
-        char buf[2048];   /* 2 KB: enough for long kernel names + tags */
-        int n;
-        if (extra && *extra)
-            n = snprintf(buf, sizeof(buf),
-                         "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-                         cat, g_pid, (int)tid,
-                         (unsigned long long)start_ns,
-                         (unsigned long long)dur_ns, name, extra);
-        else
-            n = snprintf(buf, sizeof(buf),
-                         "span:%s:%d:%d:%llu:%llu:%s\n",
-                         cat, g_pid, (int)tid,
-                         (unsigned long long)start_ns,
-                         (unsigned long long)dur_ns, name);
-        /* snprintf returns >= sizeof(buf) when truncated. Rather than
-         * silently dropping the whole span (loses a real event, e.g. a
-         * heavily-templated Kokkos/RAJA/Thrust kernel name that alone can
-         * exceed this buffer), retry with a shortened name so the event --
-         * with correct timing and full tags -- still reaches the trace. */
-        if (n >= (int)sizeof(buf)) {
-            char short_name[200];
-            size_t name_len = strlen(name);
-            if (name_len > sizeof(short_name) - 4) {
-                memcpy(short_name, name, sizeof(short_name) - 4);
-                memcpy(short_name + sizeof(short_name) - 4, "...", 4);
-            } else {
-                memcpy(short_name, name, name_len + 1);
-            }
-            if (extra && *extra)
-                n = snprintf(buf, sizeof(buf),
-                             "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-                             cat, g_pid, (int)tid,
-                             (unsigned long long)start_ns,
-                             (unsigned long long)dur_ns, short_name, extra);
-            else
-                n = snprintf(buf, sizeof(buf),
-                             "span:%s:%d:%d:%llu:%llu:%s\n",
-                             cat, g_pid, (int)tid,
-                             (unsigned long long)start_ns,
-                             (unsigned long long)dur_ns, short_name);
-        }
-        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
-        emit_callstack(start_ns);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (!hp_tx_enabled()) return;
+    if (extra && *extra)
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name, extra);
+    else
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name);
+    emit_callstack(start_ns);
 }
 
 static void emit_ctr(const char *cat, const char *name,
                      int64_t value, const char *unit) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) {
-        char buf[256];
-        int n = snprintf(buf, sizeof(buf),
-                         "ctr:%s:%d:%llu:%s:%lld:%s\n",
-                         cat, g_pid, (unsigned long long)now_ns(),
-                         name, (long long)value, unit);
-        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (!hp_tx_enabled()) return;
+    hp_tx_emitf("ctr:%s:%d:%llu:%s:%lld:%s\n", cat, (int)hp_tx_pid(),
+                (unsigned long long)now_ns(), name, (long long)value, unit);
 }
 
 /* Entry points for cupti_trace.c (see hp_cupti.h). */
@@ -195,10 +104,7 @@ void hp_cuda_emit_span(const char *cat, pid_t tid, uint64_t start_ns,
 }
 
 void hp_cuda_emit_line(const char *line) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) send_all(line, (int)strlen(line));
-    pthread_mutex_unlock(&g_sock_mutex);
+    hp_tx_emit(line, strlen(line));
 }
 
 /* ── Host submission / device activity bookkeeping ──────────────────────────
@@ -206,12 +112,12 @@ void hp_cuda_emit_line(const char *line) {
  * call itself: side=cpu, timing=host) carrying a per-process launch id
  * (lid=) and the CUPTI correlation ids captured during the call (corr=/
  * corr2=). The device work is a separate side=gpu span: from CUPTI activity
- * records when native tracing is active (cupti_trace.c), otherwise the
- * pre-existing cudaEvent-pair measurement, labelled as a proxy
- * (timing=proxy_event / proxy_host / proxy_flush).
+ * records when native tracing is active (cupti_trace.c), otherwise a
+ * cudaEvent-pair measurement labelled as a proxy (timing=proxy_event /
+ * proxy_host / proxy_flush).
  *
  * HPROFILER_DEVICE_ACTIVITY: auto (default: CUPTI if available, else proxy)
- *                            off  (proxy only -- the pre-CUPTI behaviour)
+ *                            off  (proxy only)
  *                            both (CUPTI and proxy, for comparing them; the
  *                                  analysis keeps the CUPTI span per launch) */
 static uint64_t g_lid_counter = 0;
@@ -363,19 +269,10 @@ static void pin_track_rem(void *ptr) {
 }
 
 /* ── Stream ID assignment ────────────────────────────────────────────────── */
-/* Deterministic small-integer ID derived from the pointer VALUE (MurmurHash3
- * finalizer/fmix64), not from order-of-first-observation. This hook and
- * nccl_hook.c are separate .so's with no shared state, but a CUDA stream
- * handle is the same pointer value in both when they're active in the same
- * process (the common cuda+nccl case) -- an order-of-observation counter
- * would assign the SAME stream a DIFFERENT stream=N in "cuda"-category vs
- * "nccl"-category spans whenever the two hooks happened to see it in a
- * different order (or saw different subsets of streams), silently breaking
- * any cross-hook per-stream correlation. Hashing the pointer instead makes
- * both hooks agree with no coordination needed. A hash collision just means
- * two streams share a small display ID (rare for realistic stream counts),
- * not any correctness issue. This also removes the previous STREAM_MAP_CAP
- * overflow behavior (silently collapsing to stream=-1 past 256 streams). */
+/* Small display id from the pointer value (MurmurHash3 fmix64), not from
+ * first-seen order: cuda_hook and nccl_hook are separate libraries without
+ * shared state, and hashing makes both report the same stream=N for the same
+ * handle. A collision only makes two streams share a display id. */
 static int get_stream_id(const void *stream) { return handle_id(stream); }
 
 /* ── GPU-accurate timing via cudaEvent pairs ──────────────────────────────── */
@@ -404,42 +301,19 @@ static int ev_api_ok(void) {
     return f_evCreate && f_evRecord && f_evElapsed && f_evDestroy && f_evSync;
 }
 
-/* ── Exec-start calibration: real GPU-timeline kernel-execution start ────────
- * (xs= tag), distinct from start_ns/t0 (the CPU-side launch-CALL time) ─────
+/* ── Exec-start estimate for proxy spans (xs= tag) ──────────────────────────
+ * Proxy device spans start at the host launch call (t0), but under queue
+ * backlog the GPU starts a kernel only when its predecessors finish. The
+ * event ev_s recorded right before each launch completes when the GPU
+ * reaches that point of the stream, so its time since a one-time calibration
+ * event (recorded, synchronized, and paired with a CLOCK_MONOTONIC reading)
+ * estimates the execution start. Events mark one per-device timeline, so
+ * this works across streams. xs= is additive: start_ns/duration_ns keep their
+ * meaning; the critical path prefers xs=.
  *
- * A cudaEvent_t recorded into a stream completes exactly when the GPU's
- * execution reaches that point in the stream's FIFO queue -- so ev_s
- * (already recorded immediately before each kernel launch, purely to get
- * GPU-accurate DURATION via cudaEventElapsedTime(ev_s,ev_e)) also marks the
- * true GPU-timeline instant that kernel actually began executing. This can
- * differ significantly from its CPU launch-CALL time under queue backlog:
- * several kernels launched back-to-back on a busy stream all get CPU launch
- * timestamps within microseconds of each other, but only the first can
- * start executing immediately -- the rest wait on the GPU for however long
- * their predecessors take, yet start_ns (t0) reports them all as if they
- * began at launch-call time. Without this, a critical-path/timeline view
- * built from start_ns can show queued kernels overlapping in time when they
- * actually ran strictly sequentially on the GPU.
- *
- * One-time calibration (mirrors opencl_hook.c's cl_calibrate_if_needed):
- * record a calibration event, synchronize on it immediately (forcing the
- * GPU to have reached "now"), and pair it with a CPU wall-clock reading
- * taken essentially at that same instant. Later, for any kernel's ev_s,
- * cudaEventElapsedTime(g_calib_event, ev_s) gives the GPU-side elapsed time
- * since calibration -- works across streams, since CUDA events mark points
- * on one single per-device timeline, not a per-stream one. xs= is additive
- * and never changes what start_ns/duration_ns mean -- fully backward
- * compatible with anything already reading spans without knowing about it.
- *
- * Known remaining approximation, same class as OpenCL's: a single global
- * calibration (no periodic re-anchor for long-run clock drift, no
- * per-device map for multi-GPU processes) -- see DOCUMENTATION.md.
- *
- * NOT independently verified against real kernel execution on this
- * development machine (broken NVIDIA driver -- see DOCUMENTATION.md's
- * Known Limitations); compile-checked only. The logic mirrors the already
- * hardware-verified opencl_hook.c calibration technique, but treat xs= as
- * unverified until confirmed on a working CUDA GPU. */
+ * Limitations: one global calibration (no drift correction, no per-device
+ * map). Observed ~2.4 ms late against CUPTI in one MX550 run; native
+ * tracing replaces it where available. */
 static cudaEvent_t     g_calib_event  = NULL;
 static uint64_t        g_calib_cpu_ns = 0;
 static int             g_calib_state  = 0;   /* 0=not tried, 1=ok, -1=failed */
@@ -554,15 +428,10 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
                       l->kname, final_extra);
         } else {
-            /* cudaEventSynchronize/cudaEventElapsedTime failed (e.g. event
-             * queried from a different context/device than it was created
-             * on) -- a kernel that ran to completion on the GPU must not
-             * simply vanish from the trace. Fall back to wall-clock time
-             * from launch to this flush as an (upper-bound) approximation,
-             * clearly marked as such -- distinct from the launch-time
-             * "timing=proxy_host" fallback since this interval can include time
-             * for OTHER kernels queued after this one, not just this one's
-             * own launch overhead. */
+            /* Sync/elapsed-time query failed (e.g. an event from another
+             * context): keep the kernel, timed from launch to this flush --
+             * an upper bound that can include later queued kernels
+             * (timing=proxy_flush, unlike the launch-time proxy_host). */
             char marked[300];
             if (l->extra[0])
                 snprintf(marked, sizeof(marked), "%s,timing=proxy_flush", l->extra);
@@ -575,22 +444,10 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
 
 static int pk_try_begin(cudaStream_t stream,
                         cudaEvent_t *ev_s, cudaEvent_t *ev_e) {
-    /* Calibrate the xs= reference event HERE, before this kernel's own
-     * ev_s is recorded below -- not lazily deferred to first-use inside
-     * pk_flush() (the previous approach). exec_start_calibrate_if_needed()
-     * itself SYNCS the calibration event before returning, so by
-     * construction it can only ever complete AFTER every kernel already
-     * enqueued on the GPU at the moment it's called -- deferring it into
-     * pk_flush() (which only runs once kernels are already pending/
-     * completed) meant the calibration event was GUARANTEED to postdate
-     * every kernel in whatever batch triggered it, making
-     * compute_exec_start_ns()'s elapsed-time-from-calibration always
-     * negative (silently omitting xs= entirely) for that whole first
-     * flushed batch. Calling it here, before the very first kernel this
-     * process ever launches has even been recorded, means calibration
-     * happens against an (essentially) empty GPU queue and genuinely
-     * precedes every real kernel's ev_s from then on. Idempotent (guarded
-     * by g_calib_state) -- a no-op after the first call. */
+    /* Calibrate before this launch's ev_s is recorded: the calibration event
+     * is synchronized, so it must precede every kernel compared with it
+     * (calibrating at flush time would postdate the whole first batch and
+     * make every elapsed time negative). Idempotent. */
     exec_start_calibrate_if_needed();
     *ev_s = *ev_e = NULL;
     if (!ev_api_ok()) return 0;
@@ -607,8 +464,8 @@ static void pk_commit(cudaEvent_t ev_s, cudaEvent_t ev_e,
                       cudaStream_t stream,
                       const char *cat, const char *kname, const char *extra,
                       uint64_t t0, pid_t tid) {
-    /* Record the end event BEFORE taking the mutex so we never call a
-     * CUDA API function while holding g_pk_mutex (deadlock risk fix). */
+    /* Record the end event before taking g_pk_mutex: never call a CUDA API
+     * while holding it (deadlock risk). */
     f_evRecord(ev_e, stream);
     pthread_mutex_lock(&g_pk_mutex);
     if (g_pk_n < MAX_PENDING) {
@@ -1152,9 +1009,9 @@ static void _save_cubin(const void *image) {
         size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
         if (end > 64 && end < 512ULL*1024*1024) sz = end;
     } else if ((p[0]=='/' && p[1]=='/') || p[0]=='.') {
-        /* PTX text: include null terminator only if string ends within the
-         * limit; if strnlen returns the limit the string may be unterminated
-         * and adding 1 would read past the mapped region (off-by-one fix). */
+        /* PTX text: include the terminator only if it lies within the
+         * limit; at the limit the string may be unterminated and +1 would
+         * read past the mapped region. */
         sz = strnlen((const char *)image, 64*1024*1024);
         if (sz > 0 && sz < 64*1024*1024) sz++;
     }
@@ -1216,16 +1073,9 @@ CUresult cuModuleUnload(CUmodule_t hmod) {
     if (!real) real = (fn_t)find_cuda_sym("cuModuleUnload");
     if (!real) return -1;
     CUresult ret = real(hmod);
-    /* g_knames doesn't track which module each CUfunction came from, so we
-     * can't selectively invalidate just this module's entries -- and the
-     * driver is free to reuse a freed CUfunction address for an unrelated
-     * kernel in a later-loaded module, which would otherwise make
-     * resolve_kernel_name() return the OLD kernel's name forever (its
-     * linear scan returns the first match, so even re-registering the
-     * address under its new name wouldn't fix already-stale lookups).
-     * Clearing the whole table is conservative but correct; entries for
-     * still-loaded modules are cheaply repopulated by their next
-     * cuModuleGetFunction call. */
+    /* The driver may reuse a freed CUfunction address for another kernel,
+     * and g_knames does not record modules, so clear the whole table;
+     * entries come back with the next cuModuleGetFunction. */
     if (ret == 0) {
         pthread_mutex_lock(&g_kname_mutex);
         g_kname_n = 0;
@@ -1509,13 +1359,9 @@ typedef struct {
 
 static __thread NvtxEntry nvtx_stack[MAX_NVTX_DEPTH];
 static __thread int       nvtx_depth = 0;
-/* Count of nvtxRangePush* calls rejected because nvtx_depth was already at
- * MAX_NVTX_DEPTH. Without tracking this separately, the matching
- * nvtxRangePop() for an overflowed push -- which has no way to know its
- * push was a no-op -- would decrement nvtx_depth and pop the top of
- * nvtx_stack anyway, incorrectly closing the OUTER (still legitimately
- * open) range early and desyncing all subsequent push/pop attribution on
- * this thread. */
+/* Pushes rejected at MAX_NVTX_DEPTH. Their pops must not pop a real, still
+ * open range (that would close the outer range early and desync the
+ * thread's stack). */
 static __thread int       nvtx_overflow = 0;
 /* tls_nvtx_span_id is declared near the top of this file (before the wrappers). */
 
@@ -1829,13 +1675,13 @@ static void _cupti_init(void) {
     g_cuptiEnable(_CUPTI_KIND_PC_SAMPLING);
 }
 
-static void _cupti_flush_and_send(int sock_fd) {
+static void _cupti_flush_and_send(void) {
     const char *env = getenv("HPROFILER_GPU_PCSAMPLING");
     if (!env || env[0] != '1' || !g_cupti_samples) return;
     if (g_cupti_pc_via_trace) hp_cupti_flush();
     else if (g_cuptiFlush)    g_cuptiFlush(0);
     else                      return;
-    if (sock_fd < 0) return;
+    if (!hp_tx_enabled()) return;
 
     pthread_mutex_lock(&g_cupti_mutex);
     for (int i = 0; i < g_cupti_nsamples; i++) {
@@ -1847,20 +1693,10 @@ static void _cupti_flush_and_send(int sock_fd) {
             }
         }
         if (!fname) continue;
-        char line[512];
-        int n = snprintf(line, sizeof(line),
-                         "pcsa:%d:%llu:%s:%llx:%d:%u\n",
-                         (int)g_pid,
-                         (unsigned long long)now_ns(),
-                         fname,
-                         (unsigned long long)g_cupti_samples[i].pc_offset,
-                         (int)g_cupti_samples[i].stall,
-                         g_cupti_samples[i].count);
-        if (n > 0 && n < (int)sizeof(line)) {
-            pthread_mutex_lock(&g_sock_mutex);
-            if (sock_fd >= 0) send_all(line, n);
-            pthread_mutex_unlock(&g_sock_mutex);
-        }
+        hp_tx_emitf("pcsa:%d:%llu:%s:%llx:%d:%u\n", (int)hp_tx_pid(),
+                    (unsigned long long)now_ns(), fname,
+                    (unsigned long long)g_cupti_samples[i].pc_offset,
+                    (int)g_cupti_samples[i].stall, g_cupti_samples[i].count);
     }
     pthread_mutex_unlock(&g_cupti_mutex);
 }
@@ -1869,9 +1705,7 @@ static void _cupti_flush_and_send(int sock_fd) {
 
 __attribute__((constructor))
 static void hprofiler_cuda_init(void) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    pthread_mutex_unlock(&g_sock_mutex);
+    hp_tx_init("cuda");
     _cupti_init();
     /* Statically linked CUDA runtime (the Runner detects it and sets this):
      * no wrapper will ever run, so start CUPTI now -- its callbacks then
@@ -1898,8 +1732,8 @@ static void hprofiler_cuda_fini(void) {
     /* Native activity records were force-flushed by cupti_trace.c's atexit
      * handler (before libcupti's own teardown); this catches the case
      * where no atexit ran yet. */
-    hp_cupti_flush();
-    _cupti_flush_and_send(g_sock);
+    hp_cupti_final_flush();
+    _cupti_flush_and_send();
     in_hook = 1;               /* the flush's own CUDA calls are not app calls */
     pk_flush(NULL, 1);
     in_hook = 0;
@@ -1916,8 +1750,5 @@ static void hprofiler_cuda_fini(void) {
         pthread_mutex_unlock(&g_alloc_mutex);
     }
 
-    if (g_sock >= 0) {
-        close(g_sock);
-        g_sock = -1;
-    }
+    hp_tx_shutdown(1);
 }

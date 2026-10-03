@@ -1,11 +1,8 @@
 /*
  * callstack.h — CPU call-stack capture for hprofiler hooks.
  *
- * Include this file AFTER defining the following in the including .c file:
- *   static int             g_sock;          // socket fd (-1 if not connected)
- *   static pid_t           g_pid;           // process id
- *   static pid_t gettid_compat(void);       // thread id
- *   static void send_all(const char*, int); // socket send helper
+ * Include this file AFTER hp_transport.h (records go out through
+ * hp_tx_emit(); ids come from hp_tx_pid()/hp_tx_tid()).
  *
  * The including file must also call cs_init() from its constructor to read
  * the HPROFILER_CALLSTACK environment variable.
@@ -21,7 +18,9 @@
  * If no library info is available the frame is just sym_name.
  *
  * Frames are in innermost-first order (backtrace order).
- * The receiver reverses them to build a root→leaf call tree.
+ * The receiver reverses them to build a root→leaf call tree. A stack that
+ * does not fit the record buffer ends with an explicit "[truncated]" frame
+ * (outermost frames omitted) instead of being cut silently.
  *
  * Build with HPROFILER_USE_LIBUNWIND defined to use libunwind for more
  * accurate unwinding (no -fno-omit-frame-pointer required on the profiled
@@ -50,8 +49,8 @@ static void cs_init(void)
 {
     g_callstack = !!getenv("HPROFILER_CALLSTACK");
     /* Resolve __cxa_demangle eagerly so emit_callstack never calls dlsym
-     * while holding g_sock_mutex (dlsym can call malloc which may acquire
-     * an internal lock, risking deadlock with allocator hooks). */
+     * on the hot path (dlsym can call malloc which may acquire an internal
+     * lock, risking deadlock with allocator hooks). */
     s_dem = (_cs_dem_fn_t)dlsym(RTLD_DEFAULT, "__cxa_demangle");
 }
 
@@ -80,16 +79,25 @@ static int _cs_should_skip(const char *s)
 
 /* Sanitize a string written into buf at pos, replacing frame-separator
  * characters (';' and '|') with ','.  Returns new pos. */
+/* Copies one frame name; names longer than 1 KiB (deep template
+ * instantiations) are shortened with a visible "…" instead of eating the
+ * rest of the stack. */
 static int _cs_write_sanitized(char *buf, int pos, int bufsz, const char *s)
 {
-    for (; *s && pos < bufsz - 2; s++)
+    int limit = pos + 1024;
+    for (; *s && pos < bufsz - 8; s++) {
+        if (pos >= limit) {
+            memcpy(buf + pos, "\xe2\x80\xa6", 3);   /* … */
+            return pos + 3;
+        }
         buf[pos++] = (*s == ';' || *s == '|') ? ',' : *s;
+    }
     return pos;
 }
 
 /*
- * emit_callstack — called inside emit_span while g_sock_mutex is held and
- * g_sock is known to be valid.
+ * emit_callstack — called right after the span record it annotates, on the
+ * same thread (so it follows that span in the thread's transport ring).
  *
  * Appends lib+offset to each frame for source-level resolution via addr2line:
  *   frame format: sym_name|/path/to/lib.so|0xoffset
@@ -98,13 +106,14 @@ static void emit_callstack(uint64_t start_ns)
 {
     if (!g_callstack) return;
 
-    /* s_dem is pre-resolved in cs_init() — never call dlsym under the mutex. */
+    /* s_dem is pre-resolved in cs_init() — never call dlsym here. */
 
-    char buf[8192];
+    char buf[16384];
     int pos = snprintf(buf, sizeof(buf), "stk:%d:%d:%llu:",
-                       (int)g_pid, (int)gettid_compat(),
+                       (int)hp_tx_pid(), (int)hp_tx_tid(),
                        (unsigned long long)start_ns);
     int first = 1;
+    int truncated = 0;
 
 #ifdef HPROFILER_USE_LIBUNWIND
     /* ── libunwind path (accurate, no frame-pointer required) ──────────── */
@@ -114,7 +123,8 @@ static void emit_callstack(uint64_t start_ns)
         if (unw_getcontext(&ctx) != 0 || unw_init_local(&cursor, &ctx) != 0)
             goto _fallback;
 
-        while (unw_step(&cursor) > 0 && pos < (int)sizeof(buf) - 512) {
+        while (unw_step(&cursor) > 0) {
+            if (pos >= (int)sizeof(buf) - 640) { truncated = 1; break; }
             unw_word_t ip = 0;
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
             if (!ip) continue;
@@ -161,9 +171,10 @@ static void emit_callstack(uint64_t start_ns)
 _fallback:
     /* Reset buffer position for fallback. */
     pos = snprintf(buf, sizeof(buf), "stk:%d:%d:%llu:",
-                   (int)g_pid, (int)gettid_compat(),
+                   (int)hp_tx_pid(), (int)hp_tx_tid(),
                    (unsigned long long)start_ns);
     first = 1;
+    truncated = 0;
 #endif /* HPROFILER_USE_LIBUNWIND */
 
     /* ── glibc backtrace() fallback ─────────────────────────────────────── */
@@ -175,7 +186,8 @@ _fallback:
         char **syms = backtrace_symbols(frames, nf);
         if (!syms) return;
 
-        for (int i = 0; i < nf && pos < (int)sizeof(buf) - 256; i++) {
+        for (int i = 0; i < nf; i++) {
+            if (pos >= (int)sizeof(buf) - 640) { truncated = 1; break; }
             const char *sym = syms[i];
             if (_cs_should_skip(sym)) continue;
 
@@ -232,6 +244,10 @@ _fallback:
 _done:
 #endif
     if (first) return; /* no user frames captured — don't emit */
+    if (truncated && pos < (int)sizeof(buf) - 16) {
+        memcpy(buf + pos, ";[truncated]", 12);
+        pos += 12;
+    }
     buf[pos++] = '\n';
-    send_all(buf, pos);
+    hp_tx_emit(buf, (size_t)pos);
 }

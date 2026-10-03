@@ -122,8 +122,7 @@ Item {
                     // from under it mid-drag (spec.width is a reactive
                     // Python-backed property), so a naive local mouse.x
                     // delta would use a moving reference frame and jitter.
-                    // Same bug class Round 8's horizontal-scrollbar thumb
-                    // hit and fixed the same way.
+                    // Same technique as the horizontal-scrollbar thumb.
                     onPressed: (mouse) => {
                         startSceneX = resizeMouse.mapToItem(root, mouse.x, mouse.y).x
                         startWidth = cell.spec.width

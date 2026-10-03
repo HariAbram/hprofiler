@@ -1,6 +1,6 @@
 """
 Regression test for the cross-hook stk: correlation race (see
-audit-fixes-june-2026 memory / DOCUMENTATION.md §12): each LD_PRELOAD hook
+DOCUMENTATION.md, "Wire protocol"): each LD_PRELOAD hook
 opens its own socket connection, so span: and stk: records from *different*
 hooks but the same OS tid can interleave. A single last-write-wins slot
 keyed by (pid, tid) could then have the wrong span attached, or drop the
@@ -42,7 +42,7 @@ class TestRecentSpanRing(unittest.TestCase):
         self.assertIsNone(_find_recent_span(recent, 2, 100, 1000))  # wrong pid
 
     def test_interleaved_hooks_same_tid_both_recoverable(self):
-        """The exact race this fix targets: two different hook libraries
+        """Two different hook libraries
         (e.g. cuda_hook and ompt_tool) emit spans from the same OS tid in
         close succession, on two different socket connections. With a
         single last-write-wins slot, hookB's span would overwrite hookA's

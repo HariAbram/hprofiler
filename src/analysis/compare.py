@@ -1,27 +1,23 @@
 """
 Matches and diffs two traces' aggregated stats for the GUI's Comparison
-mode (Phase C) -- pure Python, no Qt, so the matching/classification logic
-is independently unit-testable without PySide6, same discipline as every
-other module in this package. Reused by src/gui/comparison.py's
-ComparisonBridge, not duplicated there.
+mode -- pure Python, no Qt, so the matching/classification logic is
+unit-testable without PySide6. Reused by src/gui/comparison.py's
+ComparisonBridge.
 
-Matching key: (category, name), the SAME stable identifier Round 16
-already established for cross-tab navigation (span_id is real but never
-serialized to JSON -- see src/gui/nav.py's own docstring). Fallback tier
-reuses the EXISTING dash.fmt_kernel_name() normalizer (already used to
-shorten JIT hash-named kernels for display) applied to both sides before a
-second matching pass -- not a new fuzzy-matching heuristic invented for
-this feature.
+Matching key: (category, name), the same identifier cross-tab navigation
+uses (see src/gui/nav.py's docstring). The fallback tier applies the
+dash.fmt_kernel_name() normalizer (which shortens JIT hash-named kernels
+for display) to both sides before a second matching pass -- not a fuzzy
+matcher.
 
-No fabricated statistics: hprofiler captures single-run traces only, with
-no repeated-trial/variance data anywhere, so classify() below uses a
-fixed, DISCLOSED noise-floor threshold (both a minimum percentage AND a
-minimum absolute time must be cleared before a delta counts as a real
-improvement/regression) -- an explicit heuristic guard against reading
-run-to-run noise as a meaningful change, not a statistical significance
-test. This mirrors the existing measured/derived/estimated/unavailable
-honesty contract (Round 16): a delta suppressed by the noise floor is
-`kind: "derived"` with a `reason` explaining why, not silently hidden.
+No fabricated statistics: hprofiler captures single-run traces with no
+repeated-trial/variance data, so classify() below uses a fixed, DISCLOSED
+noise-floor threshold (both a minimum percentage AND a minimum absolute
+time must be cleared before a delta counts as an improvement/regression)
+-- a heuristic guard against reading run-to-run noise as a change, not a
+statistical significance test. Per the measured/derived/estimated/
+unavailable contract, a delta suppressed by the noise floor is
+`kind: "derived"` with a `reason`, not silently hidden.
 """
 from __future__ import annotations
 

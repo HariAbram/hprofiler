@@ -117,13 +117,9 @@ ColumnLayout {
         Layout.fillWidth: true
         visible: Roofline.available
         spacing: AppTheme.spacingXl
-        // Coincidentally reuses the cpu/rocm category hexes (the values
-        // already matched before this fix) -- the roofline chart's own
-        // scatter points are colored server-side (bridge.py's
-        // RooflineBridge._BOUND_COLOR), independently of AppTheme, and
-        // stay that way after this change (a real, disclosed, deeper
-        // fix would need threading `theme` into that bridge's
-        // constructor -- out of scope for a QML-only pass).
+        // Uses the cpu/rocm category colors, which match the dark-theme
+        // values of the scatter points' colors -- those are fixed server-side
+        // (bridge.py's RooflineBridge._BOUND_COLOR), independent of AppTheme.
         LegendSwatch { swatchColor: AppTheme.categoryColor("cpu"); label: "compute-bound" }
         LegendSwatch { swatchColor: AppTheme.categoryColor("rocm"); label: "memory-bound" }
         Item { Layout.fillWidth: true }

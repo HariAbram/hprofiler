@@ -251,16 +251,12 @@ class TestProfileLoadWorkerRealThread(unittest.TestCase):
     real cancel-from-the-main-thread test. Uses a real QEventLoop + a
     QTimer timeout (the correct, idiomatic Qt way to block-with-a-
     deadline in a test) instead of a manual processEvents()+time.sleep()
-    polling loop -- an earlier version of this test used that polling
-    pattern and it produced a real, ugly failure mode: a "QThread:
-    Destroyed while thread is still running" warning immediately
-    followed by a hard process crash (core dump), because the polling
-    loop could exit (deadline reached) without the thread having
-    actually been told to quit()/given a chance to wait() for long
-    enough, leaving a live QThread whose Python wrapper then got
-    garbage-collected out from under the still-running C++ thread.
-    QEventLoop.quit() driven directly off the worker's own terminal
-    signals (not a polled condition) doesn't have that gap, and every
+    polling loop: such a loop can exit (deadline reached) without the
+    thread having been told to quit()/wait()ed for long enough, leaving a
+    live QThread whose Python wrapper is garbage-collected out from under
+    the still-running C++ thread ("QThread: Destroyed while thread is
+    still running", then a core dump). QEventLoop.quit() driven directly
+    off the worker's terminal signals doesn't have that gap, and every
     test below still explicitly quit()s+wait()s the thread before
     returning as defense in depth."""
 

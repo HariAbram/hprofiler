@@ -3,7 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Hprofiler 1.0
 
-// Timeline's event search (Phase B4): a name/regex query, match count,
+// Timeline's event search: a name/regex query, match count,
 // next/previous navigation. Jumping the view to a match is left to
 // TimelineScreen.qml (matchJumped signal) -- this component only owns the
 // query/navigation UI, not view-centering, matching TimelineFilterBar's

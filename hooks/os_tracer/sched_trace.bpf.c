@@ -1,54 +1,20 @@
 /*
- * eBPF CO-RE (Compile Once - Run Everywhere) OS-level scheduler tracer.
+ * eBPF CO-RE scheduler tracer: shows whether an idle gap in a thread's spans
+ * was the OS not running the thread (preempted, waiting for a core,
+ * migrated) rather than the dependency the critical path assumes -- below
+ * what any LD_PRELOAD/OMPT/PMPI hook can observe.
  *
- * Answers a question hprofiler's other hooks structurally cannot: when a
- * thread's span shows an idle gap (e.g. inside MPI_Wait, or between two
- * kernel launches), was that gap *caused* by the thing the causal DAG
- * thinks it's waiting on, or was the OS scheduler simply not running that
- * thread on a CPU during that window (preempted by another process,
- * waiting for a free core, migrated between NUMA nodes)? None of the
- * LD_PRELOAD/OMPT/PMPI hooks can see this -- it's below the userspace
- * boundary entirely.
+ * Tracepoints (stable kernel ABI):
+ *   sched_switch        one event per off-CPU period of a task (switched out
+ *                       -> switched back in), comparable to a span's gap
+ *   sched_wakeup        instant; pairing it with the task's next switch-in
+ *                       would give run-queue latency (not computed yet)
+ *   sched_migrate_task  instant; a task moved to another CPU
  *
- * Attaches to three sched tracepoints (kernel-standardized ABI, present on
- * any Linux kernel with CONFIG_SCHED_TRACER, essentially universal):
- *   sched_switch        -- a CPU stopped running one task and started
- *                          running another. This program tracks, per
- *                          pid, how long it was off-CPU between being
- *                          switched out and switched back in, and emits
- *                          ONE event per off-CPU period (not per
- *                          switch) -- directly comparable to an
- *                          hprofiler span: an "off-cpu" duration a
- *                          Python-side consumer can overlap against any
- *                          instrumented span's idle gap.
- *   sched_wakeup        -- a sleeping task became runnable. Emitted as a
- *                          raw instant; pairing it with the NEXT
- *                          sched_switch that switches the same pid in
- *                          gives run-queue (scheduling) latency, i.e.
- *                          "wanted to run but no core was free yet" --
- *                          left as a documented follow-on Python-side
- *                          computation rather than decomposed in-kernel,
- *                          to keep this program's per-event kernel-side
- *                          work minimal.
- *   sched_migrate_task  -- a task moved to a different CPU (often across
- *                          NUMA nodes) -- a common, otherwise invisible
- *                          cause of an unexplained slowdown.
+ * Events reach userspace through a BPF ring buffer (os_tracer.c).
  *
- * Events are delivered to userspace via a BPF ring buffer (the modern,
- * simpler replacement for the older perf-buffer API) -- see os_tracer.c
- * for the loader/consumer.
- *
- * ── Verification status ─────────────────────────────────────────────────
- * Compile-checked only (`clang -target bpf`, using this machine's own
- * BTF-derived vmlinux.h for CO-RE field access -- see DOCUMENTATION.md).
- * `kernel.unprivileged_bpf_disabled=2` on this development machine blocks
- * loading/attaching without root/CAP_BPF, which was not available/
- * authorized in this session -- the kernel BPF *verifier* (a distinct,
- * additional pass beyond compilation that rejects programs violating
- * memory-safety/termination rules the C compiler itself doesn't check)
- * has never actually run on this program. Treat as unverified beyond
- * "clang accepted the C" until confirmed loadable on a machine where BPF
- * loading is permitted.
+ * Compiled only (clang -target bpf against this machine's BTF-generated
+ * vmlinux.h); the kernel verifier has never run on it (no CAP_BPF here).
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -73,22 +39,16 @@ struct sched_event {
     char  comm[16];
 };
 
-/* Ring buffer for kernel -> userspace event delivery. 256KB is generous
- * headroom for burst scheduling activity between userspace poll
- * iterations; sized independently of hooks/common/ringbuffer.h (that one
- * is userspace-only, for the LD_PRELOAD hooks' own hot path -- this is
- * the separate kernel/userspace boundary ring buffer BPF itself provides). */
+/* Kernel -> userspace ring buffer; 256 KB of headroom for scheduling bursts
+ * between polls. */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-/* Per-pid off-CPU start timestamp, populated when a task is switched OUT,
- * consumed (and cleared) when that same pid is next switched IN. A task
- * that's switched out and never switched back in within the trace window
- * (e.g. it exits) simply leaves a stale entry that's naturally evicted by
- * LRU -- not a leak, and not surfaced as a spurious event, since no
- * matching switch-IN ever reads it. */
+/* Off-CPU start per pid, set at switch-out and consumed at the next
+ * switch-in. A task that never comes back leaves an entry the LRU map
+ * evicts; no event is emitted for it. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);

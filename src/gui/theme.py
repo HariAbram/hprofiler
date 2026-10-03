@@ -1,21 +1,17 @@
 """
-Central design-token module shared by every QML screen, exposed to QML
-as a single singleton ("AppTheme") so every .qml file reads e.g.
+Central design-token module shared by every QML screen, exposed to QML as
+a single singleton ("AppTheme") so every .qml file reads e.g.
 `AppTheme.background` / `AppTheme.categoryColor("cuda")` /
-`AppTheme.spacingMd` instead of each screen hardcoding its own hex
-values, margins, or font sizes -- and so the dark/light toggle (Phase 7)
-only has to change color state in one place. Originally colors only
-(hence the class/module name); a visual-consistency audit extended it to
-also own spacing/radius/typography/row/button-size tokens and semantic
-warning/error/success/info color aliases, after finding those values
-drifting independently (2-6 different radii, 8 different font sizes,
-etc.) across screens that already deferred to this module for color.
+`AppTheme.spacingMd` instead of hardcoding hex values, margins, or font
+sizes, and the dark/light toggle changes color state in one place. Owns
+colors plus spacing/radius/typography/row/button-size tokens and semantic
+warning/error/success/info color aliases. tests/ bans raw hex colors in
+QML outside this module.
 
 Category hues are chosen independently from the TUI's Rich color names
-(src/ui/app.py's _CAT_RICH) since Rich color names ("dodger_blue2") and
-QML/CSS hex colors are different systems -- but chosen to be the same
-semantic hue per category, so a user moving between the TUI and this GUI
-sees the same category mean the same color in both.
+(src/ui/app.py's _CAT_RICH), since Rich names and CSS hex are different
+systems, but with the same semantic hue per category, so a category means
+the same color in both UIs.
 """
 from __future__ import annotations
 
@@ -249,14 +245,11 @@ class Theme(QObject):
 
     # ── Activity buckets (analysis/activity_buckets.py's BUCKETS) ───────
     # Computation/Communication/Synchronization/Memory transfer reuse the
-    # SAME category colors OverviewScreen.qml's own breakdownColor()
-    # already mapped them to since Round 16 (cpu/mpi/sync/memory) -- moved
-    # here so Python and QML can't drift into disagreeing about it the way
-    # DashboardBridge's old _bucket_of dict and this slot's absence would
-    # have let them. Runtime overhead/Annotation reuse the jit/nvtx
-    # category colors (already CVD-checked in the Round 15 palette
-    # revision) rather than adding brand-new, unvetted hex values for two
-    # buckets that are thematically close to those categories anyway.
+    # category colors of cpu/mpi/sync/memory (OverviewScreen.qml's
+    # breakdownColor() uses the same mapping); defining it here keeps Python
+    # and QML in agreement. Runtime overhead/Annotation reuse the
+    # CVD-checked jit/nvtx category colors rather than adding unvetted hex
+    # values.
     @Slot(str, result=str)
     def bucketColor(self, bucket: str) -> str:
         return bucket_color(bucket, self._dark)

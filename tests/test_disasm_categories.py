@@ -1,28 +1,18 @@
 """
-Regression test for src/core/runner.py's _collect_disasm(): the loop that
+Regression tests for src/core/runner.py's _collect_disasm(): the loop that
 extracts sym=/lib= codeptr tags into `omp_syms` (later passed to
-disasm/extractor.py's collect_disasm()) filtered on
-`span.category.value in ("openmp", "sync", "cpu")` -- "mpi" was missing,
-so even after mpi_hook.c started emitting sym=/lib= tags on its
-collective-call spans (MPI_Bcast/MPI_Allreduce/MPI_Barrier, see
-hooks/mpi_hook/mpi_hook.c), this loop never looked at them. The Source
-tab's kernel list includes every profiled span name, not just GPU
-kernels, so those MPI spans showed "No disassembly available"
-unconditionally -- not because objdump was missing, but because nothing
-ever tried.
+disasm/extractor.py's collect_disasm()) must include "mpi" spans alongside
+"openmp"/"sync"/"cpu" -- mpi_hook.c emits sym=/lib= tags on its
+collective-call spans (MPI_Bcast/MPI_Allreduce/MPI_Barrier), and without
+them the Source tab shows "No disassembly available" for every MPI span.
 
-Also covers a second, subtler bug found immediately after the first fix
-shipped: a real user's Source tab showed "Call site resolved (sym=...)
-but disassembly still failed" -- the sym= tag WAS present and correct,
-but collect_disasm() always disassembled `command[0]` for a "sym" entry,
-and the profiled command was `hprofiler run -- srun -n 4 gmx_mpi ...`,
-so `command[0]` was `srun`, not `gmx_mpi` (where the resolved symbol
-actually lives). Fixed by having the hooks also emit `symfile=<path>`
-(dladdr's own `dli_fname` -- the ELF the symbol was actually found in)
-alongside `sym=`, and `omp_syms["name"]`'s "sym" payload is now
-`(sym_name, symfile)` instead of a bare string; collect_disasm() uses
-`symfile` when present, falling back to `command[0]` only for tags from
-an older hook build (symfile is None).
+Also covers launcher-wrapped commands (`hprofiler run -- srun -n 4 gmx_mpi
+...`, where `command[0]` is `srun`, not the binary holding the resolved
+symbol): the hooks emit `symfile=<path>` (dladdr's `dli_fname` -- the ELF
+the symbol was found in) alongside `sym=`, `omp_syms["name"]`'s "sym"
+payload is `(sym_name, symfile)`, and collect_disasm() uses `symfile` when
+present, falling back to `command[0]` only for tags from a hook build
+without symfile= (symfile is None).
 
 Mocks disasm/extractor.collect_disasm() (a real implementation shells out
 to nm/objdump against a real binary, which this test has no need for --
@@ -31,9 +21,8 @@ here) rather than exercising the full extraction pipeline, which is
 already covered at the wire-protocol level by
 tests/integration/test_gomp_hook.py and test_mpi_protocol.py's
 "...carry_a_resolved_codeptr_tag_for_disasm" tests, and end-to-end
-(hook -> wire protocol -> this exact function -> real objdump output) by
-manual verification during development (see project_disasm_codeptr_fix
-memory).
+(hook -> wire protocol -> this function -> real objdump output) by
+tests/integration/test_callsite_e2e.py.
 """
 import shutil
 import subprocess
@@ -101,8 +90,7 @@ class TestCollectDisasmCategoryFilter(unittest.TestCase):
         self.assertNotIn("MPI_Send", omp_syms)
 
     def test_openmp_span_still_included_unaffected_by_the_fix(self):
-        # Non-regression: the pre-existing "openmp"/"sync"/"cpu" categories
-        # must keep working exactly as before.
+        # The "openmp"/"sync"/"cpu" categories keep working.
         trace = Trace(TraceMetadata(command="./app", cwd=""))
         trace.add(_span(Category.OPENMP, "omp_parallel_region", {"sym": "main"}))
         omp_syms = self._omp_syms_seen(trace)
@@ -113,16 +101,12 @@ class TestCollectDisasmCategoryFilter(unittest.TestCase):
 @unittest.skipUnless(shutil.which("gcc"), "gcc not available")
 class TestCollectDisasmUsesSymfileNotLauncher(unittest.TestCase):
     """
-    Real (non-mocked) end-to-end reproduction of the launcher-wrapped
-    scenario: a real user ran `hprofiler run --disasm -- srun -n 1
-    gmx_mpi ...`, so command[0] was "srun", not "gmx_mpi" -- their
-    Source tab showed a correctly-resolved `sym=_ZN3gmx19...` but still
-    "No disassembly available", because collect_disasm() always
-    disassembled command[0] for a "sym" entry regardless of where the
-    symbol actually was. Builds a REAL binary with a known function and
-    confirms collect_disasm() finds it via `symfile=`, not `command[0]`
-    -- command[0] here is deliberately something with no such symbol at
-    all, standing in for "srun".
+    Real (non-mocked) end-to-end check of the launcher-wrapped scenario
+    (`hprofiler run --disasm -- srun -n 1 gmx_mpi ...`, command[0] =
+    "srun"): builds a REAL binary with a known function and confirms
+    collect_disasm() finds it via `symfile=`, not `command[0]` --
+    command[0] here deliberately has no such symbol, standing in for
+    "srun".
     """
 
     @classmethod
@@ -161,9 +145,8 @@ class TestCollectDisasmUsesSymfileNotLauncher(unittest.TestCase):
         self.assertTrue(kd.lines, "disasm entry present but has no instruction lines")
 
     def test_falls_back_to_command0_when_symfile_is_none(self):
-        # Old-format tag (no symfile=, e.g. from a hook build that
-        # predates this fix) -- must still work exactly as before when
-        # command[0] genuinely IS the right binary.
+        # Old-format tag (no symfile=, from a hook build without it) --
+        # must still work when command[0] genuinely IS the right binary.
         omp_syms = {
             "omp_parallel_region": ("sym", ("hprofiler_test_target_function", None)),
         }
@@ -195,8 +178,7 @@ class TestCollectDisasmUsesSymfileNotLauncher(unittest.TestCase):
 
     def test_real_binary_absent_falls_back_to_command0_unchanged(self):
         # No real_binary passed at all (e.g. no hook ever connected, or
-        # SO_PEERCRED isn't available) -- must behave exactly as before
-        # this fix: command[0] is used, unchanged default behavior.
+        # SO_PEERCRED isn't available) -- command[0] is used.
         result = collect_disasm(
             command=[self.real_binary], backends=["cpu"], jit_spans=[],
             cpu_names={"hprofiler_test_target_function"},
@@ -223,9 +205,8 @@ class TestCollectDisasmUsesSymfileNotLauncher(unittest.TestCase):
         self.assertTrue(result["omp_parallel_region"].lines)
 
     def test_mangled_name_is_the_real_symbol_not_the_span_label(self):
-        # Regression test for a real user question ("what does 'omp_barrier
-        # assembly' even mean?"): kd.name stays the span/event label
-        # ("omp_parallel_region") for display grouping -- unchanged -- but
+        # kd.name stays the span/event label ("omp_parallel_region") for
+        # display grouping, but
         # kd.mangled_name must carry the REAL resolved symbol that was
         # actually disassembled (here: hprofiler_test_target_function),
         # not be left empty. Two things depend on this: annotate_with_perf
@@ -247,22 +228,16 @@ class TestCollectDisasmUsesSymfileNotLauncher(unittest.TestCase):
 
 
 class TestAnnotateWithPerfSymbolFilter(unittest.TestCase):
-    """Regression test for a real bug: annotate_with_perf() always filtered
-    `perf annotate -s <kd.name>`, but for an OMP/MPI-hook-resolved kernel
-    kd.name is an hprofiler-invented event label ("omp_barrier",
-    "MPI_Bcast") that no real ELF symbol is ever named -- perf's own
-    symbol table has no such entry, so the filter silently matched
-    nothing and every DisasmLine.sample_pct stayed 0 regardless of
-    whether perf actually recorded real samples elsewhere in the binary.
-    A real user reported exactly this: working disassembly, but "no
-    statistical information" shown at all.
+    """annotate_with_perf() must filter `perf annotate -s` by the REAL
+    resolved symbol (kd.mangled_name), not kd.name: for an OMP/MPI-hook-
+    resolved kernel kd.name is an hprofiler event label ("omp_barrier",
+    "MPI_Bcast") that no ELF symbol is named, so filtering by it matches
+    nothing and every DisasmLine.sample_pct stays 0 even though perf
+    recorded samples -- disassembly shown, but no sample statistics.
 
-    Can't exercise this against a REAL `perf record`/`perf annotate` in
-    this sandbox (perf_event_paranoid=4 here blocks perf record entirely,
-    confirmed empirically -- see project_paper4_benchmark_suite memory
-    for this machine's other confirmed perf limits), so this mocks the
-    subprocess call and asserts on the constructed argv -- which is
-    exactly the one-line change the bug fix actually was."""
+    Mocks the subprocess call and asserts on the constructed argv, since
+    a real `perf record` is blocked where perf_event_paranoid > 2 (as on
+    the development machine)."""
 
     def test_uses_mangled_name_as_the_symbol_filter_when_present(self):
         from src.disasm.extractor import annotate_with_perf, KernelDisasm, DisasmLine

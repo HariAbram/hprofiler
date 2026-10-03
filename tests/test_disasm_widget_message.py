@@ -1,21 +1,16 @@
 """
 Regression test for DisasmWidget._show_disasm's "No disassembly
-available" message (src/ui/app.py) -- it used to show the exact same
-generic "install objdump/cuobjdump/llvm-objdump" tips regardless of WHY
-disassembly was missing. A real user hit this after a fix that made
-gomp_hook.c/mpi_hook.c resolve call-site sym=/lib= tags (see
-project_disasm_codeptr_fix memory): they were still viewing a trace
-captured BEFORE rebuilding the hooks (or with a construct that genuinely
-doesn't resolve a tag yet), so every span had no sym=/lib= tag at all --
-but the old message told them to go install objdump, which was never the
-actual problem and sent them chasing the wrong fix.
+available" message (src/ui/app.py): the message must say WHY disassembly
+is missing rather than always suggesting installing objdump. A trace
+captured before rebuilding the hooks (or a construct that doesn't resolve
+a call-site tag) has no sym=/lib= tag at all, and the fix there is
+re-capturing, not installing a tool.
 
-The message now distinguishes three cases by checking the actual spans'
-tags: (1) no sym=/lib= tag anywhere for this name -- nothing was ever
-resolved, most likely a stale trace or an unrebuilt hook, NOT a missing-
-tool problem; (2) a sym=/lib= tag IS present but disasm still failed --
-now the objdump/nm tips are actually relevant; (3) a GPU kernel with no
-disasm -- the original CUDA/ROCm-specific tips, unchanged.
+The message distinguishes three cases from the spans' tags: (1) no
+sym=/lib= tag anywhere for this name -- nothing was resolved, most likely
+a stale trace or an unrebuilt hook, NOT a missing-tool problem; (2) a
+sym=/lib= tag IS present but disasm still failed -- the objdump/nm tips
+apply; (3) a GPU kernel with no disasm -- the CUDA/ROCm-specific tips.
 """
 import sys
 import unittest

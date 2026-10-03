@@ -303,12 +303,27 @@ class TestWorkspaceSettings(unittest.TestCase):
         self.assertNotIn("api-key", text)
         self.assertNotIn("api_key", text)
 
-    def test_only_resolved_file_path_is_stored_for_a_profile_not_argv(self):
+    def test_trace_path_is_never_stored_only_its_hash(self):
+        # Trace paths can reveal user names, projects or clusters: a
+        # profile's state is filed under a hash of the resolved path and
+        # the path itself is never written.
         ws = self._ws()
-        ws.save_profile_state("/tmp/traces/run.hprofiler.json", {"zoom": 1.0})
+        ws.save_profile_state("/tmp/traces/secret-project/run.hprofiler.json", {"zoom": 1.0})
         text = self._raw_file_text()
-        self.assertIn("run.hprofiler.json", text)   # the path itself is fine to store
+        self.assertNotIn("run.hprofiler.json", text)
+        self.assertNotIn("secret-project", text)
         self.assertNotIn("--", text)                  # no CLI-flag-shaped content anywhere
+        self.assertEqual(ws.load_profile_state("/tmp/traces/secret-project/run.hprofiler.json"), {"zoom": 1.0})
+
+    def test_path_written_by_an_earlier_version_is_removed_on_save(self):
+        qs = _mk_settings(self._ini_path)
+        from src.gui.settings import _storage_key
+        key = _storage_key("/tmp/old/run.json")
+        qs.setValue(f"profiles/{key}/path", "/tmp/old/run.json")
+        qs.sync()
+        ws = self._ws()
+        ws.save_profile_state("/tmp/old/run.json", {"zoom": 2.0})
+        self.assertNotIn("/tmp/old/run.json", self._raw_file_text())
 
 
 @unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 not installed (optional gui extra)")

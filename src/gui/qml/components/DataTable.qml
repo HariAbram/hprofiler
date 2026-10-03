@@ -11,13 +11,11 @@ import "."
 // bridge property (e.g. Kernels.table, System.deviceTable).
 Item {
     id: root
-    // Unique per instance (derived from `title`, which every real usage
-    // sets) since this component is instantiated more than once across
-    // the GUI (Kernels, System devices/metrics, Findings, ...) -- a
-    // hardcoded objectName here would repeat the exact bug this round
-    // already found and fixed for FlameGraphScreen's Tooltip (a
-    // non-specific "first match wins" lookup silently grabbing the WRONG
-    // instance's tooltip once a second one existed in the same window).
+    // Unique per instance (derived from `title`, which every usage sets)
+    // since this component is instantiated more than once per window
+    // (Kernels, System devices/metrics, Findings, ...) -- a hardcoded
+    // objectName would make a "first match wins" lookup silently grab the
+    // WRONG instance.
     objectName: "dataTable_" + title
     property var table: null            // TableBundle
     property string title: ""
@@ -154,9 +152,8 @@ Item {
                 }
 
                 // Mouse wheel over the body also scrolls horizontally when
-                // shift is held -- vertical scroll (the common case) stays
-                // ListView's own native wheel handling; this only adds a
-                // NEW gesture, it doesn't take one away.
+                // shift is held; vertical scroll stays ListView's native wheel
+                // handling.
                 MouseArea {
                     anchors.fill: parent
                     acceptedButtons: Qt.NoButton
@@ -183,7 +180,7 @@ Item {
             // contentX, so a stock attached ScrollBar doesn't apply (same
             // reasoning as TimelineScreen.qml's own horizontal scrollbar).
             // The drag MouseArea covers the whole FIXED track, not the
-            // thumb itself, to avoid a moving-reference-frame bug (Round 8).
+            // thumb itself, so the drag delta has a stable reference frame.
             Rectangle {
                 id: hTrack
                 visible: root.maxScrollX > 0

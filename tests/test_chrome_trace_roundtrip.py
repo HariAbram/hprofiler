@@ -1,16 +1,11 @@
 """
-Regression test for src/output/chrome_trace.py: write()/load_trace_from_json()
-silently dropped most of KernelDisasm/DisasmLine's fields on a JSON
-round-trip -- mangled_name, ptxas_derived, source_file, source_line,
-sample_pct, stall_cycles, stall_reason were all computed correctly at
-profile time but never serialized, so re-opening a SAVED trace
-(`hprofiler gui saved.hprofiler.json`, or the TUI's `hprofiler view`)
-always showed them at their dataclass defaults (empty/0/-1) regardless
-of what was actually collected. Found while investigating a real user
-report of the GUI's Source tab showing no per-instruction statistics and
-no indication of what function was being disassembled -- this is one of
-two root causes (the other: annotate_with_perf's symbol filter, see
-test_disasm_categories.py).
+Round-trip tests for src/output/chrome_trace.py: write()/load_trace_from_json()
+must preserve every KernelDisasm/DisasmLine field -- mangled_name,
+ptxas_derived, source_file, source_line, sample_pct, stall_cycles,
+stall_reason -- or re-opening a SAVED trace (`hprofiler gui
+saved.hprofiler.json`, or the TUI's `hprofiler view`) shows them at their
+dataclass defaults (empty/0/-1): no per-instruction statistics and no
+indication of which function was disassembled.
 
 Only matters for a trace that's SAVED and RE-OPENED later, not one
 viewed immediately after profiling in the same process (where the UI
@@ -76,8 +71,8 @@ class TestDisasmJsonRoundtrip(unittest.TestCase):
         self.assertEqual(ln.stall_reason, "LG Throttle")
 
     def test_defaults_are_sane_when_fields_absent(self):
-        # A trace file written by an OLDER hprofiler build (before this
-        # fix) won't have these keys in its JSON at all -- must not crash,
+        # A trace file written by an older hprofiler build lacks these keys
+        # in its JSON entirely -- must not crash,
         # and stall_cycles=-1 (not 0) means "unknown", matching
         # DisasmLine's own dataclass default.
         kd = KernelDisasm(name="k", arch="x86-64", source="/bin/a.out",
@@ -118,7 +113,7 @@ class TestCaptureTimeRoundtrip(unittest.TestCase):
         self.assertEqual(self._roundtrip(meta).capture_time_iso, "2026-09-25T10:00:00")
 
     def test_defaults_to_empty_when_absent_from_json(self):
-        # A trace saved by a build before this field existed has no
+        # A trace saved by an older build has no
         # "captureTime" key at all -- must default to "", which the GUI
         # renders as "unavailable", not a crash or a fabricated time.
         meta = TraceMetadata(command="a.out", args=[])  # capture_time_iso="" by default
@@ -127,9 +122,9 @@ class TestCaptureTimeRoundtrip(unittest.TestCase):
 
 class TestLoadTraceProgressAndCancellation(unittest.TestCase):
     """progress_cb/cancel_check (GUI async-loading worker support, see
-    src/gui/loader.py) -- optional and additive, every pre-existing
-    caller (TUI/CLI/analysis code, every OTHER test in this file) passes
-    neither and is completely unaffected; verified separately below."""
+    src/gui/loader.py) -- optional; callers that pass neither
+    (TUI/CLI/analysis code, every OTHER test in this file) are unaffected,
+    verified separately below."""
 
     def _write_trace_with_n_events(self, n: int) -> str:
         trace = Trace(TraceMetadata(command="a.out", args=[]))

@@ -3,7 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Hprofiler 1.0
 
-// Timeline's grouping/collapse/show-all-lanes control (Phase B3) -- a
+// Timeline's grouping/collapse/show-all-lanes control -- a
 // separate control from TimelineFilterBar.qml on purpose: filters narrow
 // WHAT's shown, this changes HOW the rows are organized. Per-lane hide/
 // isolate live on each lane row itself (TimelineScreen.qml's laneRowComponent,

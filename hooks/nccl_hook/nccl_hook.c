@@ -1,25 +1,15 @@
 /*
- * NCCL collective operations LD_PRELOAD hook.
+ * NCCL hook (LD_PRELOAD; no NCCL headers needed, symbols via dlsym).
  *
- * Intercepts NCCL multi-GPU communication calls and records GPU-accurate
- * spans using cudaEvent pairs (same mechanism as the CUDA hook).
+ * Wraps ncclAllReduce, Broadcast, Reduce, AllGather, ReduceScatter,
+ * AllToAll, Send, Recv (category "nccl"; tags type=, bytes= (count x dtype
+ * size), stream=, rank=, nranks=), GroupStart/GroupEnd (one ncclGroup span
+ * for the outermost pair) and CommInitRank/InitAll/Destroy.
  *
- * Captured calls:
- *   ncclAllReduce, ncclBroadcast, ncclReduce, ncclAllGather, ncclReduceScatter
- *   ncclSend, ncclRecv
- *   ncclGroupStart / ncclGroupEnd  (mark group boundaries as spans)
- *
- * Wire protocol: identical to cuda_hook — spans on HPROFILER_SOCKET.
- * Category: "nccl"
- *
- * Tags:
- *   type=allreduce|broadcast|...
- *   bytes=N          (count × dtype_size)
- *   stream=ID
- *
- * Build requirements:
- *   gcc -shared -fPIC -o libhprofiler_nccl.so nccl_hook.c -ldl -lpthread
- *   (NCCL headers not required — only type stubs below)
+ * Timing: a cudaEvent pair on the operation's stream; the wrapper waits for
+ * the end event before returning, which serializes each operation with the
+ * host. Without usable CUDA events: host wall-clock time, tagged timing=cpu.
+ * If the end-event wait or elapsed-time query fails, no span is emitted.
  */
 
 #define _GNU_SOURCE
@@ -45,11 +35,8 @@ typedef int   ncclRedOp_t;
 
 #define ncclSuccess 0
 
-/* Common NCCL datatype sizes (index matches ncclDataType_t enum order).
- * NCCL >= 2.20 added ncclFp8E4M3=10 / ncclFp8E5M2=11 (1 byte each, used by
- * FP8 training collectives) -- without these two entries every FP8
- * collective's bytes= tag (and anything computed from it, e.g. bus
- * bandwidth) was silently 4x too large via the generic fallback below. */
+/* Index = ncclDataType_t; includes the NCCL >= 2.20 FP8 types (1 byte).
+ * Unknown types fall back to 4 bytes. */
 static const size_t _nccl_dtype_sizes[] = {
     1,  /* ncclInt8    / ncclChar   */
     1,  /* ncclUint8               */
@@ -70,70 +57,30 @@ static size_t nccl_dtype_sz(ncclDataType_t dt) {
     return 4;  /* fallback for datatypes newer than this table */
 }
 
-/* ── Globals (shared with cuda_hook via socket) ──────────────────────── */
-static int             g_sock       = -1;
-static pthread_mutex_t g_sock_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pid_t           g_pid        = 0;
-
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
-static pid_t gettid_compat(void) { return (pid_t)syscall(SYS_gettid); }
 
-static void ensure_connected(void) {
-    if (g_sock >= 0) return;
-    const char *path = getenv("HPROFILER_SOCKET");
-    if (!path) return;
-    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return;
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        g_sock = s; g_pid = getpid();
-    } else {
-        close(s);
-    }
-}
-
-static void send_all(const char *buf, int n) {
-    while (n > 0) {
-        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
-        if (r < 0) { close(g_sock); g_sock = -1; return; }
-        buf += r; n -= (int)r;
-    }
-}
-
+/* Events go through the shared per-thread ring transport (its own
+ * connection, separate from cuda_hook's). */
+#include "../common/hp_transport.h"
 #include "../common/callstack.h"
+
+static pid_t gettid_compat(void) { return hp_tx_tid(); }
 
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) {
-        char buf[1024];
-        int n = snprintf(buf, sizeof(buf),
-            "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-            cat, g_pid, (int)tid,
-            (unsigned long long)start_ns, (unsigned long long)dur_ns,
-            name, extra ? extra : "");
-        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
-        emit_callstack(start_ns);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (!hp_tx_enabled()) return;
+    hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                (unsigned long long)start_ns, (unsigned long long)dur_ns,
+                name, extra ? extra : "");
+    emit_callstack(start_ns);
 }
 
-/* Appends ",timing=cpu" (or sets it bare if `extra` is empty) -- exact
- * mirror of cuda_hook.c's mark_cpu_fallback(). Marks a span whose
- * duration came from host wall-clock timing around the call rather than
- * from a synced GPU event pair, so a degraded measurement (event
- * creation/recording failed, or f_evElapsed reported a negative delta)
- * is never silently indistinguishable from a real GPU-accurate one --
- * this file's own header claims GPU-accurate timing "same mechanism as
- * the CUDA hook", so its fallback path should be marked the same way
- * the CUDA hook's is. */
+/* Appends ",timing=cpu": the span was timed by the host clock around the
+ * call (no usable CUDA events), not by an event pair. */
 static void mark_cpu_fallback(char *extra, size_t cap) {
     size_t len = strlen(extra);
     if (len == 0) {
@@ -167,9 +114,8 @@ static int ev_ok(void) {
     return f_evCreate && f_evRecord && f_evElapsed && f_evDestroy && f_evSync;
 }
 
-/* Record a GPU-accurate span: create events before and after the call.
- * _t0 is captured BEFORE f_evRecord so the CPU timestamp is never later
- * than the GPU start event (timestamp ordering fix). */
+/* Event-pair timing. _t0 is taken before the start event is recorded, so the
+ * host timestamp never follows the GPU start. */
 #define GPU_SPAN_BEGIN(stream)                          \
     uint64_t _t0 = now_ns();                            \
     cudaEvent_t _ev_s = NULL, _ev_e = NULL;             \
@@ -195,7 +141,7 @@ static int ev_ok(void) {
         if (_ev_e) f_evDestroy(_ev_e);                                   \
     }
 
-/* ── NCCL comm rank/world-size query (N2) ────────────────────────────── */
+/* ── NCCL comm rank/world-size query ─────────────────────────────────── */
 typedef ncclResult_t (*fn_CommUserRank_t)(ncclComm_t, int*);
 typedef ncclResult_t (*fn_CommCount_t)   (ncclComm_t, int*);
 static fn_CommUserRank_t f_commRank  = NULL;
@@ -215,7 +161,7 @@ static void comm_meta(ncclComm_t comm, int *rank, int *nranks) {
     if (f_commCount && comm) f_commCount(comm, nranks);
 }
 
-/* ── NCCL communicator lifecycle (N1) ───────────────────────────────── */
+/* ── NCCL communicator lifecycle ────────────────────────────────────── */
 typedef struct { char _opaque[128]; } ncclUniqueId;
 
 ncclResult_t ncclCommInitRank(ncclComm_t *comm, int nranks,
@@ -257,16 +203,9 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
     return ret;
 }
 
-/* ── NCCL stream ID (deterministic hash of the pointer, NOT an
- * order-of-first-observation counter) ──────────────────────────────────
- * Must match cuda_hook.c's get_stream_id() exactly: it's a separate .so
- * with no shared state, but the same cudaStream_t handle is the same
- * pointer value in both when cuda+nccl are active together (the common
- * case) -- an order-dependent counter would otherwise assign the SAME
- * stream a DIFFERENT stream=N in "cuda"-category vs "nccl"-category spans,
- * silently breaking cross-hook per-stream correlation. Also removes the
- * previous SMAP_CAP overflow behavior (silently collapsing to stream=-1
- * past 512 streams). */
+/* ── Stream id ───────────────────────────────────────────────────────────
+ * Pointer hash identical to cuda_hook.c's get_stream_id(), so both hooks
+ * report the same stream=N for the same handle (0 = default stream). */
 static int stream_id(cudaStream_t s) {
     if (!s) return 0;
     uint64_t v = (uint64_t)(uintptr_t)s;
@@ -430,19 +369,10 @@ ncclResult_t ncclAllToAll(const void *sb, void *rb, size_t count,
 }
 
 /* ── Group boundaries ───────────────────────────────────────────────── */
-/* KNOWN, UNVERIFIED LIMITATION: NCCL's documented group semantics defer
- * the actual kernel launch for every op issued inside
- * ncclGroupStart()/ncclGroupEnd() until ncclGroupEnd() itself returns --
- * so a GPU_SPAN_BEGIN/END event pair recorded for an op called INSIDE a
- * group may be recording/syncing against a stream that, at that point,
- * doesn't have the real work enqueued yet, meaning its measured duration
- * (and this wrapper's own, which uses plain CPU timing, not events)
- * might not reflect real GPU execution time for anything issued inside a
- * group. This follows from NCCL's own documented group contract, not a
- * guess, but hasn't been confirmed by observing real timestamps from an
- * actual multi-GPU run (none available in this project's dev/CI
- * environment) -- verify against real hardware before trusting grouped-
- * op durations in a performance-sensitive comparison. */
+/* Unverified: NCCL defers the kernels of operations issued inside
+ * ncclGroupStart/End until ncclGroupEnd, so an event pair around such an
+ * operation may not bracket its real GPU work. Follows from NCCL's documented
+ * group semantics; not checked on multi-GPU hardware. */
 static __thread uint64_t _group_start = 0;
 static __thread int      _group_depth = 0;
 
@@ -469,9 +399,7 @@ ncclResult_t ncclGroupEnd(void) {
 
 /* ── Constructor ─────────────────────────────────────────────────────── */
 __attribute__((constructor))
-static void hprofiler_nccl_init(void) { ensure_connected(); cs_init(); }
+static void hprofiler_nccl_init(void) { hp_tx_init("nccl"); cs_init(); }
 
 __attribute__((destructor))
-static void hprofiler_nccl_fini(void) {
-    if (g_sock >= 0) { close(g_sock); g_sock = -1; }
-}
+static void hprofiler_nccl_fini(void) { hp_tx_shutdown(1); }

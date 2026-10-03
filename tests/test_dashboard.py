@@ -1,20 +1,15 @@
 """
-Tests for the redesigned TUI's Overview dashboard (DashboardWidget),
-Roofline tab (RooflineWidget), and the app-chrome changes that went with
-them (TopBar/BottomBar, numbered/conditional tabs, digit-key jump) --
-src/ui/app.py. Built when the Timeline/Hotspots/System/Profile/Call-Tree
-tabs were restyled into a card-based dashboard layout at the user's
-request, modelled on a reference screenshot.
+Tests for the TUI's Overview dashboard (DashboardWidget), Roofline tab
+(RooflineWidget), and app chrome (TopBar/BottomBar, numbered/conditional
+tabs, digit-key jump) -- src/ui/app.py.
 
-Also covers two real bugs the redesign surfaced along the way:
-  - _bottleneck_analysis was a dead import (output.summary never defined
-    it), so the Profile tab's "Insight" section silently rendered
-    nothing; it's now a real, local, tested implementation.
-  - Two static hint strings (HotspotsWidget's "[s] cycle sort..." and
-    CallTreeWidget's "[u] collapse all...") relied on UNESCAPED brackets
-    that collide with Rich markup syntax ([s]=strikethrough, [u]=
-    underline, anything else bracketed is silently eaten as an unknown
-    style tag) -- confirmed visually via an SVG screenshot before fixing.
+Also guards:
+  - _bottleneck_analysis producing real tips (the Profile tab's "Insight"
+    section);
+  - static hint strings (HotspotsWidget's "[s] cycle sort...",
+    CallTreeWidget's "[u] collapse all...") escaping their brackets, which
+    otherwise collide with Rich markup ([s]=strikethrough, [u]=underline,
+    anything else bracketed is silently eaten as an unknown style tag).
 """
 import sys
 import tempfile
@@ -113,16 +108,15 @@ class TestNewFormatHelpers(unittest.TestCase):
 
 class TestBottleneckAnalysis(unittest.TestCase):
     def test_returns_real_tips_for_a_gpu_starved_trace(self):
-        # Regression test for the dead `from ..output.summary import
-        # _bottleneck_analysis` import: that function was never defined
-        # there, so this call site always silently produced an empty list.
+        # _bottleneck_analysis must return real tips (it must not be an
+        # import that silently yields an empty list).
         tips = _bottleneck_analysis(_gpu_starved_trace(), {})
         self.assertTrue(any("occupancy" in t.lower() for t in tips))
 
     def test_tips_use_plain_ascii_icons_not_emoji(self):
         # Emoji glyph coverage over a bare SSH session to an HPC cluster is
-        # unreliable (confirmed via a screenshot where an unsupported emoji
-        # silently fell back to an unrelated letter) -- every tip's icon
+        # unreliable (an unsupported emoji can silently render as an
+        # unrelated letter) -- every tip's icon
         # must come from the same safe symbol set used elsewhere in this
         # file (!, ▲, ◆, ...), not an emoji-range codepoint.
         tips = _bottleneck_analysis(_gpu_starved_trace(), {"ipc": 0.5, "cache_miss_pct": 30})
@@ -173,9 +167,8 @@ class TestTopFindings(unittest.TestCase):
         # The cheap always-available fallback -- must fire even for a
         # trace with no GPU/MPI backends at all, so the Dashboard's "Top
         # findings" panel is never silently empty for a plain CPU trace.
-        # Back-to-back calls on one thread (the old fixture overlapped ten
-        # same-thread calls 1ns apart, which only "dominated" because
-        # their overlapping durations were summed).
+        # Back-to-back (non-overlapping) calls on one thread, so dominance
+        # comes from real exclusive time.
         spans = [_span(1, 1, Category.CPU, i * 100, 100, "hot_fn") for i in range(10)]
         spans.append(_span(1, 1, Category.CPU, 1000, 5, "cold_fn"))
         findings = _top_findings(_mk_trace(spans, backends=["cpu"]))
@@ -336,6 +329,22 @@ class TestDashboardWidget(unittest.IsolatedAsyncioTestCase):
             self.assertIn("SYNC WAIT", wait)
             self.assertNotIn("MPI WAIT", wait)
 
+    async def test_capture_warnings_panel_only_when_trace_is_incomplete(self):
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")], backends=["cpu"])
+        app = _HostApp(DashboardWidget(trace))
+        async with app.run_test(size=(140, 45)):
+            self.assertFalse(app.query_one("#dash-warnings").display)
+        trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")], backends=["cpu"])
+        trace.metadata.capture_health = {
+            "state": "complete",
+            "transport": {"1/gomp": {"final": 1, "emitted": 10, "sent": 4, "received": 4,
+                                     "dropped_full": 6, "ended_without_final": False}}}
+        app = _HostApp(DashboardWidget(trace))
+        async with app.run_test(size=(140, 45)):
+            panel = app.query_one("#dash-warnings")
+            self.assertTrue(panel.display)
+            self.assertIn("6 dropped", panel.render().plain)
+
     async def test_no_gpu_backend_shows_na_for_gpu_active(self):
         trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "x")], backends=["cpu"])
         app = _HostApp(DashboardWidget(trace))
@@ -452,11 +461,10 @@ class TestProfilerAppTabs(unittest.IsolatedAsyncioTestCase):
 # ── Markup-collision regression (HotspotsWidget / CallTreeWidget hints) ────
 
 class TestHintTextMarkupSafety(unittest.IsolatedAsyncioTestCase):
-    """Regression test for two hint strings that used unescaped brackets
-    colliding with Rich markup ([s]=strikethrough, [u]=underline, any
-    other bracketed text silently eaten as an unrecognised style tag) --
-    caught via a rendered SVG screenshot showing "cycle sort" struck
-    through and "[u] collapse all" missing its key label entirely."""
+    """Hint strings must escape brackets that collide with Rich markup
+    ([s]=strikethrough, [u]=underline, any other bracketed text silently
+    eaten as an unrecognised style tag) -- otherwise "cycle sort" renders
+    struck through and "[u] collapse all" loses its key label."""
 
     async def test_hotspots_hint_shows_literal_brackets(self):
         trace = _mk_trace([_span(1, 1, Category.CPU, 0, 10, "x")])

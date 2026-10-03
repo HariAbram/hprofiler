@@ -2,54 +2,39 @@
 Qt/QML GUI bootstrap -- run as a SEPARATE PROCESS by launch.py (see that
 module's docstring for why: isolating a GLX crash from the CLI process).
 
-Usage: python3 app.py <trace.json> [--compare <baseline.json>] [--disasm]
+Usage: python3 app.py <trace.json|trace.hpstore> [--compare <baseline>] [--disasm]
 
-Exit code 0 means the window opened and closed normally (the user closed
-it) -- launch.py's caller treats that as "the GUI was shown", not
-"nothing went wrong internally"; a window that opened but rendered
-garbage due to a software/driver quirk still exits 0, since a Qt-level
-crash (the actual failure mode this process-isolation guards against) is
-what a nonzero/killed exit communicates back, not rendering quality.
+Exit code 0 means the window opened and closed normally. A window that
+rendered badly due to a driver quirk still exits 0; a nonzero/killed exit
+is what reports a Qt-level crash, the failure this isolation guards against.
 
 Python objects are exposed to QML via qmlRegisterSingletonInstance under
 the "Hprofiler" 1.0 module (import Hprofiler 1.0 in any .qml file that
 uses AppTheme/Dashboard/AppInfo) -- NOT QQmlContext.setContextProperty,
-which was found to silently fail in this PySide6 build: the object
-registers successfully (readable back from Python via
-rootContext().contextProperty()) but QML-side bindings still evaluate it
-as null at runtime, with no reported error. qmlRegisterSingletonInstance
-does not have this problem; verified with a minimal repro before
-adopting it project-wide (see project_gui_qml_context_property_bug memory).
+which silently fails in this PySide6 build: the object registers (readable
+back via rootContext().contextProperty()) but QML bindings evaluate it as
+null at runtime, with no reported error.
 
-HPROFILER_GUI_SELFTEST=1 (set by tests only): loads the QML, prints a
-one-line JSON summary of rootObjects()/warnings, and returns BEFORE
-app.exec() instead of showing a real window -- backs a subprocess-based
-test for the populated (real second trace) Compare tab, which the
-shared-engine in-process test class (tests/test_gui_timeline_hover.py)
-structurally can't do: that engine is process-global and can only ever
-have ONE trace pairing loaded in it for the whole test run, so a SECOND,
-different trace_a/trace_b pairing needs a genuinely separate process.
+HPROFILER_GUI_SELFTEST=1 (tests only): loads the QML, prints a one-line
+JSON summary of rootObjects()/warnings, and returns before app.exec()
+instead of showing a window. Backs the subprocess test for a populated
+Compare tab: the shared in-process test engine
+(tests/test_gui_timeline_hover.py) is process-global and can hold only one
+trace pairing per run.
 
-Loading (Phase 3 of the usability/persistence/loading overhaul): the
-actual parse + the four most expensive bridge computations now run on a
-background QThread (src/gui/controller.py's LoadController), not this
-thread -- but no QML engine loads, and no window appears, until that
-finishes. This is a deliberate, empirically-forced scope boundary, not
-an oversight: a SECOND QQmlApplicationEngine loading Qt Quick Controls
-types anywhere in this process corrupts Controls resolution in this
-PySide6 build, confirmed even when a FIRST, completely Controls-free
-"splash" engine is loaded and thoroughly torn down first (see project
-memory project_qml_gui.md, Round 17) -- so there is no safe way to show
-a loading-progress WINDOW before the one-and-only real engine loads.
-Progress is instead printed to stderr (`[hprofiler][gui] ...`, the same
-convention launch.py already uses for its tier-fallback logging), which
-is genuinely visible since this process is always launched from a
-terminal. HPROFILER_READY_MARKER (set by controller.py's
-open_profile_subprocess when this process was spawned as an "Open
-Profile" replacement for an already-running window): once the QML
-engine successfully loads, this process touches that path so the OLD
-process's ProfileOpenWatcher knows to close itself -- see
-controller.py's module docstring for the full handshake design.
+Loading: the parse + the four most expensive bridge computations run on a
+background QThread (controller.py's LoadController), and no QML engine
+loads or window appears until that finishes. A second
+QQmlApplicationEngine loading Qt Quick Controls types anywhere in this
+process corrupts Controls resolution in this PySide6 build -- even after a
+Controls-free "splash" engine is fully torn down -- so there is no safe way
+to show a progress WINDOW before the one real engine loads. Progress goes
+to stderr (`[hprofiler][gui] ...`, as launch.py logs its tier fallback).
+
+HPROFILER_READY_MARKER (set by controller.py's open_profile_subprocess when
+this process replaces an already-running window via "Open Profile"): once
+the QML engine loads, this process touches that path so the old process's
+ProfileOpenWatcher closes itself -- see controller.py's module docstring.
 """
 from __future__ import annotations
 
@@ -189,6 +174,17 @@ def main() -> int:
     formatter = FormatBridge()
     workspace_bridge = WorkspaceBridge(settings)
     app_controller = AppController(str(trace_path), compare_path)
+    # Saved presentation state for this profile (filters, grouping, lanes,
+    # zoom/pan, bookmarks, ranges) and table layouts: restored now, saved
+    # on change (debounced) and at quit. Never the command line, trace
+    # contents or the trace path (see settings.py).
+    from src.gui.settings import ViewStatePersister
+    persister = ViewStatePersister(settings, str(trace_path), timeline, {
+        "kernels": kernels._table.config, "findings": dashboard._findings_table.config,
+        "devices": system._device_table.config, "systemMetrics": system._metric_table.config,
+        "compare": comparison._table.config,
+    })
+    app.aboutToQuit.connect(persister.save)
     shortcuts_bridge = ShortcutsBridge()
 
     meta = trace.metadata

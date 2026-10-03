@@ -15,6 +15,7 @@ JIT cubin path (CUDA):
 """
 
 from __future__ import annotations
+import copy
 import re, os, shutil, subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -892,20 +893,15 @@ def collect_disasm(
     """
     result: dict[str, KernelDisasm] = {}
     binary = command[0] if command else ""
-    # command[0] is WRONG whenever the profiled command is launcher-
-    # wrapped (`hprofiler run -- srun -n 4 gmx_mpi ...` -> command[0] is
-    # "srun", never the real binary). OpenMP/MPI disasm doesn't care --
-    # it resolves a specific call site via dladdr from inside the
-    # profiled process (sym=/symfile= tags), which is launcher-agnostic
-    # by construction. CUDA/ROCm AoT disasm below, and the CPU
-    # perf-sampled-by-name path further down, disassemble/nm the WHOLE
-    # BINARY keyed off `binary` directly, with no per-span tag to fall
-    # back on -- real_binary (resolved via SO_PEERCRED on the hook's own
-    # socket connection, runner.py's _peer_real_exe/_collect_disasm) is
-    # the actual profiled exe regardless of how it was launched, and
-    # strictly better than command[0] whenever it's available, so it
-    # takes priority for every subsequent use of `binary` in this
-    # function.
+    # command[0] is wrong whenever the profiled command is launcher-wrapped
+    # (`hprofiler run -- srun -n 4 gmx_mpi ...` -> "srun"). OpenMP/MPI
+    # disasm resolves call sites via dladdr inside the profiled process
+    # (sym=/symfile= tags), so it is launcher-agnostic; CUDA/ROCm AoT disasm
+    # and the CPU perf-sampled-by-name path disassemble/nm the WHOLE binary
+    # with no per-span tag. real_binary (SO_PEERCRED on the hook's socket
+    # connection, runner.py's _peer_real_exe) is the actual profiled exe
+    # however it was launched, so it takes priority for every use of
+    # `binary` below.
     if real_binary and Path(real_binary).exists():
         binary = real_binary
     if omp_syms is None:
@@ -1067,51 +1063,53 @@ def collect_disasm(
     # Prevents running objdump twice when multiple span names (e.g. omp_loop and
     # omp_barrier_implicit) fall at different offsets within the same function.
     if omp_syms:
-        seen_keys: set[str] = set()
         sym_cache: dict[tuple[str, str], Optional[KernelDisasm]] = {}
+        lib_syms: dict[tuple[str, int], str] = {}
         for span_name, sym_info in omp_syms.items():
             if span_name in result:
                 continue
             kind, payload = sym_info
 
             if kind == "sym":
-                # payload is (sym_name, symfile) -- symfile is the ELF
-                # file dladdr() actually found the symbol in (see
-                # hooks/common/codeptr_resolve.h), which is NOT
-                # necessarily `binary` (command[0]): the profiled command
-                # is routinely a launcher wrapping the real binary
-                # (`hprofiler run -- srun -n 4 gmx_mpi ...`), where
-                # command[0] is `srun`, not the profiled program at all.
-                # Falls back to `binary` for tags from an older hook
-                # build that predates symfile= (payload[1] is None then).
+                # payload is (sym_name, symfile) -- symfile is the ELF file
+                # dladdr() found the symbol in (hooks/common/codeptr_resolve.h),
+                # which differs from `binary` (command[0]) when the profiled
+                # command is a launcher (`hprofiler run -- srun -n 4 gmx_mpi`
+                # -> command[0] is `srun`). Falls back to `binary` for tags
+                # from a hook build without symfile= (payload[1] is None).
                 sym_name, symfile = payload
                 target_path = symfile if symfile and Path(symfile).exists() else binary
                 if not target_path or not Path(target_path).exists():
                     continue
-                if sym_name in seen_keys:
-                    continue
-                seen_keys.add(sym_name)
             elif kind == "lib":
                 lib_path, static_off = payload
-                key = f"{lib_path}:{static_off}"
-                if key in seen_keys or not Path(lib_path).exists():
+                if not Path(lib_path).exists():
                     continue
-                seen_keys.add(key)
-                sym_name = ""
-                for s_name, (s_addr, s_size) in _nm_load(lib_path).items():
-                    if s_size > 0 and s_addr <= static_off < s_addr + s_size:
-                        sym_name = s_name
-                        break
+                sym_name = lib_syms.get((lib_path, static_off), "")
+                if not sym_name:
+                    for s_name, (s_addr, s_size) in _nm_load(lib_path).items():
+                        if s_size > 0 and s_addr <= static_off < s_addr + s_size:
+                            sym_name = s_name
+                            break
+                    lib_syms[(lib_path, static_off)] = sym_name
                 if not sym_name:
                     continue
                 target_path = lib_path
             else:
                 continue
 
-            # Skip if a different span already produced disasm for this symbol.
+            # Several event names issued from one function (MPI_Send and
+            # MPI_Recv in the same routine, a barrier and a critical section
+            # in one parallel region) share its disassembly: disassemble
+            # once, then file the same listing under each name.
             cache_key = (target_path, sym_name)
             if cache_key in sym_cache:
-                continue   # duplicate function — suppress redundant entry
+                cached = sym_cache[cache_key]
+                if cached and cached.lines:
+                    alias = copy.copy(cached)
+                    alias.name = span_name
+                    result[span_name] = alias
+                continue
 
             # Look up sym address+size, then disassemble.
             sym_addr, sym_size = _nm_load(target_path).get(sym_name, (0, 0))
@@ -1127,18 +1125,12 @@ def collect_disasm(
                 if kd:
                     kd.name = span_name
             if kd:
-                # kd.name is the span/event name (e.g. "omp_barrier") for
-                # display grouping -- there's no real ELF symbol by that
-                # name (it's an hprofiler-invented event label, not
-                # something objdump/perf/nm ever heard of); sym_name here
-                # is the REAL resolved symbol at the call site (what
-                # dladdr/nm actually found and what was disassembled).
-                # Keep it on mangled_name (same field CUPTI lookups
-                # already use this way, see runner.py's kd.mangled_name
-                # fallback) so annotate_with_perf() can filter `perf
-                # annotate` by the symbol that actually exists, and so
-                # UIs can show the user what function they're really
-                # looking at instead of just the event label.
+                # kd.name is the hprofiler event label (e.g. "omp_barrier"),
+                # not an ELF symbol; sym_name is the symbol actually
+                # resolved at the call site and disassembled. Keep it on
+                # mangled_name (as CUPTI lookups do) so annotate_with_perf()
+                # filters `perf annotate` by a symbol that exists and UIs
+                # can show which function the user is looking at.
                 kd.mangled_name = sym_name
             sym_cache[cache_key] = kd   # record result (None = not found)
             if kd and kd.lines:

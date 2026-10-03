@@ -244,11 +244,10 @@ def _make_traces(device: "DevicePeak",
             # For memory-bound kernels, the plotted Y is clamped to the
             # memory-bandwidth-implied ceiling (line above: min(achieved_tflops,
             # ai*bw)) so the point visually sits ON the memory roofline rather
-            # than floating above it -- but the tooltip used to always show
-            # the raw, unclamped m.achieved_tflops, which could read higher
-            # than where the dot is actually drawn with no explanation (e.g.
-            # if est_flops was itself overestimated). Flag it explicitly
-            # whenever the two differ non-trivially.
+            # than floating above it, while the raw m.achieved_tflops can read
+            # higher than where the dot is drawn (e.g. if est_flops was itself
+            # overestimated). Flag it explicitly whenever the two differ
+            # non-trivially.
             clamp_note = ("<br><i>⚠ plotted at the memory-BW ceiling "
                            f"({y_plotted:.4f} TFLOPs/s); computed-from-instructions "
                            f"estimate was {m.achieved_tflops:.4f} TFLOPs/s</i>"

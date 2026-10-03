@@ -1,20 +1,17 @@
 /*
- * OpenCL LD_PRELOAD hook.
+ * OpenCL hook (LD_PRELOAD).
  *
- * Wraps OpenCL API calls to collect GPU/CPU kernel execution times using
- * the built-in OpenCL profiling infrastructure (CL_QUEUE_PROFILING_ENABLE).
- *
- * Strategy:
- *   1. clCreateCommandQueue / clCreateCommandQueueWithProperties:
- *      force CL_QUEUE_PROFILING_ENABLE so every enqueued command is timed.
- *   2. clEnqueueNDRangeKernel / clEnqueueTask:
- *      capture the cl_event, then after clFinish/clWaitForEvents read
- *      CL_PROFILING_COMMAND_START/END to get GPU-side wall-clock.
- *   3. clEnqueueReadBuffer / clEnqueueWriteBuffer / clEnqueueCopyBuffer:
- *      track memory transfers.
- *   4. clBuildProgram: track JIT compilation time (important for ACPP).
- *
- * Records are emitted as newline-delimited ASCII over HPROFILER_SOCKET.
+ *   clCreateCommandQueue[WithProperties]  force CL_QUEUE_PROFILING_ENABLE
+ *   clEnqueueNDRangeKernel                host span (enqueue latency) plus a
+ *                                         device span from the event's
+ *                                         completion callback
+ *   clEnqueueRead/WriteBuffer, SVMMemcpy  transfer spans (category "memory")
+ *   clBuildProgram, clCompileProgram      JIT compile spans; built binaries
+ *                                         are saved for disassembly
+ *   clFinish, clWaitForEvents             host waits ("sync")
+ *   clCreateBuffer, clReleaseMemObject    opencl_memory_bytes counter
+ *   dlopen, dlsym                         ACPP SSCP .jit.so CPU kernels, which
+ *                                         never go through an enqueue call
  */
 
 #define _GNU_SOURCE
@@ -54,44 +51,24 @@ typedef int      cl_bool;
 #define CL_PROFILING_COMMAND_END   0x1283
 #define CL_MEM_READ_WRITE          (1<<0)
 
-/* ── Globals ─────────────────────────────────────────────────────────── */
-static int             g_sock        = -1;
-static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static pid_t           g_pid         = 0;
-
 /*
- * CL device timestamps are in the OpenCL device time domain (an opaque
- * monotonic counter reset independently from CLOCK_MONOTONIC).  To make
- * kernel spans appear at the correct wall-clock position in the trace we
- * capture a (wall_ns, cl_ns) pair once and use the offset to translate all
- * subsequent CL timestamps.
+ * Device timestamps use the OpenCL device clock, unrelated to
+ * CLOCK_MONOTONIC. One (wall, device) pair taken at the first completed
+ * command gives the offset for all later timestamps. The pair must use
+ * CL_PROFILING_COMMAND_END: the completion callback runs right at the
+ * command's end, while its START can be a whole kernel earlier (a slow first
+ * kernel would shift every later span).
  *
- * That calibration pair MUST be taken from CL_PROFILING_COMMAND_END, not
- * COMMAND_START: this function is only ever called from the CL_COMPLETE
- * callback (on_event_complete), which fires essentially AT the moment the
- * command finishes -- so now_ns() there is a tight match for gpu_end, but
- * could be off from gpu_start by the entire duration of whichever kernel
- * calibrates first (an earlier version paired now_ns() with gpu_start,
- * silently biasing the wall-clock POSITION -- not duration, which stays
- * correct -- of every subsequent span in the trace by that amount; often
- * hundreds of ms if the first kernel was a slow JIT/warm-up one).
- *
- * Known remaining approximation: this offset is a single global value even
- * if the process uses multiple OpenCL devices with independent clock
- * domains (e.g. two GPUs, or a GPU + the CPU device) -- a per-device offset
- * map would be needed to calibrate each independently; not implemented, so
- * multi-device runs may still see a modest per-device position error.
+ * Limitation: one global offset, even when devices have independent clocks
+ * (two GPUs, or a GPU and the CPU device).
  */
 static int64_t         g_cl_offset_ns   = INT64_MIN;
 static pthread_mutex_t g_cl_offset_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t now_ns(void);   /* forward declaration — defined below */
 
-/* Establishes the offset (once) from a CL_PROFILING_COMMAND_END timestamp,
- * paired with a wall-clock reading taken essentially at the same moment
- * (inside the CL_COMPLETE callback). Must be called before cl_to_wall_ns()
- * is used to convert that event's START timestamp, so the offset is always
- * anchored to an END, never a START. */
+/* Sets the offset once, from a COMMAND_END timestamp read in the CL_COMPLETE
+ * callback (see above). Call before converting that event's START. */
 static void cl_calibrate_if_needed(cl_ulong gpu_end_ns) {
     pthread_mutex_lock(&g_cl_offset_mutex);
     if (g_cl_offset_ns == INT64_MIN) {
@@ -115,94 +92,27 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-static pid_t gettid_compat(void) { return (pid_t)syscall(SYS_gettid); }
-
 static FILE *g_dbg = NULL;  /* set when HPROFILER_DEBUG=1 */
 
-static void ensure_connected(void) {
-    if (g_sock >= 0) return;
-    const char *path = getenv("HPROFILER_SOCKET");
-    if (g_dbg) fprintf(g_dbg, "[opencl-hook] ensure_connected pid=%d path=%s\n",
-                       (int)getpid(), path ? path : "(null)");
-    if (!path) return;
-    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return;
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        g_sock = s;
-        g_pid  = getpid();
-        if (g_dbg) fprintf(g_dbg, "[opencl-hook] connected fd=%d\n", s);
-    } else {
-        if (g_dbg) fprintf(g_dbg, "[opencl-hook] connect FAILED errno=%d\n", errno);
-        close(s);
-    }
-    if (g_dbg) fflush(g_dbg);
-}
-
-static void send_all(const char *buf, int n) {
-    while (n > 0) {
-        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
-        if (r < 0) { close(g_sock); g_sock = -1; return; }
-        buf += r; n -= (int)r;
-    }
-}
-
+#include "../common/hp_transport.h"
 #include "../common/callstack.h"
 
+static pid_t gettid_compat(void) { return hp_tx_tid(); }
+
+/* Records up to the transport's 64 KiB limit go out intact (long JIT kernel
+ * names included). */
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
+    if (!hp_tx_enabled()) return;
     if (g_dbg)
         fprintf(g_dbg, "[opencl-hook] emit_span cat=%s name=%s\n", cat, name);
-    if (g_sock >= 0) {
-        char buf[2048];
-        int n;
-        if (extra && *extra)
-            n = snprintf(buf, sizeof(buf),
-                "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-                cat, g_pid, tid,
-                (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                name, extra);
-        else
-            n = snprintf(buf, sizeof(buf),
-                "span:%s:%d:%d:%llu:%llu:%s\n",
-                cat, g_pid, tid,
-                (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                name);
-        /* snprintf returns >= sizeof(buf) when truncated. Rather than
-         * silently dropping the whole span, retry with a shortened name so
-         * the event -- correct timing, full tags -- still reaches the
-         * trace. */
-        if (n >= (int)sizeof(buf)) {
-            char short_name[200];
-            size_t name_len = strlen(name);
-            if (name_len > sizeof(short_name) - 4) {
-                memcpy(short_name, name, sizeof(short_name) - 4);
-                memcpy(short_name + sizeof(short_name) - 4, "...", 4);
-            } else {
-                memcpy(short_name, name, name_len + 1);
-            }
-            if (extra && *extra)
-                n = snprintf(buf, sizeof(buf),
-                    "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-                    cat, g_pid, tid,
-                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                    short_name, extra);
-            else
-                n = snprintf(buf, sizeof(buf),
-                    "span:%s:%d:%d:%llu:%llu:%s\n",
-                    cat, g_pid, tid,
-                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                    short_name);
-        }
-        if (n > 0 && n < (int)sizeof(buf))
-            send_all(buf, n);
-        emit_callstack(start_ns);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (extra && *extra)
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name, extra);
+    else
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name);
+    emit_callstack(start_ns);
 }
 
 /* CL_CALLBACK expands to nothing on Linux x86-64 (no special calling conv). */
@@ -210,11 +120,8 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
 #define CL_CALLBACK
 #endif
 
-/* Heap-allocated context passed to the OpenCL event callback. `category`
- * is set explicitly by each register_event_callback() caller (which
- * already knows whether it's timing a kernel or a memory transfer)
- * rather than re-derived by parsing `extra`'s "type=" tag back apart at
- * completion time -- simpler and can't drift out of sync with it. */
+/* Context for the event callback. `category` ("opencl" or "memory") comes
+ * from the caller, which knows what it timed. */
 typedef struct { char name[128]; char extra[128]; char category[16]; } event_cb_data_t;
 
 typedef void (*event_cb_fn_t)(cl_event, cl_int, void *);
@@ -232,14 +139,10 @@ static RetainEvent_t  g_real_retain  = NULL;
 static pthread_once_t g_ecb_once     = PTHREAD_ONCE_INIT;
 
 /* ── OpenCL symbol resolver ───────────────────────────────────────────── */
-/* ACPP loads its backends with dlopen(RTLD_DEEPBIND), which places
- * libOpenCL.so.1 in a private namespace.  RTLD_NEXT from our hook then
- * cannot find the real cl* symbols.  This helper falls back to an explicit
- * handle obtained via RTLD_NOLOAD, which works across namespaces.
- *
- * pthread_once guarantees s_ocl_h is initialised exactly once even when
- * multiple threads call find_real_ocl concurrently (bug fix: the old
- * s_tried/s_ocl_h plain-static approach was a data race).               */
+/* ACPP dlopens its backends with RTLD_DEEPBIND, which puts libOpenCL.so.1 in
+ * a private namespace where RTLD_NEXT cannot find the real cl* symbols; fall
+ * back to a handle obtained with RTLD_NOLOAD (works across namespaces).
+ * pthread_once: drivers call in from several threads at startup. */
 static void *s_ocl_h = NULL;
 static pthread_once_t s_ocl_once = PTHREAD_ONCE_INIT;
 static void _init_ocl_handle(void) {
@@ -277,23 +180,16 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
         cl_calibrate_if_needed(gpu_end);
         uint64_t wall_start = cl_to_wall_ns(gpu_start);
         uint64_t dur_ns     = (gpu_end >= gpu_start) ? (gpu_end - gpu_start) : 0;
-        /* d->category, NOT a hardcoded "opencl" -- a memory-transfer
-         * event completing here must land in category "memory" (same
-         * as its CPU-side sibling span) so it reaches the Memory tab's
-         * bandwidth accounting; only an actual kernel event belongs in
-         * "opencl". Was hardcoded to "opencl" for every completion
-         * regardless of operation kind until this fix. */
+        /* A transfer belongs in "memory", like its host span; only kernels
+         * are "opencl". */
         emit_span(d->category, gettid_compat(), wall_start, dur_ns, d->name, d->extra);
     }
     if (g_real_release) g_real_release(ev);
     free(d);
 }
 
-/* Register an async GPU-profiling callback.  Returns immediately.
-   parent_sid: if non-zero, appends psid=<parent_sid> to the GPU span's extra tags.
-   category: the span category this completion should be emitted under
-   ("opencl" for a kernel, "memory" for a buffer/SVM transfer) -- passed
-   by the caller rather than inferred later, see event_cb_data_t. */
+/* Register the completion callback; returns immediately. parent_sid != 0
+   adds psid= (link to the host span). category: see event_cb_data_t. */
 static void register_event_callback(cl_event ev,
                                     const char *name, const char *extra,
                                     uint64_t parent_sid, const char *category) {
@@ -448,14 +344,9 @@ cl_int clEnqueueSVMMemcpy(
     uint64_t t0 = now_ns();
     cl_int ret = real(q, blocking, dst, src, size, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueSVMMemcpy", extra);
-    /* Only register the async GPU-event callback for a NON-blocking call.
-     * The event still reaches CL_COMPLETE and fires its callback either
-     * way (blocking only affects whether THIS call returns early, not
-     * whether the event completion callback fires) -- for a blocking
-     * call the CPU-side span above already has the correct, complete
-     * duration, so also registering the callback would emit a SECOND
-     * span for the exact same transfer (same bytes, same duration),
-     * double-counting it in any bandwidth/time total. */
+    /* Device callback only for non-blocking calls: a blocking call's host
+     * span already covers the whole transfer, and a callback span would
+     * count it twice. */
     if (ret == CL_SUCCESS && *ev && !blocking)
         register_event_callback(*ev, "clEnqueueSVMMemcpy", extra, 0, "memory");
     return ret;
@@ -479,10 +370,7 @@ cl_int clEnqueueReadBuffer(
     uint64_t t0 = now_ns();
     cl_int ret = real(q, buf, blocking, offset, size, ptr, nwl, ewl, ev);
     emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueReadBuffer", extra);
-    /* NON-blocking only -- see clEnqueueSVMMemcpy's comment: a blocking
-     * call's CPU-side span above already has the complete, correct
-     * duration, so also firing the GPU-event callback would double-
-     * report this exact transfer. */
+    /* Non-blocking only (see clEnqueueSVMMemcpy). */
     if (ret == CL_SUCCESS && *ev && !blocking)
         register_event_callback(*ev, "clReadBuffer_gpu", extra, 0, "memory");
     return ret;
@@ -518,10 +406,8 @@ cl_int clEnqueueWriteBuffer(
  * Saves to /tmp/hprofiler_ocl_<pid>_<n>.bin and emits a jit_load span so
  * the runner's disasm extractor picks it up automatically. */
 
-/* Overflow-safe "[off, off+len) fits within [0, sz)" check -- off/len come
- * from the (untrusted-ish, locally-generated but not necessarily
- * well-formed) ELF being parsed, so off+len must not be computed directly
- * (it can wrap on a corrupt/adversarial header). */
+/* "[off, off+len) within [0, sz)" without computing off+len, which can wrap
+ * on a corrupt ELF header. */
 static int _range_ok(uint64_t off, uint64_t len, uint64_t sz)
 {
     return len <= sz && off <= sz - len;
@@ -713,15 +599,9 @@ static int64_t         g_cl_mem_bytes = 0;
 static pthread_mutex_t g_cl_alloc_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static void emit_ctr_cl(const char *name, int64_t value) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) {
-        char buf[256];
-        int n = snprintf(buf, sizeof(buf), "ctr:memory:%d:%llu:%s:%lld:bytes\n",
-                         g_pid, (unsigned long long)now_ns(), name, (long long)value);
-        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (!hp_tx_enabled()) return;
+    hp_tx_emitf("ctr:memory:%d:%llu:%s:%lld:bytes\n", (int)hp_tx_pid(),
+                (unsigned long long)now_ns(), name, (long long)value);
 }
 
 cl_mem clCreateBuffer(cl_context ctx, cl_mem_flags flags, size_t size,
@@ -886,16 +766,11 @@ void *dlopen(const char *filename, int flags) {
 }
 
 /* ── dlsym intercept ─────────────────────────────────────────────────────
-   When ACPP calls dlsym(jit_handle, "kernel_name") to find a compiled
-   CPU kernel, we intercept it:
-     • emit a span recording the kernel name (useful even if the function
-       pointer is cached — it tells us which kernels exist and their names)
-     • return a trampoline that times each actual kernel invocation
-
-   Trampoline pool: each trampoline is a small mmap'd executable thunk
-   that saves/restores registers, records wall-clock time, calls the real
-   kernel function, then emits the span.  We pre-allocate TRAMPOLINE_N
-   slots; each slot stores {real_fn, name} and has its own thunk.         */
+   ACPP SSCP looks up compiled CPU kernels with dlsym(jit_handle, name). For
+   such handles the real function goes into a slot and a per-slot wrapper
+   (trampoline) is returned that times every call of the kernel.
+   TRAMPOLINE_N slots exist; beyond that the real function is returned
+   unwrapped. */
 
 static void *(*g_real_dlsym)(void *, const char *) = NULL;
 
@@ -911,63 +786,21 @@ typedef struct {
 static trampoline_slot_t  g_slots[TRAMPOLINE_N];
 static int                g_slot_next = 0;
 static pthread_mutex_t    g_slot_mutex = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t           *g_thunk_page = NULL; /* one executable page */
-
-/*
- * Each thunk is a tiny x86-64 function body that:
- *   1. Calls clock_gettime(CLOCK_MONOTONIC, &ts) to record start time
- *   2. Calls the real kernel function preserving ALL general-purpose
- *      argument registers (rdi, rsi, rdx, rcx, r8, r9) and the stack
- *   3. Calls emit_span with the recorded times
- *
- * Rather than generating raw machine code, we use a C helper that is
- * called FROM the thunk and receives the slot index as an extra hidden
- * first argument (pushed before the real call).
- *
- * Thunk layout (N = slot index, embedded as a 32-bit immediate):
- *   push  rbp
- *   mov   rbp, rsp
- *   and   rsp, -16          ; align stack
- *   ; save argument registers
- *   push  rdi; push rsi; push rdx; push rcx; push r8; push r9
- *   ; call wrapper(slot_index, rdi, rsi, rdx, rcx, r8, r9)
- *   mov   rdi, N            ; slot index
- *   pop   r9; pop r8; pop rcx; pop rdx; pop rsi   ; shift saved regs
- *   ; rdi already set; restore remaining args
- *   ... (this gets complicated - use simpler approach below)
- *
- * Simpler approach: store start_ns in the slot via a pre-call hook,
- * then call the real fn, then a post-call hook reads it.
- * Because the slot is per-trampoline (not per-thread), this is NOT
- * thread-safe for concurrent calls to the same kernel.  For
- * profiling this is acceptable — we emit the span immediately.
- *
- * Assembly thunk (22 bytes each, N slots fit in one 4 KB page):
- *   48 b8 <imm64: slot_ptr>   ; mov rax, &g_slots[N]
- *   ff d0                     ; call rax  ← NO, we need to preserve rdi
- *
- * Cleanest approach: use a single C trampoline with __attribute__((naked))
- * and slot index passed via a thread-local.  But naked functions are not
- * portable.
- *
- * ACTUAL IMPLEMENTATION: use a per-slot wrapper C function selected at
- * registration time.  We generate TRAMPOLINE_N distinct C-callable wrappers
- * using X-macro expansion.  Each wrapper calls jit_dispatch(N, real args).
- */
 
 /* Forward declaration; defined after the macro expansion. */
 static void jit_dispatch(int slot, void *arg0, void *arg1, void *arg2,
                           void *arg3, void *arg4, void *arg5);
 
-/* Generate TRAMPOLINE_N distinct wrapper functions.
-   Each wrapper passes its fixed slot index as the first argument,
-   then forwards the first 6 pointer-sized arguments the kernel received.
-   ACPP CPU kernels receive at most a launch-config pointer + arg array,
-   so 6 slots covers all realistic cases.                                  */
+/* TRAMPOLINE_N wrappers, each passing its slot index and the first six
+   pointer-sized arguments (ACPP CPU kernels take a launch-config pointer and
+   an argument array). N is a three-digit token of octal digits (000..377,
+   see T64 below), so the slot index is the octal value 0##N -- the
+   wrapper's position in g_trampolines (N alone would read "100" as
+   decimal). */
 #define DEF_TRAMPOLINE(N) \
 static void trampoline_##N(void *a0, void *a1, void *a2, \
                             void *a3, void *a4, void *a5) { \
-    jit_dispatch(N, a0, a1, a2, a3, a4, a5); \
+    jit_dispatch(0##N, a0, a1, a2, a3, a4, a5); \
 }
 
 /* Expand 256 trampolines. */
@@ -1028,9 +861,13 @@ static void extract_kernel_name(const char *mangled, char *out, size_t outsz) {
     snprintf(out, outsz, "%.64s", mangled);
 }
 
+static void hprofiler_opencl_dlsym_init(void);
+
 void *dlsym(void *handle, const char *symbol) {
-    /* Ensure g_real_dlsym is initialised (constructor might not have run yet
-       if someone calls dlsym very early). */
+    /* Can run before this library's constructors: another preloaded hook's
+       constructor may call dlopen() (wrapped above), whose RTLD_NEXT lookup
+       lands here. Resolve the real dlsym on demand rather than return NULL. */
+    if (!g_real_dlsym) hprofiler_opencl_dlsym_init();
     if (!g_real_dlsym) return NULL;
 
     /* Don't intercept our own RTLD_NEXT lookups — those chain to the real lib. */
@@ -1094,12 +931,12 @@ static void hprofiler_opencl_init(void) {
         g_dbg = fopen(dbgpath, "w");
         if (g_dbg) { fprintf(g_dbg, "[opencl-hook] init pid=%d\n", (int)getpid()); fflush(g_dbg); }
     }
-    ensure_connected();
+    hp_tx_init("opencl");
     cs_init();
 }
 
 __attribute__((destructor))
 static void hprofiler_opencl_fini(void) {
-    if (g_dbg) { fprintf(g_dbg, "[opencl-hook] fini pid=%d g_sock=%d\n", (int)getpid(), g_sock); fclose(g_dbg); g_dbg = NULL; }
-    if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+    hp_tx_shutdown(1);
+    if (g_dbg) { fprintf(g_dbg, "[opencl-hook] fini pid=%d\n", (int)getpid()); fclose(g_dbg); g_dbg = NULL; }
 }

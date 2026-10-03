@@ -19,14 +19,11 @@ def _available() -> X11Status:
 
 
 class TestLaunchGuiDisasmThreading(unittest.TestCase):
-    """Regression tests for a real bug: `hprofiler gui trace.json --disasm`
-    accepted the flag but silently dropped it whenever the GUI actually
-    launched (launch_gui() had no `disasm` parameter at all, so the flag
-    only reached the TUI-fallback code path) -- disasm never appeared in
-    a working GUI regardless of the flag. Fixed by threading `disasm`
-    through launch_gui() into the subprocess argv; see also
-    SourceBridge's live-refresh tests in test_gui_bridge.py for the other
-    half of this fix (the GUI process actually noticing collected disasm)."""
+    """`hprofiler gui trace.json --disasm` must reach the GUI subprocess:
+    launch_gui() threads `disasm` into the subprocess argv (not only the
+    TUI-fallback path). SourceBridge's live-refresh tests in
+    test_gui_bridge.py cover the GUI process picking up collected
+    disasm."""
 
     def _run_with_mocked_subprocess(self, disasm: bool):
         from src.gui.launch import launch_gui
@@ -61,9 +58,8 @@ class TestLaunchGuiDisasmThreading(unittest.TestCase):
 
 
 class TestLaunchGuiComparePath(unittest.TestCase):
-    """`--compare TRACE_B` (Phase C) threading, mirroring the disasm
-    tests above -- same real-bug-class concern: a flag accepted by the
-    CLI silently not reaching the subprocess argv."""
+    """`--compare TRACE_B` must reach the GUI subprocess argv, like
+    `--disasm` above (a flag the CLI accepts must not be dropped)."""
 
     def _run(self, **kwargs):
         from src.gui.launch import launch_gui

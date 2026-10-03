@@ -1,11 +1,9 @@
 """
-Regression test for a self-audit bug: llvm-symbolizer's --inlining default
-(on) means a single input address can produce MULTIPLE (function, file:line)
-pairs before the blank separator, not just one. The previous parser only
-consumed the first pair per address, then assumed the very next line was
-already the blank separator -- for an inlined address it wasn't (it was the
-next inlined frame's pair), so it read those leftover lines as if they
-belonged to the NEXT address, misaligning every subsequent address's result.
+llvm-symbolizer output parsing: with --inlining (its default), one input
+address can produce SEVERAL (function, file:line) pairs before the blank
+separator. The parser must consume them all; reading only the first pair
+would attribute the remaining lines to the next address and misalign every
+later result.
 """
 import sys
 import unittest

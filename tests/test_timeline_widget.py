@@ -1,11 +1,10 @@
 """
 Tests for TimelineWidget readability/consistency improvements
-(src/ui/app.py) made in response to user feedback that the Timeline
-"doesn't look pretty": deterministic per-function color assignment
-(instead of thread-scheduling-order-dependent), MPI lanes labeled by
-actual rank instead of a generic sequential thread number, and a quieter
-idle-column representation. Connector-specific behavior (hover-gating,
-elbow routing) is covered separately in test_timeline_connectors.py.
+(src/ui/app.py): deterministic per-function color assignment (independent
+of thread scheduling order), MPI lanes labeled by actual rank instead of a
+generic sequential thread number, and a quiet idle-column representation.
+Connector-specific behavior (hover-gating, elbow routing) is covered
+separately in test_timeline_connectors.py.
 """
 import sys
 import unittest
@@ -32,11 +31,9 @@ def _mk_trace(spans):
 
 class TestDeterministicColorAssignment(unittest.TestCase):
     def test_same_function_name_gets_same_color_regardless_of_insertion_order(self):
-        # Simulates the real-world case this fixes: the same program's
-        # threads can be scheduled in a different order from one run to
-        # the next, so encounter-order color assignment gave the same
-        # kernel a different color across runs -- bad for building muscle
-        # memory across repeated profiling sessions.
+        # The same program's threads can be scheduled in a different order
+        # from one run to the next; encounter-order color assignment would
+        # give the same kernel a different color across runs.
         names_order_a = ["kernel_a", "kernel_b", "kernel_c"]
         names_order_b = ["kernel_c", "kernel_a", "kernel_b"]
         w1 = TimelineWidget(_mk_trace(
@@ -49,9 +46,8 @@ class TestDeterministicColorAssignment(unittest.TestCase):
 
     def test_distinct_functions_within_palette_size_get_distinct_colors(self):
         # Open-addressing collision resolution must still guarantee this
-        # for small function counts, matching the old encounter-order
-        # scheme's guarantee -- a hash alone (without probing) could
-        # collide even with very few distinct names.
+        # for small function counts -- a hash alone (without probing)
+        # could collide even with very few distinct names.
         names = [f"func_{i}" for i in range(16)]  # == len(_SPAN_PALETTE)
         w = TimelineWidget(_mk_trace(
             [_span(1, 1, Category.GPU_CUDA, i, 10, n) for i, n in enumerate(names)]))
@@ -102,8 +98,8 @@ class TestMpiRankLabels(unittest.TestCase):
 class TestIdleRendering(unittest.TestCase):
     def test_idle_columns_are_blank_not_a_visible_dot(self):
         # A single short span leaves most of a wide view idle -- idle
-        # columns must render as plain unstyled space, not the previous
-        # visible "·" dot (which read as noise/static on sparse traces).
+        # columns must render as plain unstyled space, not a visible "·"
+        # dot (which reads as noise/static on sparse traces).
         a = _span(1, 101, Category.CPU, 0, 10, "brief_work")
         w = TimelineWidget(_mk_trace([a]))
         chars, styles, _util = w._density_row("cpu/thread-101", width=50, lane_color="")
@@ -115,6 +111,41 @@ class TestIdleRendering(unittest.TestCase):
             self.assertIn(ch, ("█", " "))
             if ch == " ":
                 self.assertEqual(st, "")
+
+
+
+class TestWaitsDrawnIdle(unittest.TestCase):
+    """A thread lane whose span covers a barrier wait (reported on the same
+    thread's sync lane) draws the wait as idle, not as work."""
+
+    def _widget(self, pid_suffix_collision: bool = False):
+        spans = [_span(1, 10, Category.OPENMP, 0, 1_000_000, "omp_parallel_region"),
+                 _span(1, 10, Category.SYNC, 500_000, 500_000, "omp_barrier")]
+        if pid_suffix_collision:
+            # another process uses tid 10 for OpenMP only: the openmp lanes
+            # get @pid suffixes, the single sync lane does not
+            spans.append(_span(2, 10, Category.OPENMP, 0, 10, "other"))
+        return TimelineWidget(_mk_trace(spans))
+
+    def test_wait_columns_are_idle_and_excluded_from_utilisation(self):
+        w = self._widget()
+        chars, styles, util, waited = w._activity_row("openmp/thread-10", width=40, lane_color="")
+        self.assertTrue(waited)
+        self.assertEqual(set(chars[:19]), {"█"})
+        self.assertEqual(set(chars[21:]), {"░"})
+        self.assertTrue(all(st == "grey50" for st in styles[21:]))
+        self.assertAlmostEqual(util, 50.0, delta=4.0)
+        # the sync lane itself is unchanged
+        schars, _st, sutil, swaited = w._activity_row("sync/thread-10", width=40, lane_color="")
+        self.assertFalse(swaited)
+        self.assertIn("█", schars)
+
+    def test_pairing_survives_pid_suffix_on_one_lane_only(self):
+        w = self._widget(pid_suffix_collision=True)
+        lane = next(n for n in w._lane_names if n.startswith("openmp/thread-10@1"))
+        self.assertEqual(w._wait_lane.get(lane), "sync/thread-10")
+        _c, _s, _u, waited = w._activity_row(lane, width=40, lane_color="")
+        self.assertTrue(waited)
 
 
 if __name__ == "__main__":

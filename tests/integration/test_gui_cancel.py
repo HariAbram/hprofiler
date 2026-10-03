@@ -1,10 +1,9 @@
 """
 Ctrl+C during the GUI's async trace load must cancel it (exit 130) instead
-of being ignored. Regression: app.py wrapped the load in
-`except KeyboardInterrupt`, but Python signal handlers only run when the
-main thread executes bytecode, which barely happens inside Qt's event
-loop -- SIGINT sent mid-load was ignored, the load ran to completion and
-the window opened anyway (process still alive 90s later).
+of being ignored. Catching KeyboardInterrupt around the load is not enough:
+Python signal handlers only run when the main thread executes bytecode,
+which barely happens inside Qt's event loop, so SIGINT mid-load would be
+ignored and the window would open anyway.
 
 Runs src/gui/app.py as a real subprocess (as launch.py does) on a trace
 large enough to still be loading when the signal arrives.

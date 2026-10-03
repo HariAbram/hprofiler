@@ -166,6 +166,8 @@ def _metadata_json(trace: Trace) -> dict:
         # CUDA/ROCm native-tracer status, clock mapping and
         # correlation/de-duplication counts (src/core/gpu_activity.py).
         "deviceActivity": meta.device_activity,
+        # Transport / receiver / capture-state integrity (src/core/receiver.py).
+        "captureHealth": meta.capture_health,
     }
 
 
@@ -244,8 +246,8 @@ def load_trace_from_json(
     with open(path) as f:
         first = f.readline()
         if first.strip() == JSON_LAYOUT_LINE:
-            meta_raw, disasm_raw = _load_streaming(f, trace, path.stat().st_size,
-                                                   len(first), progress_cb, cancel_check)
+            meta_raw, disasm_raw, issues = _load_streaming(f, trace, path.stat().st_size,
+                                                           len(first), progress_cb, cancel_check)
         else:
             f.seek(0)
             data = json.load(f)
@@ -260,7 +262,20 @@ def load_trace_from_json(
                 if cancel_check is not None and i % _PROGRESS_STRIDE == 0 and cancel_check():
                     raise LoadCancelled(f"Cancelled while parsing event {i}/{total_events}")
                 _add_event(trace, ev, counter_units)
+            issues = {}
     _finish_load(trace, meta_raw, disasm_raw, collect_disasm)
+    if issues:
+        # Recorded with the trace (capture_warnings() renders it) and said now.
+        trace.metadata.capture_health = {**trace.metadata.capture_health, "load": issues}
+        import sys
+        if issues.get("truncated"):
+            print(f"[hprofiler][warn] {path}: the file is truncated (an interrupted export or copy) -- "
+                  f"loaded the {issues.get('events', 0)} complete events before the cut; later events "
+                  f"{'and the disassembly ' if issues.get('disasm_missing') else ''}are missing",
+                  file=sys.stderr)
+        if issues.get("bad_lines"):
+            print(f"[hprofiler][warn] {path}: {issues['bad_lines']} unreadable event line(s) skipped",
+                  file=sys.stderr)
     return trace
 
 
@@ -271,18 +286,28 @@ _PROGRESS_STRIDE = 5000
 
 
 def _load_streaming(f, trace: Trace, total_bytes: int, done_bytes: int,
-                    progress_cb, cancel_check) -> tuple[dict, dict | None]:
+                    progress_cb, cancel_check) -> tuple[dict, dict | None, dict]:
+    """Returns (metadata, disasm, issues). A file cut short (interrupted
+    export, partial copy) loads every complete event before the cut and
+    reports issues={"truncated": True, ...}; an unreadable line in the
+    middle is skipped and counted (bad_lines), never fatal."""
     meta_raw: dict = {}
     disasm_raw = None
     counter_units: dict[str, str] = {}
     in_events = False
+    events_closed = False
+    ended = False
     n = 0
+    bad_lines = 0
     meta_lines: list[str] = []
     for line in f:
+        if not line.endswith("\n"):
+            ended = line.strip() == "}"       # the writer ends with "}" (no newline) -- else cut
         done_bytes += len(line)
         if in_events:
             if line.startswith("]"):
                 in_events = False
+                events_closed = True
                 continue
             body = line.rstrip("\n")
             if body.endswith(","):
@@ -294,7 +319,12 @@ def _load_streaming(f, trace: Trace, total_bytes: int, done_bytes: int,
                     progress_cb(done_bytes, total_bytes)
                 if cancel_check is not None and cancel_check():
                     raise LoadCancelled(f"Cancelled after {n} events")
-            _add_event(trace, json.loads(body), counter_units)
+            try:
+                ev = json.loads(body)
+            except json.JSONDecodeError:
+                bad_lines += 1            # a cut-off last line, or damage in the middle
+                continue
+            _add_event(trace, ev, counter_units)
             n += 1
             continue
         if line.startswith('"traceEvents": ['):
@@ -311,10 +341,26 @@ def _load_streaming(f, trace: Trace, total_bytes: int, done_bytes: int,
             counter_units = meta_raw.get("counterUnits") or {}
             continue
         if line.startswith('"disasm": '):
-            disasm_raw = json.loads(line[len('"disasm": '):].rstrip().rstrip(","))
+            try:
+                disasm_raw = json.loads(line[len('"disasm": '):].rstrip().rstrip(","))
+            except json.JSONDecodeError:
+                disasm_raw = None        # cut inside the disassembly section
+                ended = False
+                continue
+        if line.strip() == "}":
+            ended = True
     if progress_cb is not None:
         progress_cb(total_bytes, total_bytes)
-    return meta_raw, disasm_raw
+    issues: dict = {}
+    if not events_closed or not ended:
+        issues = {"truncated": True, "events": n, "disasm_missing": events_closed and disasm_raw is None}
+        if not meta_raw:
+            issues["metadata_missing"] = True
+        if bad_lines:
+            bad_lines -= 1                  # the cut-off last event line is part of the truncation
+    if bad_lines:
+        issues["bad_lines"] = bad_lines
+    return meta_raw, disasm_raw, issues
 
 
 def _add_event(trace: Trace, ev: dict, counter_units: dict[str, str]) -> None:
@@ -385,6 +431,7 @@ def _finish_load(trace: Trace, meta_raw: dict, disasm_raw: dict | None, collect_
     metadata.capture_time_iso = meta_raw.get("captureTime", "")
     metadata.pid = meta_raw.get("pid", 0) or 0
     metadata.device_activity = dict(meta_raw.get("deviceActivity") or {})
+    metadata.capture_health = dict(meta_raw.get("captureHealth") or {})
 
     # Profiling window. Files written before startTimeNs/endTimeNs existed
     # fall back to the event extent -- never TraceMetadata's default

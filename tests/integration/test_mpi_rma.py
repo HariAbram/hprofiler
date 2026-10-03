@@ -1,13 +1,12 @@
 """
 Integration test for hooks/mpi_hook/mpi_hook.c's one-sided (RMA)
 synchronization wrappers -- MPI_Win_fence, MPI_Win_flush, MPI_Win_flush_all,
-MPI_Win_lock, MPI_Win_lock_all, MPI_Win_unlock, MPI_Win_unlock_all. Added
-alongside MPI_Put/Get/Accumulate (which already existed) after an audit
-found the standard permits an MPI implementation to defer RMA completion
-past a Put/Get/Accumulate call's own return -- real completion is only
-guaranteed after one of these synchronization calls, none of which were
-previously intercepted at all, so a deferred-completion transport would
-have that transfer's real cost attributed to nothing in the trace.
+MPI_Win_lock, MPI_Win_lock_all, MPI_Win_unlock, MPI_Win_unlock_all,
+alongside MPI_Put/Get/Accumulate. The standard permits an MPI
+implementation to defer RMA completion past a Put/Get/Accumulate call's
+own return -- completion is only guaranteed after one of these
+synchronization calls, so without them a deferred-completion transport's
+transfer cost would be attributed to nothing in the trace.
 
 Builds the real libhprofiler_mpi.so, LD_PRELOADs it into
 tests/fixtures/mpi_win_self.c, and captures the actual wire lines the hook
@@ -189,8 +188,8 @@ class TestMpiRmaSync(unittest.TestCase):
         self.assertEqual(len(self._spans_named(events, "MPI_Win_unlock_all")), 1)
 
     def test_put_get_accumulate_still_emitted_alongside_new_sync_calls(self):
-        # Regression guard: adding the new Win_* wrappers must not have
-        # disturbed the pre-existing Put/Get/Accumulate wrappers.
+        # The Win_* wrappers must not disturb the Put/Get/Accumulate
+        # wrappers.
         events = self._run_and_capture()
         self.assertEqual(len(self._spans_named(events, "MPI_Put")), 1)
         self.assertEqual(len(self._spans_named(events, "MPI_Get")), 1)

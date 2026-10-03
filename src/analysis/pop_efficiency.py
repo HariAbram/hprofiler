@@ -319,10 +319,9 @@ def duration_weighted_pct(pairs: list[tuple[int, float]]) -> float | None:
     Weighting must be by wall-clock duration, NOT by a rate like
     achieved_tflops -- weighting by a rate would let a short, high-throughput
     kernel dominate a long-running, lower-throughput one, backwards from what
-    "duration-weighted" means. (An earlier version of gpu_efficiency did
-    exactly that, plus used `x or 1.0` as a fallback, which treated a
-    genuine 0.0 achieved_tflops kernel -- e.g. a pure memory-bound kernel --
-    as if it had full weight, since 0.0 is falsy in Python.)
+    "duration-weighted" means. A genuine 0.0 achieved_tflops (e.g. a pure
+    memory-bound kernel) must not be replaced by a truthiness fallback
+    such as `x or 1.0`.
     """
     weighted, total = 0.0, 0.0
     for dur_ns, pct in pairs:

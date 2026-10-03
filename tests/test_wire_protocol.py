@@ -1,14 +1,11 @@
 """
 Regression tests for _parse_record's handling of inst: records (src/core/runner.py).
 
-Before this fix, the inst: branch discarded any trailing tags segment
-entirely -- it existed in the wire format and in InstantEvent.tags, but no
-call site ever populated it until mpi_hook.c's new MPI_Test/MPI_Testany/
-MPI_Testsome/MPI_Testall/MPI_Cancel instant events started relying on it
-for psid=/rpeer=/rtag=/flag= data (see project_full_audit_fixes /
-mpi_hook.c). It also sliced parts[:6], which is one position short of
-where inst's "name[:tags]" tail actually starts relative to span's shape,
-so a colon-containing name would have been truncated too.
+The inst: branch must keep the trailing tags segment (MPI_Test/
+MPI_Testany/MPI_Testsome/MPI_Testall/MPI_Cancel instants carry
+psid=/rpeer=/rtag=/flag= there, see mpi_hook.c) and must split inst's
+"name[:tags]" tail at its own position (one later than span's shape), so
+a colon-containing name is not truncated.
 """
 import sys
 import unittest
@@ -56,8 +53,7 @@ class TestInstantTagParsing(unittest.TestCase):
         self.assertEqual(ev.tags["type"], "cancel")
 
     def test_span_tags_still_parse_unaffected(self):
-        # Not touched by this fix, but kept alongside as a guard that the
-        # inst: change didn't regress the span: sibling branch.
+        # Guard that the span: sibling branch parses tags too.
         line = "span:mpi:1:2:0:500:MPI_Waitany:type=waitany,rank=0,completed_index=2,psid=9\n"
         ev = _parse_record(line)
         self.assertIsInstance(ev, SpanEvent)

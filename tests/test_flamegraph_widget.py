@@ -1,12 +1,8 @@
 """
-Tests for the TUI's new Flame Graph tab (src/ui/app.py's FlameGraphWidget
-/ _FlameCanvas), which replaced the old dead FlameGraphWidget (a flat,
-unwired bar chart -- never composed into ProfilerApp at all). Real
-interaction tests via Textual's Pilot (async run_test/click), not just
-"does it render" -- matches this project's established "test the actual
-interaction, don't just assume the API works" rule for anything with a
-click/zoom model (the QML flame graph popup needed the exact same
-rigor).
+Tests for the TUI's Flame Graph tab (src/ui/app.py's FlameGraphWidget /
+_FlameCanvas). Real interaction tests via Textual's Pilot (async
+run_test/click), not just "does it render", since the tab has a
+click/zoom model.
 """
 import sys
 import unittest

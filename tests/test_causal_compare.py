@@ -28,7 +28,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
 from src.analysis import causal_compare as cc
 from src.analysis import compare as cmp
@@ -195,7 +196,7 @@ class TestOverlapAndCriticalPath(unittest.TestCase):
         prepare = find(r["contributors"], "prepare")[0]
         self.assertEqual(prepare["cause"], "increased_work")
         self.assertEqual(r["contributors"][0]["label"], "prepare")
-        # L, which used to bound the iteration, left the critical path
+        # L, which bounded the iteration in the baseline, left the critical path
         lk = find(r["improvements"], "_Z1Lv")[0]
         self.assertEqual(lk["causeLabel"], "moved off the critical path")
         self.assertLess(lk["impactNs"], 0)
@@ -313,6 +314,110 @@ class TestStoresAndNames(unittest.TestCase):
     def test_name_normalization(self):
         self.assertEqual(normalize_name("foo [clone .constprop.0]"), "foo")
         self.assertEqual(normalize_name("cb@0x7f12aa001234"), "cb@0x…")
+
+
+def _scenarios() -> dict:
+    return {"paths": (S.same_name_different_paths(False), S.same_name_different_paths(True)),
+            "mpi": (S.mpi_wait(False), S.mpi_wait(True)),
+            "overlap": (S.stream_overlap(False), S.stream_overlap(True)),
+            "critical": (S.becomes_critical(False), S.becomes_critical(True)),
+            "insert": (S.iterations(10), S.iterations(11)),
+            "reorder": (S.reordered(False), S.reordered(True))}
+
+
+def _canon(report: dict) -> str:
+    return json.dumps({k: v for k, v in report.items() if k != "aggregate"}, sort_keys=True)
+
+
+_HASH_SCRIPT = r"""
+import hashlib, json, sys
+sys.path.insert(0, sys.argv[1])
+from tests.test_causal_compare import _scenarios, _canon
+from src.analysis import causal_compare as cc
+print(json.dumps({n: hashlib.sha1(_canon(cc.compare_traces(a, b)).encode()).hexdigest()
+                  for n, (a, b) in _scenarios().items()}, sort_keys=True))
+"""
+
+
+class TestInvariance(unittest.TestCase):
+    """The comparison must not depend on dict/set iteration order (hash
+    seed), on how the traces were loaded (in memory, JSON re-import, disk
+    import), or on whether dependency edges were already persisted."""
+
+    def test_independent_of_hash_seed(self):
+        outs = set()
+        for seed in ("0", "1", "4242", "987654"):
+            p = subprocess.run([sys.executable, "-c", _HASH_SCRIPT, str(REPO)], capture_output=True, text=True,
+                               timeout=300, env={**os.environ, "PYTHONHASHSEED": seed}, cwd=str(REPO))
+            self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+            outs.add(p.stdout.strip())
+        self.assertEqual(len(outs), 1, outs)
+
+    def test_independent_of_loading_mode(self):
+        from src.core import trace_io
+        from src.output import chrome_trace
+        tmp = tempfile.mkdtemp(prefix="hprofiler_cmp_load_")
+        try:
+            for name, (a, b) in _scenarios().items():
+                ref = _canon(cc.compare_traces(a, b))
+                paths = []
+                for side, t in (("a", a), ("b", b)):
+                    pth = os.path.join(tmp, f"{name}_{side}.json")
+                    chrome_trace.write(t, pth)
+                    paths.append(pth)
+                mem = [chrome_trace.load_trace_from_json(x) for x in paths]
+                self.assertEqual(_canon(cc.compare_traces(*mem)), ref, f"{name}: JSON reload")
+                disk = [trace_io.open_trace(x, disk=True) for x in paths]
+                self.assertEqual(_canon(cc.compare_traces(*disk)), ref, f"{name}: disk import")
+                for t in disk:
+                    t.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_independent_of_persisted_edges(self):
+        from src.analysis import criticalpath as cp
+        tmp = tempfile.mkdtemp(prefix="hprofiler_cmp_edges_")
+        try:
+            def to_disk(t, name):
+                d = Trace(copy.deepcopy(t.metadata), store=DiskTraceStore(os.path.join(tmp, name)))
+                for sp in t.iter_spans():
+                    d.add(copy.deepcopy(sp))
+                d.finalize()
+                return d
+            for name, (a, b) in _scenarios().items():
+                da, db = to_disk(a, f"{name}_a.hpstore"), to_disk(b, f"{name}_b.hpstore")
+                self.assertIsNone(da.store.load_edges(cp.EDGES_VERSION))
+                first = _canon(cc.compare_traces(da, db))          # builds + persists edges
+                self.assertIsNotNone(da.store.load_edges(cp.EDGES_VERSION), name)
+                second = _canon(cc.compare_traces(da, db))         # reads persisted edges
+                self.assertEqual(first, second, name)
+                self.assertEqual(first, _canon(cc.compare_traces(a, b)), f"{name}: memory store")
+                da.close()
+                db.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_swapping_baseline_and_candidate_mirrors_the_attribution(self):
+        # A slower rank-0 compute makes rank 1 wait in MPI_Recv. Forward the
+        # wait's critical-path increase is credited to the compute; reversed,
+        # the shrunken wait must likewise be credited to the faster compute
+        # (origins are traced for improvements as well as regressions).
+        a, b = S.mpi_wait(False), S.mpi_wait(True)
+        fwd, rev = cc.compare_traces(a, b), cc.compare_traces(b, a)
+        self.assertEqual(fwd["wallTime"]["deltaNs"], -rev["wallTime"]["deltaNs"])
+        self.assertEqual(fwd["criticalPathChange"]["deltaNs"], -rev["criticalPathChange"]["deltaNs"])
+        imp = lambda rows: {r["label"]: (r["impactNs"], r["propagatedFrom"] is not None) for r in rows}  # noqa: E731
+        f, r = imp(fwd["contributors"]), imp(rev["improvements"])
+        self.assertEqual(set(f), set(r))
+        for label in f:
+            self.assertEqual(f[label][0], -r[label][0], label)
+            self.assertEqual(f[label][1], r[label][1], label)
+        self.assertEqual(f["compute"], (50_000_000, False))
+        recv = next(x for x in rev["improvements"] if x["label"] == "MPI_Recv")
+        self.assertIn("origin: compute less work (-50.00ms", recv["explanation"])
+        for name, (x, y) in _scenarios().items():
+            p, q = cc.compare_traces(x, y), cc.compare_traces(y, x)
+            self.assertEqual(p["wallTime"]["deltaNs"], -q["wallTime"]["deltaNs"], name)
 
 
 class TestCli(unittest.TestCase):

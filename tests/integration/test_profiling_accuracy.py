@@ -7,7 +7,7 @@ Each run goes through the real pipeline: hook -> socket -> Runner -> Trace
 what `hprofiler run` + `hprofiler gui/summary/critical-path` do.
 
 Tolerances are explicit and chosen from repeated measurements on a laptop
-CPU (see DOCUMENTATION.md §13 "Measured accuracy"): hook-side timestamps land
+CPU (see DOCUMENTATION.md, "Ground-truth timing accuracy"): hook-side timestamps land
 within tens of microseconds of the program's own stamps; per-thread compute
 attribution within 5% (or 1ms) of truth. Timing tests never assert exact
 equality of noisy measurements.

@@ -1,7 +1,7 @@
 import QtQuick
 import Hprofiler 1.0
 
-// Timeline's time axis (Phase B5) -- tick marks/labels (TimelineModel.
+// Timeline's time axis -- tick marks/labels (TimelineModel.
 // timeTicks(), a "nice" round-number interval, same idea as any plotting
 // library's axis ticks), named-range bands, bookmark markers, and the
 // current Nav.selectedTimeRange band, all drawn on one Canvas so they

@@ -41,9 +41,7 @@ MPI `rank=`/`peer=` tags are also left unchanged -- MPI_COMM_WORLD ranks
 are already globally unique across an entire job regardless of which
 physical node a rank happens to run on, so criticalpath.py's cross-rank
 P2P/collective matching (built on those tags, not pid/tid) works
-transparently across a merge with no further change needed; this is a
-direct benefit of this redesign's Phase 1 MPI protocol work capturing real
-ranks and communicator identity.
+transparently across a merge with no further change needed.
 
 validate_causality() is a sanity check for the result: after merging, a
 matched MPI send can never causally complete after its receive already

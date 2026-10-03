@@ -6,9 +6,9 @@ this project's existing pattern for optional-tool-dependent tests (e.g.
 test_gomp_hook.py skipping when gcc isn't available).
 
 Runs headless (QT_QPA_PLATFORM=offscreen) -- these tests check computed
-Property values, not actual rendering (see the manual screenshot-based
-verification in project_qml_gui memory for that level of check), so a
-real display is not needed; a QGuiApplication instance IS needed since
+Property values, not rendering (tests/test_gui_timeline_hover.py covers
+real QML interaction), so a real display is not needed; a
+QGuiApplication instance IS needed since
 PySide6's QObject/Property machinery requires one to exist.
 """
 import os
@@ -126,8 +126,7 @@ class TestGuiBridge(unittest.TestCase):
     def test_radius_scale(self):
         theme = self._theme()
         self.assertLess(theme.radiusSmall, theme.radiusPanel)
-        # radiusPanel matches the value that already dominated every
-        # panel block across the GUI before this token existed.
+        # radiusPanel is the radius every panel block uses.
         self.assertEqual(theme.radiusPanel, 6)
 
     def test_typography_scale_is_ascending_by_role(self):
@@ -163,13 +162,11 @@ class TestGuiBridge(unittest.TestCase):
             self.assertEqual(theme.infoColor, theme.severityColor("cyan"))
 
     def test_revised_category_colors_for_colorblind_safety(self):
-        # mpi/memory/jit/nvtx were changed after a quantitative
-        # deuteranopia/protanopia/tritanopia simulation found them
-        # confusable with other categories (worst: mpi/memory confusable
-        # under both common red-green CVD forms). Exact values pinned so
-        # a future edit can't silently drift back to the old, confusable
-        # ones -- the other 8 categories are deliberately NOT asserted
-        # here since they were untouched by this fix.
+        # mpi/memory/jit/nvtx values were chosen with a quantitative
+        # deuteranopia/protanopia/tritanopia simulation so they aren't
+        # confusable with other categories (e.g. mpi vs. memory under both
+        # common red-green CVD forms). Exact values pinned so an edit can't
+        # silently drift back to confusable ones.
         theme = self._theme()
         theme.dark = True
         self.assertEqual(theme.categoryColor("mpi"), "#2563eb")
@@ -227,11 +224,9 @@ class TestGuiBridge(unittest.TestCase):
         self.assertEqual(offenders, [], "raw hex color literal(s) found outside theme.py:\n" + "\n".join(offenders))
 
     def test_light_mpi_no_longer_collides_with_old_dark_mpi(self):
-        # The exact regression this fix closes: mpi's dark value used to
-        # be #60a5fa and its light value #2563eb -- distinct at the time,
-        # but #2563eb is mpi's NEW dark value, so a naive fix that only
-        # changed the dark side would have made light-mode mpi equal the
-        # OLD dark-mode mpi, not a real fix. Confirms both sides moved.
+        # Light-mode mpi must not equal #2563eb (the dark-mode mpi value):
+        # light/dark palettes are checked independently, so both sides
+        # must keep distinct values.
         theme = self._theme()
         theme.dark = False
         self.assertNotEqual(theme.categoryColor("mpi"), "#60a5fa")
@@ -473,12 +468,8 @@ class TestGuiBridge(unittest.TestCase):
         self.assertEqual(relationships["Call Tree"]["value"], "appears in the call tree")
 
     # ── FlameGraphBridge ─────────────────────────────────────────────────
-    # Moved here (from the now-removed standalone `hprofiler flamegraph
-    # --gui` popup's own tests/test_flamegraph_gui.py) since the bridge
-    # itself moved into bridge.py alongside CallTreeBridge -- same trace-
-    # sourced data now (analysis/flamegraph_tree.py's build_flame_tree(),
-    # itself built on the same _ct_build CallTreeBridge uses), not a
-    # folded-stacks-text constructor argument the way the popup's version was.
+    # Trace-sourced data (analysis/flamegraph_tree.py's build_flame_tree(),
+    # built on the same _ct_build CallTreeBridge uses).
 
     def test_flame_graph_bridge_empty_trace(self):
         from src.gui.bridge import FlameGraphBridge
@@ -560,15 +551,11 @@ class TestGuiBridge(unittest.TestCase):
         self.assertIn("sym=main", sb.noDisasmReason("b"))
 
     def test_source_bridge_picks_up_disasm_added_after_construction(self):
-        # Regression test for a real user report: `hprofiler gui --disasm`
-        # started background disassembly collection correctly, but
-        # SourceBridge built its kernel list ONCE at construction time
-        # (a constant Property) and never looked again -- so a function
-        # that resolved a second later than the window opening (the
-        # common case: collection takes a moment) stayed stuck showing
-        # "disassembly still failed" forever, even though the exact same
-        # trace's TUI (which polls trace._disasm_version every 0.5s)
-        # showed it correctly. SourceBridge now polls the same way.
+        # `hprofiler gui --disasm` collects disassembly in the background,
+        # so a function can resolve after the window opens. SourceBridge
+        # must poll trace._disasm_version (every 0.5s, like the TUI) rather
+        # than build its kernel list once, or it stays stuck on
+        # "disassembly still failed".
         from src.gui.bridge import SourceBridge
         from src.disasm.extractor import KernelDisasm
         span = _span(1, 1, Category.OPENMP, 0, 100, "hot_fn", tags={"sym": "hot_fn"})
@@ -599,11 +586,9 @@ class TestGuiBridge(unittest.TestCase):
         self.assertEqual(received, [])
 
     def test_source_bridge_exposes_demangled_call_site_symbol(self):
-        # Regression test for a real user question: the kernel list shows
-        # the span/event label ("omp_barrier"), not the real function that
-        # was disassembled -- with no way to tell what code they're
-        # actually looking at. `symbol` now carries the demangled
-        # resolved call site (KernelDisasm.mangled_name).
+        # The kernel list shows the span/event label ("omp_barrier"), not
+        # the function that was disassembled; `symbol` carries the
+        # demangled resolved call site (KernelDisasm.mangled_name).
         from src.gui.bridge import SourceBridge
         from src.disasm.extractor import KernelDisasm
         span = _span(1, 1, Category.SYNC, 0, 100, "omp_barrier", tags={"sym": "caller_fn"})
@@ -668,11 +653,8 @@ class TestGuiBridge(unittest.TestCase):
         self.assertFalse(lines[0]["sourceChanged"])
 
     def test_source_bridge_instruction_mix_counts_and_percentages(self):
-        # Regression test: KernelDisasm.itype_counts()/itype_pcts()
-        # already existed and were already used by the TUI's
-        # DisasmWidget._show_mix -- the GUI's Source screen never called
-        # them at all, so a real user reported "no vector/memory
-        # instruction counts" with no way to see them.
+        # The Source screen exposes KernelDisasm.itype_counts()/itype_pcts(),
+        # the same instruction mix the TUI's DisasmWidget._show_mix shows.
         from src.gui.bridge import SourceBridge
         from src.disasm.extractor import KernelDisasm, DisasmLine
         from src.disasm.classifier import InsnType
@@ -798,7 +780,7 @@ class TestGuiBridge(unittest.TestCase):
         from src.gui.bridge import ProfileBridge
         ProfileBridge(_mk_trace([_span(1, 1, Category.CPU, 0, 10, "x")]), self._theme())
 
-    # ── DashboardBridge: Overview redesign (cross-tab-navigation round) ──
+    # ── DashboardBridge: Overview run summary / breakdown / next steps ──
 
     def test_dashboard_bridge_run_summary_fields(self):
         trace = _mk_trace([_span(1, 1, Category.CPU, 0, 100, "x"), _span(1, 2, Category.CPU, 0, 100, "y")],
@@ -993,10 +975,9 @@ class TestGuiBridge(unittest.TestCase):
 @unittest.skipUnless(_PYSIDE6_AVAILABLE, "PySide6 not installed")
 class TestDataTableModels(unittest.TestCase):
     """src/gui/tablemodel.py -- the shared table infrastructure (real Qt
-    model/view: QAbstractListModel + QSortFilterProxyModel, not the
-    per-screen hand-rolled JS sort/filter every table used before this
-    round). Built as a reference implementation against KERNEL_COLUMNS,
-    but this module itself is table-agnostic."""
+    model/view: QAbstractListModel + QSortFilterProxyModel). Built as a
+    reference implementation against KERNEL_COLUMNS, but this module
+    itself is table-agnostic."""
 
     _app = None
 
@@ -1029,9 +1010,8 @@ class TestDataTableModels(unittest.TestCase):
 
     def test_numeric_sort_is_correct_not_lexicographic(self):
         # A naive string/JS sort would order "1000" < "200" < "9000"
-        # lexicographically -- this is the exact bug class the old JS
-        # `b[key]-a[key]` sort in KernelsScreen.qml's recompute() could
-        # hit if a numeric field were ever stringified; TableFilterProxy's
+        # lexicographically if a numeric field were ever stringified;
+        # TableFilterProxy's
         # lessThan() must sort by real numeric value regardless.
         bundle = self._bundle()
         bundle.filters.toggleSort("count")   # 100, 20, 5 -> ascending: 5, 20, 100
@@ -1261,9 +1241,8 @@ class TestComparisonBridge(unittest.TestCase):
 
     def test_threshold_change_updates_every_derived_summary(self):
         # +8% / +0.8ms on matmul: unchanged under the default 5%/1ms
-        # floor, regressed once the floor drops. The table used to flip
-        # while topRegressions, bucketDeltas and the export kept the old
-        # verdict next to it on the same screen.
+        # floor, regressed once the floor drops. The table, topRegressions,
+        # bucketDeltas and the export must all switch verdict together.
         import json, tempfile, os
         bridge = self._pair()
         self.assertNotIn("matmul", [r["name"] for r in bridge.topRegressions])
@@ -1414,10 +1393,8 @@ class TestComparisonBridge(unittest.TestCase):
         self.assertEqual(len(bridge.comparisonCoverage), 60)
 
     def test_dashboard_bridge_without_comparison_param_is_unchanged(self):
-        # The "keep ordinary single-profile operation unchanged" requirement,
-        # asserted directly: calling DashboardBridge the OLD way (no
-        # comparison=) must behave identically to before this parameter
-        # existed.
+        # Without comparison=, DashboardBridge behaves exactly as a plain
+        # single-profile Overview.
         from src.gui.bridge import DashboardBridge
         trace = _mk_trace([_span(1, 1, Category.GPU_CUDA, 0, 1_000_000, "k")])
         bridge = DashboardBridge(trace, self._theme())

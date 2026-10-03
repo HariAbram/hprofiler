@@ -101,7 +101,7 @@ class TestBucketTotals(unittest.TestCase):
     def test_sums_duration_per_bucket(self):
         # Host spans laid out sequentially: bucket_totals attributes each
         # instant of a thread to one span, so overlapping same-thread
-        # spans are no longer summed (see the nesting tests below).
+        # spans are not summed (see the nesting tests below).
         spans = [
             _span(Category.GPU_CUDA, 100, "kernel"),
             _span(Category.GPU_CUDA, 50, "kernel"),
@@ -169,10 +169,11 @@ def _omp_program(shape: str):
 
 
 class TestExclusiveAttribution(unittest.TestCase):
-    """bucket_totals used to sum raw durations; nested host spans were
-    counted twice and the same OpenMP program was diagnosed differently
-    depending on which runtime it linked (measured: OMPT 'sync-bound'
-    66% sync, GOMP 'openmp-bound' 27.5% sync; truth 38%)."""
+    """bucket_totals must attribute exclusive time: summing raw durations
+    counts nested host spans twice, and the same OpenMP program was then
+    diagnosed differently depending on which runtime it linked (measured:
+    OMPT 'sync-bound' 66% sync, GOMP 'openmp-bound' 27.5% sync; truth
+    38%)."""
 
     def test_nested_barrier_not_double_counted(self):
         totals = ab.bucket_totals(_omp_program("gomp"))

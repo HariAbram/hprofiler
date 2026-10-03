@@ -1,13 +1,11 @@
 """
-Regression tests for a self-audit bug: integer address-arithmetic
-instructions (SASS IMAD/IMUL/XMAD, PTX mad.lo.s32-style, AMDGCN
-v_add_u32-style) were classified into the same InsnType.COMPUTE bucket as
-real floating-point ops and charged FLOPs in the disasm-based roofline
-estimate -- inflating achieved_tflops/arithmetic_intensity and able to flip
-the compute-vs-memory-bound verdict for a purely memory-bound kernel with
-normal address arithmetic. Tensor-core ops (HMMA/BMMA, MFMA) were also
-lumped into the same 2-FLOPs-per-instruction bucket as a scalar FMA,
-undercounting real tensor-core throughput by ~100x+.
+Instruction classes that the disassembly-based roofline must not charge as
+FP work: integer address arithmetic (SASS IMAD/IMUL/XMAD, PTX
+mad.lo.s32-style, AMDGCN v_add_u32-style) is INT_COMPUTE, not COMPUTE --
+charging it FLOPs would inflate achieved_tflops/arithmetic_intensity and
+could flip the compute-vs-memory-bound verdict of a memory-bound kernel.
+Tensor-core ops (HMMA/BMMA, MFMA) are TENSOR, charged per tile rather than
+the 2 FLOPs of a scalar FMA (~100x+ difference).
 """
 import sys
 import unittest

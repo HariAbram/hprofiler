@@ -1,25 +1,12 @@
 /*
- * ROCm / HIP LD_PRELOAD hook.
- *
- * Changes over initial version (mirrors CUDA hook improvements):
- *   1. Thread-local recursion guard (in_hook).
- *   2. GPU-accurate async memcpy timing via hipEvent pairs.
- *   3. More sync hooks: hipEventSynchronize, hipDeviceReset.
- *      hipMemcpy (sync) flushes pending before the real call.
- *   4. hipModuleGetFunction → kernel name table.
- *   5. More memory hooks: hipMallocAsync/FreeAsync, hipHostMalloc/Free,
- *      hipMallocManaged. Pinned host memory tracked as pinned_memory_bytes.
- *   6. send_all() loop + truncation guard (parity with CUDA hook).
- *   7. 2048-byte span buffer (handles long HIP template kernel names).
- *   8. Dynamic alloc array (realloc-based, no hard cap).
- *   9. Memory leak detection in destructor.
- *  10. ROCTx annotation interception (roctxRangePushA/Pop/MarkA).
- *  11. hipGraphLaunch span with GPU-accurate timing.
- *  12. Host submission vs. device execution: every launch/copy/memset/
- *      graph call emits a host API span (side=cpu) plus a device span
- *      (side=gpu) -- measured by ROCprofiler-SDK when it is running
- *      (rocprof_trace.c), otherwise the hipEvent-pair proxy, labelled
- *      timing=proxy_*.
+ * ROCm / HIP hook (LD_PRELOAD). Same model as cuda_hook.c: every call that
+ * submits device work (launch, copy, memset, graph launch) emits a host span
+ * (side=cpu) and a device span (side=gpu) -- from ROCprofiler-SDK when it is
+ * running (rocprof_trace.c), otherwise from a hipEvent pair around the call
+ * (timing=proxy_*). Also recorded: sync calls, event record / stream wait,
+ * allocations (device and pinned_memory_bytes counters, unreleased memory
+ * reported at exit), ROCTx ranges and marks, module loads (kernel names and
+ * code objects saved for disassembly).
  */
 
 #define _GNU_SOURCE
@@ -44,11 +31,6 @@ typedef void*  hipFunction_t;
 typedef void*  hipModule_t;
 typedef int    hipMemcpyKind;
 typedef struct { int x, y, z; } dim3;
-
-/* ── Globals ────────────────────────────────────────────────────────────── */
-static int             g_sock        = -1;
-static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static pid_t           g_pid         = 0;
 
 /* Thread-local recursion guard (shared, hidden, with rocprof_trace.c). */
 #include "hp_rocprof.h"
@@ -83,106 +65,30 @@ static uint64_t now_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
-static pid_t gettid_compat(void) { return (pid_t)syscall(SYS_gettid); }
-
-static void ensure_connected(void) {
-    if (g_sock >= 0) return;
-    const char *path = getenv("HPROFILER_SOCKET");
-    if (!path) {
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr, "[hprofiler/rocm] HPROFILER_SOCKET not set — no events will be recorded\n");
-        }
-        return;
-    }
-    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return;
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        g_sock = s; g_pid = getpid();
-    } else {
-        close(s);
-        fprintf(stderr, "[hprofiler/rocm] connect(%s) failed: %s\n", path, strerror(errno));
-    }
-}
-
-static void send_all(const char *buf, int n) {
-    while (n > 0) {
-        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
-        if (r < 0) { close(g_sock); g_sock = -1; return; }
-        buf += r; n -= (int)r;
-    }
-}
-
+#include "../common/hp_transport.h"
 #include "../common/callstack.h"
 
+static pid_t gettid_compat(void) { return hp_tx_tid(); }
+
+/* Records up to the transport's 64 KiB limit go out intact -- templated
+ * kernel names included. */
 static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
                       uint64_t dur_ns, const char *name, const char *extra) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) {
-        char buf[2048]; int n;
-        if (extra && *extra)
-            n = snprintf(buf, sizeof(buf),
-                "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-                cat, g_pid, (int)tid,
-                (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                name, extra);
-        else
-            n = snprintf(buf, sizeof(buf),
-                "span:%s:%d:%d:%llu:%llu:%s\n",
-                cat, g_pid, (int)tid,
-                (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                name);
-        /* snprintf returns >= sizeof(buf) when truncated. Rather than
-         * silently dropping the whole span, retry with a shortened name so
-         * the event -- correct timing, full tags -- still reaches the
-         * trace (heavily-templated C++ kernel names can alone exceed this
-         * buffer). */
-        if (n >= (int)sizeof(buf)) {
-            char short_name[200];
-            size_t name_len = strlen(name);
-            if (name_len > sizeof(short_name) - 4) {
-                memcpy(short_name, name, sizeof(short_name) - 4);
-                memcpy(short_name + sizeof(short_name) - 4, "...", 4);
-            } else {
-                memcpy(short_name, name, name_len + 1);
-            }
-            if (extra && *extra)
-                n = snprintf(buf, sizeof(buf),
-                    "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-                    cat, g_pid, (int)tid,
-                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                    short_name, extra);
-            else
-                n = snprintf(buf, sizeof(buf),
-                    "span:%s:%d:%d:%llu:%llu:%s\n",
-                    cat, g_pid, (int)tid,
-                    (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                    short_name);
-        }
-        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
-        emit_callstack(start_ns);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (!hp_tx_enabled()) return;
+    if (extra && *extra)
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name, extra);
+    else
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name);
+    emit_callstack(start_ns);
 }
 
 static void emit_ctr(const char *cat, const char *name,
                      int64_t value, const char *unit) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) {
-        char buf[256];
-        int n = snprintf(buf, sizeof(buf),
-                         "ctr:%s:%d:%llu:%s:%lld:%s\n",
-                         cat, g_pid, (unsigned long long)now_ns(),
-                         name, (long long)value, unit);
-        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (!hp_tx_enabled()) return;
+    hp_tx_emitf("ctr:%s:%d:%llu:%s:%lld:%s\n", cat, (int)hp_tx_pid(),
+                (unsigned long long)now_ns(), name, (long long)value, unit);
 }
 
 /* ── Kernel name table (hipModuleGetFunction → name) ──────────────────────── */
@@ -293,12 +199,8 @@ static void pin_track_rem(void *ptr) {
 }
 
 /* ── Stream ID assignment ────────────────────────────────────────────────── */
-/* Deterministic small-integer ID derived from the pointer VALUE (MurmurHash3
- * finalizer/fmix64), not from order-of-first-observation -- same technique
- * and rationale as cuda_hook.c's get_stream_id() (kept identical there and
- * here for consistency even though no AMD-side NCCL-equivalent hook exists
- * yet to cross-reference). Also removes the previous STREAM_MAP_CAP
- * overflow behavior (silently collapsing to stream=-1 past 256 streams). */
+/* Small display id from the pointer value (MurmurHash3 fmix64), as in
+ * cuda_hook.c's get_stream_id(). */
 static int handle_id(const void *h) {
     if (!h) return 0;
     uint64_t v = (uint64_t)(uintptr_t)h;
@@ -335,16 +237,9 @@ static int ev_api_ok(void) {
     return f_evCreate && f_evRecord && f_evElapsed && f_evDestroy && f_evSync;
 }
 
-/* ── Exec-start calibration: real GPU-timeline kernel-execution start ────────
- * (xs= tag), distinct from start_ns/t0 (the CPU-side launch-CALL time) ─────
- * Mirrors cuda_hook.c's identical mechanism -- see its comment for the full
- * rationale (hipEvent_t has the same FIFO-completion semantics as
- * cudaEvent_t, and hipEventElapsedTime works across streams the same way).
- * xs= is additive and never changes what start_ns/duration_ns mean.
- *
- * NOT independently verified against real kernel execution on this
- * development machine (no AMD GPU present -- see DOCUMENTATION.md's Known
- * Limitations); compile-checked only. */
+/* ── Exec-start estimate for proxy spans (xs= tag) ──────────────────────────
+ * Same mechanism as cuda_hook.c (hipEvent_t completes in stream FIFO order
+ * and hipEventElapsedTime works across streams). Never run on an AMD GPU. */
 static hipEvent_t      g_calib_event  = NULL;
 static uint64_t        g_calib_cpu_ns = 0;
 static int             g_calib_state  = 0;   /* 0=not tried, 1=ok, -1=failed */
@@ -456,12 +351,9 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
                       l->kname, final_extra);
         } else {
-            /* hipEventSynchronize/hipEventElapsedTime failed -- a kernel
-             * that ran to completion on the GPU must not simply vanish
-             * from the trace. Fall back to wall-clock time from launch to
-             * this flush (an upper-bound approximation, since it may
-             * include time for other kernels queued after this one), marked
-             * distinctly from GPU-accurate timing. */
+            /* Sync/elapsed-time query failed: keep the kernel, timed from
+             * launch to this flush -- an upper bound that can include later
+             * queued kernels (timing=proxy_flush). */
             char marked[300];
             if (l->extra[0])
                 snprintf(marked, sizeof(marked), "%s,timing=proxy_flush", l->extra);
@@ -473,17 +365,9 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
 }
 
 static int pk_try_begin(hipStream_t stream, hipEvent_t *ev_s, hipEvent_t *ev_e) {
-    /* Calibrate the xs= reference event HERE, before this kernel's own
-     * ev_s is recorded below -- same fix and same rationale as
-     * cuda_hook.c's pk_try_begin: exec_start_calibrate_if_needed()
-     * SYNCS the calibration event before returning, so deferring it to
-     * first-use inside pk_flush() (the previous approach) guaranteed it
-     * would postdate every kernel in whatever batch triggered it there,
-     * silently omitting xs= for that entire first flushed batch. Calling
-     * it here, before this process's very first kernel launch has even
-     * been recorded, means it precedes every real kernel's ev_s from
-     * then on. Idempotent (guarded by g_calib_state) -- a no-op after
-     * the first call. */
+    /* Calibrate before this launch's ev_s is recorded (see cuda_hook.c's
+     * pk_try_begin: a synchronized calibration event recorded at flush time
+     * would postdate the whole first batch). Idempotent. */
     exec_start_calibrate_if_needed();
     *ev_s = *ev_e = NULL;
     if (!ev_api_ok()) return 0;
@@ -531,10 +415,7 @@ void hp_roc_emit_span(const char *cat, pid_t tid, uint64_t start_ns,
 }
 
 void hp_roc_emit_line(const char *line) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) send_all(line, (int)strlen(line));
-    pthread_mutex_unlock(&g_sock_mutex);
+    hp_tx_emit(line, strlen(line));
 }
 
 /* ── Host submission / device activity ──────────────────────────────────────
@@ -1256,8 +1137,8 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
         }
         if (max_end > 24 && max_end < 256ULL*1024*1024) sz = max_end;
     } else if ((p[0] == '/' && p[1] == '/') || p[0] == '.') {
-        /* PTX text: include null terminator only if the string ends within
-         * the limit (off-by-one fix: sz++ past mapped region at exact 64MB). */
+        /* PTX text: include the terminator only if it lies within the
+         * limit; at exactly the limit +1 would read past the mapped region. */
         sz = strnlen((const char *)image, 64 * 1024 * 1024);
         if (sz > 0 && sz < 64 * 1024 * 1024) sz++;
     }
@@ -1336,14 +1217,10 @@ hipError_t hipModuleUnload(hipModule_t hmod) {
     if (!real) real = (fn_t)_real_hip_sym("hipModuleUnload");
     if (!real) return -1;
     hipError_t ret = real(hmod);
-    /* g_knames doesn't track which module each hipFunction_t came from, so
-     * we can't selectively invalidate just this module's entries -- and
-     * the driver is free to reuse a freed hipFunction_t address for an
-     * unrelated kernel in a later-loaded module (relevant for JIT-heavy
-     * use, e.g. ACPP/hipSYCL targeting ROCm), which would otherwise make
-     * resolve_name() return the OLD kernel's name forever. Clearing the
-     * whole table is conservative but correct; still-loaded modules are
-     * cheaply repopulated by their next hipModuleGetFunction call. */
+    /* The runtime may reuse a freed hipFunction_t address for another kernel
+     * (JIT-heavy use, e.g. ACPP), and g_knames does not record modules, so
+     * clear the whole table; entries come back with the next
+     * hipModuleGetFunction. */
     if (ret == 0) {
         pthread_mutex_lock(&g_kname_mutex);
         g_kname_n = 0;
@@ -1432,7 +1309,9 @@ __attribute__((constructor)) static void init(void) {
         g_hip_lib = dlopen("libamdhip64.so",   RTLD_LAZY | RTLD_GLOBAL);
     if (!g_hip_lib)
         g_hip_lib = dlopen("libamdhip64.so.5", RTLD_LAZY | RTLD_GLOBAL);
-    ensure_connected();
+    hp_tx_init("rocm");
+    if (!hp_tx_enabled())
+        fprintf(stderr, "[hprofiler/rocm] HPROFILER_SOCKET not set — no events will be recorded\n");
     cs_init();
 }
 __attribute__((destructor))  static void fini(void) {
@@ -1444,6 +1323,6 @@ __attribute__((destructor))  static void fini(void) {
     pthread_mutex_unlock(&g_alloc_mutex);
     if (leaked > 0)
         emit_ctr("memory", "gpu_memory_leaked_bytes", leaked, "bytes");
-    if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+    hp_tx_shutdown(1);
     if (g_hip_lib)   { dlclose(g_hip_lib); g_hip_lib = NULL; }
 }

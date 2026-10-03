@@ -4,9 +4,9 @@ Regression tests for src/analysis/cct.py's gpu_starvation():
    (meaningless for a trace loaded from JSON).
 2. launch_gap_ns must be computed from the UNION of kernel-active and
    sync-wait intervals, not gpu_active_ns + sync_ns added separately --
-   overlap between a sync call and the kernel it waits on was previously
-   double-counted, under-reporting (or, in extreme cases, zeroing) a real
-   launch gap elsewhere in the trace.
+   adding them double-counts the overlap between a sync call and the
+   kernel it waits on, under-reporting (or zeroing) a real launch gap
+   elsewhere in the trace.
 """
 import sys
 import unittest

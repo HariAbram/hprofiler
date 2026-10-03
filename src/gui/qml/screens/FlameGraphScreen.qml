@@ -7,13 +7,9 @@ import "../components"
 // Flame Graph tab -- proportional-width icicle chart of FlameGraph.tree
 // (src/gui/bridge.py's FlameGraphBridge, itself analysis/
 // flamegraph_tree.py's build_flame_tree() -- the SAME _ct_build tree the
-// Call Tree screen shows, just rendered as an icicle instead of an
-// indented list, so the two screens can never disagree about the
-// underlying call structure). The layout algorithm, and the click-zoom/
-// search interaction model, are adapted from the now-removed standalone
-// `hprofiler flamegraph --gui` popup's FlameGraphWindow.qml -- ported,
-// not copy-pasted blind, applying every lesson that window needed two
-// rounds of real-screenshot bug reports to find:
+// Call Tree screen shows, rendered as an icicle instead of an indented
+// list, so the two screens never disagree about the call structure).
+// Layout invariants:
 //   - the canvas must be BOTTOM-anchored (y: Math.max(0, viewport height
 //     - content height)) or a shallow tree renders stuck at the top with
 //     dead space below instead of the root sitting at the actual bottom;
@@ -25,10 +21,9 @@ import "../components"
 //     and gets clamped off-screen;
 //   - never name a property "data" (collides with Item's own default
 //     property).
-// Color comes directly from the bridge (theme.categoryColor, resolved in
-// Python) instead of the popup's own per-function hash palette -- ties
-// this screen's color language to the same one Call Tree/Timeline/every
-// other screen already uses, rather than a fourth, inconsistent scheme.
+// Color comes from the bridge (theme.categoryColor, resolved in Python),
+// the same category color language as Call Tree/Timeline/every other
+// screen.
 ColumnLayout {
     id: root
     spacing: 6
@@ -178,13 +173,9 @@ ColumnLayout {
                         var y = H - (f.depth + 1) * root.frameH
                         f.y = y
 
-                        // AppTheme.* is readable live inside Canvas.onPaint
-                        // (confirmed working elsewhere, e.g. Roofline's
-                        // ctx.strokeStyle = AppTheme.textMuted) -- these
-                        // used to be hardcoded hex instead, which meant
-                        // this whole canvas silently stopped repainting
-                        // correctly on the light/dark toggle while every
-                        // other element on this screen kept working.
+                        // AppTheme.* is readable live inside Canvas.onPaint, so the
+                        // canvas repaints correctly on the light/dark toggle; never
+                        // hardcode hex here.
                         var matched = !searchRe || searchRe.test(f.node.name)
                         ctx.fillStyle = matched ? f.node.color : AppTheme.panelBorder
                         // Plain fillRect, not roundedRect -- QML's Canvas

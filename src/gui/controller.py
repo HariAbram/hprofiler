@@ -1,47 +1,35 @@
 """
-Orchestration for the usability/persistence/loading overhaul (Phase 3).
-Two independent concerns live here:
+GUI load orchestration. Two independent concerns live here:
 
 1. `LoadController` -- owns exactly one `ProfileLoadWorker` + `QThread`
    lifecycle (starting it, forwarding its signals, and guaranteeing the
-   thread is stopped and cleaned up no matter how the load ends: success,
-   failure, cancellation, or the whole application quitting mid-load).
-   Used both for a first launch (app.py's main()) and, inside a freshly
-   spawned "Open Profile" child process, for that process's own first
-   launch -- there is only ever ONE loading code path, never a separate
-   "initial load" vs. "switch profile" implementation to keep in sync.
+   thread is stopped and cleaned up however the load ends: success,
+   failure, cancellation, or the application quitting mid-load). Used for
+   every launch, including a spawned "Open Profile" child's own first
+   load -- there is one loading code path, not an initial-load vs.
+   switch-profile pair.
 
-   IMPORTANT (cost real debugging time, see project memory
-   project_qml_gui.md Round 17): `LoadController.cancel()` calls
-   `self._worker.cancel()` as a PLAIN Python method call, never via a
-   Qt signal connected directly to the worker's bound `cancel` slot.
-   Connecting a cross-thread signal straight to a `@Slot`-decorated
-   method of a QObject living on another thread makes PySide
-   auto-detect a queued connection -- which can only be delivered once
-   that thread's event loop starts pumping, but `QThread`'s default
-   `run()` doesn't call `exec()` (starting that loop) until the
-   `started`-connected `worker.run()` -- the long synchronous parse --
-   already RETURNS. That's a deadlock (the queued cancel can never
-   arrive in time to matter) that also corrupts process shutdown later.
-   A plain, undecorated-at-the-call-site Python call bypasses all of
-   that -- it's just a GIL-safe attribute write, exactly what
-   `ProfileLoadWorker.cancel()` already does.
+   IMPORTANT: `LoadController.cancel()` calls `self._worker.cancel()` as a
+   PLAIN Python method call, never via a Qt signal connected directly to
+   the worker's bound `cancel` slot. A cross-thread signal connected to a
+   `@Slot` method of a QObject on another thread makes PySide pick a
+   queued connection, deliverable only once that thread's event loop
+   runs -- but `QThread`'s default `run()` doesn't call `exec()` until the
+   `started`-connected `worker.run()` (the long synchronous parse)
+   returns. The queued cancel would arrive too late, and it also corrupts
+   process shutdown. The plain call is a GIL-safe attribute write, which
+   is all `ProfileLoadWorker.cancel()` does.
 
-2. `AppController` -- registered as the "Hprofiler" 1.0 "App" singleton
-   in the real (only) QML engine once it's up. Owns "Open Profile":
-   spawning a genuinely NEW OS process rather than ever rebuilding this
-   process's own QML engine in-process. Verified empirically (see the
-   approved plan's Context section and project memory) that a SECOND
-   QQmlApplicationEngine loading Qt Quick Controls types anywhere in one
-   process corrupts Controls resolution in this PySide6 build, with no
-   teardown sequence found that avoids it -- so profile-switching must
-   never touch this process's engine at all. The OLD window stays fully
-   open and interactive for as long as the new process takes to either
-   show its own window or fail; a small ready-marker-file handshake
-   (`HPROFILER_READY_MARKER`) tells this process when the child has
-   succeeded, at which point (and only then) this process quits. A
-   failure in the child cannot touch the old window's state at all --
-   the two processes share no memory.
+2. `AppController` -- registered as the "Hprofiler" 1.0 "App" singleton in
+   the (only) QML engine. Owns "Open Profile": it spawns a NEW OS process
+   and never rebuilds this process's QML engine, because a second
+   QQmlApplicationEngine loading Qt Quick Controls types in one process
+   corrupts Controls resolution in this PySide6 build, with no teardown
+   sequence that avoids it. The old window stays open and interactive
+   until the child either shows its own window or fails; a ready-marker
+   file handshake (`HPROFILER_READY_MARKER`) tells this process the child
+   succeeded, and only then does this process quit. The processes share
+   no memory, so a child failure cannot touch the old window's state.
 """
 from __future__ import annotations
 
@@ -256,14 +244,11 @@ def build_profile_argv(trace_path: str, *, compare_path: str | None = None,
 
 class ProfileOpenWatcher(QObject):
     """Watches a just-spawned "Open Profile" subprocess without blocking
-    the current window -- polls (QTimer, never a blocking wait) for
-    either the child's own ready-marker file appearing (it successfully
-    showed its window -- app.py writes this right after
-    engine.rootObjects() succeeds) or the child process exiting early (a
-    real failure). The CURRENT window and everything in it are never
-    touched while this runs, and untouched if the child fails -- the two
-    processes share no memory, so there is nothing here that COULD
-    corrupt the old workspace."""
+    the current window -- polls (QTimer, never a blocking wait) for either
+    the child's ready-marker file (app.py writes it right after
+    engine.rootObjects() succeeds) or the child exiting early (a failure).
+    The current window is never touched while this runs, and the processes
+    share no memory, so a child failure cannot corrupt the old workspace."""
 
     ready = Signal()
     failed = Signal(object)  # HprofilerLoadError

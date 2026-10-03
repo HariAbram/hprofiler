@@ -1,11 +1,10 @@
 #!/bin/bash
-# Builds and runs the standalone C-level correctness/stress tests for
-# hooks/common/ringbuffer.h (see project_causal_attribution_redesign memory
-# / DOCUMENTATION.md's collection-path section). Separate from
-# tests/integration/run_matrix.sh, which profiles fixture *programs*
-# through the real backends -- this tests infrastructure that isn't wired
-# into any hook yet, so there's no "profile a program" path to exercise it
-# through.
+# Builds and runs the standalone C-level correctness/stress test and
+# micro-benchmark for the fixed-slot ring of hooks/common/ringbuffer.h
+# (DOCUMENTATION.md, "Measured hot-path overhead"). The variable-length rings every hook actually
+# emits through (hooks/common/hp_transport.h) are tested by
+# tests/test_transport_native.py (plain / ASan+UBSan / TSan scenarios) and,
+# end to end, by tests/integration/run_matrix.sh and the integration tests.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FAIL=0

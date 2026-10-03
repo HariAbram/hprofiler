@@ -1,19 +1,11 @@
 /*
- * OMPT Tool — correct OpenMP 5.0 Tools Interface implementation.
+ * OMPT tool (OpenMP 5.0 Tools Interface) for LLVM libomp, loaded through
+ * OMP_TOOL_LIBRARIES (and LD_PRELOADed, so its dlopen interposer is global).
  *
- * Loaded via OMP_TOOL_LIBRARIES. Uses the proper ompt_start_tool_result_t
- * ABI with initialize/finalize function pointers.
- *
- * Callbacks registered:
- *   thread_begin/end         → thread lifecycle
- *   parallel_begin/end       → parallel region spans (primary thread only)
- *   implicit_task begin/end  → per-thread share of a parallel region
- *   work (loop/sections)     → work-distribution spans
- *   sync_region (barriers)   → synchronization spans
- *   target begin/end         → GPU offload spans (OMP 5, ACPP)
- *
- * Wire format to HPROFILER_SOCKET:
- *   span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]\n
+ * Callbacks: parallel_begin/end (parallel_region, encountering thread),
+ * implicit_task (omp_implicit_task: each thread's share of a region), work
+ * (loops, sections, ...), sync_region (barriers, taskwait, taskgroup),
+ * task_create / task_schedule (omp_task_create, omp_task), target (offload).
  */
 
 #define _GNU_SOURCE
@@ -28,95 +20,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/syscall.h>
-
-/* VMA cache — built once on first miss, reused for all subsequent lookups.
- * Avoids re-parsing /proc/self/maps on every OMPT callback. */
-#define VMA_CACHE_CAP 1024
-typedef struct { uintptr_t lo, hi; uint64_t file_off; char path[256]; } VmaEntry;
-static VmaEntry        g_vma[VMA_CACHE_CAP];
-static int             g_vma_n     = 0;
-static int             g_vma_ready = 0;
-static pthread_mutex_t g_vma_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void _vma_build(void) {
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return;
-    char line[512];
-    g_vma_n = 0;
-    while (fgets(line, sizeof(line), f) && g_vma_n < VMA_CACHE_CAP) {
-        uintptr_t lo, hi, off;
-        char perms[8], dev[16], path[256];
-        int inode;
-        path[0] = '\0';
-        if (sscanf(line, "%lx-%lx %7s %lx %15s %d %255s",
-                   &lo, &hi, perms, &off, dev, &inode, path) < 6)
-            continue;
-        if (path[0] == '\0' || path[0] == '[') continue;
-        VmaEntry *e = &g_vma[g_vma_n++];
-        e->lo = lo; e->hi = hi; e->file_off = (uint64_t)off;
-        strncpy(e->path, path, sizeof(e->path) - 1);
-        e->path[sizeof(e->path) - 1] = '\0';
-    }
-    fclose(f);
-    g_vma_ready = 1;
-}
-
-static int _vma_lookup(uintptr_t addr, char *out_lib, size_t lib_sz, uint64_t *out_off) {
-    pthread_mutex_lock(&g_vma_mutex);
-    if (!g_vma_ready) _vma_build();
-    for (int i = 0; i < g_vma_n; i++) {
-        if (addr >= g_vma[i].lo && addr < g_vma[i].hi) {
-            *out_off = g_vma[i].file_off + (addr - g_vma[i].lo);
-            strncpy(out_lib, g_vma[i].path, lib_sz - 1);
-            out_lib[lib_sz - 1] = '\0';
-            pthread_mutex_unlock(&g_vma_mutex);
-            return 1;
-        }
-    }
-    /* Miss: rebuild once in case new libraries were loaded since last build. */
-    _vma_build();
-    for (int i = 0; i < g_vma_n; i++) {
-        if (addr >= g_vma[i].lo && addr < g_vma[i].hi) {
-            *out_off = g_vma[i].file_off + (addr - g_vma[i].lo);
-            strncpy(out_lib, g_vma[i].path, lib_sz - 1);
-            out_lib[lib_sz - 1] = '\0';
-            pthread_mutex_unlock(&g_vma_mutex);
-            return 1;
-        }
-    }
-    pthread_mutex_unlock(&g_vma_mutex);
-    return 0;
-}
-
-/* Resolve a codeptr_ra:
- *  1. Try dladdr() — works when the symbol is exported.
- *  2. Fall back to VMA cache — finds the library and computes the
- *     static file offset even for non-exported / internal symbols.
- *
- * On success, writes into `out_sym` (symbol name) or `out_lib`+`out_off`
- * (library path + offset).  At most one of sym / lib+off is filled.
- * Returns 1 if anything was resolved, 0 otherwise.
- */
-static int resolve_codeptr_full(const void *codeptr,
-                                const char **out_sym,   /* dladdr name */
-                                char *out_lib, size_t lib_sz,
-                                uint64_t *out_off) {
-    if (!codeptr) return 0;
-    *out_sym = NULL;
-    out_lib[0] = '\0';
-    *out_off   = 0;
-
-    /* 1. dladdr — fast path for exported symbols */
-    Dl_info info;
-    if (dladdr(codeptr, &info) && info.dli_sname && info.dli_sname[0]) {
-        *out_sym = info.dli_sname;
-        return 1;
-    }
-
-    /* 2. VMA cache — O(n) scan but cache is built only once per new library load */
-    uintptr_t addr = (uintptr_t)codeptr;
-    return _vma_lookup(addr, out_lib, lib_sz, out_off);
-}
 
 /* ── Minimal OMPT types matching omp-tools.h ────────────────────────── */
 typedef void*    ompt_device_t;
@@ -227,11 +130,6 @@ typedef struct {
 /* Frame / codeptr types we don't use deeply */
 typedef struct { void *exit_frame; void *enter_frame; } ompt_frame_t;
 
-/* ── Globals ─────────────────────────────────────────────────────────── */
-static int             g_sock        = -1;
-static pthread_mutex_t g_sock_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static pid_t           g_pid         = 0;
-
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -239,56 +137,30 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-static pid_t gettid_compat(void) { return (pid_t)syscall(SYS_gettid); }
-
-static void ensure_connected(void) {
-    if (g_sock >= 0) return;
-    const char *path = getenv("HPROFILER_SOCKET");
-    if (!path) return;
-    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return;
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-    if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-        g_sock = s;
-        g_pid  = getpid();
-    }
-}
-
-static void send_all(const char *buf, int n) {
-    while (n > 0) {
-        ssize_t r = send(g_sock, buf, (size_t)n, MSG_NOSIGNAL);
-        if (r < 0) { close(g_sock); g_sock = -1; return; }
-        buf += r; n -= (int)r;
-    }
-}
-
+#include "../common/hp_transport.h"
 #include "../common/callstack.h"
+#include "../common/codeptr_resolve.h"
+
+static pid_t gettid_compat(void) { return hp_tx_tid(); }
 
 static void emit_span(const char *cat, pid_t tid,
                       uint64_t start_ns, uint64_t dur_ns,
                       const char *name, const char *extra) {
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    if (g_sock >= 0) {
-        char buf[512]; int n;
-        if (extra && *extra)
-            n = snprintf(buf, sizeof(buf),
-                "span:%s:%d:%d:%llu:%llu:%s:%s\n",
-                cat, g_pid, tid,
-                (unsigned long long)start_ns, (unsigned long long)dur_ns,
-                name, extra);
-        else
-            n = snprintf(buf, sizeof(buf),
-                "span:%s:%d:%d:%llu:%llu:%s\n",
-                cat, g_pid, tid,
-                (unsigned long long)start_ns, (unsigned long long)dur_ns, name);
-        if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
-        emit_callstack(start_ns);
-    }
-    pthread_mutex_unlock(&g_sock_mutex);
+    if (!hp_tx_enabled()) return;
+    if (extra && *extra)
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name, extra);
+    else
+        hp_tx_emitf("span:%s:%d:%d:%llu:%llu:%s\n", cat, (int)hp_tx_pid(), (int)tid,
+                    (unsigned long long)start_ns, (unsigned long long)dur_ns, name);
+    emit_callstack(start_ns);
 }
+
+/* Call-site tags via the shared resolver (codeptr_resolve.h): sym=,symfile=
+ * or lib=,offset=. symfile= names the ELF dladdr found the symbol in, which
+ * matters when the profiled command is a launcher (srun, mpirun) wrapping
+ * the real binary. Tags that do not fit become codeptr=truncated. */
+#define EXTRA_SZ 2560
 
 /* ── Per-thread nesting stacks ───────────────────────────────────────── */
 #define MAX_DEPTH 32
@@ -310,11 +182,8 @@ static __thread uint64_t     tls_itask_par[MAX_DEPTH];
 static __thread unsigned int tls_itask_index[MAX_DEPTH];
 static __thread int          tls_itask_depth     = 0;
 
-/* Open tasks on this thread, keyed by task ID -- NOT a LIFO stack. Untied
- * tasks and task-yield points can hand a thread a task that isn't its most
- * recently created descendant, breaking strict nesting order; looking a
- * completing task up by its own ID (rather than assuming it's whatever is
- * on top of a stack) handles that correctly regardless of ordering. */
+/* Open tasks keyed by task id, not a stack: untied tasks and task yields can
+ * resume tasks out of nesting order. */
 #define MAX_TASK_DEPTH 32
 typedef struct { uint64_t id; uint64_t start_ns; int in_use; } TaskSlot;
 static __thread TaskSlot     tls_tasks[MAX_TASK_DEPTH];
@@ -324,11 +193,6 @@ static uint64_t              g_parallel_id_seq = 1;
 /* ── Callbacks ───────────────────────────────────────────────────────── */
 
 static void cb_thread_begin(ompt_thread_t type, ompt_data_t *thread_data) {
-    /* All OpenMP worker threads start concurrently; must hold the socket mutex
-     * so that g_sock is initialised by exactly one thread (race fix). */
-    pthread_mutex_lock(&g_sock_mutex);
-    ensure_connected();
-    pthread_mutex_unlock(&g_sock_mutex);
     (void)type; (void)thread_data;
 }
 
@@ -354,13 +218,8 @@ static void cb_parallel_begin(
         tls_parallel_id[tls_parallel_depth]      = par_unique;
         tls_parallel_codeptr[tls_parallel_depth] = codeptr_ra;
     }
-    /* Depth increments UNCONDITIONALLY, even past MAX_DEPTH -- see
-     * cb_parallel_end's matching comment for why: this keeps begin/end
-     * calls balanced from the OMPT runtime's perspective (one increment
-     * per begin, one decrement per end, regardless of whether the arrays
-     * above actually captured this level), which is what lets end tell
-     * an overflowed level apart from a real one instead of reading
-     * another, still-open region's data out from under it. */
+    /* Counts every begin, even past MAX_DEPTH, so begin/end stay balanced
+     * and end can recognize an overflowed level (see cb_parallel_end). */
     tls_parallel_depth++;
     (void)requested_parallelism;
 }
@@ -373,37 +232,17 @@ static void cb_parallel_end(
     (void)encountering_task_data; (void)flags; (void)codeptr_ra;
     if (tls_parallel_depth > 0) {
         tls_parallel_depth--;
-        /* If this level's depth was ever >= MAX_DEPTH (i.e. this begin/end
-         * pair overflowed the stack), cb_parallel_begin never wrote
-         * anything at this index -- reading it here would silently pop a
-         * DIFFERENT, still-legitimately-open region's data (whatever
-         * happens to occupy tls_parallel_start[MAX_DEPTH-1], the last
-         * real slot) and misattribute it to the wrong end event, then
-         * permanently desync every subsequent end on this thread by one
-         * level. Emitting nothing for an overflowed level is honest --
-         * consistent with this file's own "omit rather than guess"
-         * convention elsewhere (see compute_exec_start_ns in the CUDA/
-         * ROCm hooks for the same principle) -- we genuinely never
-         * captured this level's start data. */
+        /* An overflowed level (depth >= MAX_DEPTH) was never recorded: emit
+         * nothing rather than pop another, still-open region's slot (which
+         * would also desync every later end on this thread). */
         if (tls_parallel_depth < MAX_DEPTH) {
             uint64_t t0         = tls_parallel_start[tls_parallel_depth];
             ompt_id_t pid       = tls_parallel_id[tls_parallel_depth];
             const void *cptr    = tls_parallel_codeptr[tls_parallel_depth];
-            const char *sym = NULL; char lib[256]; uint64_t off = 0;
-            char extra[512];
-            if (resolve_codeptr_full(cptr, &sym, lib, sizeof(lib), &off)) {
-                if (sym)
-                    snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu,sym=%s",
-                             (unsigned long long)pid, (unsigned long long)pid, sym);
-                else
-                    snprintf(extra, sizeof(extra),
-                             "type=parallel,id=%llu,sid=%llu,lib=%s,offset=0x%llx",
-                             (unsigned long long)pid, (unsigned long long)pid,
-                             lib, (unsigned long long)off);
-            } else {
-                snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu",
-                         (unsigned long long)pid, (unsigned long long)pid);
-            }
+            char extra[EXTRA_SZ];
+            snprintf(extra, sizeof(extra), "type=parallel,id=%llu,sid=%llu",
+                     (unsigned long long)pid, (unsigned long long)pid);
+            hprofiler_append_codeptr_tag(extra, sizeof(extra), cptr);
             emit_span("openmp", gettid_compat(), t0, now_ns() - t0,
                       "parallel_region", extra);
         }
@@ -411,14 +250,10 @@ static void cb_parallel_end(
     (void)parallel_data;
 }
 
-/* Per-thread implicit task: the only OMPT event that shows WORKER threads
- * doing a region's work. Without it an OMPT trace had one parallel_region
- * span on the primary thread and only barrier spans on workers, so worker
- * compute was invisible and every breakdown read "sync-bound" -- while the
- * same program under GNU libgomp (gomp_hook.c's per-thread trampoline
- * spans) read "openmp-bound". The initial task (whole program) is skipped.
- * parallel_data may be NULL at scope_end per the spec, so the region id is
- * captured at begin. */
+/* Per-thread implicit task: the only OMPT event showing a worker thread's
+ * share of a region (otherwise workers show only barrier spans). The initial
+ * task (the whole program) is skipped. parallel_data may be NULL at
+ * scope_end per the spec, so the region id is captured at begin. */
 static void cb_implicit_task(
     ompt_scope_endpoint_t endpoint, ompt_data_t *parallel_data,
     ompt_data_t *task_data, unsigned int actual_parallelism,
@@ -471,43 +306,19 @@ static void cb_work(
             tls_work_type[tls_work_depth]    = wstype;
             tls_work_codeptr[tls_work_depth] = codeptr_ra;
         }
-        /* Unconditional -- see cb_parallel_begin/end's comments for why:
-         * keeps begin/end balanced even past MAX_DEPTH, so end can tell
-         * an overflowed level apart from a real one instead of reading
-         * another, still-open level's data out from under it. */
+        /* Unconditional, as in cb_parallel_begin. */
         tls_work_depth++;
     } else if (tls_work_depth > 0) {
         tls_work_depth--;
         if (tls_work_depth >= MAX_DEPTH) return;  /* overflowed level -- never captured, omit */
-        const char *sym = NULL; char lib[256]; uint64_t off = 0;
-        char extra[512];
-        if (resolve_codeptr_full(tls_work_codeptr[tls_work_depth], &sym, lib, sizeof(lib), &off)) {
-            if (sym) {
-                if (par_id)
-                    snprintf(extra, sizeof(extra), "type=work,count=%llu,psid=%llu,sym=%s",
-                             (unsigned long long)count, (unsigned long long)par_id, sym);
-                else
-                    snprintf(extra, sizeof(extra), "type=work,count=%llu,sym=%s",
-                             (unsigned long long)count, sym);
-            } else {
-                if (par_id)
-                    snprintf(extra, sizeof(extra),
-                             "type=work,count=%llu,psid=%llu,lib=%s,offset=0x%llx",
-                             (unsigned long long)count, (unsigned long long)par_id,
-                             lib, (unsigned long long)off);
-                else
-                    snprintf(extra, sizeof(extra),
-                             "type=work,count=%llu,lib=%s,offset=0x%llx",
-                             (unsigned long long)count, lib, (unsigned long long)off);
-            }
-        } else {
-            if (par_id)
-                snprintf(extra, sizeof(extra), "type=work,count=%llu,psid=%llu",
-                         (unsigned long long)count, (unsigned long long)par_id);
-            else
-                snprintf(extra, sizeof(extra), "type=work,count=%llu",
-                         (unsigned long long)count);
-        }
+        char extra[EXTRA_SZ];
+        if (par_id)
+            snprintf(extra, sizeof(extra), "type=work,count=%llu,psid=%llu",
+                     (unsigned long long)count, (unsigned long long)par_id);
+        else
+            snprintf(extra, sizeof(extra), "type=work,count=%llu",
+                     (unsigned long long)count);
+        hprofiler_append_codeptr_tag(extra, sizeof(extra), tls_work_codeptr[tls_work_depth]);
         emit_span("openmp", gettid_compat(),
                   tls_work_start[tls_work_depth], now_ns() - tls_work_start[tls_work_depth],
                   wname, extra);
@@ -541,32 +352,12 @@ static void cb_sync_region(
         if (tls_sync_depth >= MAX_DEPTH) return;  /* overflowed level -- never captured, omit */
         uint64_t t0      = tls_sync_start[tls_sync_depth];
         const void *cptr = tls_sync_codeptr[tls_sync_depth];
-        const char *sym = NULL; char lib[256]; uint64_t off = 0;
-        char extra[512];
-        if (resolve_codeptr_full(cptr, &sym, lib, sizeof(lib), &off)) {
-            if (sym) {
-                if (par_id)
-                    snprintf(extra, sizeof(extra), "type=sync,psid=%llu,sym=%s",
-                             (unsigned long long)par_id, sym);
-                else
-                    snprintf(extra, sizeof(extra), "type=sync,sym=%s", sym);
-            } else {
-                if (par_id)
-                    snprintf(extra, sizeof(extra),
-                             "type=sync,psid=%llu,lib=%s,offset=0x%llx",
-                             (unsigned long long)par_id, lib, (unsigned long long)off);
-                else
-                    snprintf(extra, sizeof(extra),
-                             "type=sync,lib=%s,offset=0x%llx",
-                             lib, (unsigned long long)off);
-            }
-        } else {
-            if (par_id)
-                snprintf(extra, sizeof(extra), "type=sync,psid=%llu",
-                         (unsigned long long)par_id);
-            else
-                snprintf(extra, sizeof(extra), "type=sync");
-        }
+        char extra[EXTRA_SZ];
+        if (par_id)
+            snprintf(extra, sizeof(extra), "type=sync,psid=%llu", (unsigned long long)par_id);
+        else
+            snprintf(extra, sizeof(extra), "type=sync");
+        hprofiler_append_codeptr_tag(extra, sizeof(extra), cptr);
         emit_span("sync", gettid_compat(), t0, now_ns() - t0,
                   sname, extra);
     }
@@ -583,20 +374,9 @@ static void cb_task_create(
     (void)flags; (void)has_dependences;
     uint64_t task_id = (uint64_t)__sync_fetch_and_add(&g_task_id_seq, 1);
     if (new_task_data) new_task_data->value = task_id;
-    const char *sym = NULL; char lib[256]; uint64_t off = 0;
-    char extra[512];
-    if (resolve_codeptr_full(codeptr_ra, &sym, lib, sizeof(lib), &off)) {
-        if (sym)
-            snprintf(extra, sizeof(extra), "type=task_create,id=%llu,sym=%s",
-                     (unsigned long long)task_id, sym);
-        else
-            snprintf(extra, sizeof(extra),
-                     "type=task_create,id=%llu,lib=%s,offset=0x%llx",
-                     (unsigned long long)task_id, lib, (unsigned long long)off);
-    } else {
-        snprintf(extra, sizeof(extra), "type=task_create,id=%llu",
-                 (unsigned long long)task_id);
-    }
+    char extra[EXTRA_SZ];
+    snprintf(extra, sizeof(extra), "type=task_create,id=%llu", (unsigned long long)task_id);
+    hprofiler_append_codeptr_tag(extra, sizeof(extra), codeptr_ra);
     uint64_t now = now_ns();
     emit_span("openmp", gettid_compat(), now, 0, "omp_task_create", extra);
 }
@@ -623,11 +403,8 @@ static void cb_task_schedule(
             }
         }
     }
-    /* Start next task -- claim any free slot (order doesn't matter, we
-     * look tasks up by ID, not position). If all MAX_TASK_DEPTH slots are
-     * in use (unusually deep concurrent task nesting on one thread), this
-     * task's span simply isn't tracked -- no corruption of another task's
-     * data, unlike overwriting a fixed stack-position slot would risk. */
+    /* Claim any free slot (tasks are found by id). With all MAX_TASK_DEPTH
+     * slots in use the task is not tracked. */
     if (next_task_data) {
         for (int i = 0; i < MAX_TASK_DEPTH; i++) {
             if (!tls_tasks[i].in_use) {
@@ -706,7 +483,7 @@ void *dlopen(const char *filename, int flags) {
         fclose(src);
         if (ok) {
             const char *base = strrchr(filename, '/');
-            char extra[640];
+            char extra[600];
             snprintf(extra, sizeof(extra), "type=jit_load,path=%s", saved);
             emit_span("jit", gettid_compat(), now_ns(), 0,
                       base ? base + 1 : filename, extra);
@@ -722,20 +499,15 @@ static int tool_initialize(ompt_function_lookup_t lookup,
                             ompt_data_t *tool_data)
 {
     (void)initial_device_num; (void)tool_data;
-    ensure_connected();
+    hp_tx_init("ompt");
     cs_init();
 
     ompt_set_callback_t set_callback =
         (ompt_set_callback_t)lookup("ompt_set_callback");
     if (!set_callback) return 0;
 
-    /* set_callback()'s return value was previously discarded: if the
-     * runtime doesn't support a given callback (e.g. ompt_callback_target
-     * on some libgomp builds), that whole span category would silently
-     * report zero events forever -- indistinguishable from "the profiled
-     * code just doesn't use that feature". Collect and report unsupported
-     * ones instead. ompt_set_error(0)/ompt_set_never(1) mean the callback
-     * will never actually fire despite the call "succeeding". */
+    /* ompt_set_error / ompt_set_never mean the callback will never fire:
+     * report those, so a category's zero events are explained. */
     char unsupported[256] = "";
 #define REG(event, cb) do { \
         ompt_set_result_t _r = set_callback(event, (ompt_interface_fn_t)(cb)); \
@@ -768,10 +540,15 @@ static int tool_initialize(ompt_function_lookup_t lookup,
     return 1;
 }
 
+/* The runtime calls this at exit: drain every thread's buffered events
+ * and send the closing status. Events after it go out synchronously; the
+ * destructor covers a runtime that never calls finalize. */
 static void tool_finalize(ompt_data_t *tool_data) {
     (void)tool_data;
-    if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+    hp_tx_shutdown(1);
 }
+
+__attribute__((destructor)) static void ompt_tool_fini(void) { hp_tx_shutdown(1); }
 
 /* ── Entry point ─────────────────────────────────────────────────────── */
 

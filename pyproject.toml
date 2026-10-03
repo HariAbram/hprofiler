@@ -39,10 +39,9 @@ dependencies = [
 #                           conda install -c conda-forge xcb-util-cursor
 #                           spack install xcb-util-cursor
 # then make sure its lib/ dir is on LD_LIBRARY_PATH (conda activation
-# does not always set this automatically). Confirmed hit on Dardel
-# (PDC/KTH) 2026-09-22 -- see project_qml_gui memory for the full
-# diagnosis, including a QT_QPA_PLATFORM=vnc workaround for machines
-# where installing the library isn't an option at all.
+# does not always set this automatically). DOCUMENTATION.md's install
+# section also describes a QT_QPA_PLATFORM=vnc workaround for machines
+# where installing the library isn't an option.
 gui = ["PySide6>=6.5"]
 
 [project.scripts]

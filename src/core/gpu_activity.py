@@ -540,6 +540,50 @@ def parse_status_line(line: str) -> tuple[int, str, dict[str, str]] | None:
     return pid, parts[2], fields
 
 
+def missing_final_flush(entry: dict) -> bool:
+    """An active native tracer that promised a final-flush marker
+    (final_marker=1, sent by hooks since the marker exists) but whose
+    process ended without it: crash, _exit or kill before the forced flush,
+    so device records still buffered in CUPTI / ROCprofiler-SDK are missing.
+    Older hooks never promised one, so their traces are not flagged."""
+    return (entry.get("status") == "active" and str(entry.get("final_marker")) == "1"
+            and str(entry.get("final_flush")) != "1")
+
+
+def degraded_warnings(device_activity: dict) -> list[str]:
+    """Device-tracing problems that make GPU numbers incomplete or
+    estimated, as one-line warnings (after a run, in `summary`, in the GUI):
+    records the tracer dropped or could not time, a native tracer that was
+    unavailable (device times fall back to host-side proxies), an
+    unmapped device clock, and a missing final flush. A tracer switched off
+    on purpose (HPROFILER_DEVICE_ACTIVITY=off) is not a warning."""
+    out = []
+    for key in sorted(k for k in device_activity if not k.startswith("_")):
+        e = device_activity[key]
+        pid, _, rt = key.partition("/")
+        who = f"{rt.upper()} pid {pid}"
+        tracer = e.get("tracer", "native tracer")
+        status = e.get("status")
+        if status in ("unavailable", "error"):
+            out.append(f"{who}: {tracer} unavailable ({e.get('reason', 'no reason given')}) -- "
+                       "device times are host-side proxies, not device measurements")
+        if e.get("dropped"):
+            out.append(f"{who}: {tracer} dropped {e['dropped']} device record(s) (activity buffers full) "
+                       "-- those kernels/copies are missing from the trace")
+        if e.get("notime"):
+            out.append(f"{who}: {e['notime']} device record(s) without timestamps were skipped")
+        if e.get("bad_records"):
+            out.append(f"{who}: {e['bad_records']} implausible device record(s) were skipped")
+        if e.get("buffer_alloc_failed"):
+            out.append(f"{who}: {tracer} could not allocate {e['buffer_alloc_failed']} activity buffer(s)")
+        if status == "active" and e.get("clock") == "unmapped":
+            out.append(f"{who}: device timestamps could not be mapped onto the host clock")
+        if missing_final_flush(e):
+            out.append(f"{who}: the process ended without {tracer}'s final flush (crash, _exit or kill) "
+                       "-- device records still buffered at that point are missing")
+    return out
+
+
 def describe(device_activity: dict) -> list[str]:
     """Human-readable one-liners for CLI/report output."""
     lines = []
@@ -557,6 +601,8 @@ def describe(device_activity: dict) -> list[str]:
             bits.append(f"native tracer {status}" + (f" ({e['reason']})" if e.get("reason") else ""))
         if e.get("clock"):
             bits.append(f"clock={e['clock']}")
+        if missing_final_flush(e):
+            bits.append("no final flush (process ended early: buffered device records may be missing)")
         for k, label in (("dropped", "records dropped"), ("notime", "records without timestamps"),
                          ("bad_records", "implausible records skipped"),
                          ("unmatched_device", "uncorrelated device ops"),

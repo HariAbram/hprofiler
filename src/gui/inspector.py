@@ -137,6 +137,7 @@ class InspectorBridge(QObject):
             context.append(_field("Runs on", "", "unavailable", "no matching spans in this trace"))
 
         self._gpu_timing_fields(here, metrics, relationships)
+        self._capture_fields(here, context)
         if sampled:
             metrics.append(_field("Sample", f"first {_SAMPLE:,} occurrences", "derived",
                                   "per-span details above use a sample; totals use every span"))
@@ -206,6 +207,25 @@ class InspectorBridge(QObject):
             "relationships": relationships, "recommendations": recommendations,
         }
         self.contentChanged.emit()
+
+    def _capture_fields(self, here: list, context: list) -> None:
+        """Capture problems (lost/dropped events, no final drain, degraded
+        device tracing) of the processes these spans came from -- shown
+        only when there are any."""
+        import re
+        from ..core.receiver import run_warnings
+        pids = {s.pid for s in here}
+        if not pids:
+            return
+        try:
+            warnings = run_warnings(self._trace.metadata)
+        except Exception:
+            return
+        pat = re.compile(r"\bpid (" + "|".join(str(p) for p in sorted(pids)) + r")\b")
+        mine = [w for w in warnings if pat.search(w)]
+        if mine:
+            context.append(_field("Capture", "; ".join(mine), "estimated",
+                                  "events from this process may be incomplete -- see Overview"))
 
     def _gpu_timing_fields(self, here: list, metrics: list, relationships: list) -> None:
         """Where a GPU span's numbers come from: device-measured (CUPTI /

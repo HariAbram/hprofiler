@@ -1,12 +1,11 @@
 """
 Integration test for hooks/gomp_hook/gomp_hook.c -- the direct GOMP_*
-interception path added for binaries linked against GNU's libgomp (which
-has no OMPT support in typical builds; hooks/ompt_tool/ompt_tool.c's OMPT
-path produces zero events for such binaries -- see both files' header
-comments, src/backends/openmp.py's module docstring, and
-project_causal_attribution_redesign memory for the real-world trigger: a
-user profiling GROMACS on the Dardel HPC cluster, where `ldd gmx_mpi`
-confirmed libgomp.so.1, not libomp).
+interception path for binaries linked against GNU's libgomp (which has no
+OMPT support in typical builds; hooks/ompt_tool/ompt_tool.c's OMPT path
+produces zero events for such binaries -- see both files' header comments
+and src/backends/openmp.py's module docstring). GROMACS builds on Cray/GNU
+toolchains are a typical case (`ldd gmx_mpi` shows libgomp.so.1, not
+libomp).
 
 Builds the real hook, compiles tests/fixtures/gomp_mini.c with plain gcc
 (confirmed via `ldd` to link libgomp, not libomp -- the whole point),
@@ -201,17 +200,17 @@ class TestGompHook(unittest.TestCase):
         self.assertEqual(len(singles), 1, "exactly one thread executes a #pragma omp single region")
 
     def test_spans_carry_a_resolved_codeptr_tag_for_disasm(self):
-        # Regression test: gomp_hook.c used to capture codeptr_ra (in
-        # GOMP_parallel's closure) but never resolve or emit it, so every
-        # span from this hook had no sym=/lib= tag at all -- the Source
-        # tab's "No disassembly available" was unconditional for GNU-
-        # libgomp binaries, not a missing-objdump problem. At least one of
+        # gomp_hook.c must resolve and emit the codeptr_ra it captures in
+        # GOMP_parallel's closure; without a sym=/lib= tag the Source tab
+        # shows "No disassembly available" for every GNU-libgomp span. At
+        # least one of
         # sym=/lib= must be present so src/core/runner.py's
         # _collect_disasm() has something to disassemble (the user's own
         # call site -- there's no ELF symbol literally named
         # "omp_parallel_region" for objdump to find on its own).
         events = self._run_and_capture()
-        for name in ("omp_parallel_region", "omp_barrier", "omp_critical_wait"):
+        for name in ("omp_parallel_region", "omp_barrier", "omp_critical_wait",
+                     "omp_critical_hold"):
             spans = [e for e in events if isinstance(e, SpanEvent) and e.name == name]
             self.assertTrue(spans, f"no {name} spans captured")
             resolved = [e for e in spans if e.tags.get("sym") or e.tags.get("lib")]

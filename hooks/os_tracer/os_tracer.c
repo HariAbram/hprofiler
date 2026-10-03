@@ -1,26 +1,18 @@
 /*
- * Userspace loader for sched_trace.bpf.c -- opens/loads/attaches the eBPF
- * program via its bpftool-generated skeleton, polls its ring buffer, and
- * forwards events into hprofiler's existing wire protocol (the same
- * newline-delimited ASCII over HPROFILER_SOCKET every other hook uses --
- * see DOCUMENTATION.md §12).
+ * Userspace loader for sched_trace.bpf.c: opens, loads and attaches the eBPF
+ * program through its bpftool-generated skeleton, polls its ring buffer and
+ * forwards events over HPROFILER_SOCKET in the hooks' wire format
+ * (DOCUMENTATION.md, "Wire protocol").
  *
- * Unlike every other hook, this is NOT an LD_PRELOAD library -- eBPF
- * loading needs CAP_BPF/root, which is a property of how THIS process is
- * launched, not something an LD_PRELOAD shim injected into an arbitrary
- * unprivileged profiled program could obtain. Run alongside the profiled
- * program as a separate, explicitly-privileged process:
+ * Not an LD_PRELOAD library: loading BPF needs CAP_BPF/root, a property of
+ * how this process is started, so it runs as a separate privileged process:
  *   sudo HPROFILER_SOCKET=/tmp/hprofiler.sock ./os_tracer &
  *   hprofiler run --backend mpi -- mpirun -np 4 ./my_app
  *   kill %1
  *
- * ── Verification status ─────────────────────────────────────────────────
- * Compile-checked only. This development machine has
- * kernel.unprivileged_bpf_disabled=2, which blocks loading/attaching any
- * BPF program without root/CAP_BPF -- not available/authorized in this
- * session, so sched_trace_bpf__open_and_load()/__attach() below have
- * never actually executed here; only the surrounding C compiles. See
- * DOCUMENTATION.md's Known Limitations.
+ * Never loaded into a kernel: the development machine has
+ * kernel.unprivileged_bpf_disabled=2 and no root, so open_and_load()/attach()
+ * have only been reached up to the EPERM privilege check.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -35,9 +27,8 @@
 #include <bpf/libbpf.h>
 #include "sched_trace.skel.h"
 
-/* Mirrors sched_trace.bpf.c's struct sched_event exactly -- kept in sync
- * manually since the BPF side can't #include a shared userspace header
- * (different compilation target). */
+/* Must match sched_trace.bpf.c's struct sched_event (kept in sync by hand:
+ * the BPF side cannot include a userspace header). */
 #define EV_OFFCPU  1
 #define EV_WAKEUP  2
 #define EV_MIGRATE 3
@@ -83,19 +74,10 @@ static void send_line(const char *buf, size_t len) {
     }
 }
 
-/* Replaces any wire-protocol-significant character (':' -- the top-level
- * field separator; ',' -- the tag separator; '=' -- the tag key/value
- * separator) with '_' before a comm string is embedded in a tag value.
- * Linux thread names (comm, max 16 bytes) are usually plain identifiers
- * but are NOT guaranteed to be -- a userspace program can set an
- * arbitrary comm via prctl(PR_SET_NAME) or pthread_setname_np(), so this
- * cannot be skipped. Without it, a comm containing e.g. ':' could corrupt
- * the emitted record's name/tags boundary exactly the way an unsanitized
- * rmatches= value did in mpi_hook.c earlier in this same redesign (see
- * DOCUMENTATION.md §12's "Tag values must never contain ':'" note) --
- * this hook produces the record directly (no snprintf-time truncation
- * retry like the LD_PRELOAD hooks have), so sanitizing at the source is
- * the only guard here. */
+/* Replace ':' (field separator), ',' (tag separator) and '=' (key/value)
+ * with '_' before embedding a comm in a tag value: a thread can set an
+ * arbitrary comm (prctl(PR_SET_NAME)), and an unsanitized ':' would move the
+ * record's name/tag boundary. */
 static void sanitize_comm(char *out, const char *in, size_t cap) {
     size_t i = 0;
     for (; in[i] != '\0' && i < cap - 1; i++) {

@@ -1,290 +1,60 @@
 # hprofiler test suite
 
-Four layers:
+How to run everything is in
+[DOCUMENTATION.md → Running the tests](../DOCUMENTATION.md#running-the-tests);
+what each layer establishes is in
+[Verification status](../DOCUMENTATION.md#verification-status). This file
+maps the files to what they cover.
 
-- **Unit tests** (`tests/test_*.py`, stdlib `unittest`, no new dependency):
-  test the analysis math and algorithms in isolation against small synthetic
-  traces with hand-computed expected answers -- not just "it runs".
+```bash
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p 'test_*.py'   # unit + native
+python3 -m unittest tests.integration.test_profiling_accuracy ...                 # integration, by name
+python3 -m unittest discover -s tests/validation -p 'test_*.py'                   # causal-graph validation
+bash tests/native/run_native_tests.sh                                             # ring-buffer stress
+bash tests/integration/run_matrix.sh                                              # CLI end to end
+```
 
-  ```bash
-  python3 -m unittest discover tests
-  ```
+Integration modules have no `__init__.py`, so discovery skips them; each
+skips (rather than fails) when its toolchain or hardware is missing.
 
-  - `test_causal_compare.py` -- the structure- and causality-aware run
-    comparison (`src/analysis/projection.py`, `causal_compare.py`) on
-    before/after pairs with one known difference (`compare_scenarios.py`):
-    identical names under different call paths, reordered independent work
-    (no false regression), inserted/removed iterations, changed stream
-    overlap (lost overlap), MPI wait propagation (traced to the slower
-    sender's compute), a non-critical kernel becoming critical; plus renamed
-    functions matched by source location, relabeled pids/tids/streams/
-    communicators/clocks, phase detection, the aggregate fallback, memory/
-    disk parity, JSON and the `hprofiler compare` CLI.
-  - `test_gui_compare_interaction.py` -- the populated Compare tab driven by
-    synthesized clicks in its own process (`gui_compare_driver.py`):
-    contributor details, Show in Timeline (zoom to the range), Open in
-    Source, phase navigation, thresholds, zero QML warnings.
-  - `test_trace_store_parity.py` -- the same synthetic trace (several
-    processes/threads, nesting, perf samples, CUDA host/device and legacy GPU
-    spans, MPI p2p/collectives/requests incl. wildcards and Waitall
-    `rmatches`, OpenMP barriers, stacks, NVTX, instants, counters, JSON-typed
-    tags) written into `MemoryTraceStore` and `DiskTraceStore`
-    (`src/core/store/`): every consumer must give identical answers -- events,
-    lanes, windows (also vs brute force), aggregates, exclusive time (also vs
-    the original `ExclusiveTime`), activity bins, lightweight scans, text
-    summary, dashboard numbers, call tree, critical path (also vs the
-    dict-based `build_dependency_graph` pipeline), multi-node merge, GUI
-    timeline answers, byte-identical JSON export and reload, metadata after
-    save/reopen. Plus schema-version refusal, derived-table rebuild, edge
-    invalidation, concurrent appends, source-annotation write-back and the
-    JSON-to-store reuse rules (`open_trace`).
-  - `test_gpu_activity.py` -- the CUDA/ROCm host/device model
-    (`src/core/gpu_activity.py`) and its consumers, fed synthetic native
-    records in the exact wire format the CUPTI / ROCprofiler-SDK decoders
-    emit: concurrent streams, async copies, missing correlations, reused
-    correlation ids, dropped records, out-of-order delivery, proxy/native
-    de-duplication, never mixing proxy and device intervals for GPU-active
-    time, JSON round trip, lanes/buckets, and the critical-path launch /
-    stream / sync / cross-stream edges (incl. the tie-break that routes the
-    path through the work that actually gated a wait).
-  - `test_runner_stack_correlation.py` -- regression test for the cross-hook
-    `stk:` correlation race fixed in `src/core/runner.py`
-    (`_remember_recent_span`/`_find_recent_span`): two different LD_PRELOAD
-    hooks emitting spans from the same OS tid on their own independent
-    socket connections must not clobber each other's call-stack attachment.
-  - `test_wire_protocol.py` -- `_parse_record`'s `inst:` tag-segment parsing
-    (`src/core/runner.py`): regression test for a bug where instant events'
-    trailing tags were silently discarded entirely.
-  - `test_disasm_categories.py` -- two fixes to `_collect_disasm`
-    (`src/core/runner.py`) and `collect_disasm` (`src/disasm/extractor.py`),
-    both found from the SAME real user report and fixed in sequence:
-    (1) the category filter for which spans' `sym=`/`lib=` codeptr tags
-    get looked at excluded `"mpi"` entirely, so `MPI_Bcast`/`MPI_Allreduce`/
-    etc. always showed "No disassembly available" -- not because `objdump`
-    was missing, but because nothing ever tried (mocks
-    `collect_disasm` for this part; see the
-    `..._carry_a_resolved_codeptr_tag_for_disasm` tests in
-    `tests/integration/test_gomp_hook.py`/`test_mpi_protocol.py` for the
-    hook side of the same fix); (2) even after (1), a resolved `sym=` tag
-    STILL produced "No disassembly available", because `collect_disasm`
-    always disassembled `command[0]` for a "sym" entry -- but the
-    profiled command is routinely a launcher wrapping the real binary
-    (`hprofiler run -- srun -n 4 gmx_mpi ...`, where `command[0]` is
-    `srun`, not `gmx_mpi`). Fixed via a new `symfile=` tag (dladdr's own
-    `dli_fname`) the hooks now also emit; `TestCollectDisasmUsesSymfileNotLauncher`
-    is a REAL (non-mocked) reproduction -- compiles an actual binary,
-    passes a deliberately-bogus `command[0]` standing in for `srun`, and
-    confirms disassembly is still found via `symfile=`.
-  - `test_disasm_widget_message.py` -- `DisasmWidget`'s (`src/ui/app.py`)
-    "No disassembly available" message: after fix (1) above, a real user
-    was STILL seeing it -- turned out they were viewing a trace captured
-    before rebuilding the hooks, but the message unconditionally told
-    them to go install `objdump`/`cuobjdump`, which was never the actual
-    problem. It now checks the span's own tags first and gives a
-    different, correct message when no `sym=`/`lib=` tag was ever
-    resolved at all (blames a stale trace / unrebuilt hooks, not missing
-    tools) versus when one IS present but disassembly still failed
-    (where the tool-installation tips are actually relevant).
-  - `test_zero_event_warning.py` -- `_total_zero_event_warning`
-    (`src/core/runner.py`): regression test for a real, intermittent bug
-    report -- a run via `srun` completed normally but captured zero
-    events across every backend, then the identical command worked on
-    the very next invocation. Checks the warning correctly names every
-    active backend, gives `srun`/`mpirun`/etc.-specific environment-
-    propagation advice only when the command actually is launcher-
-    wrapped (and not otherwise, where that advice would be wrong), and
-    doesn't crash on an empty command list.
-  - `test_pop_efficiency.py` -- `src/analysis/pop_efficiency.py`: Load
-    Balance / Communication Efficiency exact-formula checks, the
-    self-calibrated alpha/beta latency-bandwidth fit (verified against a
-    known synthetic model), the NCCL bus-bandwidth formula, computational
-    scaling, and edge cases (empty trace, single rank).
-  - `test_criticalpath.py` -- `src/analysis/criticalpath.py`: each
-    dependency-edge builder (program order, GPU stream order, device sync,
-    MPI/NCCL point-to-point and collective pairing -- including resolved
-    wildcard matches, commid=-scoped rendezvous, and async Isend/Irecv+Wait*
-    pairing -- OpenMP barrier rendezvous, explicit span_id/parent_span_id
-    correlation including `;`-separated multi-request lists), edge
-    confidence tiers, the formal DAG longest-path DP (including a
-    hand-verified case where it finds a materially better answer than the
-    old greedy walk on the same graph), cycle-fallback safety, and
-    `xs=`-aware exec-start gap correction, plus a hand-computed 2-backend
-    (MPI+CUDA) known-answer case and a causality-enforcement regression
-    test (see below).
-  - `test_multinode.py` -- `src/analysis/multinode.py`: Cristian's-algorithm
-    clock-offset arithmetic (including an asymmetric-latency case proving
-    the returned error bound actually brackets the real error, not just the
-    symmetric exact case), trace merging (pid remapping avoids cross-node
-    collisions, MPI rank=/peer= tags deliberately left unremapped), and
-    post-merge causality validation.
-  - `test_braille_canvas.py` -- `src/ui/braille_canvas.py`: the Braille
-    sub-cell line-drawing primitive behind the Timeline's cross-rank
-    communication connectors, checked against hand-computed Braille dot
-    bit-patterns (not just "a line got drawn somewhere").
-  - `test_timeline_connectors.py` -- `TimelineWidget`'s connector overlay
-    (`src/ui/app.py`): this project's first UI-level test, using Textual's
-    headless `App.run_test()` harness rather than only exercising the
-    analysis/hook layers directly. Verifies connector computation
-    (cross-lane vs. same-lane skip, MPI/NCCL-only filtering, confidence
-    tiers), that hovering a connector's endpoint actually produces Braille
-    overlay characters while nothing hovered (or an unrelated span
-    hovered) produces *none* -- a regression guard for the hover-gating
-    behavior specifically, which replaced an earlier always-on version --
-    crash-safety under extreme zoom/pan, and a 64-rank scale check.
-  - `test_timeline_widget.py` -- the readability/consistency fixes made
-    alongside the connector feature: deterministic per-function color
-    hashing (same function name gets the same color regardless of
-    insertion order, checked directly, not just "some color got
-    assigned"), MPI lanes labeled by actual `rank=` instead of a generic
-    sequential thread number (with its fallback when no rank is present),
-    and idle columns rendering as blank space instead of a visible dot.
-  - `test_dashboard.py` -- the card-based dashboard redesign of the TUI
-    (`src/ui/app.py`): the Overview tab's diagnosis/stat-card/findings/
-    source-correlation logic (including every adaptive fallback -- no MPI
-    spans, no GPU backend, no file/line tag, source file missing locally,
-    a single-span trace), the Roofline tab's coordinate math and "no data"
-    fallback (verified against synthetic `KernelMetrics`, since this
-    machine has no working GPU driver to produce real ones), numbered/
-    conditional tab composition and digit-key jump (`1`-`7`), and two real
-    bugs the redesign surfaced along the way: `_bottleneck_analysis` was a
-    dead import that silently produced empty results (now a real, shared,
-    tested implementation), and two hint strings relied on unescaped
-    brackets that collide with Rich markup syntax (`[s]`/`[u]` are
-    strikethrough/underline shorthand; anything else bracketed was
-    silently eaten as an unrecognised style tag) -- caught by literally
-    screenshotting the rendered TUI and noticing "cycle sort" struck
-    through, not just by reading the source.
+## Unit tests (`tests/test_*.py`)
 
-- **Native (C-level) stress tests** (`tests/native/`): infrastructure with
-  no GPU/MPI dependency, verified with much stronger tools than the Python
-  suite can apply.
+Small synthetic traces with hand-computed expected answers.
 
-  ```bash
-  bash tests/native/run_native_tests.sh
-  ```
+| Area | Files |
+|---|---|
+| Collection | `test_receiver.py` (collector: counting, partial records, backlog), `test_wire_protocol.py` (`inst:` tags), `test_runner_stack_correlation.py` (`stk:` matching across hooks), `test_perf_script_parsing.py`, `test_peer_real_exe.py`, `test_zero_event_warning.py`, `test_transport_native.py` (builds `tests/native/*.c`: transport scenarios plain / ASan+UBSan / TSan, OpenCL trampolines) |
+| Trace store and files | `test_trace_store_parity.py` (memory vs. disk store, every consumer), `test_store_errors.py` (damaged/interrupted traces), `test_chrome_trace_roundtrip.py`, `test_trace_lanes.py`, `test_otlp.py` |
+| GPU host/device model | `test_gpu_activity.py` (correlation, de-duplication, timing sources, critical-path edges), `test_device.py`, `test_device_bandwidth.py` |
+| Analyses | `test_criticalpath.py`, `test_pop_efficiency.py`, `test_cct.py`, `test_activity_buckets.py`, `test_multinode.py`, `test_compare.py`, `test_causal_compare.py` (scenarios in `compare_scenarios.py`), `test_call_tree_build.py`, `test_call_graph.py`, `test_flamegraph_tree.py`, `test_classifier_roofline.py`, `test_addr2line.py` |
+| Disassembly | `test_disasm_categories.py` (call-site tags, `symfile=`, perf filter; one test compiles a real binary), `test_disasm_widget_message.py` |
+| TUI (Textual `run_test`) | `test_dashboard.py`, `test_timeline_widget.py`, `test_timeline_connectors.py`, `test_braille_canvas.py`, `test_flamegraph_widget.py` |
+| GUI (PySide6, skipped without it) | `test_gui_bridge.py`, `test_gui_models.py`, `test_gui_settings.py`, `test_gui_persistence.py`, `test_gui_loader.py`, `test_gui_controller.py`, `test_gui_errors.py`, `test_gui_logging.py`, `test_gui_launch.py`, `test_gui_shortcuts.py`, `test_x11_check.py`; real QML interaction in `test_gui_timeline_hover.py` (one shared engine for the whole module — a second engine in one process corrupts Qt Quick Controls), and in separate processes `test_gui_compare_launch.py`, `test_gui_compare_interaction.py` (driver: `gui_compare_driver.py`), `test_gui_timeline_waits.py` |
 
-  `ringbuffer_stress.c` -- `hooks/common/ringbuffer.h`'s lock-free
-  per-thread ring buffer, arena allocator, and name-interning table:
-  concurrent producer/consumer correctness under real pthread scheduling,
-  drop-counter exactness under intentional overflow, FIFO order across
-  repeated wrap-around, and (best-effort, environment permitting) a clean
-  ThreadSanitizer pass -- plus a real, measured latency comparison against
-  the mutex+`send()` pattern it's designed to replace.
+## Integration tests (`tests/integration/`)
 
-- **Integration tests** (`tests/integration/`):
+Real programs (`tests/fixtures/`) through the real hooks and CLI.
 
-  - `test_store_stress.py` -- 2M synthetic spans (`HPROFILER_STRESS_EVENTS`
-    to change) captured into a `DiskTraceStore` through `Trace.add`,
-    finalized, then reopened and explored in fresh subprocesses (GUI
-    `TimelineModel` window queries, TUI timeline windows, aggregates,
-    overview numbers, call tree). Asserts bounded peak RSS that does not
-    scale versus a 200k-span baseline, interactive window latency, a
-    bins/spans switch between zoom levels, and exact answers against the
-    generator. ~1 min.
+| File | Covers | Needs |
+|---|---|---|
+| `test_profiling_accuracy.py` | timing against ground-truth programs (`*_truth.c`); `accuracy_report.py --trials N` prints the statistics | gcc/clang, mpicc, OpenCL |
+| `test_gomp_hook.py` | GNU libgomp interception, per thread and construct | gcc |
+| `test_mpi_protocol.py`, `test_mpi_rma.py` | MPI wire semantics (wildcards, requests, `commid=`, RMA synchronization) in a self-communicating process | mpicc |
+| `test_callsite_e2e.py` | call sites → saved trace → disassembly, through a launcher | mpicc, clang, gcc, CMake |
+| `test_native_gpu_records.py` | CUPTI / ROCprofiler-SDK decoders against the real vendor headers | the headers (`HPROFILER_CUPTI_INCLUDE`, `HPROFILER_ROCPROFILER_SDK_INCLUDE`) |
+| `test_cuda_native_activity.py` | CUDA device activity on a real GPU, all three modes and a static-runtime build | nvcc, a CUDA GPU, CUPTI |
+| `test_gui_cancel.py` | SIGINT during a GUI load exits 130 | PySide6 |
+| `test_store_stress.py` | 2M-span store: bounded memory, window latency, exact answers (`HPROFILER_STRESS_EVENTS` to resize) | — |
+| `run_matrix.sh` | `run` + `summary`/`efficiency`/`critical-path` per backend, crash-safety only | per-backend toolchains |
 
-    ```bash
-    python3 -m unittest tests.integration.test_store_stress
-    ```
+## Other
 
-  - `test_native_gpu_records.py` -- compiles `tests/native/*.c` against the
-    REAL CUPTI / ROCprofiler-SDK headers with the hook's own decoder
-    (`cupti_trace.c` / `rocprof_trace.c`) and feeds synthetic activity
-    records and Callback-API data through it (incomplete/corrupt/truncated
-    records, drops, clock offset, correlation capture). No GPU needed;
-    skips without headers (`HPROFILER_ROCPROFILER_SDK_INCLUDE=<rocm>/include`
-    for ROCm).
-  - `test_cuda_native_activity.py` -- `tests/fixtures/cuda_streams.cu` on a
-    real CUDA GPU in `HPROFILER_DEVICE_ACTIVITY=auto|off|both` mode and as a
-    static-runtime build: correlation, stream attribution, ordering
-    invariants, de-duplication, critical path. Functional checks, not a
-    timing-accuracy comparison. Skips without nvcc / a GPU / CUPTI.
-
-  - `run_matrix.sh` -- crash-safety matrix: builds the small per-backend
-    fixture programs in `tests/fixtures/` (skipping any whose toolchain
-    isn't available on the current machine), profiles each through its
-    hprofiler backend, and runs `summary`, `efficiency`, and
-    `critical-path` against the resulting trace -- asserting none of them
-    crash end-to-end. Some backends legitimately capture 0 events on a
-    given machine (no working GPU driver, `perf_event_paranoid` blocking
-    perf/likwid, etc.) -- that's fine and not a failure here; a crash is.
-
-    ```bash
-    ./tests/integration/run_matrix.sh
-    ```
-
-    NCCL isn't in the automated matrix -- it needs a machine-specific
-    workaround for a system without a system-wide `libnccl.so` (see
-    `hprofiler backends`); if you have one, adapt the manual steps:
-    ```bash
-    LD_LIBRARY_PATH=<path to libnccl.so>:$LD_LIBRARY_PATH \
-      python3 hprofiler run --backend nccl --no-ui -o nccl.json -- ./my_nccl_app
-    python3 hprofiler critical-path nccl.json
-    ```
-
-  - `test_mpi_protocol.py` -- unlike everything else here, this is
-    *measurement-correctness* verification, not a crash check: builds the
-    real `libhprofiler_mpi.so`, `LD_PRELOAD`s it into a self-communicating
-    fixture, captures the actual wire-protocol bytes over a real
-    `AF_UNIX` socket, and parses them with the production `_parse_record`
-    -- asserting on resolved semantics (wildcard matching, `Waitany`/
-    `Waitsome`/`Test*` completion, `commid=` self-consistency), not just
-    that the process didn't crash. Also checks that `MPI_Allreduce` spans
-    carry a `sym=`/`lib=` codeptr tag (regression test for a real user-
-    reported "no disassembly available" bug -- see `test_disasm_categories.py`
-    below).
-
-    ```bash
-    python3 -m unittest tests.integration.test_mpi_protocol -v
-    ```
-
-  - `test_gomp_hook.py` -- same measurement-correctness standard, for
-    `hooks/gomp_hook/gomp_hook.c` (direct `GOMP_*` interception for
-    binaries linked against GNU's libgomp, which has no OMPT support in
-    typical builds -- see `src/backends/openmp.py`'s module docstring).
-    Compiles `tests/fixtures/gomp_mini.c` with real `gcc` (confirmed via
-    `ldd` to link `libgomp`, not `libomp`), `LD_PRELOAD`s the hook, and
-    asserts on per-thread/per-construct correctness: exactly one
-    `omp_parallel_region` span per thread (not just one for the whole
-    region), correct barrier/critical-section/single counts, that the
-    interception doesn't change the program's own computed result, and
-    that `omp_parallel_region`/`omp_barrier`/`omp_critical_wait` spans
-    carry a resolved `sym=`/`lib=` codeptr tag (same regression as above).
-
-    ```bash
-    python3 -m unittest tests.integration.test_gomp_hook -v
-    ```
-
-- **Validation suite** (`tests/validation/`): the direct response to "these
-  tests mostly verify 'does not crash', not correctness" -- an aggregate,
-  quantitative precision/recall report (per confidence tier) across a
-  battery of synthetic scenarios with known ground-truth causal edges,
-  plus a determinism check (the same scenario, spans inserted in several
-  different orders, must produce byte-identical results). Not part of
-  `unittest discover tests` (a different directory, run separately):
-
-  ```bash
-  python3 -m unittest discover -s tests/validation -p "test_*.py" -v
-  ```
-
-## A real bug this test suite caught
-
-While validating `criticalpath.py` against a real OpenMP trace (not just
-synthetic unit tests), `hprofiler critical-path` reported "Wall time: 9.12ms,
-Time accounted for: 10.989s" -- a ~1200x overshoot on a program that actually
-ran for ~700ms. Two distinct bugs, both now covered by regression tests:
-
-1. `Trace.duration_ns` is meaningless for a trace reconstructed by
-   `load_trace_from_json` (its `TraceMetadata.start_time_ns` defaults to the
-   *load* time, not the original run's start) -- `criticalpath.py` now
-   derives wall time from the spans themselves instead, the same way
-   `src/output/summary.py` and `src/analysis/cct.py` already did.
-2. The backward critical-path walk didn't enforce causality: a rendezvous
-   ("arrival"-gated, e.g. OpenMP barrier) predecessor could be picked even
-   though it hadn't actually happened yet relative to the point being
-   explained, and a full mutual clique between all rendezvous participants
-   let the walk chain through arrival edges repeatedly instead of stopping
-   at the single true "last arriver". See `TestCausalityEnforcement` and
-   `_add_last_arriver_edges`'s docstring in `criticalpath.py` for the fix.
-
-`hprofiler critical-path` on that same real trace now reports Wall time
-702.90ms / Time accounted for 698.67ms -- sane.
+- `tests/validation/test_causal_accuracy.py` — precision/recall of the
+  dependency graph against hand-built ground-truth edges, per confidence
+  tier, plus determinism under reordered input.
+- `tests/native/run_native_tests.sh` — `ringbuffer_stress.c`: the ring
+  primitives under concurrent producers, exact overflow accounting, TSan,
+  and a latency comparison.
+- `tests/fixtures/` — the profiled programs (`*_mini`, `*_truth.c`,
+  `mpi_proto*.c`, `mpi_win_self.c`, `*_callsite.c`, `omp_hotpath.c`,
+  `cuda_streams.cu`).

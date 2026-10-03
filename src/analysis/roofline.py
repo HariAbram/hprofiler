@@ -5,9 +5,10 @@ Estimates per-kernel FLOPs and memory bytes from disasm instruction-type
 counts × thread count (grid × block), then compares achieved rates against
 device theoretical peaks.
 
-The estimates are approximate — hardware counters (CUPTI, rocProfiler) would
-be more accurate — but they reliably identify whether a kernel is memory-bound
-or compute-bound and show how far it sits from the roofline ceiling.
+The estimates are approximate -- hardware counters (`hprofiler roofline --
+backend ... -- ./app`, via ncu/rocprof/LIKWID/perf; see hwcounters.py) are
+more accurate -- but they identify whether a kernel is memory-bound or
+compute-bound and show how far it sits from the roofline ceiling.
 """
 
 from __future__ import annotations
@@ -54,9 +55,8 @@ _FLOPS: dict[str, dict[InsnType, float]] = {
         # thread count for every other instruction type too) -- real shapes
         # vary (16x8x8, 16x8x32, TF32 m16n8k4, …), so treat this as a
         # representative average, same "approximate estimate" caveat as the
-        # rest of this disasm-based model. The previous value (2.0, the
-        # same bucket as a scalar FFMA) undercounted real tensor-core
-        # throughput by ~100x+.
+        # rest of this disasm-based model. Charging it like a scalar FFMA
+        # (2.0) would undercount tensor-core throughput by ~100x+.
         InsnType.TENSOR:  128.0,
         InsnType.VECTOR:    2.0,  # generic SASS vector fallback (rarely emitted)
         InsnType.VEC_SP:    2.0,
@@ -78,9 +78,9 @@ _FLOPS: dict[str, dict[InsnType, float]] = {
         # representative v_mfma_f32_32x32x8f16 shape: 2*32*32*8 = 16384
         # FLOPs / 64-lane wavefront = 256 FLOPs "per thread" (same
         # per-instruction × total-thread-count model as every other type
-        # here; real shapes vary). The previous value (4.0, the same
-        # bucket as a plain FP32 SIMD op) undercounted real MFMA throughput
-        # by ~100x+, the AMDGCN analog of the SASS HMMA issue above.
+        # here; real shapes vary). Charging it like a plain FP32 SIMD op
+        # (4.0) would undercount MFMA throughput by ~100x+, the AMDGCN analog
+        # of the SASS HMMA case above.
         InsnType.TENSOR:  256.0,
         InsnType.COMPUTE:   2.0,  # v_mac_f32 / v_mul_f32 pair
         InsnType.SCALAR:    1.0,  # s_mul_i32 etc.

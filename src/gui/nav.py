@@ -2,25 +2,16 @@
 Cross-tab navigation and selection state -- the single source of truth
 every screen reads from and writes to, so tabs never reach into each
 other directly. Main.qml's TabBar/StackLayout are both bound to this
-singleton's `currentTab` instead of the TabBar solely owning tab state
-(previously: `StackLayout.currentIndex: tabBar.currentIndex`, a one-way
-convenience binding with nothing else able to drive it -- see this
-module's own history for why that had to change).
+singleton's `currentTab`, so any screen (not just the TabBar) can drive
+tab changes.
 
-Correlation key is (category, name) -- NOT true per-instance span
-identity. SpanEvent.span_id/parent_span_id are real per-instance IDs
-assigned at hook-capture time, but chrome_trace.write() never
-serializes them and load_trace_from_json() never restores them, so
-every span any GUI bridge sees has span_id=="". Fixing that end-to-end
-(new JSON fields + threading real IDs through every bridge) was
-evaluated and explicitly deferred as too large/invasive for this
-feature -- (category, name) is what every aggregating bridge (Kernels,
-CallTree, Dashboard, Profile) already natively groups spans by, so this
-needs no new data-model plumbing, just one shared place to hold the
-CURRENT selection. Practical consequence, intentional and disclosed
-(see InspectorBridge): selectFunction() means "select occurrences of
-this raw (category, name)", not "select the exact span instance
-clicked elsewhere in some other tab".
+Correlation key is (category, name) -- NOT per-instance span identity.
+Spans do carry span_id/parent_span_id (serialized as sid/psid), but every
+aggregating bridge (Kernels, CallTree, Dashboard, Profile) groups by
+(category, name), so that is what a cross-tab selection holds. Practical
+consequence (disclosed in InspectorBridge): selectFunction() means
+"select occurrences of this raw (category, name)", not "select the exact
+span instance clicked in another tab".
 """
 from __future__ import annotations
 

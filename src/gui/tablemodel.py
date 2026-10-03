@@ -1,29 +1,24 @@
 """
 Reusable table infrastructure for the GUI's data tables (Kernels, Call Tree,
-System devices/metrics, Overview findings, Compare) -- built on real Qt
-model/view classes (QAbstractListModel + QSortFilterProxyModel), not the
-per-screen hand-rolled JS .filter()/.sort() every table used before this
-round (KernelsScreen.qml's old recompute()).
+System devices/metrics, Overview findings, Compare) -- built on Qt
+model/view classes (QAbstractListModel + QSortFilterProxyModel).
 
 Deliberately NOT QAbstractTableModel + QML TableView/HorizontalHeaderView:
-those are *styled* Qt Quick Controls types, and this project has already
-been bitten twice by style/component resolution under the offscreen QPA
-platform this test suite runs under (see tests/test_gui_timeline_hover.py's
-module docstring). A QAbstractListModel (one row = one item, one role per
-column) driving a plain ListView sidesteps that risk entirely while still
-being genuinely "Qt's model/view architecture" -- QSortFilterProxyModel
-re-sorts/re-filters incrementally (sort()/beginFilterChange()+endFilterChange(), never
-beginResetModel() on the SOURCE model), which is what makes "avoid
-unnecessary full-table rebuilding" literally true rather than aspirational.
-The frozen identifier column reuses TimelineScreen.qml's existing fixed-
-label-column pattern (a fixed-width Item + an x-offset scroll for the rest)
-instead of a second synced view.
+those are *styled* Qt Quick Controls types, and style/component resolution
+is fragile under the offscreen QPA platform the test suite runs under (see
+tests/test_gui_timeline_hover.py's module docstring). A QAbstractListModel
+(one row = one item, one role per column) driving a plain ListView avoids
+that. QSortFilterProxyModel re-sorts/re-filters incrementally
+(sort()/beginFilterChange()+endFilterChange(), never beginResetModel() on
+the SOURCE model), so tables are not rebuilt wholesale. The frozen
+identifier column reuses TimelineScreen.qml's fixed-label-column pattern (a
+fixed-width Item + an x-offset scroll for the rest) instead of a second
+synced view.
 
 Column formatting (kind -> display string) is centralized in FormatBridge
-below (registered as the "Format" singleton) so every table's cell
-delegate calls the SAME small set of src/analysis/dashboard.py fmt_*
-helpers, rather than each screen re-implementing number formatting in QML
-JS (a real drift risk -- see that module's fmt_ns/fmt_pct/etc.).
+below (the "Format" singleton) so every table's cell delegate calls the
+same src/analysis/dashboard.py fmt_* helpers rather than re-implementing
+number formatting in QML JS.
 """
 from __future__ import annotations
 
@@ -259,8 +254,8 @@ class TableFilterProxy(QSortFilterProxyModel):
             if not any(needle in str(row.get(k, "")).lower() for k in keys):
                 return False
 
-        # A missing value (None/NaN) can't satisfy a numeric range --
-        # NaN compares false both ways, so it used to pass every filter.
+        # A missing value (None/NaN) can't satisfy a numeric range (NaN
+        # compares false both ways, so it must be rejected explicitly).
         for key, lo in self._min_values.items():
             v = _sort_num(row.get(key))
             if v == float("-inf") or v < lo:
@@ -286,12 +281,11 @@ class TableFilterProxy(QSortFilterProxyModel):
 
 
 class TableConfig(QObject):
-    """Per-table session state that must survive tab switches: column
-    widths/visibility/order and the absolute/percentage display toggle.
-    Deliberately in-memory only (no QSettings/disk persistence) -- "session"
-    here means "don't reset when switching tabs," not "remember across a
-    relaunch"; every bridge that owns a TableConfig is a singleton that
-    lives for the whole GUI process, which already satisfies that."""
+    """Per-table layout: column widths/visibility/order and the absolute/
+    percentage display toggle. Survives tab switches (the owning bridges are
+    process-lifetime singletons) and, via export_state()/restore_state()
+    and settings.ViewStatePersister, relaunches -- layout only, never row
+    data."""
 
     columnsChanged = Signal()
     modeChanged = Signal()
@@ -353,6 +347,32 @@ class TableConfig(QObject):
         self._widths = {c.key: c.width for c in self._specs}
         self._visible = {c.key: c.visible for c in self._specs}
         self.columnsChanged.emit()
+
+    def export_state(self) -> dict[str, Any]:
+        return {"order": list(self._order), "widths": dict(self._widths),
+                "visible": dict(self._visible), "percentMode": self._percent_mode}
+
+    def restore_state(self, state: Any) -> None:
+        """Applies a saved layout, tolerating anything stale or malformed:
+        unknown columns are ignored, columns added since are appended in
+        their default position, bad widths keep the default."""
+        if not isinstance(state, dict):
+            return
+        known = [c.key for c in self._specs]
+        order = [k for k in (state.get("order") or []) if k in known]
+        order = list(dict.fromkeys(order)) + [k for k in known if k not in order]
+        widths = state.get("widths") if isinstance(state.get("widths"), dict) else {}
+        visible = state.get("visible") if isinstance(state.get("visible"), dict) else {}
+        self._order = order
+        for k in known:
+            w = widths.get(k)
+            if isinstance(w, (int, float)) and 10 <= w <= 4000:
+                self._widths[k] = float(w)
+            if isinstance(visible.get(k), bool):
+                self._visible[k] = visible[k]
+        self._percent_mode = bool(state.get("percentMode", False))
+        self.columnsChanged.emit()
+        self.modeChanged.emit()
 
 
 class TableBundle(QObject):

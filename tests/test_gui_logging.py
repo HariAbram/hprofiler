@@ -4,8 +4,8 @@ configuration (repeated setup_logging() calls don't duplicate handlers or
 lose the established path), and log_error()'s HprofilerLoadError
 formatting. Needs no QGuiApplication for the temp-dir-overridden path
 this file exercises exclusively (the QStandardPaths default path DOES
-need one, but every test here passes an explicit log_dir, matching
-settings.py's tests never touching the real user config location).
+need one, but every test here passes an explicit log_dir, so no test
+touches the real user log location).
 """
 import logging
 import sys

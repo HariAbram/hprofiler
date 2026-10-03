@@ -1,5 +1,5 @@
 """
-Subprocess-based test for the POPULATED Compare tab (Phase C) -- a real
+Subprocess-based test for the POPULATED Compare tab -- a real
 second trace loaded via `--compare`. This can't be covered by the shared-
 engine in-process test class (tests/test_gui_timeline_hover.py): that
 engine is process-global and only one trace pairing can ever be live in

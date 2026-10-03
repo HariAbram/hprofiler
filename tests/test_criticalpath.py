@@ -1,6 +1,6 @@
 """
 Unit tests for src/analysis/criticalpath.py -- verifies the dependency-graph
-edge builders and the backward critical-path walk against hand-computed
+edge builders and the critical-path computation against hand-computed
 expected answers on small synthetic traces, including a 2-backend (MPI+CUDA)
 scenario modeled on the classic CASITA-style case this generalizes.
 """
@@ -102,13 +102,11 @@ class TestMPIPointToPoint(unittest.TestCase):
         self.assertEqual(matches[0][1], "medium")
 
     def test_early_posted_receive_still_matches(self):
-        """Regression test for a self-audit bug: the receiver commonly
-        posts MPI_Recv well before the matching MPI_Send even starts (an
-        intentional HPC pattern -- 'post an early receive to overlap with
-        compute'), so the recv's span can legitimately start before the
-        send's. The old matching required send.start_ns <= recv.start_ns
-        as a precondition, which silently found NO edge at all in this
-        (common) case instead of the real send->recv dependency."""
+        """The receiver commonly posts MPI_Recv well before the matching
+        MPI_Send starts (an intentional HPC pattern -- post an early receive
+        to overlap with compute), so the recv's span can start before the
+        send's. Matching must not require send.start_ns <= recv.start_ns,
+        or this common case would get no send->recv edge at all."""
         recv = _span(1, 1, Category.MPI, 0, 600, name="MPI_Recv",
                      tags={"type": "recv", "rank": "1", "peer": "0", "tag": "3"})
         send = _span(0, 1, Category.MPI, 500, 10, name="MPI_Send",
@@ -190,16 +188,15 @@ class TestCausalityEnforcement(unittest.TestCase):
     per-category time sums can wildly exceed wall-clock time."""
 
     def test_wide_rendezvous_cluster_stays_bounded_and_self_reports(self):
-        """Regression test: caught on a real OpenMP trace where a full
-        mutual clique between rendezvous participants (pre-fix) let the
+        """A full mutual clique between rendezvous participants lets a
         backward walk chain through arrival edges repeatedly within one
-        cluster, producing a category-time sum >1000x the actual wall-clock
-        time (8.2s attributed inside a 9ms run). With edges restricted to
-        "every member -> the single last arriver" (_add_last_arriver_edges)
-        plus the current-node-relative causality check in
-        compute_critical_path, a 5-thread rendezvous cluster must no longer
-        blow up like that -- and if the span-level (not event-level)
-        approximation still overshoots wall time at all, it must say so."""
+        cluster (on a real OpenMP trace: 8.2s of category time inside a 9ms
+        run). With edges restricted to "every member -> the single last
+        arriver" (_add_last_arriver_edges) plus the current-node-relative
+        causality check in compute_critical_path, a 5-thread rendezvous
+        cluster must stay bounded -- and if the span-level (not
+        event-level) approximation still overshoots wall time at all, it
+        must say so."""
         barrier_spans = [
             _span(1, tid, Category.SYNC, start, 1000 - start, name="omp_barrier_implicit")
             for tid, start in enumerate([0, 50, 300, 310, 900])
@@ -289,13 +286,11 @@ class TestSerializationEfficiencyBridge(unittest.TestCase):
         self.assertAlmostEqual(eff2, 150 / 650, places=6)
 
     def test_works_across_separately_loaded_trace_instances(self):
-        """Regression test for a self-audit bug: the bridge originally
-        matched spans by raw object identity (id()), which silently returns
-        wrong (near-zero) results if `comm_spans` comes from a DIFFERENT
-        Trace object than the one the CriticalPathReport was built from --
-        e.g. two separate load_trace_from_json() calls on the same file.
-        _span_identity_key (value-based) must make this work correctly
-        regardless of object identity."""
+        """Spans must be matched by value (_span_identity_key), not object
+        identity (id()) -- `comm_spans` may come from a DIFFERENT Trace
+        object than the one the CriticalPathReport was built from (e.g.
+        two load_trace_from_json() calls on the same file), and identity
+        matching would silently return near-zero results."""
         a = _span(1, 1, Category.MPI, 0, 100, name="a", tags={"type": "barrier"})
         b = _span(1, 1, Category.MPI, 100, 50, name="b", tags={"type": "barrier"})
         trace = _mk_trace([a, b])
@@ -401,13 +396,12 @@ class TestWaitallMultiRequestLinking(unittest.TestCase):
 
 class TestCommidScopedRendezvous(unittest.TestCase):
     def test_different_communicators_not_falsely_clustered(self):
-        """Real bug this closes: two UNRELATED communicators each running an
-        allreduce at overlapping wall-clock times used to be clustered into
-        ONE rendezvous group (_cluster_rendezvous only looks at time
-        overlap), creating a bogus arrival edge between completely
-        unrelated ranks/communicators. With commid= now available, spans
-        are bucketed by (type, commid) before clustering, so overlapping-
-        but-different communicators stay separate."""
+        """Two UNRELATED communicators each running an allreduce at
+        overlapping wall-clock times must not be clustered into ONE
+        rendezvous group (time overlap alone would create a bogus arrival
+        edge between unrelated ranks). Spans are bucketed by (type, commid)
+        before clustering, so overlapping-but-different communicators stay
+        separate."""
         # comm id=1: A and B overlap (A:[0,100), B:[10,90)) -> B is the last arriver.
         a = _span(1, 1, Category.MPI, 0, 100, name="MPI_Allreduce",
                   tags={"type": "allreduce", "commid": "1"})
@@ -441,12 +435,11 @@ class TestCommidScopedRendezvous(unittest.TestCase):
 
 class TestFormalDPBeatsGreedy(unittest.TestCase):
     """Hand-verified case where the DP's globally-optimal choice differs
-    from what the old greedy walk (picking the single locally-tightest-gate
-    predecessor at each step) would have picked -- concretely demonstrating
-    the DP is not just a refactor but a real correctness improvement for
-    competing-predecessor scenarios. See criticalpath.py's module docstring
-    for why greedy's local choice isn't guaranteed to reach the same answer
-    as the proven-optimal DAG longest-path DP.
+    from what a greedy walk (picking the single locally-tightest-gate
+    predecessor at each step) would pick, for competing-predecessor
+    scenarios. See criticalpath.py's module docstring for why greedy's
+    local choice isn't guaranteed to reach the same answer as the
+    proven-optimal DAG longest-path DP.
 
     Layout (see inline comments for the exact hand-computed numbers):
       Q  [0,500)   pid2/tid1, solo, dur=500
@@ -494,7 +487,7 @@ class TestCycleFallback(unittest.TestCase):
         edge points from an earlier-enabling event to a later-gated one --
         see the module docstring), but the DP defensively verifies this via
         topological sort rather than assuming it, and must not hang or
-        crash if one somehow exists -- falls back to the old greedy walk,
+        crash if one somehow exists -- falls back to the greedy walk,
         which is cycle-safe by construction (its `visited` set)."""
         a = _span(1, 1, Category.CPU, 0, 10, name="A")
         b = _span(1, 1, Category.CPU, 20, 10, name="B")
@@ -576,11 +569,11 @@ if __name__ == "__main__":
 
 class TestProgramOrderWithNesting(unittest.TestCase):
     """Same-thread spans that NEST (an OpenMP barrier inside a parallel
-    region/implicit task) used to break the program-order chain: each span
-    was linked to the previous span by START, i.e. to its own enclosing
-    span, whose end gate it can never meet -- the edge was dropped and
-    nothing later connected back. On a real, continuously-busy OpenMP
-    program the path explained 28% of wall time."""
+    region/implicit task) must keep the program-order chain intact. Linking
+    each span to the previous span by START would link it to its own
+    enclosing span, whose end gate it can never meet -- the edge would be
+    dropped and nothing later would connect back (on a continuously-busy
+    OpenMP program, only 28% of wall time explained)."""
 
     def _regions(self, n):
         spans = []

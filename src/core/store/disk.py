@@ -160,13 +160,19 @@ class DiskTraceStore(TraceStore):
             raise StoreError(f"{self.path}: not a trace store")
         if not exists:
             (self.path / "shards").mkdir(parents=True, exist_ok=True)
-        self._cat = self._connect(self.path / "catalog.sqlite", cache_kib=8192)
-        if exists:
-            self._check_schema()
-        else:
-            self._init_catalog()
-        self._load_dictionaries()
+        try:
+            self._cat = self._connect(self.path / "catalog.sqlite", cache_kib=8192)
+            if exists:
+                self._check_schema()
+            else:
+                self._init_catalog()
+            self._load_dictionaries()
+        except sqlite3.DatabaseError as exc:
+            raise StoreError(f"{self.path}: the store catalog is unreadable or corrupted ({exc}); "
+                             "re-run the capture, or re-import the JSON export if there is one") from exc
         self._shard_conns: "OrderedDict[int, sqlite3.Connection]" = OrderedDict()
+        if exists:
+            self._verify_shards()
         self._buf: dict[int, dict[int, list]] = {}
         self._buffered = 0
         self._next_row: dict[tuple[int, int], int] = {}
@@ -301,6 +307,43 @@ class DiskTraceStore(TraceStore):
             conn = self._conn(shard)
             conn.executescript(SHARD_DDL)
         return shard
+
+    _SQLITE_MAGIC = b"SQLite format 3\x00"
+
+    def _verify_shards(self) -> None:
+        """Every shard the catalog lists must be present and be an SQLite
+        file -- sqlite3.connect() would silently create a missing one empty
+        and the first query would fail deep inside a viewer. A zero-length
+        shard (capture killed right after creating it) just gets its
+        tables."""
+        missing, bad = [], []
+        for shard, fname in sorted(self._shard_file.items()):
+            f = self.path / "shards" / fname
+            try:
+                with open(f, "rb") as fh:
+                    head = fh.read(16)
+            except FileNotFoundError:
+                missing.append(fname)
+                continue
+            except OSError as exc:
+                bad.append(f"{fname} ({exc.strerror})")
+                continue
+            if not head:
+                try:
+                    self._conn(shard).executescript(SHARD_DDL)
+                except sqlite3.DatabaseError as exc:
+                    bad.append(f"{fname} ({exc})")
+            elif head != self._SQLITE_MAGIC:
+                bad.append(f"{fname} (not an SQLite file)")
+        if missing or bad:
+            parts = []
+            if missing:
+                parts.append(f"{len(missing)} shard file(s) missing: {', '.join(missing[:5])}")
+            if bad:
+                parts.append(f"{len(bad)} shard file(s) unreadable: {', '.join(bad[:5])}")
+            raise StoreError(f"{self.path}: the store is incomplete -- " + "; ".join(parts) +
+                             " (copied partially, or files deleted); re-run the capture, or re-import "
+                             "the JSON export if there is one")
 
     def _conn(self, shard: int) -> sqlite3.Connection:
         conn = self._shard_conns.get(shard)

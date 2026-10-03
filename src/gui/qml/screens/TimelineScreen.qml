@@ -28,7 +28,20 @@ Item {
     // first instantiates it) never actually transitions false->true, so
     // onVisibleChanged below -- which fires correctly on every SUBSEQUENT
     // tab switch -- can't be relied on for that initial activation.
-    Component.onCompleted: { jumpToSelectionIfNew(); applyFocusIfNew() }
+    Component.onCompleted: {
+        // The profile's saved zoom/pan (settings.ViewStatePersister), if
+        // any; a cross-tab jump or explicit focus request below wins.
+        var saved = TimelineModel.restoredView
+        if (saved && saved.zoom) {
+            zoom = saved.zoom
+            viewStartNs = saved.viewStartNs
+        }
+        jumpToSelectionIfNew()
+        applyFocusIfNew()
+    }
+    // Report zoom/pan for persistence (cheap; saving is debounced in Python).
+    onZoomChanged: TimelineModel.noteView(zoom, viewStartNs)
+    onViewStartNsChanged: TimelineModel.noteView(zoom, viewStartNs)
     onVisibleChanged: {
         if (!visible) return
         forceActiveFocus()
@@ -180,13 +193,13 @@ Item {
         clampViewStart()
     }
 
-    // Search "next/previous match" (Phase B4) jump: pans (does NOT zoom,
+    // Search "next/previous match" jump: pans (does NOT zoom,
     // unlike zoomToSpan/double-click -- stepping through matches
-    // shouldn't also yank the zoom level around) to center the match at
-    // the CURRENT zoom, scrolls its row into view (rowIndexForLane(), not
-    // the raw laneIndex -- the row may sit under a group header now), and
-    // sets hover state so the connector overlay highlights it the same
-    // way a real mouse hover would.
+    // shouldn't also change the zoom level) to center the match at
+    // the CURRENT zoom, scrolls its row into view (rowIndexForLane(),
+    // not the raw laneIndex -- the row may sit under a group header),
+    // and sets hover state so the connector overlay highlights it as
+    // a mouse hover would.
     function jumpToMatch(match) {
         if (!match || match.laneIndex === undefined) return
         viewStartNs = match.startNs - visibleNs / 2.0
@@ -295,14 +308,29 @@ Item {
                 visible: root.hasSyncOverlay
                 spacing: AppTheme.spacingXs
                 Rectangle {
+                    objectName: "timelineWaitLegendSwatch"
                     width: 10
                     height: 10
                     radius: AppTheme.radiusSmall / 2
-                    color: AppTheme.categoryColor("sync")
-                    opacity: 0.8
+                    color: "transparent"
+                    border.width: 1
+                    border.color: AppTheme.bucketColor("Idle")
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 1
+                        color: AppTheme.bucketColor("Idle")
+                        opacity: 0.28
+                    }
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        height: 2
+                        color: AppTheme.categoryColor("sync")
+                    }
                 }
                 Text {
-                    text: "= blocked at a nested sync event"
+                    text: "= waiting (barrier / lock), not working"
                     color: AppTheme.textMuted
                     font.pixelSize: AppTheme.typeCaption
                 }
@@ -452,15 +480,11 @@ Item {
             // ListView, not a plain Flickable+Column+Repeater -- only
             // instantiates delegates near the viewport (+ a small cache
             // margin), recycling them while scrolling, instead of
-            // building a Canvas for every lane unconditionally regardless
-            // of whether it's ever visible (a real perf risk already for
-            // a many-rank MPI trace, independent of the table-upgrade/
-            // grouping round this was built alongside). `rows`, not
-            // `lanes` directly: TimelineModel.rows is the NEW visual row
-            // list (group headers + filtered/ordered/hidden-aware lane
-            // references) -- each "lane" row still carries its own
-            // original `laneIndex`, so visibleSpans()/spanAt() calls
-            // below are completely unaffected by this switch.
+            // building a Canvas for every lane (costly for a many-rank
+            // MPI trace). Iterates `rows` (group headers +
+            // filtered/ordered/hidden-aware lane references), not
+            // `lanes`; each "lane" row carries its original
+            // `laneIndex`, which visibleSpans()/spanAt() take.
             ListView {
                 id: flick
                 objectName: "timelineFlick"
@@ -471,17 +495,13 @@ Item {
                 boundsBehavior: Flickable.StopAtBounds
                 model: TimelineModel.rows
 
-                // Real lanes (rows), for a trace with more of them than
-                // fit the window -- Flickable already supported this
-                // (contentHeight was always bound correctly), it just had
-                // no way to actually GET there: the pan/zoom MouseArea
-                // below sits on top of the whole area and only reads
-                // mouse.x, so a vertical drag silently did nothing at
-                // all. A real ScrollBar thumb, in its own reserved strip
-                // the pan MouseArea explicitly excludes (rightMargin
-                // below), fixes that without the two drag gestures
-                // (Flickable's native drag-to-scroll vs. the pan
-                // MouseArea's drag-to-pan-in-time) fighting each other.
+                // Vertical scrolling for traces with more lanes than fit
+                // the window. The pan/zoom MouseArea below covers the whole
+                // area and only reads mouse.x, so a vertical drag can't
+                // scroll; a ScrollBar thumb in its own reserved strip (which
+                // the pan MouseArea excludes via rightMargin) provides it
+                // without Flickable's drag-to-scroll and the pan MouseArea's
+                // drag-to-pan-in-time fighting each other.
                 ScrollBar.vertical: ScrollBar {
                     policy: TimelineModel.rows.length * root.rowHeight > flick.height
                             ? ScrollBar.AlwaysOn : ScrollBar.AlwaysOff
@@ -508,11 +528,10 @@ Item {
                     sourceComponent: rowData.kind === "group" ? groupRowComponent : laneRowComponent
                 }
 
-                // ── Group header row (Phase B3): label + lane count +
-                // aggregated count, click-to-collapse/expand, and (only
-                // while collapsed) a coverage strip standing in for the
-                // member lanes' own bars -- "show meaningful aggregated
-                // activity when collapsed" from the Timeline requirements.
+                // ── Group header row: label + lane count + aggregated
+                // count, click-to-collapse/expand, and (only while
+                // collapsed) a coverage strip standing in for the member
+                // lanes' own bars.
                 Component {
                     id: groupRowComponent
                     Item {
@@ -692,11 +711,10 @@ Item {
                                 height: parent.height
                                 // laneRow.rowData.laneIndex, NOT the bare
                                 // ListView `index`/rowPos -- a row's visual
-                                // position and its underlying lane's real
-                                // index diverge once grouping/hiding/
-                                // reordering are in play (B3), and every
-                                // visibleSpans()/spanAt() call below needs
-                                // the latter, stable one.
+                                // position and its lane's index diverge under
+                                // grouping/hiding/reordering, and every
+                                // visibleSpans()/spanAt() call below needs the
+                                // latter, stable one.
                                 property int laneIndex: laneRow.rowData.laneIndex
                                 property string laneName: laneRow.rowData.name
                                 property var cachedSpans: []
@@ -732,13 +750,13 @@ Item {
                                 // Throttled, not immediate: a drag/wheel gesture fires
                                 // dozens of these changes per second, and each repaint
                                 // means a Python round-trip (TimelineModel.visibleSpans)
-                                // per lane -- with 17 lanes, painting on every single
-                                // change made dragging feel very sluggish, worse still
-                                // over X11 forwarding where each composited frame also
-                                // pays network latency. Capped to ~60fps via a THROTTLE
-                                // (start-if-not-already-running), not a debounce/restart
-                                // -- it keeps repainting periodically throughout a long
-                                // continuous drag instead of only once movement pauses.
+                                // per lane -- painting on every change makes dragging
+                                // sluggish, worse over X11 forwarding where each frame
+                                // also pays network latency. Capped to ~60fps via a
+                                // THROTTLE (start-if-not-already-running), not a
+                                // debounce/restart, so it keeps repainting throughout a
+                                // long continuous drag instead of only once movement
+                                // pauses.
                                 onBoundZoomChanged: if (!repaintThrottle.running) repaintThrottle.start()
                                 onBoundStartChanged: if (!repaintThrottle.running) repaintThrottle.start()
 
@@ -750,11 +768,11 @@ Item {
                                 }
 
                                 // Search query/cursor changes and color-mode toggles
-                                // (Phase B4) don't move boundZoom/boundStart, so they
-                                // need their own repaint trigger -- a direct signal
-                                // connection, not a dirty-checked property, since e.g. a
-                                // query change that happens to keep the same match COUNT
-                                // (different matches, same total) would otherwise be missed.
+                                // don't move boundZoom/boundStart, so they need their own
+                                // repaint trigger -- a direct signal connection, not a
+                                // dirty-checked property, since e.g. a query change that
+                                // keeps the same match COUNT (different matches, same
+                                // total) would otherwise be missed.
                                 Connections {
                                     target: TimelineModel
                                     function onSearchChanged() {
@@ -766,9 +784,8 @@ Item {
                                 }
 
                                 // Shared by both the lane's own spans and the sync
-                                // overlay below -- fills `spans` left-to-right with
-                                // the same gap-aware 1px floor (see the comment this
-                                // replaced): every rect gets at least 1px for
+                                // overlay below -- fills `spans` left-to-right with a
+                                // gap-aware 1px floor: every rect gets at least 1px for
                                 // visibility, but never so wide it eats the real gap
                                 // before the next span in the SAME list.
                                 function _paintSpans(ctx, spans, scale, colorOf, alpha) {
@@ -777,13 +794,10 @@ Item {
                                     for (var i = 0; i < spans.length; i++) {
                                         var sp = spans[i]
                                         // Defense-in-depth: never paint a span that
-                                        // doesn't truly overlap the visible window,
-                                        // regardless of what the model handed back --
-                                        // guarantees this class of bug (an incorrectly
-                                        // windowed Python query smearing off-screen
-                                        // spans across the canvas) can't resurface here
-                                        // even if visibleSpans()'s own windowing ever
-                                        // regresses.
+                                        // doesn't truly overlap the visible window, whatever
+                                        // the model handed back, so an incorrectly windowed
+                                        // query can't smear off-screen spans across the
+                                        // canvas.
                                         if (sp.startNs + sp.durNs <= root.viewStartNs || sp.startNs >= viewEndNs)
                                             continue
                                         var x0 = (sp.startNs - root.viewStartNs) * scale
@@ -840,48 +854,119 @@ Item {
                                     ctx.globalAlpha = 1.0
                                 }
 
+                                // ── Waiting time on a thread lane ─────────────────
+                                // A span like omp_parallel_region covers the whole
+                                // region, including the barrier/critical waits the
+                                // paired sync lane reports -- painted as is, a thread
+                                // that spends the window waiting looks solidly busy.
+                                // Waits are therefore cut out of the lane and painted
+                                // in the neutral Idle colour, with a thin stripe in
+                                // the wait's own colour (same hue as on the sync lane)
+                                // so the two rows still correlate.
+                                readonly property color idleColor: AppTheme.bucketColor("Idle")
+
+                                function _paintWaits(ctx, waits, scale) {
+                                    var viewEndNs = root.viewStartNs + root.visibleNs
+                                    for (var i = 0; i < waits.length; i++) {
+                                        var w = waits[i]
+                                        if (w.startNs + w.durNs <= root.viewStartNs || w.startNs >= viewEndNs)
+                                            continue
+                                        var x0 = Math.max(0, (w.startNs - root.viewStartNs) * scale)
+                                        var x1 = Math.min(width, (w.startNs + w.durNs - root.viewStartNs) * scale)
+                                        var ww = Math.max(1, x1 - x0)
+                                        ctx.clearRect(x0, 3, ww, height - 6)
+                                        ctx.globalAlpha = 0.28
+                                        ctx.fillStyle = idleColor
+                                        ctx.fillRect(x0, 3, ww, height - 6)
+                                        ctx.globalAlpha = 0.9
+                                        ctx.fillStyle = w.color
+                                        ctx.fillRect(x0, height - 5, ww, 2)
+                                    }
+                                    ctx.globalAlpha = 1.0
+                                }
+
+                                // Work the thread did WHILE waiting (e.g. tasks executed
+                                // inside a barrier): lane spans lying entirely within a
+                                // wait -- spans that merely contain a wait (a loop with
+                                // a critical section in it) stay cut out.
+                                function _spansInsideWaits(spans, waits) {
+                                    var out = []
+                                    var j = 0
+                                    for (var i = 0; i < spans.length; i++) {
+                                        var sp = spans[i], spEnd = sp.startNs + sp.durNs
+                                        while (j < waits.length && waits[j].startNs + waits[j].durNs < sp.startNs) j++
+                                        for (var k = j; k < waits.length && waits[k].startNs <= sp.startNs; k++) {
+                                            if (spEnd <= waits[k].startNs + waits[k].durNs) { out.push(sp); break }
+                                        }
+                                    }
+                                    return out
+                                }
+
+                                // Zoomed out: per column, busy = lane occupancy minus
+                                // wait occupancy (waits are nested in the lane's spans).
+                                function _paintBinsMinusWaits(ctx, view, syncBins) {
+                                    var bins = view.bins
+                                    if (!bins || bins.length === 0) return
+                                    var bw = width / bins.length
+                                    for (var i = 0; i < bins.length; i++) {
+                                        var v = bins[i]
+                                        var s = (syncBins && i < syncBins.length) ? syncBins[i] : 0
+                                        var busy = Math.max(0, v - s)
+                                        if (s > 0) {
+                                            ctx.globalAlpha = 0.15 + 0.25 * Math.min(1, s)
+                                            ctx.fillStyle = idleColor
+                                            ctx.fillRect(i * bw, 3, Math.max(1, bw), height - 6)
+                                        }
+                                        if (busy > 0) {
+                                            ctx.globalAlpha = 0.25 + 0.75 * busy
+                                            ctx.fillStyle = view.color
+                                            ctx.fillRect(i * bw, 3, Math.max(1, bw), height - 6)
+                                        }
+                                    }
+                                    ctx.globalAlpha = 1.0
+                                }
+
                                 onPaint: {
                                     var ctx = getContext("2d")
                                     ctx.reset()
+                                    var px = Math.max(1, Math.round(width))
                                     var view = TimelineModel.laneView(
-                                        laneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs,
-                                        Math.max(1, Math.round(width)), 2000)
+                                        laneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs, px, 2000)
                                     var scale = width / root.visibleNs
+                                    // The paired sync lane's waits (see syncOverlayLaneIndex):
+                                    // the same wall-clock interval belongs to both lanes, and
+                                    // on this one it is waiting, not work.
+                                    var syncView = syncOverlayLaneIndex >= 0
+                                        ? TimelineModel.laneView(syncOverlayLaneIndex, root.viewStartNs,
+                                                                 root.viewStartNs + root.visibleNs, px, 2000)
+                                        : null
                                     if (view.mode === "bins") {
                                         cachedSpans = []
-                                        _paintBins(ctx, view, 1.0)
-                                    } else {
-                                        cachedSpans = view.spans
-                                        _paintSpans(ctx, view.spans, scale, function(sp) { return sp.color }, 1.0)
-                                        _paintMatchHighlights(ctx, view.spans, scale)
-                                    }
-
-                                    // Overlay the paired sync lane's spans ON TOP,
-                                    // dimmed, so a barrier/critical-section wait
-                                    // nested inside one of the spans just painted
-                                    // above reads as visibly idle instead of being
-                                    // silently absorbed into the parent's solid
-                                    // "busy" color -- see syncOverlayLaneIndex's
-                                    // comment for why the same time interval can
-                                    // legitimately belong to both lanes at once.
-                                    if (syncOverlayLaneIndex >= 0) {
-                                        var syncView = TimelineModel.laneView(
-                                            syncOverlayLaneIndex, root.viewStartNs, root.viewStartNs + root.visibleNs,
-                                            Math.max(1, Math.round(width)), 2000)
-                                        if (syncView.mode === "bins") {
-                                            _paintBins(ctx, syncView, 0.8)
-                                            return
+                                        if (syncView && syncView.mode === "bins")
+                                            _paintBinsMinusWaits(ctx, view, syncView.bins)
+                                        else {
+                                            _paintBins(ctx, view, 1.0)
+                                            if (syncView) _paintWaits(ctx, syncView.spans, scale)
                                         }
-                                        var syncSpans = syncView.spans
-                                        // Each span's OWN per-function color (sp.color,
-                                        // the same field the sync lane's own bars use),
-                                        // not a flat category color -- so a given
-                                        // function (e.g. "omp_barrier") overlays here in
-                                        // the exact same hue it renders as on the sync
-                                        // lane directly below, letting the two be
-                                        // visually correlated at a glance.
-                                        _paintSpans(ctx, syncSpans, scale, function(sp) { return sp.color }, 0.8)
+                                        return
                                     }
+                                    cachedSpans = view.spans
+                                    _paintSpans(ctx, view.spans, scale, function(sp) { return sp.color }, 1.0)
+                                    if (syncView && syncView.mode === "bins") {
+                                        var dim = syncView.bins, bw = width / Math.max(1, dim.length)
+                                        ctx.fillStyle = idleColor
+                                        for (var b = 0; b < dim.length; b++) {
+                                            if (dim[b] <= 0) continue
+                                            ctx.globalAlpha = 0.6 * Math.min(1, dim[b])
+                                            ctx.fillRect(b * bw, 3, Math.max(1, bw), height - 6)
+                                        }
+                                        ctx.globalAlpha = 1.0
+                                    } else if (syncView) {
+                                        _paintWaits(ctx, syncView.spans, scale)
+                                        _paintSpans(ctx, _spansInsideWaits(view.spans, syncView.spans), scale,
+                                                    function(sp) { return sp.color }, 1.0)
+                                    }
+                                    _paintMatchHighlights(ctx, view.spans, scale)
                                 }
 
                                 MouseArea {
@@ -899,27 +984,19 @@ Item {
                                             }
                                         }
                                         // Skip the Python round-trip (spanAt) and repaint
-                                        // entirely when the hovered span hasn't actually
-                                        // changed -- onPositionChanged fires on every
-                                        // single mouse-moved pixel, not just on entering a
-                                        // new span, so without this guard a 500px-wide
-                                        // hover over one long span meant ~500 redundant
-                                        // Python calls + overlay repaints for no visible
-                                        // change at all.
+                                        // when the hovered span hasn't changed --
+                                        // onPositionChanged fires on every mouse-moved pixel,
+                                        // so without this guard a 500px hover over one long
+                                        // span means ~500 redundant Python calls + overlay
+                                        // repaints.
                                         //
                                         // NOTE: laneIndex is a property of the enclosing
-                                        // Canvas (laneCanvas), not of this MouseArea --
-                                        // QML does not resolve a parent item's custom
-                                        // properties unqualified from a nested child's
-                                        // scope, only via its id. Referencing bare
-                                        // `laneIndex` here throws a silent JS
-                                        // ReferenceError on every hover move (visible only
-                                        // via engine.warnings, which nothing was reading
-                                        // at runtime) -- hover was completely non-
-                                        // functional from when this screen was first
-                                        // built; only ever verified via static screenshots,
-                                        // never a real synthesized mouse move, so this
-                                        // never surfaced until tested with QTest.mouseMove.
+                                        // Canvas (laneCanvas), not of this MouseArea -- QML
+                                        // does not resolve a parent item's custom properties
+                                        // unqualified from a nested child's scope, only via
+                                        // its id. A bare `laneIndex` here throws a silent JS
+                                        // ReferenceError on every hover move (visible only via
+                                        // engine.warnings), disabling hover entirely.
                                         if (found === root.hoverSpanIdx && laneCanvas.laneIndex === root.hoverLane) return
                                         if (found >= 0) {
                                             root.hoverLane = laneCanvas.laneIndex
@@ -948,14 +1025,10 @@ Item {
 
                     // ── Connector overlay: spans every lane, draws only
                     // the hovered span's own MPI/NCCL edges ──────────────
-                    // Reparented to flick.contentItem (a ListView's own
-                    // internal scrolling Item, holding every delegate) so
-                    // this stays aligned with the lane rows as the user
-                    // scrolls -- a plain child of the ListView itself
-                    // would stay fixed to the viewport instead, verified
-                    // with an isolated repro (a Rectangle reparented to
-                    // contentItem, contentY moved, scenePos confirmed to
-                    // shift by the same amount) before relying on it here.
+                    // Reparented to flick.contentItem (the ListView's internal
+                    // scrolling Item, holding every delegate) so it stays
+                    // aligned with the lane rows while scrolling -- a plain
+                    // child of the ListView would stay fixed to the viewport.
                     Canvas {
                         id: overlay
                         parent: flick.contentItem
@@ -979,13 +1052,12 @@ Item {
                                     (c.succSpanIdx !== root.hoverSpanIdx || c.succLane !== root.hoverLane))
                                     continue
                                 // rowIndexForLane(), NOT the raw lane index, as the
-                                // row-position multiplier -- a row's visual position
-                                // and its underlying lane's real index diverge once
-                                // grouping/hiding/isolating/reordering (B3) are in
-                                // play; -1 means that lane isn't currently a visible
-                                // row at all (hidden, filtered out, or collapsed
-                                // inside a group), so its edges simply aren't drawn
-                                // rather than drawn at a wrong/stale position.
+                                // row-position multiplier -- a row's visual position and
+                                // its lane's index diverge under grouping/hiding/
+                                // isolating/reordering; -1 means that lane isn't a visible
+                                // row (hidden, filtered out, or collapsed inside a group),
+                                // so its edges aren't drawn rather than drawn at a stale
+                                // position.
                                 var predRow = TimelineModel.rowIndexForLane(c.predLane)
                                 var succRow = TimelineModel.rowIndexForLane(c.succLane)
                                 if (predRow < 0 || succRow < 0) continue
@@ -1006,11 +1078,10 @@ Item {
                         }
                     }
 
-                    // Row POSITIONS (not just which lanes exist) can shift
-                    // under grouping/hide/isolate/collapse/reorder (B3) even
-                    // while a connector is being shown for an already-
-                    // hovered span -- repaint so it never freezes at a
-                    // stale y-position after e.g. a group gets collapsed.
+                    // Row POSITIONS can shift under grouping/hide/isolate/
+                    // collapse/reorder while a connector is shown for an
+                    // already-hovered span -- repaint so it never freezes at a
+                    // stale y-position (e.g. after a group is collapsed).
                     Connections {
                         target: TimelineModel
                         function onRowsChanged() { overlay.requestPaint() }
@@ -1033,12 +1104,11 @@ Item {
 
                 property real dragStartNs: 0
                 property real dragStartX: 0
-                // Shift-drag selects a time range (Nav.selectedTimeRange,
-                // dormant since Round 16 -- feeds TimeRuler's highlighted
-                // band and "+ Range" below) instead of panning -- decided
-                // once at press time from the modifier held THEN, not
-                // re-evaluated mid-drag, so releasing/re-pressing Shift
-                // partway through a drag can't switch modes underneath it.
+                // Shift-drag selects a time range (Nav.selectedTimeRange --
+                // feeds TimeRuler's highlighted band and "+ Range" below)
+                // instead of panning -- decided once at press time from the
+                // modifier held THEN, so releasing/re-pressing Shift partway
+                // through a drag can't switch modes underneath it.
                 property bool selecting: false
                 property real selectStartNs: 0
 
@@ -1085,8 +1155,8 @@ Item {
                 // Double-click ON a span (root.hoverSpanIdx is kept live by
                 // each lane's own hover MouseArea, which passes clicks
                 // through via acceptedButtons: Qt.NoButton) zooms to and
-                // centers that event; double-click on empty canvas falls
-                // back to the original reset-view behavior.
+                // centers that event; double-click on empty canvas resets
+                // the view.
                 onDoubleClicked: {
                     if (root.hoverSpanIdx >= 0)
                         root.zoomToSpan(root.hoverLane, root.hoverSpanIdx)

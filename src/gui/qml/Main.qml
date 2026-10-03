@@ -44,14 +44,11 @@ ApplicationWindow {
         Menu {
             title: "File"
             MenuItem {
-                // "\t<sequence>" -- the standard Qt convention for a
-                // right-aligned shortcut hint in a menu item; used
-                // instead of MenuItem's own `shortcut` property, which
-                // this build's QtQuick.Controls style doesn't expose
-                // ("Cannot assign to non-existent property" at QML load
-                // time, confirmed directly, not assumed) -- the actual
-                // key handling still comes from the real Shortcut{}
-                // items below, this is purely the visual hint text.
+                // "\t<sequence>" -- the standard Qt convention for a right-aligned
+                // shortcut hint in a menu item; MenuItem's own `shortcut` property
+                // isn't exposed by this build's QtQuick.Controls style ("Cannot
+                // assign to non-existent property"). Key handling comes from the
+                // Shortcut{} items below; this is only the visual hint.
                 text: "Open Profile…\t" + Shortcuts.openProfileSequence
                 onTriggered: openProfileDialog.open()
             }
@@ -209,13 +206,11 @@ ApplicationWindow {
 
     // ── Tab content ──────────────────────────────────────────────────────
     // Each tab is behind a Loader, active only once selected (then stays
-    // loaded, so revisiting a tab doesn't rebuild it) -- a StackLayout
-    // with plain screen children instead builds and paints EVERY tab
-    // eagerly at startup, including the Timeline's per-lane Canvases
-    // (each doing a real Python round-trip via TimelineModel.visibleSpans
-    // on first paint), which was pure wasted work for the 7 tabs the user
-    // hasn't opened yet and a real, measured contributor to slow startup
-    // on a large trace.
+    // loaded, so revisiting a tab doesn't rebuild it) -- a StackLayout with
+    // plain screen children would build and paint EVERY tab eagerly at
+    // startup, including the Timeline's per-lane Canvases (each doing a
+    // Python round-trip via TimelineModel.visibleSpans on first paint),
+    // measurably slowing startup on a large trace.
     RowLayout {
         anchors.fill: parent
         anchors.margins: AppTheme.spacingLg
@@ -260,15 +255,12 @@ ApplicationWindow {
     Component { id: compareComp; CompareScreen {} }
 
     // ── "Open Profile" overlay ──────────────────────────────────────────
-    // Non-blocking: this window's own content underneath is completely
-    // untouched (never hidden, never a Loader gate) the entire time --
-    // "Open Profile" always spawns a genuinely new OS process (see
-    // controller.py's module docstring for why: a second Controls-
-    // loading QQmlApplicationEngine corrupts Controls resolution in this
-    // PySide6 build), and this window only ever closes itself once that
-    // new process signals it's actually showing something. A failure
-    // there leaves this workspace exactly as it was -- visually, not
-    // just architecturally.
+    // Non-blocking: this window's content underneath is never hidden or
+    // gated. "Open Profile" spawns a new OS process (see controller.py's
+    // module docstring: a second Controls-loading QQmlApplicationEngine
+    // corrupts Controls resolution in this PySide6 build), and this window
+    // closes itself only once that process signals it is showing a window.
+    // A failure there leaves this workspace exactly as it was.
     Item {
         id: openProfileOverlay
         objectName: "openProfileOverlay"

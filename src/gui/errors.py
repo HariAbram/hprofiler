@@ -1,20 +1,14 @@
 """
-Error classification for GUI profile loading (Phase 2 of the usability/
-persistence/loading overhaul). Pure Python, no Qt dependency -- produced
-on the loading worker thread (src/gui/loader.py), consumed by
-ErrorState.qml (via a QVariantMap-shaped dict) and the log (see
-logging_setup.py). Wraps the specific, currently-uncaught exception
-sites in src/output/chrome_trace.py's load_trace_from_json() and any
-bridge-construction failure, replacing "raw traceback crashes the
-subprocess" with a concise, classified, user-facing message plus the
-full original detail kept available (not discarded) for the expandable
-technical-details panel.
+Error classification for GUI profile loading. Pure Python, no Qt
+dependency -- produced on the loading worker thread (src/gui/loader.py),
+consumed by ErrorState.qml (via a QVariantMap-shaped dict) and the log
+(logging_setup.py). Wraps exception sites in trace loading and bridge
+construction into a concise, classified, user-facing message, keeping the
+full original detail for the expandable technical-details panel.
 
-Kind vocabulary is intentionally small and closed (an Enum, not free-form
-strings) so ErrorState.qml can switch on it for icon/color choice without
-guessing at string values, mirroring this project's established closed-
-vocabulary conventions elsewhere (e.g. Field's measured/derived/
-estimated/unavailable kind).
+The kind vocabulary is small and closed (an Enum, not free-form strings)
+so ErrorState.qml can switch on it for icon/color choice, like Field's
+measured/derived/estimated/unavailable kind.
 """
 from __future__ import annotations
 
@@ -129,6 +123,22 @@ def classify_load_exception(exc: BaseException, *, file: str = "", stage: str = 
         return HprofilerLoadError(
             kind=ErrorKind.INVALID_INPUT,
             message=f"{file or 'This path'} is a directory, not a trace file.",
+            detail=str(exc), file=file, stage=stage,
+        )
+    from ..core.store.disk import StoreError
+    import sqlite3
+    if isinstance(exc, StoreError):
+        # A damaged/incomplete .hpstore (missing or foreign shard, corrupt
+        # catalog, newer schema): the store's own message says which.
+        return HprofilerLoadError(
+            kind=ErrorKind.INVALID_INPUT,
+            message="This trace store can't be opened: " + str(exc).split(": ", 1)[-1],
+            detail=str(exc), file=file, stage=stage,
+        )
+    if isinstance(exc, sqlite3.DatabaseError):
+        return HprofilerLoadError(
+            kind=ErrorKind.INVALID_INPUT,
+            message="This trace store is damaged.",
             detail=str(exc), file=file, stage=stage,
         )
     if isinstance(exc, json.JSONDecodeError):

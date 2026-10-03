@@ -1,13 +1,10 @@
 /*
  * Standalone correctness + overhead stress test for hooks/common/ringbuffer.h.
- * Not wired into any hook (see that header's comment for why the ring
- * buffer itself is verified in isolation rather than through a live hook
- * this session) -- this is the verification for the ring buffer /
- * interning primitives themselves: concurrent producer/consumer
- * correctness under real pthread scheduling, drop-counter exactness under
- * intentional overflow, and a real (not guessed) latency comparison
- * against the mutex+syscall pattern it's meant to replace on hooks' hot
- * paths.
+ * Verifies the ring buffer / interning primitives in isolation (the hooks
+ * use rb_bytes_t through hooks/common/hp_transport.h): concurrent
+ * producer/consumer correctness under real pthread scheduling, drop-counter
+ * exactness under intentional overflow, and a measured latency comparison
+ * against a mutex+syscall pattern.
  *
  * Build:  gcc -O2 -pthread -Wall -Wextra -o ringbuffer_stress ringbuffer_stress.c
  * Run:    ./ringbuffer_stress

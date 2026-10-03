@@ -2,23 +2,18 @@ import QtQuick
 import Hprofiler 1.0
 
 // Consistent WHOLE-TAB state overlay -- loading/empty/unsupported/
-// cancelled/error/ready, one shared visual language for "this entire
-// screen has nothing else useful to show right now" across every tab.
-// Deliberately distinct from EmptyState (used independently ~18 times
-// across screens already, left untouched): EmptyState is a smaller,
-// PANEL-level "this one section has no rows" message that coexists
-// alongside other populated content on the SAME screen (e.g. Kernels
-// list empty while Inspector still shows something); ScreenState is
-// for when there's nothing ELSE on the tab at all.
+// cancelled/error/ready, one visual language for "this entire screen has
+// nothing else useful to show right now". Distinct from EmptyState, a
+// smaller PANEL-level "this one section has no rows" message that
+// coexists with other populated content on the same screen (e.g. Kernels
+// list empty while Inspector still shows something).
 //
-// An OVERLAY, not a gate: placed as a sibling on top of a screen's own
-// real content (same "anchors.fill/centerIn + visible" pattern every
-// existing EmptyState/LoadingState/ErrorState usage already follows in
-// this codebase), not a Loader wrapping/deferring that content's
-// construction -- keeps each screen's own layout exactly as it already
-// is, avoids adding another nested Loader/Component indirection layer
-// (a real, previously-hit bug class here: an extra Loader with no
-// explicit sizing can collapse content to zero size with zero warning).
+// An OVERLAY, not a gate: placed as a sibling on top of a screen's real
+// content (the "anchors.fill/centerIn + visible" pattern the other state
+// components use), not a Loader deferring that content's construction --
+// keeps each screen's layout as is and avoids another nested Loader (an
+// extra Loader with no explicit sizing can collapse content to zero size
+// with no warning).
 Item {
     id: root
     // "loading" | "empty" | "unsupported" | "cancelled" | "error" | "ready"

@@ -532,16 +532,17 @@ class _Explainer:
         self.cause: dict[int, str] = {}
         self.shift: dict[int, tuple[float | None, float | None]] = {}
         self.end_b: dict[int, float] = {}      # mean end offset within its candidate phase
+        self.end_a: dict[int, float] = {}      # ... and within its baseline phase
         both = lambda i: i.ka is not None and i.kb is not None  # noqa: E731
         self.paired = {i.id for i in c.identities if both(i)}
         for ident in c.identities:
-            self.shift[ident.id], self.end_b[ident.id] = self._offsets(ident)
+            self.shift[ident.id], self.end_b[ident.id], self.end_a[ident.id] = self._offsets(ident)
 
-    def _offsets(self, ident: Identity) -> tuple[tuple[float | None, float | None], float | None]:
+    def _offsets(self, ident: Identity) -> tuple[tuple[float | None, float | None], float | None, float | None]:
         """Mean change of (start, end) offset within aligned phases, and the
-        mean end offset in the candidate."""
+        mean end offset in the candidate and in the baseline."""
         pa, pb = self.c.pa, self.c.pb
-        ds, de, eb = [], [], []
+        ds, de, eb, ea = [], [], [], []
         for pair, (a, b) in ident.pairs.items():
             if a is None or b is None:
                 continue
@@ -550,9 +551,10 @@ class _Explainer:
             ds.append((b.first_start - b0) - (a.first_start - a0))
             de.append((b.last_end - b0) - (a.last_end - a0))
             eb.append(b.last_end - b0)
+            ea.append(a.last_end - a0)
         if not ds:
-            return (None, None), None
-        return (sum(ds) / len(ds), sum(de) / len(de)), sum(eb) / len(eb)
+            return (None, None), None, None
+        return (sum(ds) / len(ds), sum(de) / len(de)), sum(eb) / len(eb), sum(ea) / len(ea)
 
     def components(self, ident: Identity) -> dict[str, float]:
         a, b = ident.a, ident.b
@@ -634,36 +636,43 @@ class _Explainer:
         now = set(self.preds_b.get(ident.id, ()))
         return [(s, k) for s, k in self.preds_a.get(ident.id, ()) if s in self.paired and (s, k) not in now]
 
-    def chain(self, ident: Identity) -> list[int]:
-        """Upstream chain in the candidate graph: repeatedly the predecessor
-        whose end moved latest relative to its phase, until one whose own
-        measured time regressed (the origin) -- explains waits and moves
-        onto the critical path by what they waited for."""
+    def chain(self, ident: Identity, improved: bool = False) -> list[int]:
+        """Upstream chain explaining a wait or a move onto/off the critical
+        path by what it waited for: repeatedly the predecessor whose end
+        moved latest (a regression: candidate graph) or earliest (an
+        improvement: baseline graph, mirror image) relative to its phase,
+        until one whose own measured time regressed / improved -- the
+        origin. Symmetric so that swapping baseline and candidate swaps the
+        attribution instead of changing it."""
         c = self.c
+        preds = self.preds_a if improved else self.preds_b
+        ends = self.end_a if improved else self.end_b
+        sign = -1.0 if improved else 1.0
+        origin_status = cmp.STATUS_IMPROVED if improved else cmp.STATUS_REGRESSED
         out: list[int] = []
         seen = {ident.id}
         cur = ident.id
         tol = 50_000
         for _ in range(MAX_CHAIN):
             best, best_shift = None, 0.0
-            cur_end = self.end_b.get(cur)
-            for s, kind in self.preds_b.get(cur, ()):
+            cur_end = ends.get(cur)
+            for s, kind in sorted(preds.get(cur, ())):
                 if s in seen or kind not in _GATING_KINDS:
                     continue
                 # only work that finishes within the node's own span can have
                 # delayed it (identity edges also join iterations: the
                 # previous iteration's sync is not what this kernel waited for)
-                s_end = self.end_b.get(s)
+                s_end = ends.get(s)
                 if cur_end is not None and s_end is not None and s_end > cur_end + tol:
                     continue
                 end_shift = self.shift.get(s, (None, None))[1]
-                if end_shift is not None and end_shift > best_shift:
-                    best, best_shift = s, end_shift
+                if end_shift is not None and sign * end_shift > best_shift:
+                    best, best_shift = s, sign * end_shift
             if best is None or best_shift < c.noise_ns / 2:
                 break
             out.append(best)
             seen.add(best)
-            if self.status.get(best) == cmp.STATUS_REGRESSED and \
+            if self.status.get(best) == origin_status and \
                     self.cause.get(best) in ("increased_work", "more_invocations", "queueing"):
                 break
             cur = best
@@ -771,8 +780,8 @@ def compare_projections(pa: TraceProjection, pb: TraceProjection, *, trace_a=Non
             if a_own(ident) >= noise_ns:
                 removed.append(r)
             continue
-        if r["propagatedFrom"] is not None and (r["status"] == cmp.STATUS_REGRESSED or
-                                                r["criticalDeltaNs"] >= noise_ns):
+        if r["propagatedFrom"] is not None and (
+                r["status"] in (cmp.STATUS_REGRESSED, cmp.STATUS_IMPROVED) or abs(r["criticalDeltaNs"]) >= noise_ns):
             propagated.append(r)
         if r["impactStatus"] == cmp.STATUS_REGRESSED:
             contributors.append(r)
@@ -780,7 +789,7 @@ def compare_projections(pa: TraceProjection, pb: TraceProjection, *, trace_a=Non
             off_path.append(r)
         if r["status"] == cmp.STATUS_IMPROVED or r["impactStatus"] == cmp.STATUS_IMPROVED:
             improvements.append(r)
-    propagated.sort(key=lambda r: -max(r["ownDeltaNs"], r["criticalDeltaNs"]))
+    propagated.sort(key=lambda r: -max(abs(r["ownDeltaNs"]), abs(r["criticalDeltaNs"])))
     d_cp = pb.critical_total_ns - pa.critical_total_ns
     contrib_ns = sum(r["impactNs"] for r in contributors)
     off_ns = sum(r["impactNs"] for r in rows.values()
@@ -824,22 +833,25 @@ def _attribute_to_origins(rows: dict[int, dict], comp: _Comparison, noise_pct: f
         r["criticalDeltaNs"] = r["impactNs"]
         r["receivedNs"] = 0
         r["passedOnNs"] = 0
-    groups: dict[int, list[dict]] = defaultdict(list)
-    for r in rows.values():
-        o = r["propagatedFrom"]
-        if o is not None and o in rows and r["criticalDeltaNs"] > 0:
-            groups[o].append(r)
-    for o, symptoms in groups.items():
-        ro = rows[o]
-        base = max(ro["criticalDeltaNs"], 0)
-        total = sum(r["criticalDeltaNs"] for r in symptoms)
-        give = max(0, min(total, max(base, ro["ownDeltaNs"]) - base))
-        ro["impactNs"] = base + give
-        ro["receivedNs"] = give
-        residual = total - give
-        for r in symptoms:
-            r["impactNs"] = int(round(residual * r["criticalDeltaNs"] / total)) if total else 0
-            r["passedOnNs"] = r["criticalDeltaNs"] - r["impactNs"]
+    # regressions (sign +1) and, mirrored, improvements (sign -1): an
+    # improved wait is credited to the origin whose work shrank
+    for sign in (1, -1):
+        groups: dict[int, list[dict]] = defaultdict(list)
+        for r in rows.values():
+            o = r["propagatedFrom"]
+            if o is not None and o in rows and sign * r["criticalDeltaNs"] > 0:
+                groups[o].append(r)
+        for o, symptoms in groups.items():
+            ro = rows[o]
+            base = max(sign * ro["criticalDeltaNs"], 0)
+            total = sum(sign * r["criticalDeltaNs"] for r in symptoms)
+            give = max(0, min(total, max(base, sign * ro["ownDeltaNs"]) - base))
+            ro["impactNs"] = sign * (base + give)
+            ro["receivedNs"] = sign * give
+            residual = total - give
+            for r in symptoms:
+                r["impactNs"] = sign * int(round(residual * sign * r["criticalDeltaNs"] / total)) if total else 0
+                r["passedOnNs"] = r["criticalDeltaNs"] - r["impactNs"]
     idents = comp.identities
     for r in rows.values():
         ident = idents[r["id"]]
@@ -959,14 +971,16 @@ def _ident_row(ident: Identity, comp: _Comparison, ex: _Explainer, alignment_con
             evidence.append({"kind": "heuristic", "type": "phase_count",
                              "text": f"{ident.extra_b or ident.extra_a} invocation(s) in phases "
                                      f"{'inserted in' if ident.extra_b else 'removed from'} the run"})
-    chain_ids = ex.chain(ident) if (has_a and has_b and regress and cause in (
+    improve = not regress and cmp.STATUS_IMPROVED in (status, impact_status)
+    chain_ids = ex.chain(ident, improved=improve) if (has_a and has_b and (regress or improve) and cause in (
         "synchronization", "communication", "moved_onto_critical_path", "lost_overlap",
         "changed_dependency", "queueing")) else []
     chain = [{"identity": c, "label": _ident_label(idents[c]), "roles": idents[c].key.role_text(),
               "cause": ex.cause.get(c, ""), "status": ex.status.get(c, ""),
               "endShiftNs": ex.shift.get(c, (None, None))[1],
               "ownDeltaNs": idents[c].b.own_ns - idents[c].a.own_ns} for c in chain_ids]
-    origin = chain[-1] if chain and chain[-1]["status"] == cmp.STATUS_REGRESSED else None
+    origin = chain[-1] if chain and chain[-1]["status"] == (
+        cmp.STATUS_IMPROVED if improve else cmp.STATUS_REGRESSED) else None
     match_kind = "exact" if (has_a and has_b and ident.ka == ident.kb) else \
         ("structural" if has_a and has_b else ("new" if has_b else "removed"))
     explanation = _explain(ident, cause, components, measured, chain, origin, evidence, regress, noise_ns)
@@ -1055,13 +1069,15 @@ def _explain(ident: Identity, cause: str, comp: dict, measured: dict, chain: lis
                      f"critical-path time {f(a.critical_ns)} → {f(b.critical_ns)} (graph-derived)")
     if chain:
         hops = " ← ".join(f"{c['label']} ({c['roles']})" for c in chain)
+        labels = CAUSE_LABELS if regress else IMPROVEMENT_LABELS
         if origin is not None:
+            d = origin["ownDeltaNs"]
             parts.append(f"it waited for {hops}; origin: {origin['label']} "
-                         f"{CAUSE_LABELS.get(origin['cause'], origin['cause'])} "
-                         f"(+{f(origin['ownDeltaNs'])}, graph-derived, heuristic phase offsets)")
+                         f"{labels.get(origin['cause'], origin['cause'])} "
+                         f"({'+' if d >= 0 else '-'}{f(abs(d))}, graph-derived, heuristic phase offsets)")
         else:
-            parts.append(f"it waited for {hops}, which finished later (graph-derived, heuristic phase "
-                         "offsets)")
+            parts.append(f"it waited for {hops}, which finished {'later' if regress else 'earlier'} "
+                         "(graph-derived, heuristic phase offsets)")
     if not parts:
         parts.append(f"own time {f(a.own_ns)} → {f(b.own_ns)}")
     return "; ".join(parts)

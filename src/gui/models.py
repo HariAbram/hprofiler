@@ -1,15 +1,10 @@
 """
-QObject models backing the Timeline screen (Phase 4) and, later, the
-Kernels/Call Tree screens (Phase 5). Unlike bridge.py's DashboardBridge
-(small, fixed-size data exposed as plain QVariantList properties), the
-Timeline is span-count-sensitive -- a real GROMACS trace easily has tens
-of thousands of spans (this project's own Dardel test run captured
-60381) -- so lane/span data is fetched ON DEMAND via @Slot methods the
-QML Canvas calls with the current viewport (start_ns, end_ns, pixel
-width), not all at once as a constant Property. This mirrors
-TimelineWidget's own numpy-vectorized spatial-index approach
-(src/ui/app.py's _density_row) for the same reason: only compute what's
-actually visible.
+QObject models backing the Timeline screen. Unlike bridge.py's
+DashboardBridge (small, fixed-size data exposed as plain properties), the
+Timeline is span-count-sensitive -- a real GROMACS trace easily has tens of
+thousands of spans -- so lane/span data is fetched on demand via @Slot
+methods the QML Canvas calls with the current viewport (start_ns, end_ns,
+pixel width). Only what is visible is computed.
 """
 from __future__ import annotations
 
@@ -27,11 +22,9 @@ from ..analysis import activity_buckets
 from ..analysis import dashboard as dash
 
 # Same 16-hue palette concept as the TUI's _SPAN_PALETTE (src/ui/app.py),
-# independently expressed as hex since QML wants CSS colors, not Rich
-# style names. Order/hues deliberately mirror the TUI's so the same
-# function tends to land in a visually similar slot on both UIs, though
-# exact index parity isn't guaranteed (different palette sizes are fine
-# either way -- both use the same crc32-modulo-then-probe algorithm).
+# expressed as hex since QML wants CSS colors. Hue order mirrors the TUI's so
+# a function tends to land in a similar slot on both UIs; exact index parity
+# isn't guaranteed (both use crc32-modulo-then-probe over different sizes).
 _SPAN_HEX_PALETTE = [
     "#f87171", "#22d3ee", "#4ade80", "#e879f9", "#fbbf24", "#60a5fa",
     "#fb923c", "#c084fc", "#f472b6", "#2dd4bf", "#a3e635", "#facc15",
@@ -62,14 +55,12 @@ class TimelineModel(QObject):
     thousands) so it's a constant Property; span data within a lane is
     fetched per-viewport via visibleSpans().
 
-    `rows` (live, notify=rowsChanged) is the NEW visual row list added for
-    filtering/grouping -- group headers + filtered/ordered/hidden-aware
-    lane references -- that QML iterates instead of `lanes` directly. A
-    "lane" row always carries its ORIGINAL `laneIndex`, so `lanes`/
-    `visibleSpans`/`spanAt`/`findByName`/`callGraph` all keep their
-    existing physical-lane-index addressing completely unchanged --
-    Round 16's cross-tab navigation (Nav/Inspector, double-click-to-zoom)
-    is built on top of that addressing and must not need to change."""
+    `rows` (live, notify=rowsChanged) is the visual row list -- group
+    headers + filtered/ordered/hidden-aware lane references -- that QML
+    iterates instead of `lanes` directly. A "lane" row always carries its
+    ORIGINAL `laneIndex`, so `lanes`/`visibleSpans`/`spanAt`/`findByName`/
+    `callGraph` keep physical-lane-index addressing, which cross-tab
+    navigation (Nav/Inspector, double-click-to-zoom) relies on."""
 
     rowsChanged = Signal()
     filtersChanged = Signal()
@@ -78,6 +69,7 @@ class TimelineModel(QObject):
     searchChanged = Signal()
     bookmarksChanged = Signal()
     namedRangesChanged = Signal()
+    viewNoted = Signal()
 
     def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -120,14 +112,10 @@ class TimelineModel(QObject):
         self._lane_rank = lane_rank
 
         # Per-lane process/thread/stream identity for filtering
-        # (applyFilters()) -- a "lane" is one category/thread-or-stream
-        # combination, so these are derived once here rather than
-        # re-parsed per filter application. pid is "whichever process this
-        # lane's spans belong to" (first-seen, same convention as
-        # lane_rank above) -- in practice a lane never mixes pids since
-        # lane keys already partition by thread/stream id, which doesn't
-        # repeat across a single merged trace's processes in the traces
-        # this codebase has seen so far.
+        # (applyFilters()), derived once here rather than per filter
+        # application. pid is the first-seen process of the lane's spans
+        # (same convention as lane_rank above); lane keys partition by
+        # thread/stream id, so a lane is not expected to mix pids.
         self._lane_pid: dict[str, int] = {}
         self._lane_tid: dict[str, int | None] = {}
         self._lane_stream: dict[str, str | None] = {}
@@ -193,7 +181,7 @@ class TimelineModel(QObject):
         self._filters: dict[str, Any] = {}
         self._span_filt = None          # SpanFilter for the event-level filters
 
-        # Grouping/hide/isolate/reorder state (Phase B3) -- lane metadata only.
+        # Grouping/hide/isolate/reorder state -- lane metadata only.
         self._grouping: str = "none"
         self._group_collapsed: dict[str, bool] = {}
         self._hidden_lanes: set[str] = set()
@@ -232,21 +220,23 @@ class TimelineModel(QObject):
         self._lane_of_key = {(info.pid, (info.cat, info.kind, info.ident)): i
                              for i, info in ((self._lane_index[n], self._infos[n]) for n in self._lane_names)}
 
-        # Search state (Phase B4) -- also safe to init before anything
-        # else below needs it, same reasoning as filter/grouping state.
+        # Search state.
         self._search_active: bool = False
         self._search_matches: list[tuple[int, int]] = []
         self._search_match_set: set[tuple[int, int]] = set()
         self._search_cursor: int = -1
         self._search_starts: dict[tuple[int, int], int] = {}
 
-        # Bookmarks / named ranges (Phase B5) -- Timeline-specific view
-        # state, lives here rather than on Nav (cross-tab selection), same
-        # reasoning as the filter/grouping state above.
+        # Bookmarks / named ranges -- Timeline-specific view state, kept here
+        # rather than on Nav (cross-tab selection), like filter/grouping.
         self._bookmarks: list[dict[str, Any]] = []
         self._named_ranges: list[dict[str, Any]] = []
         self._next_bookmark_id: int = 1
         self._next_range_id: int = 1
+        # zoom / pan as last reported by the QML view (noteView), and the
+        # saved one to apply once when the view appears (restoredView)
+        self._noted_view: dict[str, float] = {}
+        self._restored_view: dict[str, float] = {}
 
         ext = self._store.span_extent(timed_only=True)
         if ext is not None:
@@ -708,11 +698,10 @@ class TimelineModel(QObject):
     def rowIndexForLane(self, lane_index: int) -> int:
         """Current POSITION within `rows` of the lane row carrying this
         original `laneIndex` -- -1 if that lane isn't currently visible
-        (hidden, filtered out, or inside a collapsed group). Connector-
-        overlay/any other "row N is at pixel Y" calculation must use this
-        instead of the raw laneIndex now that grouping/hide/isolate/
-        reorder can make a row's visual position differ from its lane's
-        original index."""
+        (hidden, filtered out, or inside a collapsed group). Any "row N is
+        at pixel Y" calculation (e.g. the connector overlay) must use this
+        rather than the raw laneIndex, since grouping/hide/isolate/reorder
+        make a row's visual position differ from its lane's index."""
         for pos, r in enumerate(self._rows):
             if r["kind"] == "lane" and r["laneIndex"] == lane_index:
                 return pos
@@ -811,10 +800,8 @@ class TimelineModel(QObject):
             "startNs": float(s.start_ns - self._view_start),
             "durNs": float(s.duration_ns),
             "tags": dict(s.tags),
-            # pid/tid: additive, for cross-tab navigation's
-            # Nav.selectThread() (see src/gui/nav.py) -- SpanEvent carries
-            # these as real dataclass fields, not tags entries, so they
-            # weren't reachable from a click handler without this.
+            # pid/tid for Nav.selectThread() (src/gui/nav.py) -- SpanEvent
+            # carries these as dataclass fields, not tags.
             "pid": s.pid,
             "tid": s.tid,
         }
@@ -846,7 +833,7 @@ class TimelineModel(QObject):
                     return out
         return out
 
-    # ── Color mode (Phase B4) ────────────────────────────────────────
+    # ── Color mode ───────────────────────────────────────────────────
     @Property(str, notify=colorModeChanged)
     def colorMode(self) -> str:
         return self._color_mode
@@ -856,7 +843,7 @@ class TimelineModel(QObject):
         self._color_mode = mode if mode in ("function", "bucket", "category") else "function"
         self.colorModeChanged.emit()
 
-    # ── Search (Phase B4) ────────────────────────────────────────────
+    # ── Search ───────────────────────────────────────────────────────
     @Property(int, notify=searchChanged)
     def searchMatchCount(self) -> int:
         return len(self._search_matches)
@@ -959,16 +946,14 @@ class TimelineModel(QObject):
         ]
         from ..analysis.call_graph import build_call_graph, layout_call_graph
         nodes, edges = build_call_graph(visible)
-        # 60, not the module default of 30: the panel now scrolls (a
-        # dynamically-sized Flickable canvas, sized off numLayers/
-        # maxLayerSize) instead of squeezing every node into one fixed
-        # 210px box, so a less aggressive cap no longer costs readability.
+        # 60, not the module default of 30: a scrolling consumer can show
+        # more nodes without losing readability.
         layout = layout_call_graph(nodes, edges, max_nodes=60)
         for n in layout["nodes"]:
             n["color"] = self._theme.categoryColor(n["category"])
         return layout
 
-    # ── Time ruler (Phase B5) ────────────────────────────────────────
+    # ── Time ruler ───────────────────────────────────────────────────
     @Slot(float, float, int, result='QVariantList')
     def timeTicks(self, view_start_ns: float, view_end_ns: float, target_ticks: int = 8) -> list[dict[str, Any]]:
         """"Nice" round-number tick positions across [view_start_ns,
@@ -1009,7 +994,7 @@ class TimelineModel(QObject):
             t += interval
         return ticks
 
-    # ── Bookmarks / named ranges (Phase B5) ──────────────────────────
+    # ── Bookmarks / named ranges ─────────────────────────────────────
     @Property('QVariantList', notify=bookmarksChanged)
     def bookmarks(self) -> list[dict[str, Any]]:
         return self._bookmarks
@@ -1050,4 +1035,110 @@ class TimelineModel(QObject):
     @Slot(int)
     def removeNamedRange(self, range_id: int) -> None:
         self._named_ranges = [r for r in self._named_ranges if r["id"] != range_id]
+        self.namedRangesChanged.emit()
+
+    # ── Persisted view state (settings.ViewStatePersister) ───────────
+    # Presentation state only: what is filtered, grouped, hidden and where
+    # the view is -- never span data. Restoring tolerates stale entries
+    # (lanes that no longer exist are dropped, malformed values ignored).
+    _FILTER_LISTS = ("ranks", "processes", "threads", "runtimes", "streams", "buckets")
+
+    @Slot(float, float)
+    def noteView(self, zoom: float, view_start_ns: float) -> None:
+        self._noted_view = {"zoom": float(zoom), "startOffsetNs": float(view_start_ns) - self._view_start}
+        self.viewNoted.emit()
+
+    @Property('QVariantMap', constant=True)
+    def restoredView(self) -> dict[str, float]:
+        """{"zoom", "viewStartNs"} saved for this profile ({} if none) --
+        TimelineScreen applies it once when it is created."""
+        v = self._restored_view
+        if not v:
+            return {}
+        return {"zoom": v["zoom"], "viewStartNs": self._view_start + v["startOffsetNs"]}
+
+    def export_view_state(self) -> dict[str, Any]:
+        return {
+            "filters": dict(self._filters),
+            "grouping": self._grouping,
+            "groupCollapsed": dict(self._group_collapsed),
+            "colorMode": self._color_mode,
+            "hiddenLanes": sorted(self._hidden_lanes),
+            "isolatedLanes": sorted(self._isolated_lanes) if self._isolated_lanes is not None else None,
+            "rowOrder": list(self._row_order) if self._row_order is not None else None,
+            "bookmarks": [dict(b) for b in self._bookmarks],
+            "namedRanges": [dict(r) for r in self._named_ranges],
+            "view": dict(self._noted_view or self._restored_view),
+        }
+
+    def restore_view_state(self, state: dict[str, Any]) -> None:
+        if not isinstance(state, dict):
+            return
+        lanes = set(self._lane_names)
+
+        def _lane_list(v) -> list[str]:
+            return [x for x in v if isinstance(x, str) and x in lanes] if isinstance(v, list) else []
+
+        f = state.get("filters")
+        if isinstance(f, dict):
+            clean: dict[str, Any] = {}
+            for k in self._FILTER_LISTS:
+                if isinstance(f.get(k), list):
+                    clean[k] = [x for x in f[k] if isinstance(x, (str, int, float))]
+            if isinstance(f.get("nameQuery"), str):
+                clean["nameQuery"] = f["nameQuery"]
+            for k in ("nameIsRegex", "timeRangeOnly", "activeOnly"):
+                if isinstance(f.get(k), bool):
+                    clean[k] = f[k]
+            for k in ("minDurationNs", "rangeStartNs", "rangeEndNs"):
+                if isinstance(f.get(k), (int, float)) and f[k] >= 0:
+                    clean[k] = f[k]
+            if clean.get("nameIsRegex") and clean.get("nameQuery"):
+                import re
+                try:
+                    re.compile(clean["nameQuery"])
+                except re.error:
+                    clean.pop("nameIsRegex")
+            self._filters = clean
+            self._recompute_event_mask()
+        if isinstance(state.get("grouping"), str):
+            g = state["grouping"]
+            self._grouping = g if g in ("rank", "process", "runtime", "device", "stream", "thread") else "none"
+        if isinstance(state.get("groupCollapsed"), dict):
+            self._group_collapsed = {str(k): bool(v) for k, v in state["groupCollapsed"].items()}
+        if state.get("colorMode") in ("function", "category", "bucket"):
+            self._color_mode = state["colorMode"]
+        self._hidden_lanes = set(_lane_list(state.get("hiddenLanes")))
+        iso = _lane_list(state.get("isolatedLanes"))
+        self._isolated_lanes = set(iso) if iso else None
+        order = _lane_list(state.get("rowOrder"))
+        in_order = set(order)
+        self._row_order = (order + [ln for ln in self._lane_names if ln not in in_order]) if order else None
+        lo, hi = self._view_start, self._view_end
+        bms = []
+        for b in state.get("bookmarks") or []:
+            if isinstance(b, dict) and isinstance(b.get("ns"), (int, float)) and lo <= b["ns"] <= hi:
+                bms.append({"id": len(bms) + 1, "ns": float(b["ns"]), "name": str(b.get("name", ""))[:200]})
+        self._bookmarks = sorted(bms, key=lambda b: b["ns"])
+        self._next_bookmark_id = len(bms) + 1
+        rngs = []
+        for r in state.get("namedRanges") or []:
+            if (isinstance(r, dict) and isinstance(r.get("startNs"), (int, float))
+                    and isinstance(r.get("endNs"), (int, float)) and lo <= r["startNs"] <= r["endNs"] <= hi):
+                rngs.append({"id": len(rngs) + 1, "startNs": float(r["startNs"]), "endNs": float(r["endNs"]),
+                             "name": str(r.get("name", ""))[:200]})
+        self._named_ranges = sorted(rngs, key=lambda r: r["startNs"])
+        self._next_range_id = len(rngs) + 1
+        v = state.get("view")
+        self._restored_view = {}
+        if isinstance(v, dict) and isinstance(v.get("zoom"), (int, float)) \
+                and isinstance(v.get("startOffsetNs"), (int, float)):
+            zoom = min(max(float(v["zoom"]), 1.0), 1e9)
+            off = min(max(float(v["startOffsetNs"]), 0.0), float(self._trace_dur))
+            self._restored_view = {"zoom": zoom, "startOffsetNs": off}
+        self._rebuild_rows()
+        self.filtersChanged.emit()
+        self.groupingChanged.emit()
+        self.colorModeChanged.emit()
+        self.bookmarksChanged.emit()
         self.namedRangesChanged.emit()

@@ -1,16 +1,10 @@
 """
-Process runner: launches the target program with profiling hooks injected.
-
-Environment setup per backend:
-  - CUDA hook:    LD_PRELOAD += libhprofiler_cuda.so
-  - OpenCL hook:  LD_PRELOAD += libhprofiler_opencl.so
-  - OMPT tool:    OMP_TOOL_LIBRARIES = libhprofiler_ompt.so
-  - ROCm:         LD_PRELOAD += libhprofiler_rocm.so  (or roctracer)
-  - perf:         perf record run alongside the process
-
-All hooks communicate back via a Unix socket written to HPROFILER_SOCKET.
-The runner binds the socket, forks/execs the target, and reads events
-until the process exits.
+Process runner: starts the target with the selected backends' hooks injected
+(LD_PRELOAD libraries, OMP_TOOL_LIBRARIES for the OMPT tool, perf and likwid
+alongside or around the process), collects the hooks' records from the
+HPROFILER_SOCKET Unix socket (src/core/receiver.py) into the trace store, and
+post-processes the run (GPU correlation, perf samples, source lines,
+counters, disassembly).
 """
 
 from __future__ import annotations
@@ -20,6 +14,7 @@ import re
 import resource
 from collections import deque
 import shutil
+import sys
 import socket
 import subprocess
 import threading
@@ -37,19 +32,13 @@ from . import gpu_activity
 
 HOOKS_DIR = Path(__file__).parent.parent.parent / "build" / "lib"
 
-# Wire protocol from C hooks: newline-delimited ASCII records
-# span:<category>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<tag=val>...]
-# inst:<category>:<pid>:<tid>:<ts_ns>:<name>
-# ctr:<category>:<pid>:<ts_ns>:<name>:<value>:<unit>
-# gpuact:<pid>:<cupti|rocprofiler>:<k=v,...>   native GPU tracer status
-#   (status/reason/clock/dropped...) -- see src/core/gpu_activity.py
-
-# Tags are always "key=val[,key=val...]" with no colons in them, so once a
-# candidate tail (everything after the *last* colon) matches this, it's the
-# tags segment and everything before it is the name — even if the name
-# itself contains colons (e.g. demangled C++ "Namespace::kernel", or an
-# NVTX label with a ':' in it). If it doesn't match, there's no tags segment
-# and the whole remainder is the name.
+# Wire records (DOCUMENTATION.md, "Wire protocol"): span:, inst:, ctr:,
+# stk:, gpuact:, pcsa:, xport:.
+#
+# Tags are "key=val[,key=val...]" without colons: if the text after the LAST
+# colon matches, it is the tags segment and everything before it is the name
+# (which may itself contain colons, e.g. "ns::kernel"); otherwise the whole
+# remainder is the name.
 _TAGS_RE = re.compile(r"^[^,=]+=[^,]*(,[^,=]+=[^,]*)*$")
 
 
@@ -99,12 +88,8 @@ def _parse_record(line: str) -> AnyEvent | None:
             )
         if kind == "inst" and len(parts) >= 6:
             cat, pid, tid, ts_ns = parts[1], int(parts[2]), int(parts[3]), int(parts[4])
-            # inst has one fewer leading numeric field than span (no dur_ns), so
-            # "name[:tags]" starts one position earlier (parts[5], not parts[6]).
-            # The top-level split(":", 6) was sized for span's shape, so for inst
-            # it may have already split *inside* a colon-containing name or tags
-            # blob before we get here -- rejoin everything from parts[5] onward
-            # so _split_name_tags sees the same undivided tail span: gets.
+            # inst: has no dur_ns field, so name[:tags] starts at parts[5];
+            # split(":", 6) may have split inside it, so rejoin.
             rest = ":".join(parts[5:])
             name, tags_str = _split_name_tags(rest)
             tags: dict = {}
@@ -137,17 +122,10 @@ def _parse_record(line: str) -> AnyEvent | None:
     return None
 
 
-# Maps (pid, tid) -> a small ring of recent SpanEvents from that thread, used
-# to attach a stk: record to the span: record it annotates.
-#
-# stk: records are sent immediately after their span: record on the same
-# connection, but each LD_PRELOAD hook (cuda/rocm/opencl/ompt/nccl/mpi) opens
-# its own socket connection with its own handler thread, so two different
-# hooks emitting from the same OS tid in close succession can interleave
-# across connections. A single last-write-wins slot could then have already
-# been overwritten by the other hook's span by the time this stk: record
-# arrives, even though the correct span is still very recent. Keep a short
-# ring instead of one slot and match by start_ns anywhere in it.
+# (pid, tid) -> recent spans, to attach a stk: record to its span:. A stk:
+# record follows its span on the same connection, but every hook library has
+# its own connection, so another hook's span from the same thread can arrive
+# in between; match by start_ns within a short ring.
 RECENT_SPANS_PER_THREAD = 8
 
 
@@ -177,30 +155,12 @@ def _find_recent_span(
 
 
 def _peer_real_exe(client: "socket.socket") -> str:
-    """Resolve the REAL executable path of whatever process is on the
-    other end of this Unix-domain socket connection, via SO_PEERCRED --
-    a kernel-verified credential (the accepting side cannot be lied to
-    about it), not anything a hook has to self-report.
-
-    Why this exists: CUDA/ROCm AoT disassembly (disasm_cuda_sass/
-    disasm_rocm_binary) disassembles the WHOLE BINARY, keyed off
-    `command[0]` -- unlike OpenMP/MPI's disasm, which resolves a specific
-    call site via dladdr inside the profiled process (sym=/symfile=
-    tags) and so already gets the right binary regardless of how the
-    process was launched. When `command[0]` is a launcher
-    (`hprofiler run -- srun -n 4 gmx_mpi ...`), it's `srun`, never the
-    real GPU binary, and there's no per-span tag to fall back on for
-    this whole-binary case. Every hook connects to HPROFILER_SOCKET from
-    INSIDE the real profiled process (that's how LD_PRELOAD hooking
-    works), so the peer credentials of that exact connection give the
-    real PID for free -- /proc/<pid>/exe then resolves to the real
-    binary, launcher or no launcher.
-
-    Returns "" (not an exception) on any failure -- a process that's
-    already exited by the time this runs, permission issues, or a non-
-    Linux platform (SO_PEERCRED is Linux-specific) are all just "we
-    don't know", the same as command[0] not existing today.
-    """
+    """Real executable of the process on the other end of this connection
+    (SO_PEERCRED, kernel-verified, then /proc/<pid>/exe). CUDA/ROCm AoT
+    disassembly reads the whole binary, and command[0] is a launcher (srun,
+    mpirun) when one wraps the program; hooks connect from inside the real
+    process, so its credentials name the right binary. "" on any failure
+    (process gone, permissions, non-Linux)."""
     import struct
     try:
         creds = client.getsockopt(
@@ -244,7 +204,7 @@ class Runner:
 
         server_sock = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
         server_sock.bind(sock_path)
-        server_sock.listen(16)
+        server_sock.listen(128)        # many ranks/processes may connect at once
         server_sock.settimeout(0.5)
 
         env = dict(os.environ)
@@ -343,95 +303,85 @@ class Runner:
         trace = Trace(metadata, store=self.store)
         self._trace = trace
 
-        events_lock = threading.Lock()
-        client_threads: list[threading.Thread] = []
-        _recent_spans: dict[tuple[int, int], deque[SpanEvent]] = {}
-        # Real exe path(s) of whatever process(es) actually connected to
-        # the socket -- see _peer_real_exe's docstring. A set, not a
-        # single value: an MPI job launches one hook connection per rank,
-        # typically all the same binary (SPMD), but nothing here assumes
-        # that -- collect_disasm() just needs ANY one real binary path,
-        # strictly better than the launcher command[0] it'd use otherwise.
-        _real_binary_paths: set[str] = set()
-
-        def handle_client(client: sock_mod.socket) -> None:
-            buf = ""
-            real_exe = _peer_real_exe(client)
-            if real_exe:
-                with events_lock:
-                    _real_binary_paths.add(real_exe)
+        # A disk-backed capture records its metadata and "running" state up
+        # front: if the collector itself dies, reopening the store says the
+        # capture is incomplete instead of looking like a finished run.
+        metadata.capture_health = {"state": "running"}
+        if trace.store.kind == "disk":
             try:
-                while True:
-                    data = client.recv(4096)
-                    if not data:
-                        break
-                    buf += data.decode("utf-8", errors="replace")
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        if line.startswith("stk:"):
-                            try:
-                                parts = line.strip().split(":", 4)
-                                if len(parts) == 5:
-                                    pid, tid, start_ns = int(parts[1]), int(parts[2]), int(parts[3])
-                                    # Frames may be plain "sym" or "sym|/lib.so|0xoffset"
-                                    frames = [f for f in parts[4].split(";") if f]
-                                    with events_lock:
-                                        span = _find_recent_span(_recent_spans, pid, tid, start_ns)
-                                        if span is not None:
-                                            span.stack_frames = frames
-                                            trace.update_span(span)
-                            except Exception:
-                                pass
-                        elif line.startswith("gpuact:"):
-                            parsed = gpu_activity.parse_status_line(line)
-                            if parsed is not None:
-                                with events_lock:
-                                    gpu_activity.record_status(trace, *parsed)
-                        elif line.startswith("pcsa:"):
-                            # pcsa:<pid>:<ts_ns>:<func_name>:<pc_offset_hex>:<stall_reason_int>:<count>
-                            try:
-                                parts = line.strip().split(":", 6)
-                                if len(parts) == 7:
-                                    func_name = parts[3]
-                                    pc_offset = int(parts[4], 16)
-                                    stall_reason = int(parts[5])
-                                    count = int(parts[6])
-                                    with events_lock:
-                                        trace.add_pc_sample(func_name, pc_offset, stall_reason, count)
-                            except Exception:
-                                pass
-                        else:
-                            ev = _parse_record(line)
-                            if ev is not None:
-                                with events_lock:
-                                    if isinstance(ev, SpanEvent):
-                                        _remember_recent_span(_recent_spans, ev)
-                                    trace.add(ev)
-                                if self.on_event:
-                                    self.on_event(ev)
+                trace.save()
             except Exception:
                 pass
-            finally:
-                client.close()
 
-        def accept_loop(stop_event: threading.Event) -> None:
-            while not stop_event.is_set():
+        _recent_spans: dict[tuple[int, int], deque[SpanEvent]] = {}
+        # Real executables of the connected processes (see _peer_real_exe);
+        # any one of them is enough for collect_disasm.
+        _real_binary_paths: set[str] = set()
+
+        def on_connect(client: sock_mod.socket) -> None:
+            real_exe = _peer_real_exe(client)
+            if real_exe:
+                _real_binary_paths.add(real_exe)
+
+        _KNOWN = ("span", "inst", "ctr")
+
+        def handle_line(line: str) -> None:
+            """One record from a hook (called by the receiver's parser thread,
+            in per-connection order). Unknown kinds and records that fail to
+            parse are counted, never silently skipped."""
+            kind = line.split(":", 1)[0]
+            if kind == "stk":
+                parts = line.strip().split(":", 4)
+                if len(parts) != 5:
+                    receiver.note_malformed(line)
+                    return
                 try:
-                    client, _ = server_sock.accept()
-                    t = threading.Thread(target=handle_client, args=(client,), daemon=True)
-                    t.start()
-                    client_threads.append(t)
-                    # Prune finished threads to prevent unbounded growth for large MPI jobs
-                    if len(client_threads) > 50:
-                        client_threads[:] = [th for th in client_threads if th.is_alive()]
-                except sock_mod.timeout:
-                    continue
-                except Exception:
-                    break
+                    pid, tid, start_ns = int(parts[1]), int(parts[2]), int(parts[3])
+                except ValueError:
+                    receiver.note_malformed(line)
+                    return
+                # Frames may be plain "sym" or "sym|/lib.so|0xoffset"
+                frames = [f for f in parts[4].split(";") if f]
+                span = _find_recent_span(_recent_spans, pid, tid, start_ns)
+                if span is not None:
+                    span.stack_frames = frames
+                    trace.update_span(span)
+            elif kind == "gpuact":
+                parsed = gpu_activity.parse_status_line(line)
+                if parsed is None:
+                    receiver.note_malformed(line)
+                else:
+                    gpu_activity.record_status(trace, *parsed)
+            elif kind == "pcsa":
+                # pcsa:<pid>:<ts_ns>:<func_name>:<pc_offset_hex>:<stall_reason_int>:<count>
+                parts = line.strip().split(":", 6)
+                try:
+                    if len(parts) != 7:
+                        raise ValueError
+                    trace.add_pc_sample(parts[3], int(parts[4], 16), int(parts[5]), int(parts[6]))
+                except ValueError:
+                    receiver.note_malformed(line)
+            elif kind in _KNOWN:
+                ev = _parse_record(line)
+                if ev is None:
+                    receiver.note_malformed(line)
+                    return
+                if isinstance(ev, SpanEvent):
+                    _remember_recent_span(_recent_spans, ev)
+                trace.add(ev)
+                if self.on_event:
+                    self.on_event(ev)
+            else:
+                receiver.note_unknown(kind)
 
-        stop_accept = threading.Event()
-        accept_thread = threading.Thread(target=accept_loop, args=(stop_accept,), daemon=True)
-        accept_thread.start()
+        from .receiver import Receiver
+        receiver = Receiver(server_sock, _sock_dir, trace, handle_line, on_connect=on_connect)
+        receiver.start()
+        # The parser thread is CPU-bound; a short switch interval lets the
+        # socket readers (which only recv and spool) run often enough to
+        # keep the hooks' rings drained. Restored after the capture.
+        _switch_interval = sys.getswitchinterval()
+        sys.setswitchinterval(0.0005)
 
         # ── LIKWID command wrapping ───────────────────────────────────────────
         # likwid-perfctr must be the outer process; env vars (incl. HPROFILER_SOCKET)
@@ -479,14 +429,11 @@ class Runner:
                 perf_data = None
 
         # ── Attach perf stat for CPU microarch counters ───────────────────────
-        # Run for any backend where CPU-side behaviour is interesting:
-        # cpu/openmp/likwid are obviously CPU-bound; opencl dispatches from the
-        # CPU so IPC/cache-miss still give useful context.
+        # For every backend that runs on or dispatches from the CPU: IPC and
+        # cache misses also explain CPU-side launch and data-preparation costs
+        # in GPU/MPI programs.
         perf_stat_proc: subprocess.Popen | None = None
         perf_stat_file: str | None = None
-        # Collect CPU microarch counters for any backend that dispatches from CPU.
-        # GPU backends (cuda/rocm/nccl/mpi) are included because IPC and cache-
-        # miss rates help diagnose CPU-side launch overhead and data-prep costs.
         _cpu_backends = {"cpu", "openmp", "likwid", "opencl", "cuda", "rocm", "nccl", "mpi"}
         if shutil.which("perf") and any(b in self.backends for b in _cpu_backends):
             fd, perf_stat_file = tempfile.mkstemp(suffix=".perf_stat.txt", prefix="hprofiler_")
@@ -541,11 +488,14 @@ class Runner:
 
         gpu_thread.join(timeout=2)
 
-        stop_accept.set()
-        accept_thread.join(timeout=2)
-        for t in client_threads:
-            t.join(timeout=1)
+        # Every connection's data is ingested before post-processing: wait
+        # for EOF on all of them (bounded, reported) and for the parser to
+        # work through the backlog the program left behind.
+        import sys as _sys_rx
+        _sys_rx.setswitchinterval(_switch_interval)
+        receiver.finish(progress=lambda msg: print(f"[hprofiler] {msg}", file=_sys_rx.stderr))
         server_sock.close()
+        metadata.capture_health = {"state": "complete", **receiver.health()}
         try:
             os.unlink(sock_path)
         except OSError:
@@ -565,6 +515,12 @@ class Runner:
             import sys as _sys_ga
             print(f"[hprofiler][warn] GPU activity correlation failed: {exc!r} -- "
                   "device spans are left uncorrelated", file=_sys_ga.stderr)
+
+        # Incomplete capture / degraded device tracing: say so now (the
+        # same list is stored with the trace and shown by `summary`/GUI).
+        from .receiver import run_warnings
+        for _w in run_warnings(metadata):
+            print(f"[hprofiler][warn] {_w}", file=_sys_rx.stderr)
 
         # ── Parse perf record output ──────────────────────────────────────────
         if perf_data and Path(perf_data).exists():
@@ -596,13 +552,10 @@ class Runner:
             msg = _total_zero_event_warning(self.backends, self.command)
             print(msg, file=_sys1.stderr)
 
-        # ── OpenMP zero-event sanity check ────────────────────────────────────
-        # Two independent capture paths are injected together (see
-        # src/backends/openmp.py's module docstring): OMPT (needs LLVM
-        # libomp) and direct GOMP_* interception (needs GNU libgomp, no
-        # OMPT dependency). If BOTH produced zero events, something else is
-        # wrong — warn with troubleshooting steps for both paths rather
-        # than assuming which one should have worked.
+        # ── OpenMP zero-event check ───────────────────────────────────────────
+        # Both capture paths (OMPT for LLVM libomp, GOMP_* interception for GNU
+        # libgomp) are injected; if neither produced events, give
+        # troubleshooting steps for both.
         if "openmp" in self.backends:
             import sys as _sys2
             if next(iter(trace.iter_spans(categories=("openmp",))), None) is None:
@@ -849,33 +802,12 @@ _LAUNCHER_NAMES = {"srun", "mpirun", "mpiexec", "aprun", "jsrun", "ibrun"}
 
 
 def _total_zero_event_warning(backends: list[str], command: list[str]) -> str:
-    """
-    Message for when a run completes but captures ZERO events of any
-    kind across every active backend -- a much stronger signal than any
-    one backend's own zero-event check (see the "openmp" one right after
-    this is used in .run()): it means the hooks never connected to the
-    collector socket for this entire run, not that one backend's
-    particular constructs simply weren't exercised.
-
-    A real user hit exactly this running via `srun` (SLURM): the run
-    completed normally (GROMACS printed its full performance summary)
-    but captured zero spans of any kind, then the IDENTICAL command
-    captured 60381 events on the very next invocation with no code
-    change in between. Every hook's ensure_connected() is retried on
-    every single emit call, not just once at process startup, so a
-    transient "listener wasn't ready yet" race would only ever lose the
-    first few events -- not literally all of them across a multi-second
-    run. A total loss for the whole run instead points to
-    HPROFILER_SOCKET/LD_PRELOAD never having reached the profiled
-    process's environment at all, which is exactly what happens when a
-    job launcher (srun/mpirun/aprun/...) doesn't propagate the parent
-    environment to the process(es) it actually spawns -- SLURM in
-    particular can do this depending on site defaults / whether
-    `--export` was set, and it can be intermittent (site-dependent
-    scheduling/environment-cache behavior), matching the user's "works
-    on the very next run" report -- not something hprofiler's own retry
-    logic can work around from inside the already-spawned process.
-    """
+    """Warning for a run that captured no events from any backend: the hooks
+    never reached the collector, typically because a job launcher (srun,
+    mpirun, aprun, ...) did not pass HPROFILER_SOCKET/LD_PRELOAD to the
+    processes it started. With SLURM this depends on site defaults and
+    --export and can be intermittent, so launcher-specific advice is given
+    when the command is a known launcher."""
     launcher = command[0] if command else ""
     launcher_hint = ""
     if launcher in _LAUNCHER_NAMES:
@@ -947,20 +879,12 @@ def _collect_disasm(
     perf_data: str | None = None,
     real_binary_paths: "set[str] | None" = None,
 ) -> None:
-    """
-    Post-run: extract disassembly for all profiled kernels and attach to trace.
+    """Post-run: extract disassembly for the profiled kernels and attach it.
 
-    JIT .so paths come from spans emitted by the OpenCL hook when it
-    intercepts dlopen of ACPP SSCP .jit.so files (tag type=jit_load, path=...).
-
-    real_binary_paths: real exe path(s) resolved via SO_PEERCRED on each
-    hook's socket connection (see _peer_real_exe) -- the actual profiled
-    binary, correct regardless of whether `command[0]` is a launcher
-    (`srun`/`mpirun`). Passed through to collect_disasm() for the CUDA/
-    ROCm AoT disasm paths, which (unlike OpenMP/MPI's dladdr-resolved
-    sym=/symfile= tags) disassemble the whole binary keyed off
-    command[0] and had no launcher-aware fallback at all until this.
-    """
+    ACPP SSCP .jit.so paths come from the OpenCL hook's jit_load spans.
+    real_binary_paths: the connected processes' executables (_peer_real_exe),
+    used by the whole-binary CUDA/ROCm AoT paths when command[0] is a
+    launcher."""
     # Resolve the binary path: it may be relative (e.g. './main').
     # Use the saved cwd from the trace metadata to make it absolute.
     cwd = trace.metadata.cwd or ""
@@ -1003,26 +927,10 @@ def _collect_disasm(
                     "so_path": "",
                     "path":    jit_path,
                 })
-        # OpenMP/MPI/CPU: extract the first resolved codeptr info per span
-        # name. Hook emits sym=<mangled> (dladdr success) or
-        # lib=<path>,offset=0x<off> (fallback) -- "mpi" was missing here
-        # even though mpi_hook.c's collectives + MPI_Barrier do emit these
-        # tags, so an MPI span's own call-site info was silently never
-        # looked at; the Source tab's kernel list includes every profiled
-        # span name (not just GPU kernels), so MPI_Bcast/MPI_Allreduce/
-        # MPI_Barrier showed up there with "No disassembly available"
-        # unconditionally, not because objdump was missing.
-        #
-        # sym=<mangled> is paired with an optional symfile=<path> -- the
-        # ELF file dladdr() actually found the symbol in. The profiled
-        # command is routinely a launcher wrapping the real binary
-        # (`hprofiler run -- srun -n 4 gmx_mpi ...`), so command[0] (what
-        # collect_disasm() used to assume was always the right file to
-        # `nm`/disassemble) is `srun`, not the profiled program -- a real
-        # user's genuinely-resolved sym= still produced "No disassembly
-        # available" for exactly this reason. symfile is None when the
-        # hook build predates this fix; collect_disasm() falls back to
-        # command[0] in that case, same as before.
+        # OpenMP/MPI/CPU spans: the first resolved call site per span name --
+        # sym=<mangled> (+ symfile=, the ELF dladdr found it in; the command
+        # may be a launcher) or lib=<path>,offset=0x<off>. Without symfile=
+        # (older hooks) collect_disasm() falls back to command[0].
         if span.category.value in ("openmp", "sync", "cpu", "mpi") and span.name not in omp_syms:
             sym = span.tags.get("sym", "")
             if sym:
@@ -1049,10 +957,8 @@ def _collect_disasm(
             sm_version = f"sm_{major}{minor}"
             break
 
-    # Any ONE real binary path is strictly better than command[0] when
-    # that's a launcher -- for the common SPMD case (all ranks running
-    # the same binary) any one is correct; picking one is not an attempt
-    # at "the right" rank, there generally isn't a wrong one here.
+    # Any connected binary beats a launcher command[0] (SPMD: every rank runs
+    # the same binary).
     real_binary = next(iter(real_binary_paths), "") if real_binary_paths else ""
 
     try:
@@ -1196,28 +1102,14 @@ def _resolve_jit_sym(addr: int, so_path: str) -> str:
 
 
 def _parse_perf_script(perf_data: str, trace: Trace, freq: int = 99) -> None:
-    """
-    Parse perf script output into SpanEvents.
+    """Parse `perf script` output into SpanEvents.
 
-    Handles both formats:
-      Flat:  comm pid ts: period event: addr sym (dso)
-      Stack: same header followed by indented frame lines, blank-line separated.
-
-    In stack mode (--perf-callgraph was passed), each SAMPLE becomes ONE
-    SpanEvent -- name=the leaf/currently-executing frame, stack_frames=the
-    ancestor chain (innermost-first, same convention hook-captured spans
-    already use) -- not one span per frame per sample the way this used
-    to work. That old shape (N spans per sample, duration_ns=0,
-    stack_frames never set, the whole stack redundantly duplicated as a
-    string in tags["stack"]) was invisible to analysis/call_tree.py's
-    _ct_build (requires duration_ns>0 AND stack_frames truthy) and only
-    ever got consumed by analysis/cct.py's own separate tag-string
-    re-parser -- which already prefers span.stack_frames when present
-    (cct.py's _extract_frames, checked first), so this needs no matching
-    change there. `duration_ns` is a nominal per-sample weight
-    (1e9/freq ns, i.e. "this sample represents one sampling interval"),
-    the same assumption perf's own report/annotate percentages already
-    make -- there's no real "duration" for a single sampled instant.
+    Flat format: one line per sample, a zero-duration span each. Stack format
+    (--perf-callgraph): a header line followed by indented frames, samples
+    separated by blank lines; each sample becomes ONE span named after its
+    leaf frame, with the ancestors as stack_frames (innermost first) and a
+    nominal duration of one sampling interval (1e9/freq ns) -- the weight
+    perf report itself assumes.
     """
     try:
         result = subprocess.run(
@@ -1268,10 +1160,7 @@ def _parse_perf_script(perf_data: str, trace: Trace, freq: int = 99) -> None:
     cur_ts: int = 0
     cur_top_sym = ""
     cur_stack: list[str] = []
-    # Nominal per-sample weight: each sample stands in for one sampling
-    # interval's worth of wall time. Only used in stack mode -- the flat
-    # (no --perf-callgraph) path below is intentionally left at
-    # duration_ns=0, unchanged, out of scope for this fix.
+    # Nominal per-sample weight (stack format only; flat samples keep 0).
     sample_weight_ns = max(1, round(1_000_000_000 / freq)) if freq > 0 else 1
 
     def _flush():
@@ -1279,11 +1168,8 @@ def _parse_perf_script(perf_data: str, trace: Trace, freq: int = 99) -> None:
             return
         rel_ts = cur_ts
         if cur_stack:
-            # cur_stack is innermost-first (backtrace order) exactly as
-            # appended -- cur_stack[0] is the leaf/currently-executing
-            # frame, cur_stack[1:] is its ancestor chain, already in the
-            # same innermost-first order SpanEvent.stack_frames expects
-            # (see core/events.py's field comment) -- no reversal needed.
+            # cur_stack is innermost-first: [0] is the leaf, [1:] the
+            # ancestors, already in stack_frames order.
             leaf = cur_stack[0]
             trace.add(SpanEvent(
                 name=leaf, category=Category.CPU,

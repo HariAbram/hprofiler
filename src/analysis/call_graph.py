@@ -116,8 +116,7 @@ def layout_call_graph(
     FIXED pixel size and spacing regardless of how many total
     layers/nodes there are (normalized x/y alone can't do this: cramming
     a layer of 10 nodes into the same fixed pixel height as a layer of
-    2 is exactly what made nodes visually overlap in the GUI's call-graph
-    panel before this field existed), sizing a scrollable canvas to fit
+    2 makes nodes visually overlap), sizing a scrollable canvas to fit
     instead of squeezing everything into one fixed viewport.
     """
     kept = nodes[:max_nodes]

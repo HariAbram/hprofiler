@@ -1,38 +1,28 @@
 """
-Real-interaction tests for src/gui/qml/screens/TimelineScreen.qml, using a
-single shared Main.qml load for the whole module (see TestTimelineHover's
-own docstring for why: a second independent QQmlApplicationEngine loading
-Main.qml later in the same process was found, empirically, to corrupt Qt
-Quick Controls' component resolution under this offscreen QPA platform --
-not specific to any one control type, confirmed by reproducing it with two
-unrelated components (Fusion style's ToolButton/ButtonPanel, then Basic
-style's StatCard) depending on which style got resolved first. All Timeline
-QML-interaction coverage therefore lives in ONE test class/engine here,
-not split across files the way tests/test_gui_*.py otherwise are.
+Real-interaction tests for src/gui/qml/screens/TimelineScreen.qml (and the
+other screens' QML interaction), using a single shared Main.qml load for
+the whole module: a second independent QQmlApplicationEngine loading
+Main.qml in the same process corrupts Qt Quick Controls' component
+resolution under the offscreen QPA platform (reproduced with unrelated
+components -- Fusion's ToolButton/ButtonPanel, Basic's StatCard -- depending
+on which style resolved first). All QML-interaction coverage therefore
+lives in ONE test class/engine here, not split across files the way
+tests/test_gui_*.py otherwise are.
 
-Originally just the hover regression below. Root cause of THAT bug: the
-per-lane Canvas's `laneIndex` property was referenced UNQUALIFIED from its
-child MouseArea's onPositionChanged/onExited handlers -- QML does not
-resolve a parent item's custom properties by bare name from a nested
-child's scope, only via the parent's own `id` (here: `laneCanvas.laneIndex`).
-The bare reference threw a JS ReferenceError on every single hover move,
-reported only via engine.warnings (which nothing at runtime was
-watching), so it was completely silent: no crash, no visible error, the
-hover callback just never did anything useful.
+The hover tests guard a nested-scope bug class: the per-lane Canvas's
+`laneIndex` referenced UNQUALIFIED from its child MouseArea's handlers.
+QML does not resolve a parent item's custom properties by bare name from a
+nested child's scope, only via the parent's `id` (`laneCanvas.laneIndex`);
+the bare reference throws a JS ReferenceError on every hover move,
+reported only via engine.warnings -- no crash, no visible error. Only a
+synthesized mouse move (QTest.mouseMove) makes this observable, so these
+tests use real input, not static rendering checks. Loads the real Main.qml
+(not TimelineScreen.qml standalone) so the Timeline gets the same
+StackLayout-driven sizing as the real app.
 
-This was never caught by the project's existing static/screenshot-based
-QML verification (see project_qml_gui memory) because none of it
-synthesized a real mouse move -- this test does, via QTest.mouseMove,
-which is the only way this specific bug class (working QML that still
-throws at a nested-scope property reference) is actually observable.
-Loads the real Main.qml (not TimelineScreen.qml standalone) so the
-Timeline gets the same StackLayout-driven sizing it has in the real app,
-rather than reproducing that sizing by hand in the test.
-
-Requires a real Qt platform plugin (offscreen is enough -- QTest event
-delivery works the same as a real window, just without visible pixels).
-Skipped entirely if PySide6 isn't installed, matching this project's
-other GUI tests.
+Requires a Qt platform plugin (offscreen is enough -- QTest event delivery
+works the same as a real window, just without visible pixels). Skipped if
+PySide6 isn't installed, like the other GUI tests.
 """
 import os
 import sys
@@ -136,9 +126,7 @@ class TestTimelineHover(unittest.TestCase):
         # no stored reference lets them get garbage-collected almost
         # immediately, which is exactly what "singleton has already been
         # deleted" / "returns a null pointer" below means. This is the
-        # same PySide6 lifetime gotcha documented in project_qml_gui
-        # memory for src/gui/app.py, reproduced here by first getting it
-        # wrong the same way.
+        # same PySide6 lifetime requirement src/gui/app.py follows.
         cls._theme = Theme(dark=True)
         cls._app_info = _AppInfo()
         cls._dashboard = DashboardBridge(cls._trace, cls._theme)
@@ -276,33 +264,27 @@ class TestTimelineHover(unittest.TestCase):
         kernels_tooltip = self._root.findChild(QObject, "dataTableTooltip_Kernels")
         if kernels_tooltip is not None:
             kernels_tooltip.setProperty("visible", False)
-        # Timeline filters (Phase B2) are process-lifetime model state too
-        # -- a test that applies one and forgets to clear it would
-        # otherwise leak into e.g. test_row_list_scales_to_many_lanes...'s
-        # hardcoded len(rows)==44 assertion, depending on alphabetical
-        # test order.
+        # Timeline filters are process-lifetime model state too -- a test
+        # that applies one and forgets to clear it would leak into e.g.
+        # test_row_list_scales_to_many_lanes...'s hardcoded len(rows)==44
+        # assertion, depending on alphabetical test order.
         self._timeline_model.clearFilters()
         filter_popup = self._root.findChild(QObject, "timelineFilterPopup")
         if filter_popup is not None and filter_popup.property("visible"):
             filter_popup.setProperty("visible", False)
-        # Grouping/hide/isolate (Phase B3) are the same kind of process-
-        # lifetime model state as filters above -- reset for the same
-        # reason (test-order independence, protects the hardcoded
-        # len(rows)==44 assertion elsewhere).
+        # Grouping/hide/isolate: same process-lifetime state, same reset.
         self._timeline_model.setGrouping("none")
         self._timeline_model.showAllLanes()
         group_popup = self._root.findChild(QObject, "timelineGroupPopup")
         if group_popup is not None and group_popup.property("visible"):
             group_popup.setProperty("visible", False)
-        # Search/color-mode (Phase B4) -- same process-lifetime state
-        # reset as filters/grouping above.
+        # Search/color-mode: same process-lifetime state reset.
         self._timeline_model.clearSearch()
         self._timeline_model.setColorMode("function")
         search_field = self._root.findChild(QObject, "timelineSearchField")
         if search_field is not None and search_field.property("text"):
             search_field.setProperty("text", "")
-        # Bookmarks/named ranges (Phase B5) -- same process-lifetime state
-        # reset as filters/grouping/search above.
+        # Bookmarks/named ranges: same process-lifetime state reset.
         for b in list(self._timeline_model.bookmarks):
             self._timeline_model.removeBookmark(b["id"])
         for r in list(self._timeline_model.namedRanges):
@@ -317,26 +299,18 @@ class TestTimelineHover(unittest.TestCase):
 
     def _stable_center(self, item: QObject) -> QPoint:
         """`item`'s scene-space center, waited for RowLayout/ColumnLayout
-        geometry polish to actually settle first -- a real bug found via
-        direct diagnostics while chasing a flaky search-bar click test:
-        reading mapToScene() right after a sibling's visibility/text
-        change (e.g. a status Text becoming visible, which resizes the
-        whole row and shifts every button after it) can return a STALE
-        pre-layout position where several siblings all still report the
-        SAME point -- and critically, plain processEvents() calls (no
-        matter how many) don't reliably flush it: Qt Quick's layout
-        polish is tied to the render/timer loop, which only actually
-        advances when real wall-clock time passes (QTest.qWait), not
-        merely when the Python event queue is drained. A click computed
-        from the stale position reads as "on the right button" in the
-        test but can land on a totally different, still-overlapping
-        neighbor at runtime (confirmed via direct diagnostics: this
-        silently clicked "Clear" instead of "Next" in the search bar,
-        wiping the very search state the test was about to verify; a
-        processEvents()-only wait loop reproduced this in ~50% of runs,
-        while switching to qWait here reproduced it 0/5 times). Polls
-        until two consecutive reads agree, a real settle condition, not
-        a guessed iteration count."""
+        geometry polish to settle first: reading mapToScene() right after a
+        sibling's visibility/text change (e.g. a status Text becoming
+        visible, which resizes the row and shifts every button after it)
+        can return a STALE pre-layout position where several siblings
+        report the SAME point. processEvents() calls (however many) don't
+        reliably flush it -- Qt Quick's layout polish is tied to the
+        render/timer loop, which advances only when wall-clock time passes
+        (QTest.qWait). A click computed from the stale position can land on
+        a different, overlapping neighbor (e.g. "Clear" instead of "Next"
+        in the search bar; ~50% of runs with a processEvents()-only wait,
+        0/5 with qWait). Polls until two consecutive reads agree -- a real
+        settle condition, not a guessed iteration count."""
         prev = None
         for _ in range(40):
             QTest.qWait(10)
@@ -354,10 +328,8 @@ class TestTimelineHover(unittest.TestCase):
         # real hover path (mouse event -> MouseArea -> laneIndex ->
         # TimelineModel.spanAt -> hoverText) works end to end. Both
         # lanes' spans cover the FULL trace duration at zoom 1.0x, so
-        # any x within a lane row hits something. Range starts at 150 (not
-        # the old 70) -- the lanes area now sits below the bookmarks/
-        # legend row and TimeRuler added in Phase B5, pushing it down by
-        # roughly 110px from where it used to start.
+        # any x within a lane row hits something. Range starts at 150:
+        # the lanes area sits below the bookmarks/legend row and TimeRuler.
         for y in range(150, 300, 10):
             for x in (150, 400, 700, 1000):
                 self._move_to(QPoint(x, y))
@@ -368,20 +340,14 @@ class TestTimelineHover(unittest.TestCase):
     def _find_target_event_point(self) -> QPoint | None:
         """Sweeps for the short "target_event" span (3rd lane row),
         shared by both the double-click-to-zoom and click-to-select
-        tests. Wrapped in a bounded outer retry -- the fixture's row
-        count grew (see _build_trace()'s extra lanes, added for the
-        row-virtualization test) enough that this single-pass sweep,
-        which used to succeed reliably first-try, was empirically found
-        to occasionally miss under the added per-move Canvas repaint
-        cost, the same "synthetic input isn't 100% deterministic under
-        offscreen QPA on the first pass" class already documented for
-        this file's FlameGraph-tooltip and Call-Tree-click tests -- same
-        remedy, not a new one. Range starts at 150, not the old 70, and
-        extends further down (420 vs. 260) -- the lanes area sits lower
-        now (Phase B5's bookmarks/legend row + TimeRuler above it), and
-        under grouping (see the grouping-specific test using this helper)
-        target_event's row can sit several rows deeper than in the flat,
-        ungrouped case."""
+        tests. Wrapped in a bounded outer retry: with the fixture's many
+        lanes (see _build_trace()), the per-move Canvas repaint cost makes
+        a single-pass sweep occasionally miss -- synthetic input isn't 100%
+        deterministic on the first pass under offscreen QPA (same remedy as
+        the FlameGraph-tooltip and Call-Tree-click tests). The range starts
+        at 150 and extends to 420: the lanes area sits below the
+        bookmarks/legend row + TimeRuler, and under grouping target_event's
+        row can sit several rows deeper than in the flat case."""
         for _attempt in range(3):
             for y in range(150, 420, 10):
                 for x in range(140, int(self._window.width() * 0.9), 20):
@@ -435,8 +401,8 @@ class TestTimelineHover(unittest.TestCase):
         # not just the math function in isolation.
         view_start_before = self._timeline_root.property("viewStartNs")
         visible_ns_before = self._timeline_root.property("visibleNs")
-        # y=200, not the old 100 -- the lanes area now sits below the
-        # bookmarks/legend row and TimeRuler added in Phase B5.
+        # y=200: the lanes area sits below the bookmarks/legend row and
+        # TimeRuler.
         cursor = QPointF(300, 200)
         canvas_w = self._window.width() - 130 - 13
         ns_under_cursor_before = view_start_before + (cursor.x() - 130) / canvas_w * visible_ns_before
@@ -455,7 +421,7 @@ class TestTimelineHover(unittest.TestCase):
         ns_under_cursor_after = view_start_after + (cursor.x() - 130) / canvas_w * visible_ns_after
         # The timestamp under the cursor before the zoom should still be
         # (approximately) under the cursor after it -- the whole point of
-        # zoom-to-cursor, unlike the old center-anchored behavior.
+        # zoom-to-cursor, as opposed to center-anchored zoom.
         self.assertAlmostEqual(ns_under_cursor_before, ns_under_cursor_after, delta=visible_ns_before * 0.02)
         self.assertEqual(self._warnings, [])
 
@@ -608,7 +574,7 @@ class TestTimelineHover(unittest.TestCase):
         self.assertEqual(self._warnings, [])
         self._flick.setProperty("contentY", 0)
 
-    # ── Timeline filters (Phase B2) ──────────────────────────────────
+    # ── Timeline filters ─────────────────────────────────────────────
 
     def test_timeline_filter_button_opens_and_closes_popup(self):
         # The filter button itself is a static child (not Repeater-
@@ -692,7 +658,7 @@ class TestTimelineHover(unittest.TestCase):
             self._app.processEvents()
         self.assertEqual(self._flick.property("count"), 44)
 
-    # ── Timeline grouping / hide / isolate (Phase B3) ───────────────
+    # ── Timeline grouping / hide / isolate ──────────────────────────
 
     def test_timeline_group_button_opens_popup(self):
         button = self._root.findChild(QObject, "timelineGroupButton")
@@ -808,7 +774,7 @@ class TestTimelineHover(unittest.TestCase):
         self.assertGreaterEqual(self._timeline_root.property("hoverSpanIdx"), 0)
         self.assertEqual(self._warnings, [])
 
-    # ── Timeline search / color mode (Phase B4) ─────────────────────
+    # ── Timeline search / color mode ────────────────────────────────
 
     def test_timeline_search_field_updates_status_and_model(self):
         field = self._root.findChild(QObject, "timelineSearchField")
@@ -917,7 +883,7 @@ class TestTimelineHover(unittest.TestCase):
             if self._workspace.timelineOverlayDismissed:
                 # Reset directly through settings -- WorkspaceBridge
                 # itself has no "undismiss" Slot (dismissal is meant to
-                # be permanent from a real user's perspective; only test
+                # be permanent for a user; only test
                 # cleanup needs to undo it so later tests in this shared-
                 # engine class see the overlay in its original state).
                 self._workspace_settings.save_timeline_overlay_dismissed(False)
@@ -995,7 +961,7 @@ class TestTimelineHover(unittest.TestCase):
             _click(color_btn)  # bucket -> category
             _click(color_btn)  # category -> function, restore default
 
-    # ── Timeline ruler / bookmarks / named ranges (Phase B5) ────────
+    # ── Timeline ruler / bookmarks / named ranges ───────────────────
 
     def test_timeline_add_bookmark_button_creates_bookmark_at_view_center(self):
         button = self._root.findChild(QObject, "timelineAddBookmarkButton")
@@ -1129,8 +1095,7 @@ class TestTimelineHover(unittest.TestCase):
         self._timeline_root.setProperty("zoom", 1.0)
         self._timeline_root.setProperty("viewStartNs", self._timeline_model.viewStartNs)
 
-    # ── Visual-consistency audit: cross-screen smoke test + the
-    #    FlameGraph theme-toggle regression, direct not just visual ────
+    # ── Cross-screen smoke test + FlameGraph theme-toggle regression ──
 
     def test_every_tab_loads_without_warnings(self):
         # Cheap, catches a broken "../components" import or missing
@@ -1148,14 +1113,10 @@ class TestTimelineHover(unittest.TestCase):
             self.assertEqual(self._warnings, [], f"tab {i} produced QML warnings: {self._warnings}")
 
     def test_flame_graph_tooltip_repaints_on_theme_toggle(self):
-        # Direct regression test for the audit's headline bug:
-        # FlameGraphScreen's tooltip used to be built from 8 hardcoded
-        # hex literals that never repainted on the light/dark toggle.
-        # Checks the actual bound QColor property, not a screenshot --
-        # screenshots of this exact tooltip were visually misjudged
-        # (misread as "still dark") during this fix's own verification,
-        # while property introspection was unambiguous; this test uses
-        # the reliable method.
+        # Regression guard: FlameGraphScreen's tooltip colors must follow
+        # the light/dark toggle (no hardcoded hex). Checks the bound QColor
+        # property rather than a screenshot -- screenshots of this tooltip
+        # are easy to misjudge, property introspection is unambiguous.
         self._tab_bar.setProperty("currentIndex", 4)  # Flame Graph
         for _ in range(10):
             self._app.processEvents()
@@ -1299,9 +1260,8 @@ class TestTimelineHover(unittest.TestCase):
 
         pt = self._header_click_point(header, "totalNs")
         # Move-priming before press/release -- a bare click on a
-        # Flickable/Repeater-recursed item was found unreliable earlier
-        # this round (see the Call Tree click test's own note); the same
-        # precaution here costs nothing and avoids re-discovering it.
+        # Flickable/Repeater-recursed item is unreliable under offscreen
+        # QPA (see the Call Tree click test's note).
         start = pt - QPoint(0, 15)
         for step in range(1, 5):
             self._move_to(start + (pt - start) * step / 4)
@@ -1440,12 +1400,9 @@ class TestTimelineHover(unittest.TestCase):
         # Repeater itself for lifecycle management, not to their visual
         # parent Item (QQuickItem::parentItem() and QObject::parent() are
         # separate trees in Qt Quick) -- findChildren() walks the QOBJECT
-        # tree and structurally cannot reach them, confirmed by direct
-        # comparison against a real screenshot showing fully-rendered rows
-        # while findChildren() returned none. A coordinate sweep (the same
-        # technique _find_hover_point already uses for Timeline) sidesteps
-        # this rather than hunting for an Item handle that can't be found
-        # this way.
+        # tree and structurally cannot reach them, even though the rows
+        # render correctly. A coordinate sweep (the same technique
+        # _find_hover_point uses for Timeline) sidesteps this.
         #
         # Priming mouseMoves stepping up to the point, THEN an explicit
         # mousePress + processEvents + mouseRelease -- confirmed by direct
@@ -1607,12 +1564,11 @@ class TestTimelineHover(unittest.TestCase):
         self.assertFalse(dialog.property("visible"))
 
     def test_icon_only_controls_have_real_accessible_names(self):
-        # Spot-checks both patterns fixed in the tooltip/accessibility
-        # audit: real ToolButtons (which get Accessible.role for free)
-        # and MouseArea-based pseudo-buttons (which do NOT, and need
-        # Accessible.role set explicitly) -- see QAccessible usage note
-        # in project memory for why plain .property("Accessible.name")
-        # can't be used here.
+        # Spot-checks both icon-only control patterns: real ToolButtons
+        # (which get Accessible.role for free) and MouseArea-based
+        # pseudo-buttons (which need Accessible.role set explicitly).
+        # Accessible.name is read back through QAccessible because plain
+        # .property("Accessible.name") doesn't return the attached value.
         from PySide6.QtGui import QAccessible
 
         def accessible_name(item):
@@ -1693,9 +1649,8 @@ class TestTimelineHover(unittest.TestCase):
         # side of the handshake against the real rendered Main.qml:
         # AppController.profileOpening/profileOpenFailed driving the
         # overlay's visible state, exactly as a real "Open Profile"
-        # attempt would (Phase 5 wires the actual File-menu trigger that
-        # calls App.openProfile() -- this overlay already works fully
-        # independently of that, reacting to the same two signals).
+        # attempt would (the File-menu trigger calls App.openProfile(),
+        # which emits the same two signals).
         overlay = self._root.findChild(QObject, "openProfileOverlay")
         self.assertIsNotNone(overlay, "could not locate the Open Profile overlay")
 

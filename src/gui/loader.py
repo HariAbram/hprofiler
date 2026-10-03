@@ -1,35 +1,25 @@
 """
-Async profile loading (Phase 3 of the usability/persistence/loading
-overhaul) -- runs the expensive, Qt-free parts of opening a trace
-(load_trace_from_json()'s parse, plus the pure-compute functions
-extracted from DashboardBridge/CallTreeBridge/FlameGraphBridge in
-bridge.py) on a dedicated QThread, so the GUI process's main thread stays
-responsive and can show real progress instead of appearing frozen.
+Async profile loading -- runs the expensive, Qt-free parts of opening a
+trace (the parse, plus the pure-compute functions extracted from
+DashboardBridge/CallTreeBridge/FlameGraphBridge in bridge.py) on a
+dedicated QThread, so the GUI process's main thread stays responsive and
+reports progress.
 
-Design: a QObject worker moved to a QThread via moveToThread(), driven
-by queued signals -- NOT an extension of the existing SourceBridge/
-chrome_trace.py fire-and-forget background-Thread pattern (that pattern
-has no done/error/progress/cancel contract; this needs all four,
-natively, from Signal/Slot). The worker constructs NO QObject bridge
-instances itself -- only plain Python (Trace, dicts, dataclasses) ever
-crosses the thread boundary; every bridge QObject is constructed on the
-main thread afterward, from this worker's LoadResult payload, exactly
-matching Qt's requirement that a QObject live on the thread that
-constructs it.
+Design: a QObject worker moved to a QThread via moveToThread(), driven by
+queued signals, with a done/error/progress/cancel contract (the
+fire-and-forget background-Thread pattern used by SourceBridge and
+chrome_trace.py has none of these). The worker constructs NO QObject
+bridge instances -- only plain Python (Trace, dicts, dataclasses) crosses
+the thread boundary; every bridge QObject is constructed on the main
+thread afterward from the LoadResult payload, as Qt requires a QObject to
+live on the thread that constructs it.
 
-Scope note (deliberate, not an oversight): only the highest-cost
-computations are moved here -- load_trace_from_json's event-parsing loop
-(the dominant cost for a large trace, confirmed by direct profiling: a
-single blocking json.load() plus a per-event Python object build) and
-the three bridges independently confirmed to do genuinely expensive
+Scope: only the highest-cost computations run here -- the trace parse
+(the dominant cost for a large trace) and the three bridges that do
 multi-pass/O(n log n) work (Dashboard, Call Tree, Flame Graph).
-TimelineModel's construction, while real work, is numpy-vectorized over
-already-in-memory span objects (fast even at tens of thousands of spans)
-and stays on the main thread, as does every smaller/bounded bridge
-(Kernels, Roofline, Source, System, Profile, Inspector, Comparison) --
-a disclosed, reasonable scope boundary given the transcription risk of
-extracting every bridge versus the value of extracting the four that
-actually dominate load time.
+TimelineModel and the smaller, bounded bridges (Kernels, Roofline, Source,
+System, Profile, Inspector, Comparison) are constructed on the main
+thread.
 """
 from __future__ import annotations
 
@@ -151,10 +141,8 @@ class ProfileLoadWorker(QObject):
                     self.cancelled.emit()
                     return
                 # Never collect_disasm=True for the comparison trace --
-                # it's a per-run debugging aid for the run being actively
-                # inspected, not something a comparison-only trace needs
-                # (matches the design already established for --compare
-                # in app.py before this round).
+                # disassembly is a debugging aid for the run being
+                # inspected, not for a comparison-only trace.
                 trace_b = open_trace(
                     self._compare_path, collect_disasm=False,
                     cancel_check=self._is_cancelled,

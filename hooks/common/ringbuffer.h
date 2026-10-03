@@ -1,58 +1,16 @@
 /*
- * Lock-free per-thread SPSC ring buffer + append-only arena + name
- * interning table, for the profiling-collection hot path.
+ * Lock-free single-producer/single-consumer rings, an append-only arena and
+ * a name-interning table for the collection hot path.
  *
- * ── Why this exists ─────────────────────────────────────────────────────
- * Every hook's current emit_span() does, synchronously, on the profiled
- * program's own calling thread, for every single intercepted call:
- *   1. snprintf() the record into a stack buffer
- *   2. lock a process-wide mutex shared by every thread using this hook
- *   3. lazily connect() the socket if not already connected
- *   4. send() -- a blocking syscall, subject to backpressure from however
- *      fast (or slow) the Python collector's reader thread drains it
- *   5. unlock
- * That is real, unavoidable-today overhead added to the profiled program's
- * own critical path on every intercepted call -- exactly what low-overhead
- * tracing systems (Score-P, HPCToolkit, etc.) avoid via asynchronous,
- * buffered collection. This header provides that alternative: the hot path
- * becomes a bump-allocate + memcpy into the CALLING THREAD'S OWN ring
- * buffer (no lock, no syscall, wait-free from the producer's perspective),
- * and the actual socket write happens later, off a separate drain path.
+ * One ring per producing thread (sharding by thread avoids a multi-producer
+ * structure): only the owning thread pushes, one consumer drains.
  *
- * ── Design: per-thread SPSC, not a shared MPSC structure ───────────────
- * Multiple threads DO concurrently call into a hook (e.g. every OpenMP
- * worker thread), so naively this would need a multi-producer structure --
- * which is real work to get right lock-free. Sharding by thread sidesteps
- * that entirely: each OS thread gets its OWN ring buffer (rb_get_local()),
- * written to ONLY by that thread (the producer) and drained by ONE
- * separate consumer (a background thread, or an existing flush point) --
- * a true single-producer/single-consumer buffer per shard, which is a
- * well-understood, provably-correct pattern with a much smaller surface
- * for concurrency bugs than a general MPSC queue.
- *
- * ── What this header does NOT do ────────────────────────────────────────
- * It does not open a socket, does not spawn a drain thread, and is not
- * wired into any hook's actual emit_span() path. That integration --
- * background-thread lifecycle across fork/exec, ordering with the
- * process's own exit and the existing MPI_Finalize-style final-flush
- * pattern, per-hook socket reuse -- is real additional work with its own
- * failure modes (a stuck or crashed drain thread silently losing the
- * tail of a trace is a much worse failure than today's synchronous-but-
- * simple path), and is deliberately left as a designed-but-not-yet-wired-
- * up next step rather than rushed into hook code without the ability to
- * stress-test it under this machine's real GPU/multi-node workloads. This
- * header is verified in isolation (see tests/native/ringbuffer_stress.c):
- * concurrent producer/consumer correctness (no lost or corrupted events
- * short of a full buffer), the drop counter accounting exactly for events
- * dropped once it does overflow, and a standalone latency comparison
- * against the mutex+send pattern it would replace.
- *
- * ── Drop policy ──────────────────────────────────────────────────────────
- * rb_push() never blocks. If the buffer is full, the new event is dropped
- * and rb->dropped is atomically incremented -- "drop newest", the simplest
- * policy that can never stall the profiled program regardless of how slow
- * the consumer is. rb_dropped_count() lets a periodic counter/summary flush
- * report how many events were lost, rather than the loss being silent.
+ * rb_bytes_t (variable-length records) is what hooks/common/hp_transport.h
+ * uses for every hook. The fixed-slot ringbuffer_t (truncates records longer
+ * than RB_SLOT_SIZE; when full, rb_push drops the new event and counts it in
+ * rb->dropped), the arena and the interning table are exercised by
+ * tests/native/ringbuffer_stress.c (also under ThreadSanitizer) and are not
+ * used by the hooks.
  */
 #ifndef HPROFILER_RINGBUFFER_H
 #define HPROFILER_RINGBUFFER_H
@@ -88,11 +46,10 @@ static inline void rb_init(ringbuffer_t *rb) {
     atomic_init(&rb->dropped, 0);
 }
 
-/* Producer side -- call only from the single thread that owns this ring
- * buffer. Never blocks. Returns 1 on success, 0 if the buffer was full
- * (the event was dropped; rb->dropped was incremented). Truncates any
- * record longer than RB_SLOT_SIZE, same truncation risk the existing
- * fixed-size snprintf buffers already have -- not a new regression. */
+/* Producer side -- call only from the single thread that owns this ring.
+ * Never blocks. Returns 1 on success, 0 if the ring was full (the event was
+ * dropped; rb->dropped was incremented). Records longer than RB_SLOT_SIZE
+ * are truncated. */
 static inline int rb_push(ringbuffer_t *rb, const char *data, uint16_t len) {
     uint64_t tail = atomic_load_explicit(&rb->tail, memory_order_relaxed);
     uint64_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
@@ -131,27 +88,104 @@ static inline uint64_t rb_dropped_count(const ringbuffer_t *rb) {
     return atomic_load_explicit((_Atomic uint64_t *)&rb->dropped, memory_order_relaxed);
 }
 
-/* Approximate depth (items currently buffered, not yet drained). Racy by
- * nature if called concurrently with push/pop (head/tail may be read at
- * slightly different instants) -- fine for a monitoring/diagnostic read,
- * not meant for anything requiring an exact count. */
+/* Approximate depth; racy against concurrent push/pop (diagnostics only). */
 static inline uint64_t rb_depth(const ringbuffer_t *rb) {
     uint64_t tail = atomic_load_explicit((_Atomic uint64_t *)&rb->tail, memory_order_relaxed);
     uint64_t head = atomic_load_explicit((_Atomic uint64_t *)&rb->head, memory_order_relaxed);
     return tail - head;
 }
 
+/* ── Variable-length byte ring (used by hp_transport.h) ───────────────────
+ * Same single-producer / single-consumer protocol as ringbuffer_t above,
+ * over a power-of-two byte array holding length-prefixed records
+ * ([uint32 len][len bytes]), so records of any size up to half the ring
+ * travel intact -- no fixed slot, no truncation. head/tail are byte
+ * offsets that only grow; positions wrap with `mask`. The producer
+ * publishes a record with one release store of tail after copying it; the
+ * consumer releases the space with one release store of head after
+ * copying it out. */
+typedef struct {
+    char             *buf;
+    uint64_t          cap;      /* power of two */
+    uint64_t          mask;
+    _Atomic uint64_t  head;     /* consumer position */
+    _Atomic uint64_t  tail;     /* producer position */
+} rb_bytes_t;
+
+static inline int rb_bytes_init(rb_bytes_t *r, uint64_t cap) {
+    uint64_t c = 1;
+    while (c < cap) c <<= 1;
+    r->buf = (char *)malloc(c);
+    if (!r->buf) return 0;
+    r->cap = c;
+    r->mask = c - 1;
+    atomic_init(&r->head, 0);
+    atomic_init(&r->tail, 0);
+    return 1;
+}
+
+static inline void _rb_bytes_in(rb_bytes_t *r, uint64_t pos, const void *src, uint64_t n) {
+    uint64_t off = pos & r->mask, first = r->cap - off;
+    if (first >= n) { memcpy(r->buf + off, src, n); return; }
+    memcpy(r->buf + off, src, first);
+    memcpy(r->buf, (const char *)src + first, n - first);
+}
+
+static inline void _rb_bytes_out(const rb_bytes_t *r, uint64_t pos, void *dst, uint64_t n) {
+    uint64_t off = pos & r->mask, first = r->cap - off;
+    if (first >= n) { memcpy(dst, r->buf + off, n); return; }
+    memcpy(dst, r->buf + off, first);
+    memcpy((char *)dst + first, r->buf, n - first);
+}
+
+/* Free bytes as seen by the producer (exact for the producer, which owns
+ * tail; head only grows, so the true free space can only be larger). */
+static inline uint64_t rb_bytes_free(rb_bytes_t *r) {
+    uint64_t t = atomic_load_explicit(&r->tail, memory_order_relaxed);
+    uint64_t h = atomic_load_explicit(&r->head, memory_order_acquire);
+    return r->cap - (t - h);
+}
+
+/* Producer: append one record. Returns 1, or 0 when it does not fit right
+ * now (caller decides whether to wait or count a drop). */
+static inline int rb_bytes_push(rb_bytes_t *r, const char *data, uint32_t len) {
+    uint64_t need = 4 + (uint64_t)len;
+    uint64_t t = atomic_load_explicit(&r->tail, memory_order_relaxed);
+    uint64_t h = atomic_load_explicit(&r->head, memory_order_acquire);
+    if (r->cap - (t - h) < need) return 0;
+    _rb_bytes_in(r, t, &len, 4);
+    _rb_bytes_in(r, t + 4, data, len);
+    atomic_store_explicit(&r->tail, t + need, memory_order_release);
+    return 1;
+}
+
+/* Consumer: length of the next record, or -1 when empty. */
+static inline int64_t rb_bytes_peek_len(rb_bytes_t *r) {
+    uint64_t h = atomic_load_explicit(&r->head, memory_order_relaxed);
+    uint64_t t = atomic_load_explicit(&r->tail, memory_order_acquire);
+    if (h >= t) return -1;
+    uint32_t len;
+    _rb_bytes_out(r, h, &len, 4);
+    return (int64_t)len;
+}
+
+/* Consumer: copy the next record (whose length rb_bytes_peek_len returned)
+ * into dst and release its space. */
+static inline void rb_bytes_pop(rb_bytes_t *r, char *dst, uint32_t len) {
+    uint64_t h = atomic_load_explicit(&r->head, memory_order_relaxed);
+    _rb_bytes_out(r, h + 4, dst, len);
+    atomic_store_explicit(&r->head, h + 4 + len, memory_order_release);
+}
+
+static inline int rb_bytes_empty(rb_bytes_t *r) {
+    return atomic_load_explicit(&r->head, memory_order_acquire) >=
+           atomic_load_explicit(&r->tail, memory_order_acquire);
+}
+
 /* ── Append-only arena ────────────────────────────────────────────────────
- * A simple bump allocator for variable-length data (e.g. long call stacks
- * or tag blobs) that doesn't fit a fixed-size ring slot. Single fixed-size
- * block, thread-safe via one atomic fetch-add (no lock) -- allocation
- * itself is wait-free; the arena as a whole is meant to be reset (or
- * simply left to fill and rotated to a fresh block) by the consumer/drain
- * side, not the hot path. Returns NULL if the arena is full -- caller must
- * handle that (e.g. fall back to truncating into a ring slot directly)
- * rather than this header silently growing/reallocating, which would
- * reintroduce a lock on the hot path.
- */
+ * Bump allocator: one atomic fetch-add per allocation (wait-free), reset by
+ * the consumer side. Returns NULL when full; it never grows, since that
+ * would need a lock on the hot path. */
 typedef struct {
     char             *base;
     uint32_t          capacity;
@@ -177,17 +211,8 @@ static inline void arena_reset(arena_t *a) {
 }
 
 /* ── Name interning ──────────────────────────────────────────────────────
- * Maps each unique string (typically a kernel/function name repeated
- * across many events) to a small integer id, assigned the first time it's
- * seen -- so repeat occurrences can reference the id instead of resending
- * the full string. Backed by a simple mutex-protected open-addressing
- * table: unlike the ring buffer/arena, this does NOT need to be lock-free
- * to deliver the intended benefit -- interning a given name only touches
- * the lock ONCE (the first time that name is seen), not once per event,
- * so contention is proportional to the number of *distinct* names, not
- * the number of *events* -- orders of magnitude less hot than the
- * per-event path this whole header exists to get off a lock.
- */
+ * Maps repeated names to small ids. A mutex-protected open-addressing table
+ * is enough: the lock is taken once per distinct name, not per event. */
 #define INTERN_TABLE_CAP 4096   /* must be a power of 2; distinct names per process */
 
 typedef struct {

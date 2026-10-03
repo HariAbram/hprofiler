@@ -182,10 +182,9 @@ class TestComputationalScaling(unittest.TestCase):
 
 
 class TestDurationWeightedPct(unittest.TestCase):
-    """Regression tests for a self-audit bug: gpu_efficiency() originally
-    weighted by achieved_tflops (a RATE) instead of duration_ns, and used
-    `x or 1.0` which silently treated a genuine 0.0-tflops kernel as full
-    weight (0.0 is falsy in Python)."""
+    """gpu_efficiency() must weight by duration_ns, not by achieved_tflops
+    (a RATE), and must not use `x or 1.0`, which would treat a genuine
+    0.0-tflops kernel as full weight (0.0 is falsy in Python)."""
 
     def test_weighted_by_duration_not_by_rate(self):
         # A long, low-utilization kernel should dominate a short,
@@ -199,8 +198,7 @@ class TestDurationWeightedPct(unittest.TestCase):
     def test_zero_pct_kernel_with_real_duration_pulls_average_down(self):
         # A kernel achieving genuinely 0% (e.g. pure memory-bound, no FP
         # ops) must count with its real duration as weight, not be
-        # excluded/mis-weighted just because its pct (or, in the old bug,
-        # its rate-based weight) was 0.
+        # excluded/mis-weighted just because its pct was 0.
         pairs = [(100, 0.0), (100, 100.0)]
         result = pe.duration_weighted_pct(pairs)
         self.assertAlmostEqual(result, 0.5, places=6)
@@ -213,9 +211,9 @@ class TestDurationWeightedPct(unittest.TestCase):
 
 
 class TestPerCategoryTransferEfficiency(unittest.TestCase):
-    """Regression test for a self-audit bug: fitting one alpha/beta model
-    across MPI and NCCL spans mixed together lets whichever category
-    dominates the regression corrupt the "ideal" time for the other."""
+    """MPI and NCCL get separate alpha/beta fits: one model across both
+    would let whichever category dominates the regression corrupt the
+    "ideal" time for the other."""
 
     def test_mpi_and_nccl_fit_independently(self):
         # MPI: slow network-like model. NCCL: fast NVLink-like model.

@@ -37,6 +37,13 @@ class TraceMetadata:
     # src/core/gpu_activity.py): native tracer status, clock mapping,
     # dropped records, correlation/de-duplication counts.
     device_activity: dict = field(default_factory=dict)
+    # Capture integrity (src/core/receiver.py): "state" (running ->
+    # complete; "interrupted" when a store is reopened that never
+    # completed), the hook transports' status per pid/hook (drops, lost,
+    # oversize, missing final drain) and the receiver's counters (malformed /
+    # unknown / partial records, processing errors). Empty for traces
+    # captured before this existed. receiver.capture_warnings() renders it.
+    capture_health: dict = field(default_factory=dict)
 
 
 class Trace:

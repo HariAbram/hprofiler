@@ -52,6 +52,8 @@ HP_HIDDEN void hp_cupti_disarm(uint32_t *corr, uint32_t *corr2);
 /* Deliver every buffered activity record now (forced flush). A no-op after
  * the at-exit flush has run. */
 HP_HIDDEN void hp_cupti_flush(void);
+/* Forced final flush at process exit (idempotent); sends final_flush=1. */
+HP_HIDDEN void hp_cupti_final_flush(void);
 
 /* 1 when cupti_trace.c was compiled with CUPTI headers (it then owns the
  * process's single CUPTI buffer-callback registration). */

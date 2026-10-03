@@ -2,13 +2,11 @@
 Column specifications for the GUI's data tables (src/gui/tablemodel.py's
 DictListTableModel/TableConfig, rendered by components/DataTable.qml) --
 one place naming every column a table can show, its formatting `kind`, and
-(for numeric columns) its tooltip definition, instead of each screen
-hardcoding its own column list the way KernelsScreen.qml's TableHeaderRow
-did before this round.
+(for numeric columns) its tooltip definition.
 
-A row is still a plain dict (same shape every bridge already builds via
-trace.aggregated_stats()/etc.) -- a ColumnSpec just describes how to turn
-one dict key into a header + a formatted, sortable, filterable cell.
+A row is a plain dict (the shape every bridge builds via
+trace.aggregated_stats()/etc.) -- a ColumnSpec describes how to turn one
+dict key into a header + a formatted, sortable, filterable cell.
 """
 from __future__ import annotations
 

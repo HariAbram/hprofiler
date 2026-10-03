@@ -2,12 +2,12 @@
 Trace.lanes() naming and parse_lane_name() -- the display-lane key both
 Timelines (TUI src/ui/app.py, GUI src/gui/models.py) build rows from.
 
-Regression: lanes were keyed by stream id or tid WITHOUT the process, so in
-a multi-rank GPU job every rank's default-stream kernels (stream id 0 in
-every process) were drawn overlapping in ONE "cuda/stream-0" lane, and
-merge-nodes output (pids remapped, tids not) merged same-tid threads from
-different nodes. Device-timed OpenCL spans (side=gpu) landed in whatever
-driver callback thread's lane fired -- sometimes the main thread's.
+Lanes are keyed by process as well as stream id or tid: in a multi-rank GPU
+job every rank's default-stream kernels share stream id 0, and merge-nodes
+output (pids remapped, tids not) reuses tids across nodes, so without the
+process they would overlap in one lane. Device-timed OpenCL spans
+(side=gpu) get a per-category device lane rather than whichever driver
+callback thread reported them.
 """
 import os
 import sys

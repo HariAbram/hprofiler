@@ -4,7 +4,7 @@
 # and runs `summary`, `efficiency`, and `critical-path` against the
 # resulting trace -- asserting none of them crash. This is the "does the
 # whole toolchain still work end-to-end" check referenced in
-# DOCUMENTATION.md / the audit-fixes memory; unit tests in tests/*.py check
+# DOCUMENTATION.md ("Running the tests"); unit tests in tests/*.py check
 # the analysis math in isolation, this checks the real pipeline.
 #
 # Not all backends produce events on every machine (e.g. no working GPU

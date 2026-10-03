@@ -1,11 +1,9 @@
 """
-Regression test for a self-audit bug: OTLP-exported timestamps were off by
-the machine's CLOCK_MONOTONIC reading at trace start (i.e. system uptime at
-that moment) -- hours to months on a persistent HPC login/compute node --
-because trace_epoch_ns = meta.start_time_ns + epoch_offset double-counted
-an absolute monotonic reading as if it were a relative offset. Fixed by
-using epoch_offset directly against each event's own absolute
-CLOCK_MONOTONIC timestamp.
+OTLP timestamps: each event's absolute CLOCK_MONOTONIC timestamp is
+converted with the monotonic->epoch offset directly. Adding the trace's
+start_time_ns as well would double-count an absolute monotonic reading and
+shift every timestamp by the machine's uptime (hours to months on a
+persistent HPC node).
 """
 import sys
 import time

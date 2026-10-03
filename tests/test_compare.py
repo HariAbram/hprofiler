@@ -224,9 +224,9 @@ if __name__ == "__main__":
 class TestMatchRowsNeverDoubleMatches(unittest.TestCase):
     def test_exact_match_is_claimed_before_normalized_fallback(self):
         # Both baseline JIT names normalize to the same display name; the
-        # comparison run only has the SECOND one. The first baseline row
-        # used to grab it via its normalized name, then the second matched
-        # it exactly again -- one comparison row counted twice.
+        # comparison run only has the SECOND one. Exact matches are claimed
+        # first, so the first baseline row must not grab it via its
+        # normalized name (which would count one comparison row twice).
         from src.analysis.compare import match_rows
         a = [{"category": "cuda", "name": "1111111.2222.jit.so", "total_ns": 5},
              {"category": "cuda", "name": "9111111.2222.jit.so", "total_ns": 7}]

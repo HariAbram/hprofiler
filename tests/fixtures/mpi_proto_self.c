@@ -8,8 +8,8 @@
  * MPICH/Hydra cannot form a real multi-rank MPI_COMM_WORLD (every rank
  * independently observes MPI_Comm_size == 1 under `mpirun -np N` for
  * N > 1, confirmed via UCX_LOG_LEVEL=info to be a PMI/KVS rank-discovery
- * failure that predates and is unrelated to hprofiler -- reproducible
- * with the pre-existing, unmodified mpi_mini.c fixture too). Self-send
+ * failure unrelated to hprofiler -- reproducible with the plain
+ * mpi_mini.c fixture too). Self-send
  * still drives the real PMPI_Isend/Irecv/Waitany/Waitsome/Test/Cancel
  * implementation and lets this hook's status-resolution and request-table
  * logic be verified against genuine MPI completion semantics, just
@@ -80,7 +80,7 @@ int main(int argc, char **argv) {
 
     /* ── Phase D0: MPI_Waitall over 2 wildcard Irecv, self-sent -- the
      * rmatches= resolution logic here is a separate call site from
-     * Waitsome's (same fix, different function), so needs its own check. */
+     * Waitsome's, so it needs its own check. */
     int rbufsD[2];
     MPI_Request rreqsD[2];
     for (int i = 0; i < 2; i++)

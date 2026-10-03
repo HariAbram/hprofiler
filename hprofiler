@@ -64,17 +64,18 @@ def cli():
     """Multi-backend CPU/GPU profiler for Linux.
 
     Traces programs across CUDA, ROCm, OpenCL, OpenMP, NCCL, and MPI via
-    LD_PRELOAD hooks and OMPT callbacks. CPU sampling is provided via Linux
-    perf. All backends can run simultaneously.
+    LD_PRELOAD hooks, OMPT callbacks and GNU libgomp interception. CPU
+    sampling is provided via Linux perf. All backends can run simultaneously.
 
     \b
     Backends:
       cpu      Linux perf — CPU samples and call-graph stacks
       cuda     CUDA Runtime + Driver API + NVTX — kernels, memcpy, sync
       opencl   OpenCL — kernel enqueues, buffer transfers, JIT compile time
-      openmp   OpenMP OMPT — parallel regions, tasks, barriers, target offload
+      openmp   OpenMP — OMPT (LLVM libomp) or GOMP_* (GNU libgomp): regions,
+               tasks, barriers, critical sections
       rocm     ROCm/HIP — kernel launches, memcpy, device memory
-      nccl     NCCL — AllReduce, Broadcast, Send/Recv (GPU-accurate timing)
+      nccl     NCCL — AllReduce, Broadcast, Send/Recv (CUDA-event timing)
       mpi      MPI — point-to-point, collectives, one-sided ops (PMPI)
       likwid   Hardware PMU counters via likwid-perfctr (FLOPS, bandwidth)
 
@@ -92,17 +93,22 @@ def cli():
       hprofiler run --perf-callgraph dwarf -- ./app    # + flame graph (Flame Graph tab)
       hprofiler run --gui -- ./app                     # pop up the Qt GUI (falls back to TUI)
       hprofiler roofline --backend cuda -- ./app       # hardware roofline chart
-      hprofiler view app.hprofiler.json                # reopen a saved trace in the TUI
-      hprofiler gui app.hprofiler.json                 # reopen a saved trace in the Qt GUI
+      hprofiler view app.hprofiler.hpstore             # reopen a saved trace in the TUI
+      hprofiler gui app.hprofiler.hpstore              # reopen a saved trace in the Qt GUI
+      hprofiler compare before.hpstore after.hpstore   # what changed between two runs
 
     \b
     Output written after every run:
-      <prog>.hprofiler.json — Chrome Trace (open in ui.perfetto.dev)
-      TUI viewer            — opens automatically (tabs: Overview, Timeline,
-                              Kernels, [Call Tree], [Roofline], [Source],
-                              System, Profile). Pass --gui for the Qt/QML
-                              popup GUI instead (falls back to the TUI when
-                              no usable X11 display or PySide6 is found).
+      <prog>.hprofiler.hpstore — indexed trace store (opens instantly)
+      <prog>.hprofiler.json    — Chrome Trace JSON for ui.perfetto.dev
+                                 (skip with --no-json)
+      TUI viewer               — opens automatically (tabs: Overview,
+                                 Timeline, Kernels, [Call Tree],
+                                 [Flame Graph], [Roofline], [Source],
+                                 System, Profile). Pass --gui for the Qt/QML
+                                 popup GUI instead (falls back to the TUI
+                                 when no usable X11 display or PySide6 is
+                                 found).
 
     Always separate hprofiler options from the target program with --:
 
@@ -114,7 +120,8 @@ def cli():
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.option("--backend", "-b", default="auto",
-              help="Comma-separated backends: cpu,cuda,opencl,rocm,openmp  [default: auto]")
+              help="Comma-separated backends: cpu,cuda,opencl,rocm,openmp,mpi,nccl,likwid "
+                   "(aliases: perf,cl,hip,omp,hwc)  [default: auto: every available backend]")
 @click.option("--output", "-o", default=None,
               help="Output trace: a .json file (also writes the indexed <name>.hpstore store next "
                    "to it) or a .hpstore directory (store only).  Default: <program>.hprofiler.json")
@@ -166,15 +173,16 @@ def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph
       hprofiler run --backend cuda -- ./cuda_app
       hprofiler run --backend cuda,nccl -- ./multi_gpu_app
       hprofiler run --backend mpi -- mpirun -np 4 ./mpi_app
-      hprofiler run --backend cuda --disasm -- ./app        # adds Disasm tab
+      hprofiler run --backend cuda --disasm -- ./app        # adds Source tab
       hprofiler run --call-tree --backend cuda -- ./app     # adds Call Tree tab
       hprofiler run --no-ui -o my_trace.json -- ./app       # skip TUI
 
     \b
     The --call-tree flag captures CPU call stacks at every API interception
     point, enabling a from-main call tree in the TUI. Requires the profiled
-    binary to be compiled with -fno-omit-frame-pointer -rdynamic. Adds ~50 us
-    overhead per intercepted call; do not use during benchmarking.
+    binary to be compiled with -fno-omit-frame-pointer -rdynamic. Adds roughly
+    5-15 us (libunwind) to 50-90 us (glibc backtrace) per intercepted call;
+    do not use during benchmarking.
 
     Separate hprofiler options from the program and its arguments with --:
 
@@ -234,7 +242,6 @@ def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph
 
     if otlp_endpoint or otlp_file:
         from src.output.otlp import export as _otlp_export
-        otlp_out = otlp_file or (Path(view_path).stem + ".otlp.json")
         try:
             _otlp_export(trace, endpoint=otlp_endpoint, output_file=otlp_file)
             if otlp_file:
@@ -285,7 +292,7 @@ def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph
 @click.option("--otlp-file", default=None, metavar="PATH",
               help="Write OTLP JSON to file (e.g. trace.otlp.json)")
 def view(trace_file, disasm, otlp_endpoint, otlp_file):
-    """Open the TUI viewer for a saved trace JSON file.
+    """Open the TUI viewer for a saved trace (.hpstore or JSON).
 
     Loads the trace and opens the same terminal UI produced by 'hprofiler run'.
     Tabs shown depend on what data the trace contains:
@@ -294,9 +301,11 @@ def view(trace_file, disasm, otlp_endpoint, otlp_file):
       Overview   — diagnosis, headline stats, top findings, hot kernels
       Timeline   — Gantt view; per-stream lanes for CUDA/ROCm
       Kernels    — filterable, sortable table (type to filter, 's' to sort)
-      Call Tree  — only when trace was recorded with --call-tree
+      Call Tree  — only when spans carry call stacks (--call-tree or
+                   --perf-callgraph)
+      Flame Graph — same condition and data as Call Tree
       Roofline   — only when hardware-counter/disasm kernel metrics exist
-      Source     — only when --disasm is passed to this command
+      Source     — when the trace contains disassembly, or with --disasm
       System     — device specs, peak compute/bandwidth, IPC, RSS
       Profile    — GPU activity, time breakdown, hotspots, insight tips
 
@@ -338,7 +347,7 @@ def view(trace_file, disasm, otlp_endpoint, otlp_file):
               help="Compare against a baseline run (Compare tab): the opened trace is the "
                    "candidate, BEFORE the baseline -- as in 'hprofiler compare BEFORE AFTER'")
 def gui(trace_file, disasm, compare):
-    """Open the Qt/QML popup GUI for a saved trace JSON file.
+    """Open the Qt/QML popup GUI for a saved trace (.hpstore or JSON).
 
     Same trace data as 'hprofiler view', in a native popup window instead
     of the terminal — works over X11 forwarding (ssh -X/-Y). Falls back
@@ -424,9 +433,10 @@ def _open_browser(path: str) -> None:
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
 )
 @click.option("--backend", "-b", default=None,
-              help="Backend to use when running command  (cuda | rocm | cpu | openmp)")
+              help="Backend to use when running command  (cuda | rocm | cpu | openmp | opencl)")
 @click.option("--output", "-o", default=None,
-              help="Output file path  (HTML when --html; ignored for TUI)")
+              help="HTML output path, written in both modes  "
+                   "[default: <program>.roofline.html or <trace>.roofline.html]")
 @click.option("--html", "use_html", is_flag=True, default=False,
               help="Write an HTML file and open it in the browser instead of the TUI")
 @click.argument("target", nargs=-1, type=click.UNPROCESSED)
@@ -434,7 +444,8 @@ def roofline(backend, output, use_html, target):
     """Generate an interactive roofline chart using hardware performance counters.
 
     By default the chart opens as a native TUI (works on HPC clusters without
-    a browser).  Pass --html to write an HTML file and open it in the browser.
+    a browser); an HTML copy is always written as well.  Pass --html to open
+    the HTML file in the browser instead of the TUI.
 
     Two modes:
 
@@ -633,11 +644,15 @@ def roofline(backend, output, use_html, target):
 @click.option("--top", "-n", default=20, show_default=True,
               help="Number of top hotspots to show")
 def summary(trace_file, top):
-    """Print a text summary of a saved trace JSON file.
+    """Print a text summary of a saved trace (.hpstore or JSON).
 
-    Groups spans by (name, category), sorts by total time, and shows count,
-    total / average duration, and percentage of wall time. Use --top to limit
-    how many entries are printed.
+    Starts with any capture warnings (dropped or lost events, a run that
+    ended before its final drain or GPU flush, an interrupted capture, a
+    truncated file, proxy device timing), then groups spans by (name,
+    category), sorts by total time, and shows count, total / average
+    duration, and percentage of wall time. Use --top to limit how many
+    entries are printed. A missing, truncated or damaged trace ends with a
+    one-line error and exit status 2.
 
     \b
     Example:
@@ -659,10 +674,10 @@ def summary(trace_file, top):
 @click.option("--list", "list_only", is_flag=True, default=False,
               help="List available kernel names and exit.")
 def disasm(trace_file, kernel, output, list_only):
-    """Dump kernel disassembly from a saved trace JSON to a file or stdout.
+    """Dump kernel disassembly from a saved trace to a file or stdout.
 
-    The trace must have been recorded with --disasm (or viewed with --disasm)
-    so that assembly data is embedded in the JSON.
+    The trace (.hpstore or JSON) must have been recorded with
+    'hprofiler run --disasm' so that assembly data is embedded in it.
 
     \b
     Examples:
@@ -809,7 +824,8 @@ def critical_path_cmd(trace_file, top, export):
     certain (hardware/runtime-enforced or an explicit id the hook itself
     assigned) down to medium (call-order matching with no stronger
     evidence available) -- shown in the "Path evidence strength" section
-    below. Single-node only (see DOCUMENTATION.md).
+    below. A capture is single-node; merge per-node traces with
+    'hprofiler merge-nodes' first (see DOCUMENTATION.md).
 
     \b
     Examples:
@@ -949,7 +965,8 @@ def compare_cmd(before, after, fmt, output, top, min_pct, min_ns, min_confidence
 @cli.command("merge-nodes")
 @click.argument("trace_files", type=click.Path(exists=True), nargs=-1, required=True)
 @click.option("-o", "--output", required=True, type=click.Path(),
-              help="Where to write the merged trace (Chrome Trace JSON).")
+              help="Where to write the merged trace: a .json file (Chrome Trace JSON plus a "
+                   "sibling .hpstore) or a .hpstore directory (store only).")
 @click.option("--offset-ns", multiple=True, type=int, metavar="NS",
               help="Explicit clock offset for a node, in ns, same order as TRACE_FILES "
                    "(overrides any HPROFILER_CLOCK_SYNC counters in that trace). "
@@ -1077,6 +1094,9 @@ def backends():
 def build(build_dir, jobs):
     """Build the C hook libraries (CUDA, OpenCL, OpenMP, ROCm, NCCL, MPI).
 
+    The eBPF scheduler tracer (hooks/os_tracer) is built separately with
+    'make -C hooks/os_tracer'; see DOCUMENTATION.md.
+
     Runs CMake to compile the hook shared libraries into build/lib/. Only
     hooks whose required headers are detected at configure time are built
     (e.g. libhprofiler_mpi.so requires MPI headers).
@@ -1085,8 +1105,9 @@ def build(build_dir, jobs):
     Libraries produced in build/lib/:
       libhprofiler_cuda.so    CUDA Runtime + Driver API + NVTX
       libhprofiler_opencl.so  OpenCL ICD
-      libhprofiler_ompt.so    OpenMP OMPT tool (requires libomp, not libgomp)
-      libhprofiler_rocm.so    ROCm/HIP (requires ROCm at /opt/rocm)
+      libhprofiler_ompt.so    OpenMP OMPT tool (LLVM libomp / Intel OpenMP)
+      libhprofiler_gomp.so    OpenMP GOMP_* interception (GNU libgomp)
+      libhprofiler_rocm.so    ROCm/HIP (ROCm needed at run time, not to build)
       libhprofiler_nccl.so    NCCL collectives (no NCCL headers needed)
       libhprofiler_mpi.so     MPI PMPI wrappers (requires mpicc)
 
@@ -1130,5 +1151,31 @@ def build(build_dir, jobs):
     click.echo(click.style("[hprofiler] Build complete.", fg="green"))
 
 
+def _main() -> None:
+    """Run the CLI; a trace that cannot be opened (missing, not a trace,
+    truncated/corrupted JSON, damaged store) ends with one clear message and
+    exit status 2 instead of a traceback. HPROFILER_DEBUG=1 re-raises."""
+    import json
+    import sqlite3
+    from src.core.store.disk import StoreError
+    try:
+        cli()
+    except (StoreError, sqlite3.DatabaseError, json.JSONDecodeError, UnicodeDecodeError,
+            FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+        if os.environ.get("HPROFILER_DEBUG"):
+            raise
+        if isinstance(exc, json.JSONDecodeError):
+            msg = (f"the trace file is not valid JSON ({exc}) -- it is truncated or corrupted, "
+                   "or not a trace hprofiler wrote")
+        elif isinstance(exc, UnicodeDecodeError):
+            msg = "the trace file is not text (not a JSON trace or .hpstore directory)"
+        elif isinstance(exc, sqlite3.DatabaseError):
+            msg = f"the trace store is damaged ({exc})"
+        else:
+            msg = str(exc)
+        click.echo(click.style(f"[hprofiler] error: {msg}", fg="red"), err=True)
+        sys.exit(2)
+
+
 if __name__ == "__main__":
-    cli()
+    _main()

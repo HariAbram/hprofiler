@@ -95,22 +95,17 @@ Column {
             // resolution to runtime, which sidesteps that restriction.
             delegate: Loader {
                 // Without an explicit width, this Loader and its loaded
-                // TreeNode (which sets its own width from `parent.width`,
-                // i.e. THIS Loader) reference each other circularly --
-                // resolved to 0 in practice, collapsing every recursive
-                // level to invisible. The whole subtree silently vanished
-                // this way (no QML error/warning at all) until traced
-                // down to this one missing binding.
+                // TreeNode (which sets its own width from `parent.width`, i.e.
+                // THIS Loader) reference each other circularly -- resolving to
+                // 0 and collapsing every recursive level to invisible, with no
+                // QML error or warning.
                 width: childrenColumn.width
                 asynchronous: false
                 // setSource's property map passes initial values to the
-                // component's constructor (like arguments), evaluated
-                // BEFORE the item's own bindings first run -- more
-                // reliable for a recursive self-load than creating with
-                // defaults via `source:` and mutating via onLoaded
-                // afterwards, which left this tree rendering only its
-                // root row with every child silently missing (no error,
-                // just an empty result) when tried first.
+                // component's constructor (like arguments), evaluated BEFORE the
+                // item's own bindings first run. Loading with defaults via
+                // `source:` and mutating in onLoaded instead renders only the
+                // root row, every child silently missing.
                 Component.onCompleted: setSource("TreeNode.qml", {
                     node: modelData,
                     depth: root.depth + 1,

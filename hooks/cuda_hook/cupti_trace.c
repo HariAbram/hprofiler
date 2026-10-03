@@ -40,7 +40,7 @@
  * deliver older, shorter record versions); a newer one is accepted on the
  * basis that CUPTI extends records by appending fields -- records with
  * implausible timestamps are counted (bad_records) and skipped rather than
- * emitted. Not validated against a working GPU on the development machine.
+ * emitted. Checked functionally on a GeForce MX550 (CUDA 12.9 CUPTI).
  */
 #define _GNU_SOURCE
 #include "hp_cupti.h"
@@ -102,6 +102,7 @@ unsigned hp_cupti_start(unsigned want) {
 void hp_cupti_arm(void) {}
 void hp_cupti_disarm(uint32_t *corr, uint32_t *corr2) { *corr = 0; *corr2 = 0; }
 void hp_cupti_flush(void) {}
+void hp_cupti_final_flush(void) {}
 
 #else
 /* ── CUPTI available at build time ───────────────────────────────────────── */
@@ -587,15 +588,23 @@ static void lib_init(void) {
     g_lib_ok = 1;
 }
 
+/* Forced final flush (atexit, before libcupti's own teardown; or the hook
+ * destructor if no atexit ran). The final_flush=1 status after it is the
+ * collector's evidence that buffered device records were delivered: an
+ * active tracer whose process ends without it (crash, _exit, kill) is
+ * reported as possibly missing device records. */
 static void atexit_flush(void) {
     if (g_lib_ok && !g_exit_flushed) {
         int saved = hp_cuda_in_hook;
         hp_cuda_in_hook = 1;
         p.FlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
         hp_cuda_in_hook = saved;
+        if (g_active & HP_CUPTI_ACTIVITY) emit_status("final_flush=1");
     }
     g_exit_flushed = 1;
 }
+
+void hp_cupti_final_flush(void) { atexit_flush(); }
 
 unsigned hp_cupti_start(unsigned want) {
     pthread_once(&g_lib_once, lib_init);
@@ -634,11 +643,11 @@ unsigned hp_cupti_start(unsigned want) {
             char f[256];
             if (g_clock_cb)
                 snprintf(f, sizeof(f), "status=active,api_version=%u,headers_version=%u,clock=monotonic_callback,"
-                         "correlation=%s,latency=%d", g_lib_version, (unsigned)CUPTI_API_VERSION,
+                         "correlation=%s,latency=%d,final_marker=1", g_lib_version, (unsigned)CUPTI_API_VERSION,
                          g_callbacks_ok ? "callback" : "unavailable", g_latency);
             else
                 snprintf(f, sizeof(f), "status=active,api_version=%u,headers_version=%u,clock=offset,offset_ns=%lld,"
-                         "clock_err_ns=%llu,correlation=%s,latency=%d", g_lib_version, (unsigned)CUPTI_API_VERSION,
+                         "clock_err_ns=%llu,correlation=%s,latency=%d,final_marker=1", g_lib_version, (unsigned)CUPTI_API_VERSION,
                          (long long)g_offset_ns, (unsigned long long)g_offset_err_ns,
                          g_callbacks_ok ? "callback" : "unavailable", g_latency);
             emit_status(f);

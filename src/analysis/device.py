@@ -96,8 +96,8 @@ def _cuda_fp64_ratio(major: int, minor: int) -> float:
 # crippled packed-FP16 (__half2) throughput -- roughly on par with FP32, NOT
 # the 2x every later architecture (Volta+) and Pascal's own datacenter part
 # (P100, cc 6.0) achieve via real 2-per-clock packed FP16 execution.
-# Applying a uniform 2x to Pascal consumer parts overstated their FP16
-# roofline ceiling by ~2x.
+# A uniform 2x would overstate Pascal consumer parts' FP16 roofline ceiling
+# by ~2x.
 _CUDA_FP16_RATIO: dict[tuple[int, int], float] = {
     (6, 0): 2.0,   # Pascal P100 (datacenter) -- real 2x packed FP16
     (6, 1): 1.0,   # Pascal consumer (GTX 10-series) -- crippled FP16
@@ -107,6 +107,54 @@ _CUDA_FP16_RATIO: dict[tuple[int, int], float] = {
 
 def _cuda_fp16_ratio(major: int, minor: int) -> float:
     return _CUDA_FP16_RATIO.get((major, minor), 2.0)  # Volta+ (7.0+): full 2x packed FP16
+
+
+# ── DRAM peak bandwidth ──────────────────────────────────────────────────────
+# The driver's MEMORY_CLOCK_RATE attribute is the memory clock; the per-pin
+# data rate is a multiple of it. For every NVIDIA part (GDDR5/5X/6/6X, HBM2/
+# HBM2e/HBM3) and AMD up to CDNA2 the reported clock is half the data rate
+# (x2): V100 877 MHz x 4096 bit -> 898 GB/s, A100 1215 MHz x 5120 -> 1555,
+# H100 SXM 2619 MHz x 5120 -> 3352, RTX 4090 10501 MHz x 384 -> 1008,
+# MX550 6001 MHz x 64 -> 96 (read on real hardware), MI100 1200 MHz x 4096 ->
+# 1229, MI250X 1600 MHz x 8192 -> 3277. CDNA3 (MI300A/X, HBM3) reports
+# 1300 MHz for a 5.2 Gb/s pin rate: x4 -> 5325 GB/s (datasheet 5.3 TB/s);
+# x2 would report half.
+_MEM_DATA_RATE_X4 = frozenset({"gfx940", "gfx941", "gfx942"})
+
+# Datasheet peak DRAM bandwidth (GB/s), used only when the driver attributes
+# needed to compute it are unavailable. Matched by substring of the device
+# name, most specific first.
+_DATASHEET_BW_GBS: tuple[tuple[str, float], ...] = (
+    ("MI300X", 5300.0), ("MI300A", 5300.0), ("MI250X", 3276.8), ("MI250", 3276.8),
+    ("MI210", 1638.4), ("MI100", 1228.8),
+    ("H100 SXM", 3350.0), ("H100 PCIe", 2000.0), ("H100", 3350.0),
+    ("A100-SXM4-80GB", 2039.0), ("A100 80GB PCIe", 1935.0), ("A100", 1555.0),
+    ("V100", 900.0), ("RTX 4090", 1008.0), ("MX550", 96.0),
+)
+
+
+def dram_bandwidth_gbs(backend: str, arch: str, mem_clock_khz: int, mem_bus_bits: int,
+                       name: str = "") -> tuple[float, str]:
+    """Peak DRAM bandwidth and where it came from: ("computed") from the
+    detected memory clock x bus width x the architecture's data-rate factor,
+    ("datasheet") from the table above when those attributes are missing,
+    or (0.0, "unavailable")."""
+    if mem_clock_khz > 0 and mem_bus_bits > 0:
+        factor = 4 if backend == "rocm" and arch.lower() in _MEM_DATA_RATE_X4 else 2
+        return factor * (mem_clock_khz / 1e6) * mem_bus_bits / 8, "computed"
+    for key, gbs in _DATASHEET_BW_GBS:
+        if key.lower() in name.lower():
+            return gbs, "datasheet"
+    return 0.0, "unavailable"
+
+
+# Provenance of a DevicePeak value (DevicePeak.provenance):
+#   detected   read from the driver / OS as is
+#   computed   derived from detected values by an exact formula
+#   datasheet  vendor peak for this device model (detection unavailable)
+#   estimate   architecture-level rule of thumb (e.g. L2 bandwidth table)
+#   fallback   generic default because nothing better was available
+PROVENANCE_KINDS = ("detected", "computed", "datasheet", "estimate", "fallback", "unavailable")
 
 
 @dataclass
@@ -128,6 +176,12 @@ class DevicePeak:
     l2_bandwidth_gbs: float = 0.0  # L2 cache peak bandwidth (GPU); 0 = unknown
     l1_bandwidth_gbs: float = 0.0  # L1 cache peak bandwidth (GPU); 0 = unknown
     l3_bandwidth_gbs: float = 0.0  # L3/LLC peak bandwidth (CPU); 0 = unknown
+    # field name -> one of PROVENANCE_KINDS; empty for traces saved before
+    # provenance was recorded (shown as unknown, never guessed)
+    provenance: dict = field(default_factory=dict)
+
+    def source_of(self, fld: str) -> str:
+        return self.provenance.get(fld, "")
 
     @property
     def ridge_point(self) -> float:
@@ -148,6 +202,7 @@ class DevicePeak:
             "l2_bandwidth_gbs": self.l2_bandwidth_gbs,
             "l1_bandwidth_gbs": self.l1_bandwidth_gbs,
             "l3_bandwidth_gbs": self.l3_bandwidth_gbs,
+            "provenance": dict(self.provenance),
         }
 
     @staticmethod
@@ -169,6 +224,7 @@ class DevicePeak:
             l2_bandwidth_gbs=float(d.get("l2_bandwidth_gbs", 0)),
             l1_bandwidth_gbs=float(d.get("l1_bandwidth_gbs", 0)),
             l3_bandwidth_gbs=float(d.get("l3_bandwidth_gbs", 0)),
+            provenance=dict(d.get("provenance") or {}),
         )
 
 
@@ -211,15 +267,13 @@ def query_cuda_devices() -> list[DevicePeak]:
                 v = ctypes.c_int(0)
                 rc = cuda.cuDeviceGetAttribute(ctypes.byref(v), attr_id, dev)
                 if rc != 0:
-                    # Previously silently ignored: a failed query left
-                    # v.value at its ctypes default (0), indistinguishable
-                    # from a device that genuinely reports 0 for that
-                    # attribute -- e.g. a 0 mem_bus_bits/mem_clock_khz
-                    # zeroes bandwidth_gbs, which zeroes ridge_point,
-                    # forcing every kernel to classify as compute-bound;
-                    # a 0 sm_count/core_clock_khz zeroes fp32_tflops,
-                    # making flops_pct always report exactly 0.0% instead
-                    # of surfacing that the device query itself failed.
+                    # A failed query leaves v.value at its ctypes default
+                    # (0), indistinguishable from a device that reports 0:
+                    # a 0 mem_bus_bits/mem_clock_khz zeroes bandwidth_gbs
+                    # and ridge_point (every kernel classifies as
+                    # compute-bound); a 0 sm_count/core_clock_khz zeroes
+                    # fp32_tflops (flops_pct always 0.0%). Warn so the
+                    # failed device query is visible.
                     if attr_id not in _cuda_attr_warned:
                         _cuda_attr_warned.add(attr_id)
                         import sys
@@ -254,8 +308,10 @@ def query_cuda_devices() -> list[DevicePeak]:
                 tensor_tflops = fp32_tflops * 4
 
             mem_clock_ghz  = mem_clock_khz / 1e6
-            bandwidth_gbs  = 2 * mem_clock_ghz * mem_bus_bits / 8  # DDR ×2
+            bandwidth_gbs, bw_src = dram_bandwidth_gbs("cuda", f"{major}.{minor}",
+                                                       mem_clock_khz, mem_bus_bits, name)
             l2_bw_gbs      = _cuda_l2_bw_gbs(major, minor, bandwidth_gbs)
+            l2_known       = (major, minor) in _CUDA_L2_BW_GBS or (major, 0) in _CUDA_L2_BW_GBS
 
             devices.append(DevicePeak(
                 name=name or f"CUDA device {i}",
@@ -272,6 +328,14 @@ def query_cuda_devices() -> list[DevicePeak]:
                 compute_cap=f"{major}.{minor}",
                 tensor_tflops=tensor_tflops,
                 l2_bandwidth_gbs=l2_bw_gbs,
+                provenance={
+                    "sm_count": "detected", "core_clock_ghz": "detected",
+                    "mem_clock_ghz": "detected", "mem_bus_bits": "detected", "vram_gb": "detected",
+                    "fp32_tflops": "computed", "fp64_tflops": "computed", "fp16_tflops": "computed",
+                    "tensor_tflops": "estimate" if tensor_tflops else "unavailable",
+                    "bandwidth_gbs": bw_src,
+                    "l2_bandwidth_gbs": "estimate" if l2_known else "fallback",
+                },
             ))
         return devices
     except Exception:
@@ -434,7 +498,7 @@ def query_rocm_devices() -> list[DevicePeak]:
             fp16_tflops = fp32_tflops * 2
 
             mem_clock_ghz = mem_clock_khz / 1e6
-            bandwidth_gbs = 2 * mem_clock_ghz * mem_bus_bits / 8
+            bandwidth_gbs, bw_src = dram_bandwidth_gbs("rocm", gfx_str, mem_clock_khz, mem_bus_bits, name)
             l2_bw_gbs     = _rocm_l2_bw_gbs(gfx_str, bandwidth_gbs)
 
             devices.append(DevicePeak(
@@ -451,6 +515,13 @@ def query_rocm_devices() -> list[DevicePeak]:
                 vram_gb=total_mem.value / 1e9,
                 compute_cap=gfx_str,
                 l2_bandwidth_gbs=l2_bw_gbs,
+                provenance={
+                    "sm_count": "detected", "core_clock_ghz": "detected",
+                    "mem_clock_ghz": "detected", "mem_bus_bits": "detected", "vram_gb": "detected",
+                    "fp32_tflops": "computed", "fp64_tflops": "computed", "fp16_tflops": "computed",
+                    "bandwidth_gbs": bw_src,
+                    "l2_bandwidth_gbs": "estimate" if gfx_str.lower() in _ROCM_L2_BW_GBS else "fallback",
+                },
             ))
         return devices
     except Exception:
@@ -500,6 +571,7 @@ def query_cpu_device() -> Optional[DevicePeak]:
 
         # Memory bandwidth: try dmidecode, fall back to conservative estimate
         bw_gbs = 50.0
+        bw_src = "fallback"            # dmidecode usually needs root
         try:
             dmi = subprocess.run(
                 ["dmidecode", "-t", "memory"],
@@ -513,6 +585,7 @@ def query_cpu_device() -> Optional[DevicePeak]:
                 # Estimate: assume dual-channel (slots/2) at max speed
                 channels = max(slots // 2, 1)
                 bw_gbs = max(speeds) * max(widths) / 8 * channels / 1000
+                bw_src = "estimate"    # assumes dual-channel population
         except Exception:
             pass
 
@@ -535,6 +608,12 @@ def query_cpu_device() -> Optional[DevicePeak]:
             vram_gb=0.0,
             compute_cap="",
             l3_bandwidth_gbs=l3_bw_gbs,
+            provenance={
+                "sm_count": "detected", "core_clock_ghz": "detected",
+                "fp32_tflops": "computed", "fp64_tflops": "computed",
+                "fp16_tflops": "computed" if fp16_tflops else "unavailable",
+                "bandwidth_gbs": bw_src, "l3_bandwidth_gbs": "estimate",
+            },
         )
     except Exception:
         return None

@@ -1,25 +1,19 @@
 """
-Workspace persistence (Phase 1 of the usability/persistence/loading
-overhaul) -- QSettings(IniFormat)-backed, versioned, with GLOBAL settings
-(profile-independent: window geometry, theme, per-table column config,
-legend/first-use-overlay dismissal) kept separate from PER-PROFILE
-settings (filters, timeline zoom/pan/grouping, selected entity,
-bookmarks -- keyed by the trace file's own resolved absolute path).
+Workspace persistence -- QSettings(IniFormat)-backed, versioned, with
+GLOBAL settings (window geometry, theme, per-table column config,
+legend/first-use-overlay dismissal) kept separate from PER-PROFILE settings
+(filters, timeline zoom/pan/grouping, selected entity, bookmarks).
 
-Resolved via Qt's own org/app-name mechanism (app.py already calls
-app.setApplicationName("hprofiler")/setOrganizationName("hprofiler")) to
-~/.config/hprofiler/hprofiler.conf on Linux -- IniFormat, not
-NativeFormat (registry/plist), deliberately: a plain text file is
-human-diffable/greppable, which matters for "recover gracefully from
-invalid settings" (a corrupt file is trivially inspectable) and for the
-"copy diagnostics"/support story generally.
+Resolved via Qt's org/app-name mechanism (app.py sets both to "hprofiler")
+to ~/.config/hprofiler/hprofiler.conf on Linux. IniFormat rather than
+NativeFormat so a corrupt settings file is human-inspectable/greppable.
 
-Deliberately does NOT persist AppInfo.commandLine/argv/env -- only the
-trace file PATH is ever written. The profiled program's own command line
-(already shown live in the window title/footer) can legitimately contain
-secrets (API keys, credentials passed as args); nothing about restoring
-"which profile was open" requires remembering how it was originally
-launched, so that data never touches disk here.
+Only presentation state is persisted: Timeline filters, grouping, colour
+mode, lane visibility/order, zoom/pan, bookmarks and named ranges, and
+table column layouts (ViewStatePersister below). Never written: the
+profiled command line/argv/env (they can contain secrets), trace contents,
+and the trace file's path -- a profile's state is filed under a hash of its
+resolved path, which finds it again without recording where the file is.
 """
 from __future__ import annotations
 
@@ -45,15 +39,10 @@ def _resolved_path(trace_path: str) -> str:
 
 def _storage_key(trace_path: str) -> str:
     """A stable, QSettings-group-safe key for `trace_path` -- the raw
-    resolved path can't be used directly as a group/key segment (it
-    contains '/', which QSettings treats as ITS OWN group-nesting
-    separator, so two different paths sharing a prefix would silently
-    create overlapping/ambiguous groups). Hashing sidesteps that
-    entirely; the raw path is still stored as a VALUE alongside the
-    state (not as part of the key) purely for human-readability of the
-    resulting .ini file and as a collision sanity-check, not because
-    lookup depends on it -- lookup re-hashes the incoming path the same
-    way every time, so it's always correct regardless."""
+    resolved path can't be a group/key segment ('/' is QSettings' own
+    group-nesting separator, so paths sharing a prefix would create
+    overlapping groups). Lookup re-hashes the incoming path the same way;
+    the path itself is never stored."""
     return hashlib.sha256(_resolved_path(trace_path).encode("utf-8")).hexdigest()[:16]
 
 
@@ -157,7 +146,7 @@ class WorkspaceSettings:
         key = _storage_key(trace_path)
         self._s.beginGroup("profiles")
         self._s.beginGroup(key)
-        self._s.setValue("path", _resolved_path(trace_path))
+        self._s.remove("path")          # older settings files stored the path; drop it
         self._s.setValue("state", json.dumps(state))
         self._s.setValue("lastOpenedIso", _now_iso())
         self._s.endGroup()
@@ -301,3 +290,58 @@ class WorkspaceBridge(QObject):
         self._timeline_overlay_dismissed = False
         self.legendCollapsedChanged.emit()
         self.timelineOverlayDismissedChanged.emit()
+
+
+class ViewStatePersister(QObject):
+    """Restores the opened profile's saved presentation state (Timeline
+    view state, see TimelineModel.export_view_state) and the global table
+    layouts when the GUI starts, then saves them again shortly after every
+    change (debounced) and when the application quits. Nothing else is
+    written -- see the module docstring."""
+
+    DEBOUNCE_MS = 1500
+
+    def __init__(self, settings: WorkspaceSettings, trace_path: str, timeline,
+                 tables: dict[str, Any], parent: QObject | None = None) -> None:
+        from PySide6.QtCore import QTimer
+        super().__init__(parent)
+        self._settings = settings
+        self._path = str(trace_path)
+        self._timeline = timeline
+        self._tables = {k: v for k, v in tables.items() if v is not None}
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.DEBOUNCE_MS)
+        self._timer.timeout.connect(self.save)
+        self._restoring = False
+        self.restore()
+        for sig in ("filtersChanged", "groupingChanged", "rowsChanged", "colorModeChanged",
+                    "bookmarksChanged", "namedRangesChanged", "viewNoted"):
+            getattr(timeline, sig).connect(self._changed)
+        for cfg in self._tables.values():
+            cfg.columnsChanged.connect(self._changed)
+            cfg.modeChanged.connect(self._changed)
+
+    def restore(self) -> None:
+        self._restoring = True
+        try:
+            state = self._settings.load_profile_state(self._path) or {}
+            tl = state.get("timeline")
+            if isinstance(tl, dict):
+                self._timeline.restore_view_state(tl)
+            for table_id, cfg in self._tables.items():
+                cfg.restore_state(self._settings.load_table_config(table_id))
+        finally:
+            self._restoring = False
+
+    def _changed(self, *args) -> None:
+        if not self._restoring:
+            self._timer.start()
+
+    @Slot()
+    def save(self) -> None:
+        self._timer.stop()
+        self._settings.save_profile_state(self._path, {"timeline": self._timeline.export_view_state()})
+        for table_id, cfg in self._tables.items():
+            self._settings.save_table_config(table_id, cfg.export_state())
+        self._settings.sync()
