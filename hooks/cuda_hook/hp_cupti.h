@@ -27,6 +27,10 @@ HP_HIDDEN void hp_cuda_emit_line(const char *line);
  * PC-sampling tables (CUPTI allows one buffer-callback registration per
  * process, so cupti_trace.c owns it for both features). */
 HP_HIDDEN void hp_cuda_pc_record(const void *record, uint32_t kind);
+/* Module id (hp_module.h) of a launched function handle -- a CUfunction from
+ * cuModuleGetFunction, or a host stub the runtime registered -- or 0 when it
+ * comes from no captured module. cuda_hook.c owns the table. */
+HP_HIDDEN uint64_t hp_cuda_function_module(const void *fn);
 
 /* ── provided by cupti_trace.c ─────────────────────────────────────────── */
 
@@ -70,6 +74,8 @@ void hp_cupti_test_note_internal(uint32_t corr);
 void hp_cupti_test_set_cb_syncs(int on);
 /* Invoke the Callback-API handler with a synthetic CUpti_CallbackData. */
 void hp_cupti_test_api_callback(int runtime_domain, const void *callback_data);
+/* ... with its callback id (CUPTI_DRIVER_TRACE_CBID_* / CUPTI_RUNTIME_TRACE_CBID_*). */
+void hp_cupti_test_api_callback_id(int runtime_domain, uint32_t cbid, const void *callback_data);
 #endif
 
 #endif /* HP_CUPTI_H */

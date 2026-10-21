@@ -44,6 +44,20 @@ class TraceMetadata:
     # unknown / partial records, processing errors). Empty for traces
     # captured before this existed. receiver.capture_warnings() renders it.
     capture_health: dict = field(default_factory=dict)
+    # Exit status of the profiled command (`hprofiler run`): its return
+    # code, or -N when killed by signal N. None when unknown (traces
+    # captured before this existed, or built by hand).
+    exit_status: "int | None" = None
+    # Known holes in the MPI dependency graph, counted at the end of the
+    # capture (src/analysis/criticalpath.py mpi_dependency_diagnostics).
+    dependency_diagnostics: dict = field(default_factory=dict)
+    # The clock the timestamps are on (Runner): {"clock": "CLOCK_MONOTONIC",
+    # "boot_id", "clocksource", "timens_monotonic_ns"} -- traces with the
+    # same boot_id and time-namespace offset share one clock, so
+    # merge-nodes aligns them with offset 0. A merged trace has {"merge":
+    # plan} instead (src/analysis/multinode.py MergePlan.to_dict). Empty for
+    # traces recorded before this existed.
+    clock: dict = field(default_factory=dict)
 
 
 class Trace:
@@ -75,13 +89,86 @@ class Trace:
         self._devices: list["DevicePeak"] = []  # type: ignore[type-arg]
 
     def add_disasm(self, kd: "KernelDisasm") -> None:  # type: ignore[type-arg]
+        """Stored under kd.key: "name@module" for code from a captured
+        module/JIT blob, so variants that share a kernel name stay apart."""
         with self._lock:
-            self._disasm[kd.name] = kd
+            self._disasm[kd.key] = kd
             # Also store under 255-char prefix so spans recorded by older hook
             # builds (which truncated kname to 255 chars) still match.
-            if len(kd.name) > 255:
+            if not kd.module and len(kd.name) > 255:
                 self._disasm.setdefault(kd.name[:255], kd)
             self._disasm_version += 1
+
+    # How disasm_for() found the code; the last two must be shown as such.
+    DISASM_FOUND_HOW = {
+        "module":         "exact code: matched by the launch's module id",
+        "symbol":         "the program's own code, matched by symbol",
+        "name":           "matched by kernel name only -- the launches carried no module id "
+                          "for this code, so it may not be what ran",
+        "name-ambiguous": "matched by kernel name only -- several modules define this name; "
+                          "showing the most-launched one (each is listed as name@module)",
+    }
+
+    def disasm_for(self, name: str, module: str = "") -> "tuple[KernelDisasm | None, str]":  # type: ignore[type-arg]
+        """Disassembly for a kernel/function name (or a "name@module" key)
+        and how it was found -- a DISASM_FOUND_HOW key, or "none".
+
+        `module` is the mod= of the launch being looked up. Without it, a
+        name defined by exactly one module whose launches carried that id is
+        still exact; the name-only matches are reported as such."""
+        with self._lock:
+            d = self._disasm
+            kd = d.get(name)
+            if kd is not None and kd.module and kd.key == name:
+                return kd, "module"                      # a variant row's key
+            if module:
+                kd = d.get(f"{name}@{module}")
+                if kd is not None:
+                    return kd, "module"
+            variants = [v for v in d.values() if v.module and v.name == name]
+            plain = d.get(name)
+            if plain is None and len(name) > 255:
+                plain = d.get(name[:255])
+            if plain is not None and plain.module:
+                plain = None
+        if module:                                       # its module's code is missing
+            pick = plain or (max(variants, key=lambda v: v.launches or 0) if variants else None)
+            return (pick, "name") if pick else (None, "none")
+        if not variants:
+            return (plain, "symbol") if plain else (None, "none")
+        if len(variants) == 1 and plain is None:
+            linked = (variants[0].launches or 0) > 0 and variants[0].launch_basis != "name"
+            return variants[0], ("module" if linked else "name")
+        pick = max(variants, key=lambda v: v.launches or 0)
+        if plain is not None and not pick.launches:
+            pick = plain
+        return pick, "name-ambiguous"
+
+    def disasm_listing(self, names: "list[str]") -> "list[str]":
+        """Rows for a kernel list: each name, followed by its "name@module"
+        keys when more than one piece of code has that name, then the
+        disassembled entries no name in `names` refers to."""
+        # canonical keys only (not the 255-character aliases)
+        d = {k: kd for k, kd in self.disasm.items() if k == kd.key}
+        by_name: dict[str, list[str]] = {}
+        for key, kd in d.items():
+            by_name.setdefault(kd.name, []).append(key)
+        rows, seen = [], set()
+        for n in names:
+            rows.append(n)
+            seen.add(n)
+            keys = by_name.get(n, [])
+            if len(keys) > 1:
+                for k in sorted(keys, key=lambda k: -(d[k].launches or 0)):
+                    if k != n:
+                        rows.append(k)
+                        seen.add(k)
+        named = set(names)
+        for key, kd in d.items():
+            if key in seen or kd.name in named or key[:255] in named:
+                continue
+            rows.append(key)
+        return rows
 
     def add_pc_sample(self, func_name: str, pc_offset: int, stall_reason: int, count: int) -> None:
         with self._lock:

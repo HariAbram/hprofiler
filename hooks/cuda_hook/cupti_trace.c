@@ -44,6 +44,7 @@
  */
 #define _GNU_SOURCE
 #include "hp_cupti.h"
+#include "../common/hp_ids.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -429,7 +430,44 @@ static const api_class_t *classify(const char *name) {
     return NULL;
 }
 
-static void emit_callback_span(const CUpti_CallbackData *cb, uint64_t t0, uint64_t t1) {
+/* Kernel launches the hook did not intercept (cuLaunchKernelEx obtained with
+ * dlsym, as Triton does; a library's own launches): the launched function
+ * handle is in the call's parameters, and its module id names the code that
+ * ran (mod=, copied to the device span by the correlation). Only the leading
+ * members are declared -- layouts from CUPTI's generated_cuda_meta.h and
+ * generated_cuda_runtime_api_meta.h; callback ids (stable numbers) from
+ * cupti_driver_cbid.h and cupti_runtime_cbid.h. */
+typedef struct { const void *f; } hp_launch_f_params;                       /* f first */
+typedef struct { const void *config; const void *f; } hp_launch_cfg_f_params;  /* config, f */
+
+enum {
+    HP_DRV_cuLaunchKernel = 307, HP_DRV_cuLaunchKernel_ptsz = 442,
+    HP_DRV_cuLaunchCooperativeKernel = 477, HP_DRV_cuLaunchCooperativeKernel_ptsz = 478,
+    HP_DRV_cuLaunchKernelEx = 652, HP_DRV_cuLaunchKernelEx_ptsz = 653,
+    HP_RT_cudaLaunchKernel_v7000 = 211, HP_RT_cudaLaunchKernel_ptsz_v7000 = 214,
+    HP_RT_cudaLaunchCooperativeKernel_v9000 = 269, HP_RT_cudaLaunchCooperativeKernel_ptsz_v9000 = 270,
+    HP_RT_cudaLaunchKernelExC_v11060 = 430, HP_RT_cudaLaunchKernelExC_ptsz_v11060 = 431,
+};
+
+/* The function handle of a kernel-launch callback, or NULL. */
+static const void *launch_function(int is_rt, CUpti_CallbackId cbid, const void *params) {
+    if (!params) return NULL;
+    switch (is_rt ? -(int)cbid : (int)cbid) {
+    case HP_DRV_cuLaunchKernel: case HP_DRV_cuLaunchKernel_ptsz:
+    case HP_DRV_cuLaunchCooperativeKernel: case HP_DRV_cuLaunchCooperativeKernel_ptsz:
+    case -HP_RT_cudaLaunchKernel_v7000: case -HP_RT_cudaLaunchKernel_ptsz_v7000:
+    case -HP_RT_cudaLaunchCooperativeKernel_v9000: case -HP_RT_cudaLaunchCooperativeKernel_ptsz_v9000:
+        return ((const hp_launch_f_params *)params)->f;
+    case HP_DRV_cuLaunchKernelEx: case HP_DRV_cuLaunchKernelEx_ptsz:
+    case -HP_RT_cudaLaunchKernelExC_v11060: case -HP_RT_cudaLaunchKernelExC_ptsz_v11060:
+        return ((const hp_launch_cfg_f_params *)params)->f;
+    default:
+        return NULL;
+    }
+}
+
+static void emit_callback_span(const CUpti_CallbackData *cb, int is_rt, CUpti_CallbackId cbid,
+                               uint64_t t0, uint64_t t1) {
     const api_class_t *c = classify(cb->functionName);
     if (!c) return;
     /* "cudaLaunchKernel_v7000" -> "cudaLaunchKernel" */
@@ -442,22 +480,25 @@ static void emit_callback_span(const CUpti_CallbackData *cb, uint64_t t0, uint64
                      : (!strcmp(c->op, "stream_wait") || !strcmp(c->op, "event_record")) ? c->op
                      : (!strcmp(c->op, "kernel") || !strcmp(c->op, "graph") || is_async)
                        ? "launch" : c->op;   /* blocking copy/memset: the call is the transfer */
-    /* Span id: same (pid << 32 | n) scheme as cuda_hook.c's host spans, in
-     * the upper half of the 32-bit range so the two never collide. */
+    /* Span id: the CUDA hook's id space (hp_ids.h) with bit 31 of the
+     * counter set, so it never collides with cuda_hook.c's host spans. */
     static uint32_t cb_seq = 0;
-    uint64_t sid = ((uint64_t)(uint32_t)getpid() << 32) | 0x80000000u |
-                   (__atomic_add_fetch(&cb_seq, 1, __ATOMIC_RELAXED) & 0x7fffffffu);
+    uint64_t sid = hp_span_id(HP_ID_CUDA, (uint32_t)getpid(),
+                              0x80000000u | (__atomic_add_fetch(&cb_seq, 1, __ATOMIC_RELAXED) & 0x7fffffffu));
     char x[256];
     int n = snprintf(x, sizeof(x), "type=%s,op=%s,side=cpu,rt=cuda,timing=host,src=cupti_cb,corr=%u,sid=%llu",
                      type, c->op, cb->correlationId, (unsigned long long)sid);
     if (c->sync && n > 0 && n < (int)sizeof(x))
-        snprintf(x + n, sizeof(x) - (size_t)n, ",sync=%s", c->sync);
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",sync=%s", c->sync);
+    uint64_t mod = hp_cuda_function_module(launch_function(is_rt, cbid, cb->functionParams));
+    if (mod && n > 0 && n < (int)sizeof(x))
+        snprintf(x + n, sizeof(x) - (size_t)n, ",mod=%016llx", (unsigned long long)mod);
     hp_cuda_emit_span(c->cat, (pid_t)syscall(SYS_gettid), t0, t1 - t0, name, x);
 }
 
 static void CUPTIAPI api_callback(void *ud, CUpti_CallbackDomain dom,
                                   CUpti_CallbackId cbid, const void *data) {
-    (void)ud; (void)cbid;
+    (void)ud;
     if (dom != CUPTI_CB_DOMAIN_RUNTIME_API && dom != CUPTI_CB_DOMAIN_DRIVER_API) return;
     const CUpti_CallbackData *cb = (const CUpti_CallbackData *)data;
     int is_rt = dom == CUPTI_CB_DOMAIN_RUNTIME_API;
@@ -484,7 +525,7 @@ static void CUPTIAPI api_callback(void *ud, CUpti_CallbackDomain dom,
     } else {
         uint64_t v = cb->correlationData ? *cb->correlationData : 0;
         if (v & CB_OPEN_BIT) t_rt_open--;
-        if (v & CB_EMIT_BIT) emit_callback_span(cb, v & CB_TS_MASK, mono_ns());
+        if (v & CB_EMIT_BIT) emit_callback_span(cb, is_rt, cbid, v & CB_TS_MASK, mono_ns());
     }
 }
 
@@ -692,6 +733,10 @@ void hp_cupti_test_set_cb_syncs(int on) { g_cb_syncs = on; }
 void hp_cupti_test_api_callback(int runtime_domain, const void *callback_data) {
     api_callback(NULL, runtime_domain ? CUPTI_CB_DOMAIN_RUNTIME_API : CUPTI_CB_DOMAIN_DRIVER_API,
                  0, callback_data);
+}
+void hp_cupti_test_api_callback_id(int runtime_domain, uint32_t cbid, const void *callback_data) {
+    api_callback(NULL, runtime_domain ? CUPTI_CB_DOMAIN_RUNTIME_API : CUPTI_CB_DOMAIN_DRIVER_API,
+                 (CUpti_CallbackId)cbid, callback_data);
 }
 #endif
 

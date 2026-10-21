@@ -133,9 +133,9 @@ ScrollView {
                 Layout.fillHeight: true
                 label: "CPU ACTIVE"
                 value: Dashboard.cpuUtilPct.toFixed(0) + "%"
-                valueColor: Dashboard.cpuUtilPct >= 70 ? AppTheme.severityColor("green")
-                            : Dashboard.cpuUtilPct >= 40 ? AppTheme.severityColor("yellow")
-                            : AppTheme.severityColor("red")
+                valueColor: Dashboard.cpuUtilPct >= 70 ? AppTheme.severityColor("green", AppTheme.dark)
+                            : Dashboard.cpuUtilPct >= 40 ? AppTheme.severityColor("yellow", AppTheme.dark)
+                            : AppTheme.severityColor("red", AppTheme.dark)
             }
             StatCard {
                 Layout.fillWidth: true
@@ -144,9 +144,9 @@ ScrollView {
                 value: Dashboard.gpuActiveAvailable
                        ? Dashboard.gpuActivePct.toFixed(0) + "%" : "n/a"
                 valueColor: Dashboard.gpuActiveAvailable
-                            ? (Dashboard.gpuActivePct >= 70 ? AppTheme.severityColor("green")
-                               : Dashboard.gpuActivePct >= 40 ? AppTheme.severityColor("yellow")
-                               : AppTheme.severityColor("red"))
+                            ? (Dashboard.gpuActivePct >= 70 ? AppTheme.severityColor("green", AppTheme.dark)
+                               : Dashboard.gpuActivePct >= 40 ? AppTheme.severityColor("yellow", AppTheme.dark)
+                               : AppTheme.severityColor("red", AppTheme.dark))
                             : AppTheme.textMuted
             }
             StatCard {
@@ -154,9 +154,9 @@ ScrollView {
                 Layout.fillHeight: true
                 label: Dashboard.waitLabel
                 value: Dashboard.waitPct.toFixed(0) + "%"
-                valueColor: Dashboard.waitPct >= 40 ? AppTheme.severityColor("red")
-                            : Dashboard.waitPct >= 20 ? AppTheme.severityColor("yellow")
-                            : AppTheme.severityColor("green")
+                valueColor: Dashboard.waitPct >= 40 ? AppTheme.severityColor("red", AppTheme.dark)
+                            : Dashboard.waitPct >= 20 ? AppTheme.severityColor("yellow", AppTheme.dark)
+                            : AppTheme.severityColor("green", AppTheme.dark)
             }
             StatCard {
                 Layout.fillWidth: true
@@ -189,7 +189,7 @@ ScrollView {
                             delegate: Rectangle {
                                 width: breakdownBar.width * modelData.pct / 100
                                 height: breakdownBar.height
-                                color: AppTheme.bucketColor(modelData.label)
+                                color: AppTheme.bucketColor(modelData.label, AppTheme.dark)
                             }
                         }
                     }
@@ -202,7 +202,7 @@ ScrollView {
                         model: Dashboard.timeBreakdown
                         delegate: LegendSwatch {
                             circular: false
-                            swatchColor: AppTheme.bucketColor(modelData.label)
+                            swatchColor: AppTheme.bucketColor(modelData.label, AppTheme.dark)
                             label: modelData.label + "  " + modelData.pct.toFixed(1) + "%  (" + modelData.ns.toLocaleString() + " ns, derived)"
                         }
                     }
@@ -312,7 +312,7 @@ ScrollView {
                             id: previewRow
                             width: parent.width
                             spacing: AppTheme.spacingSm
-                            property string rowColor: modelData.color
+                            property string rowColor: AppTheme.categoryColor(modelData.category, AppTheme.dark)
 
                             Text {
                                 text: modelData.category
@@ -375,7 +375,7 @@ ScrollView {
                     delegate: RowLayout {
                         width: ListView.view.width
                         height: AppTheme.rowCompact
-                        Rectangle { width: 8; height: 8; radius: 4; color: modelData.color }
+                        Rectangle { width: 8; height: 8; radius: 4; color: AppTheme.categoryColor(modelData.category, AppTheme.dark) }
                         Text {
                             text: modelData.name
                             color: AppTheme.text

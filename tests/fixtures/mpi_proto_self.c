@@ -4,12 +4,13 @@
  * Cancel, Comm_split) via self-communication (rank 0 sending to itself)
  * instead of real cross-rank traffic.
  *
- * Why this exists alongside mpi_proto.c: this development machine's
- * MPICH/Hydra cannot form a real multi-rank MPI_COMM_WORLD (every rank
- * independently observes MPI_Comm_size == 1 under `mpirun -np N` for
- * N > 1, confirmed via UCX_LOG_LEVEL=info to be a PMI/KVS rank-discovery
- * failure unrelated to hprofiler -- reproducible with the plain
- * mpi_mini.c fixture too). Self-send
+ * Why this exists alongside mpi_proto.c: it needs one process only, so it
+ * runs with any MPI -- Ubuntu's MPICH/Hydra cannot form a real multi-rank
+ * MPI_COMM_WORLD (every rank independently observes MPI_Comm_size == 1
+ * under `mpirun -np N` for N > 1, a PMI/KVS rank-discovery failure
+ * unrelated to hprofiler); mpi_proto.c itself runs on 4 real ranks in
+ * tests/integration/test_mpi_multirank.py where Intel MPI is installed.
+ * Self-send
  * still drives the real PMPI_Isend/Irecv/Waitany/Waitsome/Test/Cancel
  * implementation and lets this hook's status-resolution and request-table
  * logic be verified against genuine MPI completion semantics, just

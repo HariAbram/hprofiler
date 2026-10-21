@@ -67,6 +67,8 @@ _DARK = {
     "text":         "#e6edf3",
     "textMuted":    "#8b949e",
     "accent":       "#22d3ee",
+    "control":      "#21262d",
+    "textDisabled": "#848d97",
 }
 
 _LIGHT = {
@@ -77,6 +79,8 @@ _LIGHT = {
     "text":         "#1f2328",
     "textMuted":    "#656d76",
     "accent":       "#0969da",
+    "control":      "#eaeef2",
+    "textDisabled": "#6e7781",
 }
 
 
@@ -149,6 +153,57 @@ def cause_color(cause: str, dark: bool) -> str:
     if cause in _CAUSE_TO_SEVERITY:
         return severity_color(_CAUSE_TO_SEVERITY[cause], dark)
     return text_muted_color(dark)
+
+
+# Instruction types (disasm/classifier.py) on the Source tab -> (dark,
+# light): the dark values are the Source tab's original ones; the light
+# ones are the same hues 700-weight, >= 4.5:1 on white (the dark ones,
+# e.g. amber or cyan text, were ~1.7:1 there).
+_ITYPE_COLORS: dict[str, tuple[str, str]] = {
+    "vec_sp":      ("#4ade80", "#15803d"),
+    "vec_dp":      ("#22d3ee", "#0e7490"),
+    "vec_mem":     ("#fb923c", "#c2410c"),
+    "vector":      ("#16a34a", "#166534"),
+    "scalar":      ("#7dd3fc", "#0369a1"),
+    "memory":      ("#fbbf24", "#b45309"),
+    "control":     ("#e879f9", "#a21caf"),
+    "sync":        ("#f87171", "#b91c1c"),
+    "compute":     ("#60a5fa", "#1d4ed8"),
+    "int_compute": ("#3b82f6", "#1e40af"),
+    "tensor":      ("#c084fc", "#7e22ce"),
+    "other":       ("#9ca3af", "#4b5563"),
+}
+
+
+def itype_color(itype: str, dark: bool) -> str:
+    pair = _ITYPE_COLORS.get(itype, _ITYPE_COLORS["other"])
+    return pair[0] if dark else pair[1]
+
+
+# Roofline points by bound: the category pairs of cpu / rocm / other.
+_BOUND_TO_CATEGORY = {"compute": "cpu", "memory": "rocm"}
+
+
+def bound_color(bound: str, dark: bool) -> str:
+    return category_color(_BOUND_TO_CATEGORY.get(bound, "other"), dark)
+
+
+# Source-tab advice severities (analysis/asm_advisor.py) -> severity family.
+_ADVICE_TO_SEVERITY = {"crit": "red", "warn": "yellow", "info": "cyan"}
+
+
+def advice_color(severity: str, dark: bool) -> str:
+    family = _ADVICE_TO_SEVERITY.get(severity)
+    if family is None:
+        return (_DARK if dark else _LIGHT)["text"]
+    return severity_color(family, dark)
+
+
+# Timeline MPI/NCCL connectors by edge confidence: theme tokens (the
+# "certain" one was the dark theme's near-white text, also on white).
+def confidence_color(confidence: str, dark: bool) -> str:
+    pal = _DARK if dark else _LIGHT
+    return {"certain": pal["text"], "high": pal["accent"]}.get(confidence, pal["textMuted"])
 
 # Non-color layout tokens -- spacing/radius/typography/row/button scales.
 # Unlike the palettes above, these don't vary with the dark/light toggle,
@@ -235,13 +290,32 @@ class Theme(QObject):
     def accent(self) -> str:
         return self._pal()["accent"]
 
+    # Qt Quick Controls' palette (Main.qml): a button/tab face, and the text
+    # of a disabled control -- far dimmer than `text`, still >= 3:1 on the
+    # background, the face, and the lighter face Fusion draws for a
+    # disabled Button.
+    @Property(str, notify=themeChanged)
+    def control(self) -> str:
+        return self._pal()["control"]
+
+    @Property(str, notify=themeChanged)
+    def textDisabled(self) -> str:
+        return self._pal()["textDisabled"]
+
+    # Every colour slot takes an optional `dark`. QML passes AppTheme.dark
+    # (`AppTheme.categoryColor(cat, AppTheme.dark)`): a binding re-evaluates
+    # only when a property it read changes, and a slot call alone reads
+    # none -- with one argument the colour kept the theme the screen was
+    # built with after a light/dark toggle.
     @Slot(str, result=str)
-    def categoryColor(self, category: str) -> str:
-        return category_color(category, self._dark)
+    @Slot(str, bool, result=str)
+    def categoryColor(self, category: str, dark: bool | None = None) -> str:
+        return category_color(category, self._dark if dark is None else dark)
 
     @Slot(str, result=str)
-    def severityColor(self, severity: str) -> str:
-        return severity_color(severity, self._dark)
+    @Slot(str, bool, result=str)
+    def severityColor(self, severity: str, dark: bool | None = None) -> str:
+        return severity_color(severity, self._dark if dark is None else dark)
 
     # ── Activity buckets (analysis/activity_buckets.py's BUCKETS) ───────
     # Computation/Communication/Synchronization/Memory transfer reuse the
@@ -251,19 +325,44 @@ class Theme(QObject):
     # CVD-checked jit/nvtx category colors rather than adding unvetted hex
     # values.
     @Slot(str, result=str)
-    def bucketColor(self, bucket: str) -> str:
-        return bucket_color(bucket, self._dark)
+    @Slot(str, bool, result=str)
+    def bucketColor(self, bucket: str, dark: bool | None = None) -> str:
+        return bucket_color(bucket, self._dark if dark is None else dark)
+
+    # The Source tab's instruction types and advice, Roofline bounds and
+    # Timeline connector confidence -- same optional-`dark` convention.
+    @Slot(str, result=str)
+    @Slot(str, bool, result=str)
+    def itypeColor(self, itype: str, dark: bool | None = None) -> str:
+        return itype_color(itype, self._dark if dark is None else dark)
+
+    @Slot(str, result=str)
+    @Slot(str, bool, result=str)
+    def boundColor(self, bound: str, dark: bool | None = None) -> str:
+        return bound_color(bound, self._dark if dark is None else dark)
+
+    @Slot(str, result=str)
+    @Slot(str, bool, result=str)
+    def adviceColor(self, severity: str, dark: bool | None = None) -> str:
+        return advice_color(severity, self._dark if dark is None else dark)
+
+    @Slot(str, result=str)
+    @Slot(str, bool, result=str)
+    def confidenceColor(self, confidence: str, dark: bool | None = None) -> str:
+        return confidence_color(confidence, self._dark if dark is None else dark)
 
     # ── Comparison status (src/analysis/compare.py's classify()) ────────
     # Reuses severityColor()'s existing family palette rather than a new
     # dict -- one fewer place a future theme edit has to remember to touch.
     @Slot(str, result=str)
-    def changeColor(self, status: str) -> str:
-        return change_color(status, self._dark)
+    @Slot(str, bool, result=str)
+    def changeColor(self, status: str, dark: bool | None = None) -> str:
+        return change_color(status, self._dark if dark is None else dark)
 
     @Slot(str, result=str)
-    def causeColor(self, cause: str) -> str:
-        return cause_color(cause, self._dark)
+    @Slot(str, bool, result=str)
+    def causeColor(self, cause: str, dark: bool | None = None) -> str:
+        return cause_color(cause, self._dark if dark is None else dark)
 
     # ── Semantic severity aliases ───────────────────────────────────────
     # Additive, not a replacement: severityColor()'s "red"/"yellow"/

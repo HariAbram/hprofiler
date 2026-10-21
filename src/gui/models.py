@@ -20,6 +20,7 @@ from ..core.trace import Trace, parse_lane_name
 from ..analysis import criticalpath as _cp
 from ..analysis import activity_buckets
 from ..analysis import dashboard as dash
+from . import theme as theme_mod
 
 # Same 16-hue palette concept as the TUI's _SPAN_PALETTE (src/ui/app.py),
 # expressed as hex since QML wants CSS colors. Hue order mirrors the TUI's so
@@ -31,7 +32,6 @@ _SPAN_HEX_PALETTE = [
     "#818cf8", "#fca5a5", "#34d399", "#f0abfc",
 ]
 
-_CONFIDENCE_HEX = {"certain": "#e6edf3", "high": "#22d3ee", "medium": "#8b949e"}
 
 
 def _assign_span_colors(names: list[str]) -> dict[str, str]:
@@ -70,6 +70,10 @@ class TimelineModel(QObject):
     bookmarksChanged = Signal()
     namedRangesChanged = Signal()
     viewNoted = Signal()
+    # The light/dark theme was toggled and the theme-dependent colours
+    # (lane labels and occupancy, bucket/category span colours,
+    # connectors) were recomputed: lanes repaint.
+    colorsChanged = Signal()
 
     def __init__(self, trace: Trace, theme, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -171,6 +175,7 @@ class TimelineModel(QObject):
             self._lane_meta.append({
                 "name": lane_name,
                 "label": label,
+                "category": cat,
                 "color": self._theme.categoryColor(cat),
                 "count": self._infos[lane_name].count,
             })
@@ -213,6 +218,7 @@ class TimelineModel(QObject):
         self._category_colors: dict[str, str] = {
             c: self._theme.categoryColor(c) for c in {r["category"] for r in stats}
         }
+        theme.themeChanged.connect(self._on_theme_changed)
         # (pid, lane base) -> lane index, to place a span found by a name
         # query (findByName/search) on its lane.
         from ..core.store.common import lane_base
@@ -254,6 +260,12 @@ class TimelineModel(QObject):
             self._connectors = self._build_connectors()
         except Exception:
             self._connectors = []
+        # (lane, spanIdx) -> the connectors that start or end at that span:
+        # what the overlay draws for a hovered span (connectorsOf()).
+        self._connectors_of: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for c in self._connectors:
+            self._connectors_of.setdefault((c["predLane"], c["predSpanIdx"]), []).append(c)
+            self._connectors_of.setdefault((c["succLane"], c["succSpanIdx"]), []).append(c)
 
     # Building the dependency graph for connectors costs a pass over every
     # span; above this size it is only done when the store already holds
@@ -285,9 +297,29 @@ class TimelineModel(QObject):
                 "succLane": succ_lane,
                 "succSpanIdx": succ.eid,
                 "succMidNs": (succ.start_ns + succ.end_ns) / 2.0,
-                "color": _CONFIDENCE_HEX.get(_cp.EDGE_CONFS[conf], "#8b949e"),
+                "confidence": _cp.EDGE_CONFS[conf],
+                "color": theme_mod.confidence_color(_cp.EDGE_CONFS[conf], self._theme.dark),
             })
         return out
+
+    def _on_theme_changed(self) -> None:
+        """Recompute every theme-dependent colour (computed once, they kept
+        the starting theme's: e.g. the dark theme's near-white "sync" lane
+        label on the light background)."""
+        dark = self._theme.dark
+        for m in self._lane_meta:
+            m["color"] = theme_mod.category_color(m["category"], dark)
+        self._bucket_colors = {b: theme_mod.bucket_color(b, dark) for b in self._bucket_colors}
+        self._category_colors = {c: theme_mod.category_color(c, dark) for c in self._category_colors}
+        for c in self._connectors:
+            c["color"] = theme_mod.confidence_color(c["confidence"], dark)
+        # rows carry the lane colour too: updated in place, without
+        # rowsChanged, which would reset the lane list (and its scroll
+        # position) -- QML colours the labels by category for the theme
+        for r in self._rows:
+            if r.get("kind") == "lane":
+                r["color"] = self._lane_meta[r["laneIndex"]]["color"]
+        self.colorsChanged.emit()
 
     def _lane_of_span(self, span) -> int | None:
         return self._lane_of_key.get((span.pid, self._lane_base(span)))
@@ -308,6 +340,18 @@ class TimelineModel(QObject):
     @Property('QVariantList', constant=True)
     def connectors(self) -> list[dict[str, Any]]:
         return self._connectors
+
+    @Slot(int, float, result='QVariantList')
+    def connectorsOf(self, lane: int, span_idx: float) -> list[dict[str, Any]]:
+        """The connectors that start or end at one span (`spanIdx`, a store
+        event id: a float, as in spanAt(), since it passes 2^31). The hover
+        overlay asks for these instead of reading `connectors`: QML re-read
+        that whole list from Python on each element access, so one repaint
+        over an OSU multi-pair bandwidth run's 44k connectors blocked the
+        GUI for minutes."""
+        if span_idx is None or span_idx < 0:
+            return []
+        return self._connectors_of.get((lane, int(span_idx)), [])
 
     # ── Rows (live: filtering/grouping/reordering) ──────────────────────
     def _lane_passes_static_filters(self, lane_name: str) -> bool:
@@ -368,6 +412,7 @@ class TimelineModel(QObject):
             "laneIndex": i,
             "name": lane,
             "label": m["label"],
+            "category": m["category"],
             "color": m["color"],
             "count": m["count"],
             "filteredCount": filtered_count,

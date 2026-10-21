@@ -231,6 +231,8 @@ class DashboardBridge(QObject):
     """Backs the Overview screen (Main.qml's OverviewScreen.qml)."""
 
     _TIMELINE_BUCKETS = _DASHBOARD_TIMELINE_BUCKETS
+    # The theme was toggled: diagnosisColor follows it.
+    colorsChanged = Signal()
 
     def __init__(self, trace: Trace, theme, parent: QObject | None = None, *, comparison=None,
                  precomputed: dict[str, Any] | None = None) -> None:
@@ -243,6 +245,7 @@ class DashboardBridge(QObject):
         # Overview is unchanged (asserted in tests).
         self._comparison = comparison
         self._compute(precomputed)
+        theme.themeChanged.connect(self.colorsChanged)
 
     def _compute(self, precomputed: dict[str, Any] | None = None) -> None:
         # `precomputed`: compute_dashboard_data() already run off-thread by
@@ -259,7 +262,7 @@ class DashboardBridge(QObject):
     def diagnosisLabel(self) -> str:
         return self._diagnosis_label
 
-    @Property(str, constant=True)
+    @Property(str, notify=colorsChanged)
     def diagnosisColor(self) -> str:
         return self._theme.severityColor(self._diagnosis_severity)
 
@@ -630,12 +633,14 @@ class FlameGraphBridge(QObject):
     def tree(self) -> dict[str, Any]:
         return self._tree
 
-    @Property(int, constant=True)
-    def totalNs(self) -> int:
+    @Property(float, constant=True)
+    def totalNs(self) -> float:
         """Inclusive nanoseconds at the tree's root -- real time from
         build_flame_tree()'s reuse of _ct_build's inclusive-time
-        accumulation, NOT a sample count."""
-        return self._tree.get("value", 0)
+        accumulation, NOT a sample count. A float (QML number, exact to
+        2^53 ns): a Qt int overflows past 2.1 s, and QML then got an
+        error instead of the total (an 8-thread LULESH run)."""
+        return float(self._tree.get("value", 0))
 
 
 class RooflineBridge(QObject):
@@ -646,7 +651,6 @@ class RooflineBridge(QObject):
     data's own bounds) for a QML Canvas to draw, so the QML side needs
     no log-scale math of its own."""
 
-    _BOUND_COLOR = {"compute": "#22d3ee", "memory": "#e879f9", "unknown": "#9ca3af"}
 
     def __init__(self, trace: Trace, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -683,7 +687,7 @@ class RooflineBridge(QObject):
                 points.append({
                     "x": x, "y": 1.0 - y,  # canvas y grows downward
                     "name": m.kernel_name, "bound": m.bound,
-                    "color": self._BOUND_COLOR.get(m.bound, "#9ca3af"),
+                    "color": theme_mod.bound_color(m.bound, True),   # QML: by "bound"
                     "ai": m.arith_intensity, "tflops": m.achieved_tflops,
                     "flopsPct": m.flops_pct, "bwPct": m.bw_pct,
                 })
@@ -731,14 +735,9 @@ class RooflineBridge(QObject):
         return f"{10**self._lo_y:.2g}–{10**self._hi_y:.2g} TFLOP/s"
 
 
-# Same instruction-type semantics as disasm/classifier.py's ITYPE_COLOR,
-# independently expressed as hex for the same Rich-name-vs-QML-hex reason
-# as theme.py's category colors.
-_ITYPE_HEX = {
-    "vec_sp": "#4ade80", "vec_dp": "#22d3ee", "vec_mem": "#fb923c", "vector": "#16a34a",
-    "scalar": "#7dd3fc", "memory": "#fbbf24", "control": "#e879f9", "sync": "#f87171",
-    "compute": "#60a5fa", "int_compute": "#3b82f6", "tensor": "#c084fc", "other": "#9ca3af",
-}
+# Instruction-type colours: theme.py's itype_color() (dark and light
+# values). The rows' "color" is the dark one; SourceScreen.qml colours
+# them by "itype"/"type" for the current theme.
 
 # Fuller labels than the TUI's terse 3-char ITYPE_LABEL (classifier.py),
 # which also lacks int_compute/tensor. Same instruction-type set as
@@ -796,13 +795,13 @@ class SourceBridge(QObject):
         stats = trace.aggregated_stats()
         profiled_names = [r["name"] for r in stats]
         stats_by_name = {r["name"]: r for r in stats}
-        disasm = trace.disasm
-        disasm_only = [n for n in disasm if n not in profiled_names]
-        names = profiled_names + disasm_only
+        # each name is followed by its name@module variants when several
+        # modules define it (Trace.disasm_listing)
+        names = trace.disasm_listing(profiled_names)
 
         kernels: list[dict[str, Any]] = []
         for name in names:
-            kd = disasm.get(name)
+            kd, how = trace.disasm_for(name)
             stat = stats_by_name.get(name)
             # kd.name (== `name` here) is the span/event label hprofiler
             # itself invents ("omp_barrier", "MPI_Bcast") -- there is no
@@ -816,13 +815,21 @@ class SourceBridge(QObject):
             # so the Source screen can tell the user what they're actually
             # looking at instead of just the event label.
             symbol = dash.demangle(kd.mangled_name) if kd and kd.mangled_name else ""
+            variant_row = kd is not None and kd.module and name == kd.key
             kernels.append({
-                "name": dash.fmt_kernel_name(name),
+                "name": (f"{dash.fmt_kernel_name(kd.name)} @{kd.module[:6]}" if variant_row
+                         else dash.fmt_kernel_name(name)),
                 "rawName": name,
                 "hasDisasm": kd is not None,
                 "arch": kd.arch if kd else "—",
-                "total": dash.fmt_ns(stat["total_ns"]) if stat else "—",
+                "total": dash.fmt_ns(stat["total_ns"]) if stat else (
+                    f"{kd.launches}×" if kd is not None and kd.launches else "—"),
                 "symbol": symbol,
+                # How the code was matched (Trace.disasm_for); a name-only
+                # match carries a note the Source screen shows as a warning.
+                "match": how,
+                "matchNote": Trace.DISASM_FOUND_HOW[how] if how.startswith("name") else "",
+                "module": kd.module if kd is not None else "",
             })
         self._kernels = kernels
         self.kernelsChanged.emit()
@@ -833,7 +840,7 @@ class SourceBridge(QObject):
 
     @Slot(str, result='QVariantList')
     def disasmLines(self, raw_name: str) -> list[dict[str, Any]]:
-        kd = self._trace.disasm.get(raw_name)
+        kd, _how = self._trace.disasm_for(raw_name)
         if kd is None:
             return []
         out = []
@@ -856,7 +863,7 @@ class SourceBridge(QObject):
                 "operands": ln.operands,
                 "comment": ln.comment,
                 "itype": itype,
-                "color": _ITYPE_HEX.get(itype, "#9ca3af"),
+                "color": theme_mod.itype_color(itype, True),
                 "samplePct": ln.sample_pct,
                 "sourceFile": ln.source_file,
                 "sourceLine": ln.source_line,
@@ -895,7 +902,7 @@ class SourceBridge(QObject):
         """Instruction-type breakdown (vector/memory/scalar/control/...)
         for the disassembled kernel, from KernelDisasm.itype_counts() --
         the GUI's equivalent of the TUI's DisasmWidget._show_mix."""
-        kd = self._trace.disasm.get(raw_name)
+        kd, _how = self._trace.disasm_for(raw_name)
         if kd is None or not kd.lines:
             return []
         counts = kd.itype_counts()
@@ -908,7 +915,7 @@ class SourceBridge(QObject):
             rows.append({
                 "type": itype,
                 "label": _ITYPE_MIX_LABEL.get(itype, itype),
-                "color": _ITYPE_HEX.get(itype, "#9ca3af"),
+                "color": theme_mod.itype_color(itype, True),
                 "count": count,
                 "pct": 100.0 * count / total,
             })
@@ -922,7 +929,7 @@ class SourceBridge(QObject):
         analysis/asm_advisor.py. Pure pattern analysis of the instruction
         stream (no runtime data, no network), so it works on an air-gapped
         compute node."""
-        kd = self._trace.disasm.get(raw_name)
+        kd, _how = self._trace.disasm_for(raw_name)
         if kd is None or not kd.lines:
             return []
         try:
@@ -930,7 +937,6 @@ class SourceBridge(QObject):
             advices = advise(kd)
         except Exception:
             return []
-        _SEV_HEX = {"crit": "#f87171", "warn": "#fbbf24", "info": "#22d3ee"}
         return [
             {
                 "severity": adv.severity,
@@ -938,7 +944,7 @@ class SourceBridge(QObject):
                 "message": adv.message,
                 "detail": adv.detail,
                 "icon": adv.icon,
-                "color": _SEV_HEX.get(adv.severity, "#e6edf3"),
+                "color": theme_mod.advice_color(adv.severity, True),   # QML: by "severity"
             }
             for adv in advices
         ]
@@ -1070,6 +1076,7 @@ class ProfileBridge(QObject):
                 "label": label, "activePct": pct, "syncPct": sync_pct, "efficiency": eff,
                 "launches": ka.used, "total": dash.fmt_ns(kern_acc),
                 "timingSource": ga.SOURCE_LABELS.get(ka.source, ka.source or ""),
+                "category": cat_val,
                 "color": theme.categoryColor(cat_val),
             })
 

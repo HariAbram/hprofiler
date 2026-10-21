@@ -14,6 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from ..core.events import SpanEvent
+from .span_links import SpanIdResolver
 
 
 @dataclass
@@ -42,42 +43,36 @@ def _ct_build_raw(spans: list[SpanEvent]) -> list[_RawNode]:
 
     When spans carry explicit span_id / parent_span_id links (emitted by hooks),
     those take precedence over temporal containment for spans that stay within
-    the same input set.
+    the same input set. One node per span: span ids can collide across hooks
+    in older traces, so a parent is resolved by span_links.SpanIdResolver
+    (never "the node of that id"), and only a span placed before the child
+    in start order can be its explicit parent -- every link points forward,
+    so the result is a forest (a shared node used to close cycles, and
+    _ct_aggregate recursed until Python's limit).
     """
     sorted_spans = sorted(spans, key=lambda s: s.start_ns)
-    # Map from span_id → node for explicit linking.
-    nodes_by_sid: dict[str, _RawNode] = {
-        s.span_id: _RawNode(span=s)
-        for s in sorted_spans
-        if s.span_id
-    }
-    # Remaining spans without a span_id get plain nodes.
-    all_nodes: dict[int, _RawNode] = {}  # id(span) → node
-    for s in sorted_spans:
-        if s.span_id and s.span_id in nodes_by_sid:
-            all_nodes[id(s)] = nodes_by_sid[s.span_id]
-        else:
-            all_nodes[id(s)] = _RawNode(span=s)
-
-    explicitly_parented: set[int] = set()  # id(span) of spans handled via explicit link
-    for s in sorted_spans:
-        if s.parent_span_id and s.parent_span_id in nodes_by_sid:
-            parent_node = nodes_by_sid[s.parent_span_id]
-            child_node  = all_nodes[id(s)]
-            if child_node is not parent_node:
-                parent_node.children.append(child_node)
-                explicitly_parented.add(id(s))
+    nodes = [_RawNode(span=s) for s in sorted_spans]
+    ids = SpanIdResolver()
+    for i, s in enumerate(sorted_spans):
+        ids.add_span(s, i)
+    explicitly_parented = [False] * len(nodes)
+    for i, s in enumerate(sorted_spans):
+        if s.parent_span_id:
+            p = ids.parent_of(s)
+            if p is not None and p < i:
+                nodes[p].children.append(nodes[i])
+                explicitly_parented[i] = True
 
     # Temporal containment for spans not already parented explicitly.
     # Explicitly-parented spans are still pushed onto the stack so their
     # temporally-contained children nest under them correctly.
     stack: list[_RawNode] = []
     roots: list[_RawNode] = []
-    for s in sorted_spans:
+    for i, s in enumerate(sorted_spans):
         while stack and stack[-1].span.end_ns <= s.start_ns:
             stack.pop()
-        node = all_nodes[id(s)]
-        if id(s) not in explicitly_parented:
+        node = nodes[i]
+        if not explicitly_parented[i]:
             if stack and stack[-1].span.end_ns >= s.end_ns:
                 stack[-1].children.append(node)
             else:
@@ -214,16 +209,14 @@ def _ct_build(spans: list[SpanEvent]) -> list[_CTNode]:
 
     # Identify spans that are explicit children of spans in a *different* thread.
     # We use the span_id → (pid, tid) map to detect cross-thread links.
-    sid_to_thread: dict[str, tuple[int, int]] = {
-        s.span_id: (s.pid, s.tid)
-        for s in duration_spans
-        if s.span_id
-    }
+    sid_to_thread = SpanIdResolver()
+    for s in duration_spans:
+        sid_to_thread.add_span(s, (s.pid, s.tid))
     cross_thread_children: dict[tuple[int, int], list[SpanEvent]] = defaultdict(list)
     orphan_threads: set[tuple[int, int]] = set()
     for s in duration_spans:
         if s.parent_span_id:
-            parent_thread = sid_to_thread.get(s.parent_span_id)
+            parent_thread = sid_to_thread.parent_of(s)
             my_thread = (s.pid, s.tid)
             if parent_thread and parent_thread != my_thread:
                 cross_thread_children[parent_thread].append(s)
@@ -264,13 +257,12 @@ def _build_call_tree(trace) -> list[_CTNode]:
     del stacked
     # Only spans carrying ids take part in cross-thread links: one pass
     # over that subset (arrival order) instead of every span.
-    sid_to_thread: dict[str, tuple[int, int]] = {}
+    sid_to_thread = SpanIdResolver()          # (pid, id): ids are per process
     linked: list[SpanEvent] = []
     for s in trace.iter_spans(with_ids=True):
         if s.duration_ns <= 0:
             continue
-        if s.span_id:
-            sid_to_thread[s.span_id] = (s.pid, s.tid)
+        sid_to_thread.add_span(s, (s.pid, s.tid))
         if s.parent_span_id:
             linked.append(s)
     # Containment needs timing, names and ids only: light spans (no tag
@@ -286,7 +278,7 @@ def _build_call_tree(trace) -> list[_CTNode]:
             [s for s in store.iter_spans_light(pid=pid, tid=tid) if s.duration_ns > 0]))
     cross_thread_children: dict[tuple[int, int], list[SpanEvent]] = defaultdict(list)
     for s in linked:
-        parent_thread = sid_to_thread.get(s.parent_span_id)
+        parent_thread = sid_to_thread.parent_of(s)
         if parent_thread and parent_thread != (s.pid, s.tid):
             cross_thread_children[parent_thread].append(s)
     del linked

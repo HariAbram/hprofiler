@@ -81,6 +81,14 @@ def _peer_pid(client: socket.socket) -> int:
         return 0
 
 
+def _peer_uid(client: socket.socket) -> int:
+    try:
+        creds = client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", creds)[1]
+    except OSError:
+        return -1
+
+
 class _Conn:
     __slots__ = ("id", "sock", "path", "wfd", "rfd", "done", "bytes", "lines", "tail", "keys",
                  "final_keys", "mem", "spool_failed", "peer_pid", "closed_at_deadline")
@@ -105,9 +113,14 @@ class _Conn:
 
 class Receiver:
     def __init__(self, server_sock: socket.socket, spool_dir: str, trace,
-                 handle_line: Callable[[str], None], *, on_connect: Callable[[socket.socket], None] | None = None):
+                 handle_line: Callable[[str], None], *, on_connect: Callable[[socket.socket], None] | None = None,
+                 require_uid: int | None = None):
         self.server = server_sock
         self.spool_dir = spool_dir
+        # Abstract-namespace collector sockets have no file permissions:
+        # connections from other users are refused (counted).
+        self.require_uid = require_uid
+        self.rejected_peers = 0
         self.trace = trace
         self.handle_line = handle_line           # records other than xport:
         self.on_connect = on_connect
@@ -155,6 +168,10 @@ class Receiver:
             self._register(client)
 
     def _register(self, client: socket.socket) -> None:
+        if self.require_uid is not None and _peer_uid(client) != self.require_uid:
+            self.rejected_peers += 1
+            client.close()
+            return
         client.setblocking(True)
         if self.on_connect is not None:
             try:
@@ -348,6 +365,11 @@ class Receiver:
                 self._wake.clear()
 
     # ── end of run ──────────────────────────────────────────────────────
+    def open_connections(self) -> int:
+        """Hook connections whose process has not closed them yet."""
+        with self._conns_lock:
+            return sum(1 for c in self._conns if not c.done.is_set())
+
     def backlog_bytes(self) -> int:
         with self._conns_lock:
             conns = list(self._conns)
@@ -428,6 +450,7 @@ class Receiver:
                 "spool_errors": self.spool_errors, "decode_replaced": self.decode_replaced,
                 "connections_without_status": self.conns_without_status,
                 "open_at_deadline": self.open_at_deadline,
+                **({"rejected_peers": self.rejected_peers} if self.rejected_peers else {}),
             },
             "transport": transport,
         }
@@ -438,8 +461,18 @@ def run_warnings(metadata) -> list[str]:
     the capture itself (capture_warnings) plus degraded native GPU tracing
     (gpu_activity.degraded_warnings). Shown after a run, by `summary`, and
     on the GUI Overview."""
-    return (capture_warnings(getattr(metadata, "capture_health", None) or {})
-            + gpu_activity.degraded_warnings(getattr(metadata, "device_activity", None) or {}))
+    out = (capture_warnings(getattr(metadata, "capture_health", None) or {})
+           + gpu_activity.degraded_warnings(getattr(metadata, "device_activity", None) or {}))
+    status = getattr(metadata, "exit_status", None)
+    if status:
+        out.append(f"the profiled command exited with status {status}"
+                   + (f" (killed by signal {-status})" if status < 0 else "")
+                   + ": the trace covers a failed or interrupted run")
+    diag = getattr(metadata, "dependency_diagnostics", None) or {}
+    if diag:
+        from ..analysis.criticalpath import dependency_warnings
+        out.extend(dependency_warnings(diag))
+    return out
 
 
 def capture_warnings(health: dict) -> list[str]:

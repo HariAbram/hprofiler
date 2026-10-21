@@ -28,7 +28,10 @@ Text {
     anchors.centerIn: centered ? parent : undefined
     horizontalAlignment: Text.AlignHCenter
     color: AppTheme.textMuted
-    font.family: monospace ? "monospace" : ""
+    // The application's own font otherwise -- never "": an empty family is
+    // not "the default" but whatever fontconfig matches first (a serif or
+    // even a script font on some desktops).
+    font.family: monospace ? "monospace" : Qt.application.font.family
     font.pixelSize: AppTheme.typeBody
     wrapMode: wrap ? Text.WordWrap : Text.NoWrap
     width: wrap && parent ? Math.min(implicitWidth, parent.width - AppTheme.spacingXl * 2) : implicitWidth

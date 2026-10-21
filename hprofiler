@@ -26,8 +26,19 @@ from pathlib import Path
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _available_backends() -> dict[str, bool]:
+    """Installed backends (hook/tool and library present)."""
     from src.backends import ALL_BACKENDS
     return {name: cls().is_available() for name, cls in ALL_BACKENDS.items()}
+
+
+def _backend_usability() -> dict[str, tuple[str, str]]:
+    """{name: ("usable" | "installed" | "missing", reason)}, the probes run
+    concurrently (each has its own timeout)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from src.backends import ALL_BACKENDS
+    with ThreadPoolExecutor(max_workers=len(ALL_BACKENDS)) as ex:
+        futs = {name: ex.submit(lambda c=cls: c().usability()) for name, cls in ALL_BACKENDS.items()}
+    return {name: f.result() for name, f in futs.items()}
 
 
 _ALIASES: dict[str, str] = {
@@ -40,20 +51,34 @@ _ALIASES: dict[str, str] = {
 
 
 def _resolve_backends(backend_str: str | None) -> list[str]:
-    """Resolve comma-separated backend list (with aliases), defaulting to all available."""
-    avail = _available_backends()
+    """Resolve comma-separated backend list (with aliases); "auto": every
+    backend that is usable here (installed is not enough: see `hprofiler
+    backends`)."""
     if not backend_str or backend_str == "auto":
-        chosen = [name for name, ok in avail.items() if ok]
+        use = _backend_usability()
+        chosen = [name for name, (state, _why) in use.items() if state == "usable"]
+        skipped = [f"{name} ({why})" for name, (state, why) in use.items() if state == "installed"]
+        if skipped:
+            click.echo(f"[hprofiler] auto: installed but not usable here, skipped: {'; '.join(skipped)}",
+                       err=True)
         if not chosen:
             chosen = ["cpu"]
         return chosen
+    avail = _available_backends()
     requested = [_ALIASES.get(b.strip(), b.strip()) for b in backend_str.split(",")]
     unknown = [b for b in requested if b not in avail]
     if unknown:
         valid = list(avail.keys()) + list(_ALIASES.keys())
         click.echo(f"[warn] Unknown backends: {', '.join(unknown)} "
                    f"(valid: {', '.join(sorted(valid))})", err=True)
-    return [b for b in requested if b in avail]
+    chosen = [b for b in requested if b in avail]
+    from src.backends import ALL_BACKENDS
+    for b in chosen:
+        state, why = ALL_BACKENDS[b]().usability()
+        if state != "usable":
+            click.echo(f"[hprofiler][warn] backend {b} is {'installed but not usable' if state == 'installed' else 'not installed'}"
+                       f"{': ' + why if why else ''} -- requested explicitly, so it is used anyway", err=True)
+    return chosen
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -151,9 +176,17 @@ def cli():
               help="Export to OTLP HTTP collector, e.g. http://localhost:4318")
 @click.option("--otlp-file", default=None, metavar="PATH",
               help="Write OTLP JSON to file (e.g. trace.otlp.json)")
+@click.option("--exit-status", "propagate_exit", is_flag=True, default=False,
+              help="Exit with the profiled command's exit status (128+N when it was killed by "
+                   "signal N) instead of 0. The status is always printed and stored in the "
+                   "trace  [default: exit 0]")
+@click.option("--python-jit", is_flag=True, default=False,
+              help="Python programs: record a Python JIT compiler's own compilation (Triton: "
+                   "Python -> TTIR -> ... -> cubin, per stage) as jit spans, which no hook "
+                   "sees otherwise  [default: no]")
 @click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph, disasm, call_tree,
-        gpu_pc_sampling, otlp_endpoint, otlp_file, command):
+        gpu_pc_sampling, otlp_endpoint, otlp_file, propagate_exit, python_jit, command):
     """Profile COMMAND with the selected backends.
 
     Backends are injected via LD_PRELOAD (CUDA, OpenCL, ROCm, NCCL, MPI) or
@@ -214,6 +247,8 @@ def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph
         env_extra["HPROFILER_CALLSTACK"] = "1"
     if gpu_pc_sampling:
         env_extra["HPROFILER_GPU_PCSAMPLING"] = "1"
+    if python_jit:
+        env_extra["HPROFILER_PYTHON_JIT"] = "1"
 
     # Events stream into an on-disk store in bounded batches while the
     # program runs (src/core/store/disk.py), never all held in memory.
@@ -230,6 +265,10 @@ def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph
 
     trace = runner.run()
     click.echo(f"\n[hprofiler] Run complete — {trace.span_count()} events captured", err=True)
+    status = runner.exit_status
+    if status is not None:
+        how = (f"killed by signal {-status}" if status < 0 else f"exited with status {status}")
+        click.echo(f"[hprofiler] Profiled command {how}", err=True)
 
     # Indexes, lanes, activity index and aggregates for the viewers.
     trace.finalize()
@@ -281,6 +320,9 @@ def run(backend, output, write_json, ui, gui, summary, perf_freq, perf_callgraph
                 from src.core.trace_io import write_json_export
                 write_json_export(trace, json_path)
             click.echo(f"[hprofiler] Disasm added to: {view_path}", err=True)
+
+    if propagate_exit and status:
+        sys.exit(128 - status if status < 0 else min(status, 255))
 
 
 @cli.command()
@@ -695,23 +737,39 @@ def disasm(trace_file, kernel, output, list_only):
                    "Re-run with --disasm to collect it.", err=True)
         raise SystemExit(1)
 
-    names = sorted(trace.disasm)
+    # One entry per piece of code: code from a captured module/JIT blob is
+    # keyed "name@module", so variants that share a kernel name are separate.
+    disasm = {k: kd for k, kd in trace.disasm.items() if k == kd.key}
+    names = sorted(disasm)
     if kernel:
         names = [n for n in names if kernel.lower() in n.lower()]
         if not names:
             click.echo(f"[hprofiler] No kernels matching '{kernel}'.", err=True)
             raise SystemExit(1)
 
+    def _module_note(kd) -> str:
+        parts = [f"module {kd.module}"] if kd.module else []
+        if kd.launch_basis == "unknown":
+            parts.append("launch count unknown (several entries share this kernel name)")
+        elif kd.launches and kd.launch_basis == "name":
+            parts.append(f"{kd.launches} launches, counted by kernel name (no module id on them)")
+        elif kd.launches:
+            parts.append(f"{kd.launches} launches")
+        elif kd.module:
+            parts.append("no launch carried this module id")
+        return ("  " + ", ".join(parts)) if parts else ""
+
     if list_only:
         for n in names:
-            kd = trace.disasm[n]
-            click.echo(f"{n}  [{kd.arch}, {len(kd.lines)} insns]")
+            kd = disasm[n]
+            click.echo(f"{n}  [{kd.arch}, {len(kd.lines)} insns]{_module_note(kd)}")
         return
 
     lines_out = []
     for name in names:
-        kd = trace.disasm[name]
-        lines_out.append(f"; ── {name}  [{kd.arch}]  {len(kd.lines)} instructions ──")
+        kd = disasm[name]
+        lines_out.append(f"; ── {kd.name}  [{kd.arch}]  {len(kd.lines)} instructions ──"
+                         f"{_module_note(kd)}")
         lines_out.append(f"; source: {kd.source}")
         lines_out.append("")
         for ln in kd.lines:
@@ -793,6 +851,28 @@ def efficiency(trace_file, baseline, interconnect_bw, use_cp):
         click.echo(f"\n  NCCL achieved bus BW       : {report.nccl_bus_bw_gbs:.1f} GB/s")
         if report.nccl_efficiency is not None:
             click.echo(f"  NCCL Efficiency            : {pct(report.nccl_efficiency)}")
+    # the critical path's MPI graph holes (Serialization Efficiency rests on it)
+    diag = getattr(cp_report, "diagnostics", None) or {}
+    if diag:
+        click.echo(f"\n  MPI dependency coverage:")
+        click.echo(f"    receive completions : {diag.get('receives', 0)}, "
+                   f"with a point-to-point edge: {diag.get('matched', 0)} "
+                   f"(key: {diag.get('key', '?')})")
+        for k, v in sorted((diag.get("unmatched_by_comm") or {}).items()):
+            click.echo(f"    no sender found     : {v} on communicator id {k}")
+        if diag.get("test_only_completions"):
+            click.echo(f"    Test*-only completions (no edge, by design): {diag['test_only_completions']}")
+        if diag.get("orphan_completions"):
+            click.echo(f"    waits on requests never seen posted: {diag['orphan_completions']}")
+        if diag.get("cancelled"):
+            click.echo(f"    cancelled requests (not matched): {diag['cancelled']}")
+        if diag.get("matched_after_loss"):
+            click.echo(f"    paired after lost MPI events ('low', order may be shifted): "
+                       f"{diag['matched_after_loss']}")
+        if diag.get("exact_high"):
+            click.echo(f"    exact matches graded 'high' (complete channels, --exact-p2p-high): "
+                       f"{diag['exact_high']}")
+
     if report.notes:
         click.echo(f"\n  Notes:")
         for n in report.notes:
@@ -808,7 +888,11 @@ def efficiency(trace_file, baseline, interconnect_bw, use_cp):
               help="Write the trace back out as Chrome Trace JSON with critical-path "
                    "spans tagged on_critical_path=1 and path_confidence=<tier>, "
                    "for highlighting in Perfetto.")
-def critical_path_cmd(trace_file, top, export):
+@click.option("--exact-p2p-high", is_flag=True,
+              help="Experimental: grade exact (non-wildcard) MPI matches 'high' where the capture "
+                   "of their channel is provably complete (same as HPROFILER_EXACT_P2P_HIGH=1; see "
+                   "DOCUMENTATION.md, Edge confidence).")
+def critical_path_cmd(trace_file, top, export, exact_p2p_high):
     """Compute and print the N-way cross-runtime critical path for a saved trace.
 
     Builds a dependency graph over every captured span (CUDA/ROCm/OpenCL/
@@ -832,6 +916,8 @@ def critical_path_cmd(trace_file, top, export):
       hprofiler critical-path trace.json
       hprofiler critical-path trace.json --export trace.critpath.json
     """
+    if exact_p2p_high:
+        os.environ["HPROFILER_EXACT_P2P_HIGH"] = "1"
     from src.core.trace_io import open_trace
     from src.analysis import criticalpath as cpmod
 
@@ -852,7 +938,10 @@ def critical_path_cmd(trace_file, top, export):
     click.echo(f"{'='*64}")
     click.echo(f"  Path length (spans) : {len(report.path_span_indices)}")
     click.echo(f"  Wall time           : {fmt_ns(report.wall_ns)}")
-    click.echo(f"  Time accounted for  : {fmt_ns(report.total_path_ns)}")
+    click.echo(f"  Time accounted for  : {fmt_ns(report.total_path_ns)}  (each instant once)")
+    if report.dp_accounted_ns > report.total_path_ns:
+        click.echo(f"  Longest-path value  : {fmt_ns(report.dp_accounted_ns)}  (counts overlap on both "
+                   f"sides of start-gated hops; see Notes)")
 
     click.echo(f"\n  Time ON the critical path, by category (productive work):")
     for cat, ns in sorted(report.time_on_path_by_category.items(), key=lambda kv: -kv[1])[:top]:
@@ -869,12 +958,39 @@ def critical_path_cmd(trace_file, top, export):
             pct = 100.0 * ns / conf_total if conf_total else 0.0
             click.echo(f"    {tier:<12} {fmt_ns(ns):>12}  ({pct:5.1f}%)")
 
+    if report.path_time_by_annotation:
+        click.echo(f"\n  Path time inside annotation ranges (NVTX/ROCTX; display only, nested ranges "
+                   f"each count it):")
+        for name, ns in sorted(report.path_time_by_annotation.items(), key=lambda kv: -kv[1])[:top]:
+            click.echo(f"    {name[:60]:<60} {fmt_ns(ns):>12}")
+
     if report.wait_caused_by_category:
         click.echo(f"\n  Idle time on the critical path, blamed by category (what it was waiting on):")
         for cat, ns in report.top_blame(top):
             click.echo(f"    {cat:<12} {fmt_ns(ns):>12}")
     else:
         click.echo(f"\n  No idle gaps on the critical path -- fully back-to-back.")
+
+    diag = report.diagnostics
+    if diag:
+        click.echo(f"\n  MPI dependency coverage:")
+        click.echo(f"    receive completions : {diag.get('receives', 0)}, "
+                   f"with a point-to-point edge: {diag.get('matched', 0)} "
+                   f"(key: {diag.get('key', '?')})")
+        for k, v in sorted((diag.get("unmatched_by_comm") or {}).items()):
+            click.echo(f"    no sender found     : {v} on communicator id {k}")
+        if diag.get("test_only_completions"):
+            click.echo(f"    Test*-only completions (no edge, by design): {diag['test_only_completions']}")
+        if diag.get("orphan_completions"):
+            click.echo(f"    waits on requests never seen posted: {diag['orphan_completions']}")
+        if diag.get("cancelled"):
+            click.echo(f"    cancelled requests (not matched): {diag['cancelled']}")
+        if diag.get("matched_after_loss"):
+            click.echo(f"    paired after lost MPI events ('low', order may be shifted): "
+                       f"{diag['matched_after_loss']}")
+        if diag.get("exact_high"):
+            click.echo(f"    exact matches graded 'high' (complete channels, --exact-p2p-high): "
+                       f"{diag['exact_high']}")
 
     if report.notes:
         click.echo(f"\n  Notes:")
@@ -962,6 +1078,134 @@ def compare_cmd(before, after, fmt, output, top, min_pct, min_ns, min_confidence
         click.echo(text)
 
 
+def _expand_node_pattern(path: str) -> str:
+    """%h: hostname, %j: Slurm/PBS job id, %p: pid (one collector per node
+    writes its own file)."""
+    import platform
+    job = os.environ.get("SLURM_JOB_ID") or os.environ.get("PBS_JOBID", "").split(".")[0] or "nojob"
+    return path.replace("%h", platform.node().split(".")[0]).replace("%j", job).replace("%p", str(os.getpid()))
+
+
+def _default_collector_socket() -> str:
+    job = os.environ.get("SLURM_JOB_ID") or os.environ.get("PBS_JOBID", "").split(".")[0]
+    return f"@hprofiler-{job}" if job else ""
+
+
+@cli.command()
+@click.option("--backend", "-b", default="mpi,openmp", show_default=True,
+              help="Backends whose hooks report here (the same list as `hprofiler exec`).")
+@click.option("--socket", "socket_address", default=None, metavar="ADDRESS",
+              help="Collector socket: @name (abstract: node-local, nothing on disk) or a path. "
+                   "Default inside a Slurm/PBS job: @hprofiler-<job id>.")
+@click.option("--output", "-o", default="hprofiler.%h.json", show_default=True,
+              help="Trace written by this node's collector (%h hostname, %j job id, %p pid).")
+@click.option("--json/--no-json", "write_json", default=True, show_default=True,
+              help="Also export Chrome/Perfetto JSON next to the store.")
+@click.option("--idle-exit", default=10.0, show_default=True, metavar="SEC",
+              help="Finish SEC seconds after the last hook connection closed (0: only on SIGINT/SIGTERM).")
+@click.option("--summary/--no-summary", default=False, show_default=True)
+def collect(backend, socket_address, output, write_json, idle_exit, summary):
+    """Node collector: one collector for every process on this node.
+
+    Per-rank capture (one `hprofiler run` per rank) runs one Python
+    collector per rank; this runs one per node. Processes started with
+    `hprofiler exec --socket ADDRESS` (which execs the program with the
+    hooks preloaded -- no Python stays behind) report to it. It writes one
+    trace per node; merge the nodes' traces with `hprofiler merge-nodes`.
+
+    \b
+    Slurm (one collector per node, then the ranks; see DOCUMENTATION.md):
+      srun --ntasks-per-node=1 --overlap hprofiler collect -b mpi,openmp -o trace.%h.json &
+      srun hprofiler exec -b mpi,openmp -- ./app
+      wait
+      hprofiler merge-nodes trace.*.json -o merged.json
+    """
+    from src.core.runner import Runner
+    from src.core.trace_io import create_disk_trace, write_json_export
+    address = socket_address or _default_collector_socket()
+    if not address:
+        click.echo("[hprofiler] collect: give --socket (no job id to derive a default from)", err=True)
+        raise SystemExit(2)
+    backends = _resolve_backends(backend)
+    out = _expand_node_pattern(output)
+    store_path = out if out.endswith(".hpstore") else (out[:-5] if out.endswith(".json") else out) + ".hpstore"
+    capture = create_disk_trace(store_path)
+    runner = Runner([], backends=backends, store=capture.store, collect_address=address,
+                    idle_exit_s=idle_exit if idle_exit > 0 else None)
+    trace = runner.run()
+    trace.finalize()
+    trace.save()
+    if write_json and not out.endswith(".hpstore"):
+        write_json_export(trace, out)
+    if summary:
+        from src.output.summary import print_summary
+        print_summary(trace)
+    pids = len(trace.store.pids())
+    click.echo(f"[hprofiler] node collector: {trace.span_count()} spans from {pids} process(es) -> "
+               f"{out if write_json and not out.endswith('.hpstore') else store_path}", err=True)
+
+
+def _collector_listening(address: str) -> bool:
+    """Whether a socket is listening at `address` ("@name" or a path) on this
+    node, from /proc/net/unix -- without connecting (a probe connection would
+    show up in the collector's capture health)."""
+    want = address if address.startswith("@") else os.path.abspath(address)
+    try:
+        with open("/proc/net/unix") as f:
+            next(f)
+            for line in f:
+                parts = line.split()
+                # Num RefCount Protocol Flags Type St Inode [Path]; listening: St 01, __SO_ACCEPTCON
+                if len(parts) >= 8 and parts[7] == want and parts[5] == "01" and int(parts[3], 16) & 0x10000:
+                    return True
+    except (OSError, ValueError, StopIteration):
+        return True        # cannot tell: do not delay the program
+    return False
+
+
+@cli.command(name="exec", context_settings={"ignore_unknown_options": True, "allow_interspersed_args": False})
+@click.option("--backend", "-b", default="mpi,openmp", show_default=True)
+@click.option("--socket", "socket_address", default=None, metavar="ADDRESS",
+              help="The node collector's socket (default inside a Slurm/PBS job: @hprofiler-<job id>).")
+@click.option("--wait", "wait_s", default=30.0, show_default=True, metavar="SEC",
+              help="Wait up to SEC seconds for the node collector to listen before starting COMMAND.")
+@click.option("--python-jit", is_flag=True, default=False,
+              help="As for `run`: a Python JIT compiler's (Triton's) compilation as jit spans.")
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+def exec_cmd(backend, socket_address, wait_s, python_jit, command):
+    """Start COMMAND with the hooks reporting to a node collector.
+
+    Sets LD_PRELOAD, OMP_TOOL_LIBRARIES, HPROFILER_SOCKET and the backends'
+    variables, then replaces itself with COMMAND (exec): nothing of
+    hprofiler keeps running in the process. See `hprofiler collect`.
+    """
+    from src.core.runner import hook_environment
+    address = socket_address or _default_collector_socket()
+    if not address:
+        click.echo("[hprofiler] exec: give --socket (no job id to derive a default from)", err=True)
+        raise SystemExit(2)
+    cmd = list(command)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    import time as _time
+    deadline = _time.monotonic() + max(0.0, wait_s)
+    while not _collector_listening(address):
+        if _time.monotonic() >= deadline:
+            click.echo(f"[hprofiler] exec: no collector is listening on {address} -- starting anyway "
+                       f"(the hooks retry; events before it starts are lost)", err=True)
+            break
+        _time.sleep(0.2)
+    env = hook_environment(_resolve_backends(backend), address, cmd,
+                           {"HPROFILER_PYTHON_JIT": "1"} if python_jit else None)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as e:
+        click.echo(f"[hprofiler] exec: cannot start {cmd[0]}: {e}", err=True)
+        raise SystemExit(127)
+
+
 @cli.command("merge-nodes")
 @click.argument("trace_files", type=click.Path(exists=True), nargs=-1, required=True)
 @click.option("-o", "--output", required=True, type=click.Path(),
@@ -969,28 +1213,28 @@ def compare_cmd(before, after, fmt, output, top, min_pct, min_ns, min_confidence
                    "sibling .hpstore) or a .hpstore directory (store only).")
 @click.option("--offset-ns", multiple=True, type=int, metavar="NS",
               help="Explicit clock offset for a node, in ns, same order as TRACE_FILES "
-                   "(overrides any HPROFILER_CLOCK_SYNC counters in that trace). "
-                   "Omit for a node to use its embedded counters (or 0 for node 0, "
-                   "the assumed reference).")
-def merge_nodes_cmd(trace_files, output, offset_ns):
-    """Merge multiple per-node traces from a multi-node run onto one timeline.
+                   "(applied as given: no estimate, no tightening).")
+@click.option("--ignore-boot-id", is_flag=True,
+              help="Never treat traces with the same kernel boot_id as one clock (to exercise "
+                   "the estimates on one host).")
+def merge_nodes_cmd(trace_files, output, offset_ns, ignore_boot_id):
+    """Merge multiple per-node (or per-rank) traces onto one timeline.
 
     hprofiler's collector is a local socket, so a multi-node job produces
-    one independent trace file per node (profile each node separately,
-    e.g. via your job launcher's per-node wrapper, then merge here). The
-    first TRACE_FILES argument is treated as the reference node (offset
-    0); every other node's clock offset relative to it comes from
-    HPROFILER_CLOCK_SYNC counters embedded in that trace (see the `mpi`
-    backend's clock-sync section in DOCUMENTATION.md -- off by default,
-    set HPROFILER_CLOCK_SYNC=1 when running each node to capture them) or
-    from --offset-ns if given explicitly.
+    one trace per node (or per rank). The trace holding MPI rank 0 is the
+    reference clock. Every other trace's offset: 0 when it was recorded on
+    the same clock (same kernel boot_id -- the same host); else the
+    HPROFILER_CLOCK_SYNC measurement (offset, and linear drift when both
+    the MPI_Init and MPI_Finalize measurements exist), tightened with the
+    matched MPI send/receive pairs so that no send starts after its matched
+    receive ended, within the measured error bound; --offset-ns overrides.
+    Each node's decision is printed and stored in the merged trace
+    (metadata "clock"). Remaining order problems are reported.
 
     pid is remapped into a per-node-unique namespace so same-numbered
     pids from different physical nodes are never conflated; MPI rank=/
     peer= tags are left untouched (already globally unique across the
-    whole job). After merging, checks that no matched MPI send/receive
-    pair violates causality -- a violation usually means a wrong clock
-    offset, printed as a warning rather than silently trusted.
+    whole job).
 
     \b
     Examples:
@@ -1000,26 +1244,31 @@ def merge_nodes_cmd(trace_files, output, offset_ns):
     from src.core.trace_io import open_trace, create_disk_trace
     from src.analysis import multinode as mn
 
+    traces = [open_trace(path, collect_disasm=False) for path in trace_files]
+    explicit = list(offset_ns) + [None] * (len(trace_files) - len(offset_ns))
+    plan = mn.plan_offsets(traces, labels=[str(p) for p in trace_files], explicit=explicit,
+                           ignore_boot_id=ignore_boot_id)
     nodes = []
-    for i, path in enumerate(trace_files):
-        trace = open_trace(path, collect_disasm=False)
-        if i < len(offset_ns):
-            offset = offset_ns[i]
-            error_bound = 0
-        elif i == 0:
-            offset, error_bound = 0, 0
-        else:
-            est = mn.offset_from_counters(trace)
-            if est is None:
-                click.echo(f"  Warning: {path} has no HPROFILER_CLOCK_SYNC counters and "
-                           f"no --offset-ns given -- merging at an uncorrected 0 offset.")
-                offset, error_bound = 0, 0
-            else:
-                offset, error_bound = est.offset_ns, est.error_bound_ns
-                click.echo(f"  {path}: offset={offset}ns (±{error_bound}ns from "
-                           f"embedded HPROFILER_CLOCK_SYNC measurement)")
-        nodes.append(mn.NodeTrace(trace=trace, offset_ns=offset, error_bound_ns=error_bound,
-                                  label=str(path)))
+    for k, (path, trace, p) in enumerate(zip(trace_files, traces, plan.nodes)):
+        bound = "unknown" if p.bound_ns == float("inf") else f"{int(p.bound_ns)}ns"
+        detail = {
+            "reference": "reference clock (holds MPI rank 0)" if k == plan.reference else "reference clock",
+            "same-clock": "same clock as the reference (same boot_id)",
+            "explicit": "--offset-ns",
+            "estimate": f"HPROFILER_CLOCK_SYNC estimate {p.estimate_ns}ns +-{bound}",
+            "estimate+drift": f"HPROFILER_CLOCK_SYNC estimate {p.estimate_ns}ns +-{bound}, "
+                              f"drift {p.drift_ppm:+.3f} ppm",
+            "estimate (counters)": f"HPROFILER_CLOCK_SYNC counters (older hook) {p.estimate_ns}ns +-{bound}",
+            "message order": "no clock-sync data: from the matched messages alone",
+            "none": "no clock-sync data and no matched messages: uncorrected 0",
+        }[p.method]
+        corr = f", corrected by {p.correction_ns:+d}ns" if p.correction_ns else ""
+        click.echo(f"  {path}: offset={p.offset_ns}ns ({detail}{corr}; {p.constraints} matched messages "
+                   f"with other traces)")
+        nodes.append(mn.NodeTrace(trace=trace, offset_ns=p.offset_ns,
+                                  error_bound_ns=0 if p.bound_ns == float("inf") else int(p.bound_ns),
+                                  label=str(path), model=p.model))
+    click.echo(f"  Clock alignment: {plan.tightening}")
 
     # Merged into an on-disk store (events streamed, never all in memory):
     # the output itself when it is a .hpstore, else a store next to the
@@ -1027,6 +1276,7 @@ def merge_nodes_cmd(trace_files, output, offset_ns):
     store_out = output if output.endswith(".hpstore") else \
         (output[:-5] if output.endswith(".json") else output) + ".hpstore"
     merged, warnings = mn.merge_traces(nodes, into=create_disk_trace(store_out))
+    merged.metadata.clock = {"merge": plan.to_dict()}
     merged.finalize()
     for w in warnings:
         click.echo(f"  Warning: {w}")
@@ -1039,6 +1289,8 @@ def merge_nodes_cmd(trace_files, output, offset_ns):
             click.echo(f"    - {p}")
         if len(problems) > 10:
             click.echo(f"    ... and {len(problems) - 10} more")
+    else:
+        click.echo("  Message order after merging: every matched send starts before its receive ends")
 
     if not output.endswith(".hpstore"):
         from src.core.trace_io import write_json_export
@@ -1066,17 +1318,23 @@ def backends():
     for alias, canon in _ALIASES.items():
         reverse_aliases.setdefault(canon, []).append(alias)
 
-    click.echo("\nAvailable backends:\n")
+    click.echo("\nBackends (auto-detection uses the usable ones):\n")
+    use = _backend_usability()
     for name, cls in ALL_BACKENDS.items():
         backend_obj = cls()
-        ok = backend_obj.is_available()
-        if ok:
-            status = click.style("✓", fg="green") + "  available  "
+        state, why = use[name]
+        if state == "usable":
+            status = click.style("✓", fg="green") + "  usable     "
+        elif state == "installed":
+            status = click.style("!", fg="yellow") + "  installed  "
         else:
-            status = click.style("✗", fg="red") + "  unavailable"
+            status = click.style("✗", fg="red") + "  missing    "
         aliases = reverse_aliases.get(name, [])
         alias_str = f"  [alias: {', '.join(aliases)}]" if aliases else ""
         click.echo(f"  {name:<10}  {status}  {backend_obj.description}{alias_str}")
+        if why:
+            click.echo(f"  {'':10}     {'':13} → "
+                       f"{click.style(why, fg='yellow' if state != 'usable' else None)}")
 
         # Extra hint for OpenMP when libomp is missing
         note = getattr(backend_obj, "availability_note", lambda: "")()

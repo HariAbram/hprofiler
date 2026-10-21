@@ -34,6 +34,8 @@ Item {
         id: canvas
         objectName: "timeRulerCanvas"
         anchors.fill: parent
+        // painted with AppTheme colours: repaint on a light/dark toggle
+        Connections { target: AppTheme; function onThemeChanged() { canvas.requestPaint() } }
 
         onPaint: {
             var ctx = getContext("2d")

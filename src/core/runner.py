@@ -12,7 +12,7 @@ import datetime
 import os
 import re
 import resource
-from collections import deque
+from collections import Counter, deque
 import shutil
 import sys
 import socket
@@ -154,21 +154,299 @@ def _find_recent_span(
     return None
 
 
-def _peer_real_exe(client: "socket.socket") -> str:
-    """Real executable of the process on the other end of this connection
-    (SO_PEERCRED, kernel-verified, then /proc/<pid>/exe). CUDA/ROCm AoT
-    disassembly reads the whole binary, and command[0] is a launcher (srun,
-    mpirun) when one wraps the program; hooks connect from inside the real
-    process, so its credentials name the right binary. "" on any failure
-    (process gone, permissions, non-Linux)."""
+def _static_cuda_binary(command: list[str]) -> str:
+    """The program in `command` linked with the static CUDA runtime, or "".
+
+    Checks the command and every executable ELF file named in its arguments:
+    the command is often a wrapper (a script, env, srun, mpirun) whose own
+    binary says nothing about the program it starts."""
+    candidates = [shutil.which(command[0]) or command[0]]
+    candidates += [a for a in command[1:] if os.path.isfile(a) and os.access(a, os.X_OK)]
+    for target in candidates:
+        try:
+            with open(target, "rb") as f:
+                if f.read(4) != b"\x7fELF":
+                    continue
+            r = subprocess.run(["ldd", target], capture_output=True, text=True, timeout=5)
+            if "libcudart" in r.stdout + r.stderr or "libcuda.so" in r.stdout + r.stderr:
+                continue                      # the shared runtime: the hook interposes it
+            nm_r = subprocess.run(["nm", target], capture_output=True, text=True, timeout=10)
+            if "T cudaLaunchKernel" in nm_r.stdout or "T cuLaunchKernel" in nm_r.stdout:
+                return target
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return ""
+
+
+def clock_domain() -> dict:
+    """The clock this host's hooks timestamp with: CLOCK_MONOTONIC, which is
+    one clock per kernel boot (boot_id) and time namespace. Two traces with
+    the same boot_id and namespace offset are on the same clock."""
+    def first_line(path: str) -> str:
+        try:
+            with open(path) as f:
+                return f.readline().strip()
+        except OSError:
+            return ""
+    timens = 0
+    try:
+        with open("/proc/self/timens_offsets") as f:      # Linux >= 5.6
+            for line in f:
+                parts = line.split()
+                if len(parts) == 3 and parts[0] == "monotonic":
+                    timens = int(parts[1]) * 1_000_000_000 + int(parts[2])
+    except (OSError, ValueError):
+        pass
+    return {"clock": "CLOCK_MONOTONIC",
+            "boot_id": first_line("/proc/sys/kernel/random/boot_id"),
+            "clocksource": first_line("/sys/devices/system/clocksource/clocksource0/current_clocksource"),
+            "timens_monotonic_ns": timens}
+
+
+def _peer_process(client: "socket.socket") -> tuple[int, str]:
+    """(pid, real executable) of the process on the other end of this
+    connection (SO_PEERCRED, kernel-verified, then /proc/<pid>/exe). CUDA/ROCm
+    AoT disassembly reads the whole binary, and command[0] is a launcher
+    (srun, mpirun) when one wraps the program; hooks connect from inside the
+    real process, so its credentials name the right binary. (0, "") on any
+    failure (process gone, permissions, non-Linux)."""
     import struct
     try:
         creds = client.getsockopt(
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         peer_pid, _uid, _gid = struct.unpack("3i", creds)
-        return os.readlink(f"/proc/{peer_pid}/exe")
+        return peer_pid, os.readlink(f"/proc/{peer_pid}/exe")
     except Exception:
-        return ""
+        return 0, ""
+
+
+def _peer_real_exe(client: "socket.socket") -> str:
+    return _peer_process(client)[1]
+
+
+def disasm_binaries(exes_by_pid: "dict[int, list[str]] | set[str] | None", gpu_pids: "set[int]") -> list[str]:
+    """The executables whose ahead-of-time GPU code is disassembled (all of
+    them, merged), in a fixed order: those of the processes that emitted
+    kernel launches or device activity, else every connected executable --
+    a wrapper or launcher (env, a shell, mpirun) connects too when the hooks
+    are preloaded into it, and its binary has no GPU code. A process that
+    exec()s (env) connects once per image under one pid: its last image,
+    the program, comes first (it is also the binary for CPU code). Never in
+    set order: string hashing differs per Python process. A plain set
+    (older callers) has no pids: every executable, sorted."""
+    if not exes_by_pid:
+        return []
+    if not isinstance(exes_by_pid, dict):
+        return sorted(exes_by_pid)
+    pids = sorted(p for p in exes_by_pid if p in gpu_pids) or sorted(exes_by_pid)
+    last = sorted({exes_by_pid[p][-1] for p in pids if exes_by_pid[p]})
+    rest = sorted({e for p in pids for e in exes_by_pid[p]} - set(last))
+    return last + rest
+
+
+# Linux sun_path holds 108 bytes including the terminating NUL.
+_SUN_PATH_MAX = 107
+
+
+class _CollectWait:
+    """Stands in for the child process in node-collector mode: wait() returns
+    on SIGINT/SIGTERM, or idle_exit_s seconds after the last hook
+    connection closed (once at least one was seen)."""
+    pid = 0
+    returncode = None
+
+    def __init__(self, receiver, idle_exit_s: float | None) -> None:
+        self.receiver = receiver
+        self.idle_exit_s = idle_exit_s
+
+    def wait(self) -> None:
+        import signal
+        stop = threading.Event()
+        old = {}
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                old[sig] = signal.signal(sig, lambda *_a: stop.set())
+        idle_since = None
+        try:
+            while not stop.is_set():
+                if self.receiver.connections and self.receiver.open_connections() == 0:
+                    idle_since = idle_since or time.monotonic()
+                    if self.idle_exit_s is not None and time.monotonic() - idle_since >= self.idle_exit_s:
+                        break
+                else:
+                    idle_since = None
+                stop.wait(0.2)
+        finally:
+            for sig, handler in old.items():
+                signal.signal(sig, handler)
+
+
+def _open_collector_socket(address: str | None = None):
+    """The collector's listening AF_UNIX socket.
+
+    Returns (socket, HPROFILER_SOCKET value, private spool directory,
+    socket path or None). The socket lives in a private directory under
+    $TMPDIR. A long $TMPDIR (batch jobs: /scratch/<job>/...) would exceed
+    the 107-byte socket path limit, so the socket then goes to a private
+    directory under /tmp, and when even that is not possible to Linux's
+    abstract namespace (HPROFILER_SOCKET="@<name>"; the hooks connect to it
+    by that name, and the receiver accepts only this user's processes).
+    The spool directory stays under $TMPDIR.
+
+    `address` (node-collector mode): bind exactly there instead -- "@name"
+    for an abstract socket (node-local, no file), else a path (an existing
+    stale socket file is replaced)."""
+    import secrets
+    import socket as sock_mod
+    spool_dir = tempfile.mkdtemp(prefix="hprofiler_")
+    if address:
+        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        if address.startswith("@"):
+            s.bind("\0" + address[1:])
+            path = None
+        else:
+            path = os.path.abspath(address)
+            if len(os.fsencode(path)) > _SUN_PATH_MAX:
+                s.close()
+                raise OSError(f"collector socket path longer than {_SUN_PATH_MAX} bytes: {path} "
+                              f"(use an abstract socket, @name)")
+            try:
+                st = os.lstat(path)
+                import stat as _stat
+                if _stat.S_ISSOCK(st.st_mode):
+                    os.unlink(path)          # a stale socket of an earlier collector
+            except FileNotFoundError:
+                pass
+            s.bind(path)
+        s.listen(1024)
+        s.settimeout(0.5)
+        return s, (address if path is None else path), spool_dir, path
+    candidates = [spool_dir]
+    if len(os.fsencode(os.path.join(spool_dir, "s.sock"))) > _SUN_PATH_MAX:
+        try:
+            candidates.append(tempfile.mkdtemp(prefix="hprofiler_", dir="/tmp"))
+        except OSError:
+            pass
+    for d in candidates:
+        path = os.path.join(d, "s.sock")
+        if len(os.fsencode(path)) > _SUN_PATH_MAX:
+            continue
+        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        try:
+            s.bind(path)
+        except OSError:
+            s.close()
+            continue
+        if d != spool_dir:
+            print(f"[hprofiler] TMPDIR is too long for a socket path; collector socket: {path}",
+                  file=sys.stderr)
+        for other in candidates:
+            if other not in (d, spool_dir):
+                try:
+                    os.rmdir(other)
+                except OSError:
+                    pass
+        s.listen(128)        # many ranks/processes may connect at once
+        s.settimeout(0.5)
+        return s, path, spool_dir, path
+    for other in candidates[1:]:
+        try:
+            os.rmdir(other)
+        except OSError:
+            pass
+    name = f"hprofiler-{os.getpid()}-{secrets.token_hex(8)}"
+    s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+    s.bind("\0" + name)
+    print(f"[hprofiler] no usable socket path under TMPDIR or /tmp; using the abstract "
+          f"socket @{name}", file=sys.stderr)
+    s.listen(128)
+    s.settimeout(0.5)
+    return s, "@" + name, spool_dir, None
+
+
+def hook_environment(backends: list[str], sock_address: str, command: list[str] | None = None,
+                     env_extra: dict[str, str] | None = None, base_env: dict[str, str] | None = None) -> dict:
+    """The environment a program needs for these backends' hooks to report
+    to the collector at `sock_address` (HPROFILER_SOCKET): LD_PRELOAD,
+    OMP_TOOL_LIBRARIES and each backend's variables. Used by `hprofiler run`
+    and `hprofiler exec` (node-collector mode)."""
+    env = dict(os.environ if base_env is None else base_env)
+    env["HPROFILER_SOCKET"] = sock_address
+    env.update(env_extra or {})
+    # --python-jit: Python JIT compilers' (Triton's) own compile as jit spans,
+    # from a sitecustomize that runs the program's own one first
+    # (src/instrument/pysite/).
+    if env.get("HPROFILER_PYTHON_JIT") == "1":
+        site = str(Path(__file__).resolve().parent.parent / "instrument" / "pysite")
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (site, env.get("PYTHONPATH", "")) if p)
+
+    # ── Inject hooks via backend interface ───────────────────────────────
+    from ..backends import ALL_BACKENDS
+    preload_libs: list[str] = []
+    _hook_backends: list[str] = []   # backends that expect LD_PRELOAD
+    _PRELOAD_BACKENDS = {"cuda", "opencl", "rocm", "nccl", "mpi"}
+    for bname in backends:
+        backend_cls = ALL_BACKENDS.get(bname)
+        if backend_cls is None:
+            continue
+        try:
+            b = backend_cls()
+            added = False
+            for lib_path in b.preload_libs():
+                if lib_path and Path(lib_path).exists():
+                    preload_libs.append(lib_path)
+                    added = True
+            if bname in _PRELOAD_BACKENDS and not added:
+                _hook_backends.append(bname)
+            for k, v in b.env_vars().items():
+                # OMP_TOOL_LIBRARIES uses ":" separator
+                if k == "OMP_TOOL_LIBRARIES":
+                    existing = env.get(k, "")
+                    env[k] = ":".join(filter(None, [existing, v]))
+                else:
+                    env.setdefault(k, v)
+        except Exception:
+            pass
+
+    # Warn when a hook-based backend was requested but the .so is missing
+    import sys as _sys
+    for bname in _hook_backends:
+        hook_path = HOOKS_DIR / f"libhprofiler_{bname}.so"
+        if not hook_path.exists():
+            print(
+                f"[hprofiler][warn] {bname} hook not found at {hook_path}\n"
+                f"  Run 'hprofiler build' in the hprofiler directory to compile it.\n"
+                f"  On clusters: load the ROCm/CUDA module first, then build.",
+                file=_sys.stderr,
+            )
+
+    # Warn when the target binary has a statically-linked CUDA runtime —
+    # LD_PRELOAD hooks cannot intercept static symbols, so 0 events will
+    # be captured even though the program runs normally.
+    if "cuda" in backends and command:
+        _target = _static_cuda_binary(command)
+        if _target:
+            # LD_PRELOAD cannot intercept a static runtime; start CUPTI
+            # when the hook loads instead, so its callbacks report the
+            # host calls and its activity records the device work
+            # (hooks/cuda_hook/cupti_trace.c).
+            env.setdefault("HPROFILER_CUPTI_EAGER", "1")
+            print(
+                f"[hprofiler][warn] '{_target}' appears to be linked with "
+                f"the STATIC CUDA runtime (libcudart_static.a).\n"
+                f"  LD_PRELOAD interception is not possible; CUDA calls and device "
+                f"work will be recorded through CUPTI instead (needs libcupti -- "
+                f"see the 'gpuact' status in the trace). Without CUPTI no cuda "
+                f"events are captured: rebuild with the shared runtime "
+                f"(nvcc -cudart shared).",
+                file=_sys.stderr,
+            )
+
+    if preload_libs:
+        existing = env.get("LD_PRELOAD", "")
+        env["LD_PRELOAD"] = ":".join(filter(None, [existing] + preload_libs))
+
+    return env
 
 
 class Runner:
@@ -181,6 +459,8 @@ class Runner:
         on_event: Callable[[AnyEvent], None] | None = None,
         collect_disasm: bool = False,
         store: "TraceStore | None" = None,
+        collect_address: str | None = None,
+        idle_exit_s: float | None = None,
     ) -> None:
         self.command = command
         self.backends = backends
@@ -194,111 +474,36 @@ class Runner:
         self.store = store
         self._trace: Trace | None = None
         self._disasm_thread: threading.Thread | None = None
+        # The profiled command's exit status after run() (see TraceMetadata).
+        self.exit_status: int | None = None
+        # Node-collector mode (`hprofiler collect`): no command is started;
+        # hooks of processes started elsewhere (`hprofiler exec`) report to
+        # this socket address ("@name": abstract, else a path). The capture
+        # ends on SIGINT/SIGTERM, or idle_exit_s seconds after the last hook
+        # connection closed (at least one having been seen).
+        self.collect_address = collect_address
+        self.idle_exit_s = idle_exit_s
 
     def run(self) -> Trace:
-        import socket as sock_mod
         import platform
 
-        _sock_dir = tempfile.mkdtemp(prefix="hprofiler_")
-        sock_path = os.path.join(_sock_dir, "s.sock")
+        server_sock, sock_address, _sock_dir, sock_path = _open_collector_socket(self.collect_address)
+        _abstract_socket = sock_path is None
 
-        server_sock = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
-        server_sock.bind(sock_path)
-        server_sock.listen(128)        # many ranks/processes may connect at once
-        server_sock.settimeout(0.5)
+        env = None if self.collect_address is not None else \
+            hook_environment(self.backends, sock_address, self.command, self.env_extra)
 
-        env = dict(os.environ)
-        env["HPROFILER_SOCKET"] = sock_path
-        env.update(self.env_extra)
-
-        # ── Inject hooks via backend interface ───────────────────────────────
-        from ..backends import ALL_BACKENDS
-        preload_libs: list[str] = []
-        _hook_backends: list[str] = []   # backends that expect LD_PRELOAD
-        _PRELOAD_BACKENDS = {"cuda", "opencl", "rocm", "nccl", "mpi"}
-        for bname in self.backends:
-            backend_cls = ALL_BACKENDS.get(bname)
-            if backend_cls is None:
-                continue
-            try:
-                b = backend_cls()
-                added = False
-                for lib_path in b.preload_libs():
-                    if lib_path and Path(lib_path).exists():
-                        preload_libs.append(lib_path)
-                        added = True
-                if bname in _PRELOAD_BACKENDS and not added:
-                    _hook_backends.append(bname)
-                for k, v in b.env_vars().items():
-                    # OMP_TOOL_LIBRARIES uses ":" separator
-                    if k == "OMP_TOOL_LIBRARIES":
-                        existing = env.get(k, "")
-                        env[k] = ":".join(filter(None, [existing, v]))
-                    else:
-                        env.setdefault(k, v)
-            except Exception:
-                pass
-
-        # Warn when a hook-based backend was requested but the .so is missing
         import sys as _sys
-        for bname in _hook_backends:
-            hook_path = HOOKS_DIR / f"libhprofiler_{bname}.so"
-            if not hook_path.exists():
-                print(
-                    f"[hprofiler][warn] {bname} hook not found at {hook_path}\n"
-                    f"  Run 'hprofiler build' in the hprofiler directory to compile it.\n"
-                    f"  On clusters: load the ROCm/CUDA module first, then build.",
-                    file=_sys.stderr,
-                )
-
-        # Warn when the target binary has a statically-linked CUDA runtime —
-        # LD_PRELOAD hooks cannot intercept static symbols, so 0 events will
-        # be captured even though the program runs normally.
-        if "cuda" in self.backends and self.command:
-            _target = shutil.which(self.command[0]) or self.command[0]
-            try:
-                r = subprocess.run(
-                    ["ldd", _target], capture_output=True, text=True, timeout=5
-                )
-                ldd_out = r.stdout + r.stderr
-                has_cudart = "libcudart" in ldd_out or "libcuda" in ldd_out
-                if not has_cudart and Path(_target).exists():
-                    # Double-check: are CUDA symbols statically baked in?
-                    nm_r = subprocess.run(
-                        ["nm", _target], capture_output=True, text=True, timeout=10
-                    )
-                    if "T cudaLaunchKernel" in nm_r.stdout or "T cuLaunchKernel" in nm_r.stdout:
-                        # LD_PRELOAD cannot intercept a static runtime; start
-                        # CUPTI when the hook loads instead, so its callbacks
-                        # report the host calls and its activity records the
-                        # device work (hooks/cuda_hook/cupti_trace.c).
-                        env.setdefault("HPROFILER_CUPTI_EAGER", "1")
-                        print(
-                            f"[hprofiler][warn] '{self.command[0]}' appears to be linked with "
-                            f"the STATIC CUDA runtime (libcudart_static.a).\n"
-                            f"  LD_PRELOAD interception is not possible; CUDA calls and device "
-                            f"work will be recorded through CUPTI instead (needs libcupti -- "
-                            f"see the 'gpuact' status in the trace). Without CUPTI no cuda "
-                            f"events are captured: rebuild with the shared runtime "
-                            f"(nvcc -cudart shared).",
-                            file=_sys.stderr,
-                        )
-            except Exception:
-                pass
-
-        if preload_libs:
-            existing = env.get("LD_PRELOAD", "")
-            env["LD_PRELOAD"] = ":".join(filter(None, [existing] + preload_libs))
-
         metadata = TraceMetadata(
-            command=self.command[0],
-            args=self.command[1:],
+            command=self.command[0] if self.command else "(node collector)",
+            args=self.command[1:] if self.command else [f"socket={sock_address}"],
             start_time_ns=0,  # filled in after Popen below
             pid=os.getpid(),
             backends_used=list(self.backends),
             hostname=platform.node(),
             cwd=os.getcwd(),
             capture_time_iso=datetime.datetime.now().isoformat(timespec="seconds"),
+            clock=clock_domain(),
         )
         trace = Trace(metadata, store=self.store)
         self._trace = trace
@@ -314,14 +519,17 @@ class Runner:
                 pass
 
         _recent_spans: dict[tuple[int, int], deque[SpanEvent]] = {}
-        # Real executables of the connected processes (see _peer_real_exe);
-        # any one of them is enough for collect_disasm.
-        _real_binary_paths: set[str] = set()
+        # Real executables of the connected processes, by pid in connection
+        # order (see _peer_process; disasm_binaries() picks among them).
+        _real_binary_paths: dict[int, list[str]] = {}
 
-        def on_connect(client: sock_mod.socket) -> None:
-            real_exe = _peer_real_exe(client)
+        def on_connect(client: socket.socket) -> None:
+            peer_pid, real_exe = _peer_process(client)
             if real_exe:
-                _real_binary_paths.add(real_exe)
+                seen = _real_binary_paths.setdefault(peer_pid, [])
+                if real_exe in seen:
+                    seen.remove(real_exe)
+                seen.append(real_exe)
 
         _KNOWN = ("span", "inst", "ctr")
 
@@ -375,7 +583,10 @@ class Runner:
                 receiver.note_unknown(kind)
 
         from .receiver import Receiver
-        receiver = Receiver(server_sock, _sock_dir, trace, handle_line, on_connect=on_connect)
+        # An abstract socket has no file permissions: accept only this
+        # user's processes (a private directory protects a path socket).
+        receiver = Receiver(server_sock, _sock_dir, trace, handle_line, on_connect=on_connect,
+                            require_uid=os.getuid() if _abstract_socket else None)
         receiver.start()
         # The parser thread is CPU-bound; a short switch interval lets the
         # socket readers (which only recv and spool) run often enough to
@@ -388,7 +599,7 @@ class Runner:
         # are inherited by the child so all socket-based hooks still work.
         _likwid_backend = None
         run_command = list(self.command)
-        if "likwid" in self.backends:
+        if "likwid" in self.backends and self.collect_address is None:
             from ..backends.likwid import LIKWIDBackend
             _likwid_backend = LIKWIDBackend()
             run_command = _likwid_backend.wrap_command(self.command)
@@ -398,14 +609,28 @@ class Runner:
         # simultaneously without nesting and still get the env vars right.
         # Read HPROFILER_CALLGRAPH from env_extra without mutating caller's dict.
         callgraph = self.env_extra.get("HPROFILER_CALLGRAPH")
-        proc = subprocess.Popen(run_command, env=env)
+        # close_fds=False: the program inherits file descriptors exactly as
+        # it would without hprofiler -- an MPI launcher's PMI socket
+        # (PMI_FD: MPICH/Intel MPI Hydra, Slurm --mpi=pmi2) must survive
+        # when one `hprofiler run` wraps each rank. Nothing of hprofiler's
+        # leaks: every descriptor it opens itself (collector socket and
+        # connections, spool and store files, perf temp files) is
+        # non-inheritable (Python's default, O_CLOEXEC/SOCK_CLOEXEC), which
+        # tests/test_runner_process.py checks.
+        if self.collect_address is not None:
+            print(f"[hprofiler] collecting on {sock_address}: start programs with "
+                  f"`hprofiler exec --socket {sock_address} --backend {','.join(self.backends)} -- ...`",
+                  file=_sys.stderr)
+            proc = _CollectWait(receiver, self.idle_exit_s)
+        else:
+            proc = subprocess.Popen(run_command, env=env, close_fds=False)
         metadata.start_time_ns = time.monotonic_ns()
         pid = proc.pid
 
         # ── Attach perf record for CPU sampling ───────────────────────────────
         perf_record_proc: subprocess.Popen | None = None
         perf_data: str | None = None
-        if "cpu" in self.backends and shutil.which("perf"):
+        if "cpu" in self.backends and pid and shutil.which("perf"):
             fd, perf_data = tempfile.mkstemp(suffix=".perf.data", prefix="hprofiler_")
             os.close(fd)
             perf_cmd = [
@@ -435,7 +660,7 @@ class Runner:
         perf_stat_proc: subprocess.Popen | None = None
         perf_stat_file: str | None = None
         _cpu_backends = {"cpu", "openmp", "likwid", "opencl", "cuda", "rocm", "nccl", "mpi"}
-        if shutil.which("perf") and any(b in self.backends for b in _cpu_backends):
+        if pid and shutil.which("perf") and any(b in self.backends for b in _cpu_backends):
             fd, perf_stat_file = tempfile.mkstemp(suffix=".perf_stat.txt", prefix="hprofiler_")
             os.close(fd)
             _MICROARCH_EVENTS = (
@@ -470,6 +695,9 @@ class Runner:
         proc.wait()
         rss_after  = resource.getrusage(resource.RUSAGE_CHILDREN)
         metadata.end_time_ns = time.monotonic_ns()
+        # Return code, or -N when killed by signal N (subprocess convention).
+        metadata.exit_status = proc.returncode
+        self.exit_status = proc.returncode
 
         # ── Tear down background collectors ───────────────────────────────────
         gpu_stop.set()
@@ -496,10 +724,11 @@ class Runner:
         receiver.finish(progress=lambda msg: print(f"[hprofiler] {msg}", file=_sys_rx.stderr))
         server_sock.close()
         metadata.capture_health = {"state": "complete", **receiver.health()}
-        try:
-            os.unlink(sock_path)
-        except OSError:
-            pass
+        if sock_path is not None:
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
         try:
             os.rmdir(_sock_dir)
         except OSError:
@@ -515,6 +744,17 @@ class Runner:
             import sys as _sys_ga
             print(f"[hprofiler][warn] GPU activity correlation failed: {exc!r} -- "
                   "device spans are left uncorrelated", file=_sys_ga.stderr)
+
+        # Known holes in the MPI dependency graph (receives without a
+        # sender, Test*-only and orphan completions), counted once here and
+        # stored with the trace (one pass over the MPI spans only).
+        if "mpi" in self.backends:
+            try:
+                from ..analysis.criticalpath import mpi_dependency_diagnostics
+                metadata.dependency_diagnostics = mpi_dependency_diagnostics(trace)
+            except Exception as exc:
+                print(f"[hprofiler][warn] MPI dependency diagnostics failed: {exc!r}",
+                      file=_sys_rx.stderr)
 
         # Incomplete capture / degraded device tracing: say so now (the
         # same list is stored with the trace and shown by `summary`/GUI).
@@ -549,7 +789,7 @@ class Runner:
         # ── Total zero-event sanity check ───────────────────────────────────────
         if self.backends and not trace.span_count() and not trace.store.instant_count():
             import sys as _sys1
-            msg = _total_zero_event_warning(self.backends, self.command)
+            msg = _total_zero_event_warning(self.backends, self.command, metadata.exit_status)
             print(msg, file=_sys1.stderr)
 
         # ── OpenMP zero-event check ───────────────────────────────────────────
@@ -801,13 +1041,26 @@ def _parse_perf_stat_microarch(text: str) -> dict[str, float]:
 _LAUNCHER_NAMES = {"srun", "mpirun", "mpiexec", "aprun", "jsrun", "ibrun"}
 
 
-def _total_zero_event_warning(backends: list[str], command: list[str]) -> str:
-    """Warning for a run that captured no events from any backend: the hooks
-    never reached the collector, typically because a job launcher (srun,
-    mpirun, aprun, ...) did not pass HPROFILER_SOCKET/LD_PRELOAD to the
-    processes it started. With SLURM this depends on site defaults and
-    --export and can be intermittent, so launcher-specific advice is given
-    when the command is a known launcher."""
+def _total_zero_event_warning(backends: list[str], command: list[str],
+                              exit_status: int | None = None) -> str:
+    """Warning for a run that captured no events from any backend. When the
+    program itself failed (non-zero exit status) that is the likely reason
+    and the warning says so first. Otherwise the hooks never reached the
+    collector, typically because a job launcher (srun, mpirun, aprun, ...)
+    did not pass HPROFILER_SOCKET/LD_PRELOAD to the processes it started.
+    With SLURM this depends on site defaults and --export and can be
+    intermittent, so launcher-specific advice is given when the command is a
+    known launcher."""
+    if exit_status:
+        how = (f"was killed by signal {-exit_status}" if exit_status < 0
+               else f"exited with status {exit_status}")
+        return (
+            f"[hprofiler][warn] run captured ZERO events of any kind across all active "
+            f"backends ({', '.join(backends)}), and the profiled command {how}: it most "
+            f"likely failed before making any profiled call (check its own output). "
+            f"If it ran normally without hprofiler, the hooks may not have reached the "
+            f"collector instead (see DOCUMENTATION.md, \"Launchers and MPI jobs\")."
+        )
     launcher = command[0] if command else ""
     launcher_hint = ""
     if launcher in _LAUNCHER_NAMES:
@@ -877,14 +1130,14 @@ def _collect_disasm(
     backends: list[str],
     profiled_pid: int = 0,
     perf_data: str | None = None,
-    real_binary_paths: "set[str] | None" = None,
+    real_binary_paths: "dict[int, list[str]] | set[str] | None" = None,
 ) -> None:
     """Post-run: extract disassembly for the profiled kernels and attach it.
 
     ACPP SSCP .jit.so paths come from the OpenCL hook's jit_load spans.
-    real_binary_paths: the connected processes' executables (_peer_real_exe),
-    used by the whole-binary CUDA/ROCm AoT paths when command[0] is a
-    launcher."""
+    real_binary_paths: the connected processes' executables by pid
+    (_peer_process), read by the whole-binary CUDA/ROCm AoT paths when
+    command[0] is a launcher (disasm_binaries() chooses)."""
     # Resolve the binary path: it may be relative (e.g. './main').
     # Use the saved cwd from the trace metadata to make it absolute.
     cwd = trace.metadata.cwd or ""
@@ -895,7 +1148,7 @@ def _collect_disasm(
                        if not _os.path.isabs(binary_rel) else binary_rel)] + command[1:]
 
     try:
-        from ..disasm.extractor import collect_disasm
+        from ..disasm.extractor import attribute_launches, collect_disasm
     except ImportError:
         return
 
@@ -906,8 +1159,22 @@ def _collect_disasm(
     omp_syms: dict[str, tuple] = {}
     # cpu_names: function names from perf-sampled CPU spans (no sym/lib tags)
     cpu_names: set[str] = set()
+    # Module identity (hooks/common/hp_module.h): saved blob path -> mod=,
+    # and how often each kernel name was launched from each module ("" for
+    # launches without a module id).
+    module_ids: dict[str, str] = {}
+    launches: Counter = Counter()
+    gpu_pids: set[int] = set()            # processes that launched or ran GPU work
 
     for span in trace.iter_spans():
+        mod = span.tags.get("mod", "")
+        if span.category.value in ("cuda", "rocm") or span.tags.get("rt") in ("cuda", "rocm"):
+            gpu_pids.add(span.pid)
+        if span.category == Category.JIT and mod and span.tags.get("path"):
+            module_ids[span.tags["path"]] = mod
+        elif span.category.value in ("cuda", "rocm", "opencl") and (
+                span.tags.get("side") == "gpu" or span.tags.get("type") == "jit_kernel"):
+            launches[(span.name, mod)] += 1
         # OpenCL/ACPP SSCP JIT .so files
         if span.category == Category.JIT and span.tags.get("type") == "jit_load":
             so_path = span.tags.get("path", "")
@@ -917,6 +1184,7 @@ def _collect_disasm(
                     "name":    span.name,
                     "so_path": so_path,
                     "mangled": span.tags.get("mangled", ""),
+                    "mod":     mod,
                 })
         # ROCm JIT: hipModuleLoadData emits type=jit_compile with path= of saved ELF
         if span.category == Category.JIT and span.tags.get("type") == "jit_compile":
@@ -926,6 +1194,7 @@ def _collect_disasm(
                     "name":    span.name,
                     "so_path": "",
                     "path":    jit_path,
+                    "mod":     mod,
                 })
         # OpenMP/MPI/CPU spans: the first resolved call site per span name --
         # sym=<mangled> (+ symfile=, the ELF dladdr found it in; the command
@@ -957,31 +1226,26 @@ def _collect_disasm(
             sm_version = f"sm_{major}{minor}"
             break
 
-    # Any connected binary beats a launcher command[0] (SPMD: every rank runs
-    # the same binary).
-    real_binary = next(iter(real_binary_paths), "") if real_binary_paths else ""
+    # Connected executables beat a launcher command[0]: those of the
+    # processes that did GPU work (SPMD: every rank runs the same binary),
+    # else all of them, in a fixed order.
+    binaries = disasm_binaries(real_binary_paths, gpu_pids)
+
+    launched_by_module: dict[str, set[str]] = {}
+    for (name, mod) in launches:
+        if mod:
+            launched_by_module.setdefault(mod, set()).add(name)
 
     try:
         disasm_map = collect_disasm(command, backends, jit_spans, omp_syms, profiled_pid, cpu_names,
-                                    sm_version=sm_version, real_binary=real_binary)
+                                    sm_version=sm_version, real_binaries=binaries,
+                                    module_ids=module_ids, launched_by_module=launched_by_module)
+        attribute_launches(disasm_map.values(), launches)
 
-        import copy as _copy
-
-        # CUDA/ROCm ACPP JIT: kernel launches are recorded as "<jit-kernel>"
-        # because dladdr can't resolve JIT function pointers.  Map the first
-        # captured JIT kernel to that name so clicking it shows something.
-        _JIT_NAME = "<jit-kernel>"
-        if (any(r["name"] == _JIT_NAME for r in trace.aggregate_stats())
-                and _JIT_NAME not in disasm_map):
-            # Alias first available GPU kernel to <jit-kernel> so spans get
-            # disassembly even when the hook couldn't resolve the name (e.g.
-            # native HIP AoT where stubs aren't in .dynsym).
-            for kd in disasm_map.values():
-                if kd.arch in ("ptx", "sass", "amdgcn"):
-                    alias = _copy.copy(kd)
-                    alias.name = _JIT_NAME
-                    disasm_map[_JIT_NAME] = alias
-                    break
+        # Launches recorded as "<jit-kernel>" (the hook could resolve neither
+        # a name nor a module) get no disassembly: attaching some other
+        # kernel's code -- this used to alias the first GPU kernel found --
+        # would show code that may never have run.
 
         # ── Instruction-level heat annotation ─────────────────────────────
         # CPU kernels: perf annotate instruction percentages

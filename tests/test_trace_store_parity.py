@@ -618,5 +618,43 @@ class TestTimelineModelParity(_Pair):
         td.clearFilters()
 
 
+
+class TestZoomedOutOccupancy(unittest.TestCase):
+    """The activity index paints zoomed-out lanes (laneView's "bins"): busy
+    time is assumed uniform within a source bin, so a source bin straddling
+    a pixel column's edge leaks into the next column. It resampled from the
+    COARSEST level that resolves a column (source bins up to a column wide):
+    idle columns showed busy, and went idle once zooming in switched the
+    lane to exact spans. Now the finest level."""
+
+    def test_index_occupancy_stays_close_to_the_exact_one(self):
+        from src.core.store.common import occupancy_from_spans
+        rng = random.Random(7)
+        tmp = tempfile.mkdtemp()
+        try:
+            t = trace_io.create_disk_trace(os.path.join(tmp, "o.hpstore"), TraceMetadata())
+            spans, x = [], 0
+            for i in range(30000):
+                x += rng.choice([50, 200, 1000, 5000, 20000, 200000])
+                dur = rng.choice([100, 400, 2000, 10000]) if i % 500 else 3_000_000
+                t.add(SpanEvent("work", Category.CPU, x, dur, 1, 1))
+                spans.append((x, x + dur))
+                x += dur
+            t.finalize()
+            lane = t.lane_infos()[0].name
+            t0, t1 = spans[0][0], spans[-1][1]
+            for zoom, limit in ((1, 0.02), (3, 0.05), (10, 0.1)):
+                width = (t1 - t0) / zoom
+                for off in (0.0, 0.5, 0.87):
+                    a = t0 + off * (t1 - t0 - width)
+                    got = t.store.occupancy(lane, a, a + width, 1420)
+                    self.assertIsNotNone(got, zoom)
+                    err = float(np.abs(got - occupancy_from_spans(spans, a, a + width, 1420)).max())
+                    self.assertLess(err, limit, (zoom, off))      # coarsest level: 0.08 / 0.07 / 0.31
+            t.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

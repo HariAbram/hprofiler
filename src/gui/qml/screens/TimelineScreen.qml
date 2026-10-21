@@ -63,8 +63,16 @@ Item {
     readonly property real visibleNs: TimelineModel.traceDurationNs / zoom
 
     property int hoverLane: -1
-    property int hoverSpanIdx: -1
+    // A store event id, (shard << 38) | row -- past 2^31 for every span of
+    // a disk store, so a real (double, exact to 2^53), never an int: an
+    // int kept only the row, and click-to-select, double-click zoom, the
+    // hover's repeat guard and the connectors all looked up a wrong id.
+    property real hoverSpanIdx: -1
     property string hoverText: ""
+    // Where hoverText's tooltip points (this item's coordinates): the
+    // cursor, or the search match jumped to.
+    property real hoverX: 0
+    property real hoverY: 0
     // How many spans share the currently cross-tab-selected (category,
     // name) -- 0 when nothing's selected or it has no occurrences here.
     property int matchCount: 0
@@ -212,6 +220,13 @@ Item {
             root.hoverSpanIdx = match.spanIdx
             root.hoverText = detail.name + "  @" + root.fmtNs(detail.startNs) +
                              "  dur " + root.fmtNs(detail.durNs)
+            var laneW = flick.width - root.labelWidth
+            var row = rowPos >= 0 ? flick.itemAtIndex(rowPos) : null
+            var p = row ? row.mapToItem(root, 0, row.height / 2)
+                        : flick.mapToItem(root, 0, flick.height / 2)
+            root.hoverX = p.x + root.labelWidth +
+                          Math.max(0, Math.min(1, (match.startNs - viewStartNs) / visibleNs)) * laneW
+            root.hoverY = p.y
         }
         overlay.requestPaint()
     }
@@ -262,27 +277,33 @@ Item {
         spacing: AppTheme.spacingXs
 
         // ── Status / controls row ───────────────────────────────────────
+        // Neither toolbar row may be wider than the screen: a ColumnLayout
+        // widens EVERY child to its widest child's minimum, so a row that
+        // could not shrink made the lanes wider than the window (hidden
+        // under the Inspector / past the edge), and a hover label shown
+        // here widened them on every hover (the timeline jumped). Hence
+        // minimumWidth 0 on both rows, the texts elide, and the hover
+        // label is a tooltip over the lanes (end of this file).
         RowLayout {
+            objectName: "timelineStatusRow"
             Layout.fillWidth: true
+            Layout.minimumWidth: 0
             Layout.preferredHeight: 24
             Layout.maximumHeight: 24
             spacing: AppTheme.spacingMd
 
             Text {
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                Layout.maximumWidth: implicitWidth
                 text: "zoom " + root.zoom.toFixed(1) + "×   offset " +
                       root.fmtNs(root.viewStartNs - TimelineModel.viewStartNs) +
                       "   window " + root.fmtNs(root.visibleNs)
                 color: AppTheme.textMuted
                 font.pixelSize: AppTheme.typeLabel
+                elide: Text.ElideRight
             }
             Item { Layout.fillWidth: true }
-            Text {
-                visible: root.hoverText.length > 0
-                text: root.hoverText
-                color: AppTheme.text
-                font.pixelSize: AppTheme.typeLabel
-                font.bold: true
-            }
             Text {
                 visible: root.matchCount > 1
                 text: root.matchCount + (root.matchCount >= 50 ? "+" : "") + " matches"
@@ -304,37 +325,6 @@ Item {
                 onMatchJumped: (match) => root.jumpToMatch(match)
             }
             Item { Layout.fillWidth: true }
-            RowLayout {
-                visible: root.hasSyncOverlay
-                spacing: AppTheme.spacingXs
-                Rectangle {
-                    objectName: "timelineWaitLegendSwatch"
-                    width: 10
-                    height: 10
-                    radius: AppTheme.radiusSmall / 2
-                    color: "transparent"
-                    border.width: 1
-                    border.color: AppTheme.bucketColor("Idle")
-                    Rectangle {
-                        anchors.fill: parent
-                        anchors.margins: 1
-                        color: AppTheme.bucketColor("Idle")
-                        opacity: 0.28
-                    }
-                    Rectangle {
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
-                        height: 2
-                        color: AppTheme.categoryColor("sync")
-                    }
-                }
-                Text {
-                    text: "= waiting (barrier / lock), not working"
-                    color: AppTheme.textMuted
-                    font.pixelSize: AppTheme.typeCaption
-                }
-            }
             RowLayout {
                 spacing: 2
                 ToolButton {
@@ -380,16 +370,13 @@ Item {
                     Accessible.description: "Resets zoom and pan to the full trace view"
                 }
             }
-            Text {
-                text: "wheel: zoom@cursor · drag: pan · shift-drag: select range · dbl-click event: zoom to it · arrows/+/-/Home/End/0: keyboard"
-                color: AppTheme.textMuted
-                font.pixelSize: AppTheme.typeCaption
-            }
         }
 
-        // ── Bookmarks / named ranges / bucket legend row ────────────────
+        // ── Bookmarks / named ranges / legends / help row ───────────────
         RowLayout {
+            objectName: "timelineSecondRow"
             Layout.fillWidth: true
+            Layout.minimumWidth: 0
             Layout.preferredHeight: 20
             Layout.maximumHeight: 20
             spacing: AppTheme.spacingSm
@@ -446,6 +433,47 @@ Item {
             Item { Layout.fillWidth: true }
             BucketLegend {
                 visible: TimelineModel.colorMode === "bucket"
+            }
+            RowLayout {
+                visible: root.hasSyncOverlay
+                spacing: AppTheme.spacingXs
+                Rectangle {
+                    objectName: "timelineWaitLegendSwatch"
+                    width: 10
+                    height: 10
+                    radius: AppTheme.radiusSmall / 2
+                    color: "transparent"
+                    border.width: 1
+                    border.color: AppTheme.bucketColor("Idle", AppTheme.dark)
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 1
+                        color: AppTheme.bucketColor("Idle", AppTheme.dark)
+                        opacity: 0.28
+                    }
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        height: 2
+                        color: AppTheme.categoryColor("sync", AppTheme.dark)
+                    }
+                }
+                Text {
+                    text: "= waiting (barrier / lock), not working"
+                    color: AppTheme.textMuted
+                    font.pixelSize: AppTheme.typeCaption
+                }
+            }
+            Text {
+                objectName: "timelineInputHint"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                Layout.maximumWidth: implicitWidth
+                text: "wheel: zoom@cursor · drag: pan · shift-drag: select range · dbl-click event: zoom to it · arrows/+/-/Home/End/0: keyboard"
+                color: AppTheme.textMuted
+                font.pixelSize: AppTheme.typeCaption
+                elide: Text.ElideRight
             }
         }
 
@@ -582,6 +610,10 @@ Item {
                             property real boundStart: root.viewStartNs
                             onBoundZoomChanged: if (visible) requestPaint()
                             onBoundStartChanged: if (visible) requestPaint()
+                            Connections {
+                                target: AppTheme
+                                function onThemeChanged() { if (coverageCanvas.visible) coverageCanvas.requestPaint() }
+                            }
                             onVisibleChanged: if (visible) requestPaint()
                             onPaint: {
                                 var ctx = getContext("2d")
@@ -633,6 +665,7 @@ Item {
 
                             Text {
                                 id: laneLabel
+                                objectName: "laneLabel_" + laneRow.rowData.laneIndex
                                 width: root.labelWidth
                                 height: parent.height
                                 verticalAlignment: Text.AlignVCenter
@@ -640,7 +673,8 @@ Item {
                                       (laneRow.rowData.filteredCount !== laneRow.rowData.count
                                        ? laneRow.rowData.filteredCount + "/" + laneRow.rowData.count
                                        : laneRow.rowData.count) + ")"
-                                color: laneRow.rowData.filteredCount === 0 ? AppTheme.textMuted : laneRow.rowData.color
+                                color: laneRow.rowData.filteredCount === 0 ? AppTheme.textMuted
+                                       : AppTheme.categoryColor(laneRow.rowData.category, AppTheme.dark)
                                 font.bold: true
                                 font.pixelSize: AppTheme.typeLabel
                                 elide: Text.ElideRight
@@ -781,6 +815,10 @@ Item {
                                     function onColorModeChanged() {
                                         if (!repaintThrottle.running) repaintThrottle.start()
                                     }
+                                    // light/dark toggle: the model recomputed its colours
+                                    function onColorsChanged() {
+                                        if (!repaintThrottle.running) repaintThrottle.start()
+                                    }
                                 }
 
                                 // Shared by both the lane's own spans and the sync
@@ -807,8 +845,15 @@ Item {
                                             var nextX0 = (spans[i + 1].startNs - root.viewStartNs) * scale
                                             w = Math.max(wReal, Math.min(w, nextX0 - x0))
                                         }
+                                        // Clipped to the canvas from BOTH ends: a span that
+                                        // began left of the view covers 0 .. its own end. The
+                                        // rect used to start at 0 but keep the span's full
+                                        // width, so an MPI_Barrier that ended 7% into the
+                                        // window filled the whole lane (idle drawn as busy,
+                                        // flipping as zoom/pan moved its start on screen).
+                                        var left = Math.max(0, x0), right = Math.min(width, x0 + w)
                                         ctx.fillStyle = colorOf(sp)
-                                        ctx.fillRect(Math.max(0, x0), 3, Math.min(w, width - x0), height - 6)
+                                        ctx.fillRect(left, 3, Math.max(1, right - left), height - 6)
                                     }
                                     ctx.globalAlpha = 1.0
                                 }
@@ -829,8 +874,8 @@ Item {
                                             continue
                                         var x0 = (sp.startNs - root.viewStartNs) * scale
                                         var w = Math.max(1, sp.durNs * scale)
-                                        ctx.strokeRect(Math.max(0, x0) + 0.5, 1.5,
-                                                        Math.min(w, width - x0) - 1, height - 3)
+                                        var left = Math.max(0, x0), right = Math.min(width, x0 + w)
+                                        ctx.strokeRect(left + 0.5, 1.5, Math.max(1, right - left) - 1, height - 3)
                                     }
                                 }
 
@@ -863,7 +908,7 @@ Item {
                                 // in the neutral Idle colour, with a thin stripe in
                                 // the wait's own colour (same hue as on the sync lane)
                                 // so the two rows still correlate.
-                                readonly property color idleColor: AppTheme.bucketColor("Idle")
+                                readonly property color idleColor: AppTheme.bucketColor("Idle", AppTheme.dark)
 
                                 function _paintWaits(ctx, waits, scale) {
                                     var viewEndNs = root.viewStartNs + root.visibleNs
@@ -974,6 +1019,9 @@ Item {
                                     hoverEnabled: true
                                     acceptedButtons: Qt.NoButton
                                     onPositionChanged: (mouse) => {
+                                        var at = mapToItem(root, mouse.x, mouse.y)
+                                        root.hoverX = at.x
+                                        root.hoverY = at.y
                                         var ns = root.viewStartNs + mouse.x / laneCanvas.width * root.visibleNs
                                         var found = -1
                                         var spans = laneCanvas.cachedSpans
@@ -1043,14 +1091,13 @@ Item {
                             ctx.reset()
                             if (root.hoverLane < 0) return
                             var scale = width / root.visibleNs
-                            var conns = TimelineModel.connectors
+                            // Only the hovered span's own connectors -- never the
+                            // whole `connectors` list, which QML re-read from
+                            // Python on every element access (minutes per repaint
+                            // with 44k connectors).
+                            var conns = TimelineModel.connectorsOf(root.hoverLane, root.hoverSpanIdx)
                             for (var i = 0; i < conns.length; i++) {
                                 var c = conns[i]
-                                if (c.predLane !== root.hoverLane && c.succLane !== root.hoverLane)
-                                    continue
-                                if ((c.predSpanIdx !== root.hoverSpanIdx || c.predLane !== root.hoverLane) &&
-                                    (c.succSpanIdx !== root.hoverSpanIdx || c.succLane !== root.hoverLane))
-                                    continue
                                 // rowIndexForLane(), NOT the raw lane index, as the
                                 // row-position multiplier -- a row's visual position and
                                 // its lane's index diverge under grouping/hiding/
@@ -1065,13 +1112,14 @@ Item {
                                 var x1 = (c.succMidNs - root.viewStartNs) * scale
                                 var y0 = predRow * root.rowHeight + root.rowHeight / 2
                                 var y1 = succRow * root.rowHeight + root.rowHeight / 2
-                                ctx.strokeStyle = c.color
+                                var cc = AppTheme.confidenceColor(c.confidence, AppTheme.dark)
+                                ctx.strokeStyle = cc
                                 ctx.lineWidth = 2
                                 ctx.beginPath()
                                 ctx.moveTo(x0, y0)
                                 ctx.lineTo(x1, y1)
                                 ctx.stroke()
-                                ctx.fillStyle = c.color
+                                ctx.fillStyle = cc
                                 ctx.beginPath(); ctx.arc(x0, y0, 3, 0, 2 * Math.PI); ctx.fill()
                                 ctx.beginPath(); ctx.arc(x1, y1, 3, 0, 2 * Math.PI); ctx.fill()
                             }
@@ -1085,6 +1133,7 @@ Item {
                     Connections {
                         target: TimelineModel
                         function onRowsChanged() { overlay.requestPaint() }
+                        function onColorsChanged() { overlay.requestPaint() }
                     }
                 }
 
@@ -1235,6 +1284,25 @@ Item {
                     }
                 }
             }
+        }
+    }
+
+    // The hovered span (or the search match jumped to): name, start, duration.
+    // Floats over the lanes, outside every layout, so its width never
+    // changes theirs.
+    Tooltip {
+        objectName: "timelineHoverTooltip"
+        visible: root.hoverText.length > 0
+        anchorX: root.hoverX
+        anchorY: root.hoverY
+        Text {
+            objectName: "timelineHoverTooltipText"
+            Layout.maximumWidth: Math.max(0, root.width - 3 * AppTheme.spacingLg)
+            text: root.hoverText
+            color: AppTheme.text
+            font.pixelSize: AppTheme.typeLabel
+            font.bold: true
+            elide: Text.ElideMiddle
         }
     }
 

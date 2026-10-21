@@ -51,6 +51,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,10 +178,21 @@ static int hp_tx_connect_locked(void) {
     int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (s >= 0) {
         struct sockaddr_un addr;
+        socklen_t alen = sizeof(addr);
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        memcpy(addr.sun_path, hp_tx.path, sizeof(addr.sun_path) - 1);
-        if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        if (hp_tx.path[0] == '@') {
+            /* "@name": Linux abstract namespace (the runner's fallback when
+             * no short enough socket path exists). The name is length-
+             * delimited, not NUL-terminated: the address length must cover
+             * exactly the leading NUL plus the name. */
+            size_t n = strnlen(hp_tx.path + 1, sizeof(addr.sun_path) - 1);
+            memcpy(addr.sun_path + 1, hp_tx.path + 1, n);
+            alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+        } else {
+            memcpy(addr.sun_path, hp_tx.path, sizeof(addr.sun_path) - 1);
+        }
+        if (connect(s, (struct sockaddr *)&addr, alen) == 0) {
             hp_tx.sock = s;
             return 1;
         }

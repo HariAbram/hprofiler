@@ -3,8 +3,16 @@
  *
  * Wraps ncclAllReduce, Broadcast, Reduce, AllGather, ReduceScatter,
  * AllToAll, Send, Recv (category "nccl"; tags type=, bytes= (count x dtype
- * size), stream=, rank=, nranks=), GroupStart/GroupEnd (one ncclGroup span
- * for the outermost pair) and CommInitRank/InitAll/Destroy.
+ * size), stream=, rank=, nranks=, commid=, and seq= on collectives),
+ * GroupStart/GroupEnd (one ncclGroup span for the outermost pair) and
+ * CommInitRank/InitRankConfig/InitAll/Split/Destroy/Abort.
+ *
+ * commid= names the communicator identically on every rank: the hash of the
+ * ncclUniqueId all ranks passed to ncclCommInitRank (ncclCommSplit: of the
+ * parent's id and the color; ncclCommInitAll: of this process and call).
+ * seq= numbers the collectives of one communicator; NCCL requires every
+ * rank to issue them in the same order, so (commid, seq) is the same call
+ * on every rank -- criticalpath.py pairs collectives by it.
  *
  * Timing: a cudaEvent pair on the operation's stream; the wrapper waits for
  * the end event before returning, which serializes each operation with the
@@ -67,6 +75,7 @@ static uint64_t now_ns(void) {
  * connection, separate from cuda_hook's). */
 #include "../common/hp_transport.h"
 #include "../common/callstack.h"
+#include "../common/hp_module.h"
 
 static pid_t gettid_compat(void) { return hp_tx_tid(); }
 
@@ -161,6 +170,72 @@ static void comm_meta(ncclComm_t comm, int *rank, int *nranks) {
     if (f_commCount && comm) f_commCount(comm, nranks);
 }
 
+/* ── Communicator identity: comm handle -> (commid, collective count) ─── */
+typedef struct { ncclComm_t comm; uint64_t id; uint64_t seq; } CommEntry;
+static CommEntry      *g_comms;
+static size_t          g_ncomms, g_capcomms;
+static pthread_mutex_t g_comm_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void comm_register(ncclComm_t comm, uint64_t id) {
+    if (!comm) return;
+    pthread_mutex_lock(&g_comm_mutex);
+    for (size_t i = 0; i < g_ncomms; i++) {
+        if (g_comms[i].comm == comm) {          /* a reused handle: a new communicator */
+            g_comms[i].id = id;
+            g_comms[i].seq = 0;
+            pthread_mutex_unlock(&g_comm_mutex);
+            return;
+        }
+    }
+    if (g_ncomms == g_capcomms) {
+        size_t cap = g_capcomms ? g_capcomms * 2 : 16;
+        CommEntry *p = (CommEntry *)realloc(g_comms, cap * sizeof(*p));
+        if (!p) { pthread_mutex_unlock(&g_comm_mutex); return; }
+        g_comms = p;
+        g_capcomms = cap;
+    }
+    g_comms[g_ncomms++] = (CommEntry){comm, id, 0};
+    pthread_mutex_unlock(&g_comm_mutex);
+}
+
+static void comm_forget(ncclComm_t comm) {
+    pthread_mutex_lock(&g_comm_mutex);
+    for (size_t i = 0; i < g_ncomms; i++) {
+        if (g_comms[i].comm == comm) {
+            g_comms[i] = g_comms[--g_ncomms];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_comm_mutex);
+}
+
+/* ",commid=<id>[,seq=<n>]" into buf (empty for a communicator created
+ * before the hook saw it); collective != 0 counts this call in seq=. */
+static const char *comm_ident(ncclComm_t comm, int collective, char *buf, size_t cap) {
+    buf[0] = '\0';
+    pthread_mutex_lock(&g_comm_mutex);
+    for (size_t i = 0; i < g_ncomms; i++) {
+        if (g_comms[i].comm != comm) continue;
+        if (collective)
+            snprintf(buf, cap, ",commid=%016llx,seq=%llu", (unsigned long long)g_comms[i].id,
+                     (unsigned long long)++g_comms[i].seq);
+        else
+            snprintf(buf, cap, ",commid=%016llx", (unsigned long long)g_comms[i].id);
+        break;
+    }
+    pthread_mutex_unlock(&g_comm_mutex);
+    return buf;
+}
+
+static uint64_t comm_id_of(ncclComm_t comm) {
+    uint64_t id = 0;
+    pthread_mutex_lock(&g_comm_mutex);
+    for (size_t i = 0; i < g_ncomms; i++)
+        if (g_comms[i].comm == comm) { id = g_comms[i].id; break; }
+    pthread_mutex_unlock(&g_comm_mutex);
+    return id;
+}
+
 /* ── NCCL communicator lifecycle ────────────────────────────────────── */
 typedef struct { char _opaque[128]; } ncclUniqueId;
 
@@ -175,6 +250,42 @@ ncclResult_t ncclCommInitRank(ncclComm_t *comm, int nranks,
     uint64_t t0 = now_ns();
     ncclResult_t ret = real(comm, nranks, clique_id, rank);
     emit_span("nccl", gettid_compat(), t0, now_ns()-t0, "ncclCommInitRank", extra);
+    if (ret == ncclSuccess && comm) comm_register(*comm, hp_fnv1a64(&clique_id, sizeof(clique_id)));
+    return ret;
+}
+
+ncclResult_t ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId clique_id,
+                                     int rank, void *config) {
+    typedef ncclResult_t (*fn_t)(ncclComm_t*, int, ncclUniqueId, int, void*);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "ncclCommInitRankConfig");
+    if (!real) return -1;
+    char extra[64];
+    snprintf(extra, sizeof(extra), "type=comm_init,nranks=%d,rank=%d", nranks, rank);
+    uint64_t t0 = now_ns();
+    ncclResult_t ret = real(comm, nranks, clique_id, rank, config);
+    emit_span("nccl", gettid_compat(), t0, now_ns()-t0, "ncclCommInitRankConfig", extra);
+    if (ret == ncclSuccess && comm) comm_register(*comm, hp_fnv1a64(&clique_id, sizeof(clique_id)));
+    return ret;
+}
+
+/* Every rank with the same color gets the same child: id = hash(parent id,
+ * color), equal on all of them when the parent's is. */
+ncclResult_t ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t *newcomm, void *config) {
+    typedef ncclResult_t (*fn_t)(ncclComm_t, int, int, ncclComm_t*, void*);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "ncclCommSplit");
+    if (!real) return -1;
+    uint64_t t0 = now_ns();
+    ncclResult_t ret = real(comm, color, key, newcomm, config);
+    char extra[48];
+    snprintf(extra, sizeof(extra), "type=comm_split,color=%d", color);
+    emit_span("nccl", gettid_compat(), t0, now_ns()-t0, "ncclCommSplit", extra);
+    uint64_t parent = comm_id_of(comm);
+    if (ret == ncclSuccess && newcomm && *newcomm && parent) {
+        uint64_t h = hp_fnv1a64_update(HP_FNV1A64_INIT, &parent, sizeof(parent));
+        comm_register(*newcomm, hp_fnv1a64_update(h, &color, sizeof(color)));
+    }
     return ret;
 }
 
@@ -188,6 +299,13 @@ ncclResult_t ncclCommInitAll(ncclComm_t *comm, int ndev, const int *devlist) {
     uint64_t t0 = now_ns();
     ncclResult_t ret = real(comm, ndev, devlist);
     emit_span("nccl", gettid_compat(), t0, now_ns()-t0, "ncclCommInitAll", extra);
+    if (ret == ncclSuccess && comm) {
+        /* one clique inside this process: (pid, call number) names it */
+        static uint64_t calls = 0;
+        uint64_t key[2] = {(uint64_t)getpid(), __atomic_add_fetch(&calls, 1, __ATOMIC_RELAXED)};
+        uint64_t id = hp_fnv1a64(key, sizeof(key));
+        for (int i = 0; i < ndev; i++) comm_register(comm[i], id);
+    }
     return ret;
 }
 
@@ -200,6 +318,17 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
     ncclResult_t ret = real(comm);
     emit_span("nccl", gettid_compat(), t0, now_ns()-t0,
               "ncclCommDestroy", "type=comm_destroy");
+    comm_forget(comm);
+    return ret;
+}
+
+ncclResult_t ncclCommAbort(ncclComm_t comm) {
+    typedef ncclResult_t (*fn_t)(ncclComm_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "ncclCommAbort");
+    if (!real) return -1;
+    ncclResult_t ret = real(comm);
+    comm_forget(comm);
     return ret;
 }
 
@@ -227,9 +356,10 @@ ncclResult_t ncclAllReduce(const void *sb, void *rb, size_t count,
     if (!real) return -1;
     size_t nb = count * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=allreduce,bytes=%zu,stream=%d,rank=%d,nranks=%d",
-        nb, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 1, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=allreduce,bytes=%zu,stream=%d,rank=%d,nranks=%d%s",
+        nb, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(sb, rb, count, dt, op, comm, stream);
     GPU_SPAN_END("nccl", "ncclAllReduce", extra, stream)
@@ -246,9 +376,10 @@ ncclResult_t ncclBroadcast(const void *sb, void *rb, size_t count,
     if (!real) return -1;
     size_t nb = count * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=broadcast,bytes=%zu,root=%d,stream=%d,rank=%d,nranks=%d",
-        nb, root, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 1, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=broadcast,bytes=%zu,root=%d,stream=%d,rank=%d,nranks=%d%s",
+        nb, root, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(sb, rb, count, dt, root, comm, stream);
     GPU_SPAN_END("nccl", "ncclBroadcast", extra, stream)
@@ -265,9 +396,10 @@ ncclResult_t ncclReduce(const void *sb, void *rb, size_t count,
     if (!real) return -1;
     size_t nb = count * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=reduce,bytes=%zu,root=%d,stream=%d,rank=%d,nranks=%d",
-        nb, root, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 1, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=reduce,bytes=%zu,root=%d,stream=%d,rank=%d,nranks=%d%s",
+        nb, root, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(sb, rb, count, dt, op, root, comm, stream);
     GPU_SPAN_END("nccl", "ncclReduce", extra, stream)
@@ -284,9 +416,10 @@ ncclResult_t ncclAllGather(const void *sb, void *rb, size_t sendcount,
     if (!real) return -1;
     size_t nb = sendcount * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=allgather,bytes=%zu,stream=%d,rank=%d,nranks=%d",
-        nb, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 1, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=allgather,bytes=%zu,stream=%d,rank=%d,nranks=%d%s",
+        nb, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(sb, rb, sendcount, dt, comm, stream);
     GPU_SPAN_END("nccl", "ncclAllGather", extra, stream)
@@ -303,9 +436,10 @@ ncclResult_t ncclReduceScatter(const void *sb, void *rb, size_t recvcount,
     if (!real) return -1;
     size_t nb = recvcount * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=reduce_scatter,bytes=%zu,stream=%d,rank=%d,nranks=%d",
-        nb, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 1, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=reduce_scatter,bytes=%zu,stream=%d,rank=%d,nranks=%d%s",
+        nb, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(sb, rb, recvcount, dt, op, comm, stream);
     GPU_SPAN_END("nccl", "ncclReduceScatter", extra, stream)
@@ -321,9 +455,10 @@ ncclResult_t ncclSend(const void *sb, size_t count, ncclDataType_t dt,
     if (!real) return -1;
     size_t nb = count * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=send,bytes=%zu,peer=%d,stream=%d,rank=%d,nranks=%d",
-        nb, peer, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 0, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=send,bytes=%zu,peer=%d,stream=%d,rank=%d,nranks=%d%s",
+        nb, peer, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(sb, count, dt, peer, comm, stream);
     GPU_SPAN_END("nccl", "ncclSend", extra, stream)
@@ -339,9 +474,10 @@ ncclResult_t ncclRecv(void *rb, size_t count, ncclDataType_t dt,
     if (!real) return -1;
     size_t nb = count * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=recv,bytes=%zu,peer=%d,stream=%d,rank=%d,nranks=%d",
-        nb, peer, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 0, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=recv,bytes=%zu,peer=%d,stream=%d,rank=%d,nranks=%d%s",
+        nb, peer, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(rb, count, dt, peer, comm, stream);
     GPU_SPAN_END("nccl", "ncclRecv", extra, stream)
@@ -359,9 +495,10 @@ ncclResult_t ncclAllToAll(const void *sb, void *rb, size_t count,
     if (!real) return -1;
     size_t nb = count * nccl_dtype_sz(dt);
     int rank = -1, nranks = -1; comm_meta(comm, &rank, &nranks);
-    char extra[192]; snprintf(extra, sizeof(extra),
-        "type=alltoall,bytes=%zu,stream=%d,rank=%d,nranks=%d",
-        nb, stream_id(stream), rank, nranks);
+    char cid[64]; comm_ident(comm, 1, cid, sizeof(cid));
+    char extra[256]; snprintf(extra, sizeof(extra),
+        "type=alltoall,bytes=%zu,stream=%d,rank=%d,nranks=%d%s",
+        nb, stream_id(stream), rank, nranks, cid);
     GPU_SPAN_BEGIN(stream)
     ncclResult_t ret = real(sb, rb, count, dt, comm, stream);
     GPU_SPAN_END("nccl", "ncclAllToAll", extra, stream)

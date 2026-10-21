@@ -18,6 +18,41 @@ ApplicationWindow {
     title: "hprofiler — " + AppInfo.commandLine
     color: AppTheme.background
 
+    // Every Qt Quick Controls item -- buttons, tool buttons, tabs, menus,
+    // check boxes, text fields, tool tips, dialogs -- draws with this
+    // palette, and every Popup inherits it. Left unset, it came from the
+    // desktop's own theme: on a light desktop, near-black button text on
+    // the dark theme's background (invisible) and light tab/menu bars.
+    // Text roles are set per colour group: assigning e.g. palette.buttonText
+    // sets all three groups and wins over palette.disabled.buttonText, so a
+    // disabled button looked enabled.
+    palette.active.windowText: AppTheme.text
+    palette.inactive.windowText: AppTheme.text
+    palette.active.buttonText: AppTheme.text
+    palette.inactive.buttonText: AppTheme.text
+    palette.active.text: AppTheme.text
+    palette.inactive.text: AppTheme.text
+    palette.active.placeholderText: AppTheme.textMuted
+    palette.inactive.placeholderText: AppTheme.textMuted
+    palette.disabled.windowText: AppTheme.textDisabled
+    palette.disabled.buttonText: AppTheme.textDisabled
+    palette.disabled.text: AppTheme.textDisabled
+    palette.disabled.placeholderText: AppTheme.textDisabled
+    palette.window: AppTheme.background
+    palette.base: AppTheme.surface
+    palette.alternateBase: AppTheme.background
+    palette.button: AppTheme.control
+    palette.brightText: AppTheme.text
+    palette.highlight: AppTheme.accent
+    palette.highlightedText: AppTheme.background
+    palette.toolTipBase: AppTheme.surface
+    palette.toolTipText: AppTheme.text
+    palette.link: AppTheme.accent
+    palette.light: AppTheme.control
+    palette.midlight: AppTheme.control
+    palette.mid: AppTheme.panelBorder
+    palette.dark: AppTheme.panelBorder
+
     // Persist geometry on every resize/move, and once more on close --
     // deliberately NOT throttled/debounced: these are cheap QSettings
     // writes (a handful of ints), not per-frame work, and saving on

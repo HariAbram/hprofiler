@@ -69,7 +69,9 @@ Item {
         anchors.top: parent.top
         anchors.bottom: parent.bottom
         width: parent.width * root.barFraction
-        color: Qt.alpha(root.row && root.row.color ? root.row.color : AppTheme.accent, 0.18)
+        // the row's category colour for the current theme (Kernels, Call Tree)
+        color: Qt.alpha(root.row && root.row.category !== undefined
+                        ? AppTheme.categoryColor(root.row.category, AppTheme.dark) : AppTheme.accent, 0.18)
     }
 
     Rectangle {
@@ -80,7 +82,9 @@ Item {
         width: 8
         height: 8
         radius: 4
-        color: root.row && root.row.color ? root.row.color : AppTheme.categoryColor(root.displayText)
+        // the cell's own value (category, backend), coloured for the current theme
+        color: AppTheme.categoryColor(root.row && root.row[root.column.key] !== undefined
+                                      ? String(root.row[root.column.key]) : root.displayText, AppTheme.dark)
     }
 
     Rectangle {
@@ -91,7 +95,7 @@ Item {
         width: 8
         height: 8
         radius: 4
-        color: root.row ? AppTheme.changeColor(root.row.status) : AppTheme.textMuted
+        color: root.row ? AppTheme.changeColor(root.row.status, AppTheme.dark) : AppTheme.textMuted
     }
 
     Text {
@@ -104,7 +108,7 @@ Item {
         text: root.displayText
         color: root.isFieldValueCell ? root.fieldKindColor
                : (root.column.kind === "status" && root.row && root.row.status !== undefined
-                  ? AppTheme.changeColor(root.row.status) : AppTheme.text)
+                  ? AppTheme.changeColor(root.row.status, AppTheme.dark) : AppTheme.text)
         font.italic: root.isFieldValueCell && root.row.kind === "unavailable"
         font.pixelSize: AppTheme.typeBody
         horizontalAlignment: root.column.align === "left" ? Text.AlignLeft : Text.AlignRight

@@ -279,22 +279,27 @@ class TestReusedCorrelationIds(unittest.TestCase):
     def test_each_record_goes_to_the_latest_submission_before_it(self):
         # A wrapped 32-bit CUPTI id: the same corr=7 on two submissions only
         # 10 us apart (closer than the clock tolerance -- the harder case).
-        t = build([
+        lines = [
             host("cudaLaunchKernel", 1_000_000, 1_000, lid=1, corr=7, stream=1),
             host("cudaLaunchKernel", 1_010_000, 1_000, lid=2, corr=7, stream=2),
             cupti_kernel(7, 5, 1_005_000, 1_006_000, name="_Z5firstv"),
             cupti_kernel(7, 6, 1_020_000, 1_030_000, name="_Z6secondv"),
-            cupti_kernel(7, 5, 800_000, 900_000, name="_Z5earlyv"),   # 100 us before any submission
-        ])
-        corr = ga.correlate(t.spans)
-        first, second, early = (t.spans.index(one(t, n)) for n in ("_Z5firstv", "_Z6secondv", "_Z5earlyv"))
-        self.assertEqual(t.spans[corr.host_of[first]].start_ns, 1_000_000)
-        self.assertEqual(t.spans[corr.host_of[second]].start_ns, 1_010_000)
+            cupti_kernel(7, 5, 800_000, 900_000, name="_Z5earlyv"),   # 200 us before any submission
+        ]
+        raw = build(lines, assemble=False)
+        corr = ga.correlate(raw.spans)
+        first, second, early = (raw.spans.index(one(raw, n)) for n in ("_Z5firstv", "_Z6secondv", "_Z5earlyv"))
+        self.assertEqual(raw.spans[corr.host_of[first]].start_ns, 1_000_000)
+        self.assertEqual(raw.spans[corr.host_of[second]].start_ns, 1_010_000)
         self.assertEqual(corr.confidence[first], "high")
+        # before every candidate: the nearest one (only a mapping error explains it), flagged
+        self.assertEqual(raw.spans[corr.host_of[early]].start_ns, 1_000_000)
         self.assertIn(early, corr.precedes_submission)
+        t = build(lines[:4])
         self.assertEqual(one(t, "_Z5firstv").tags["stream"], "1")
         self.assertEqual(one(t, "_Z6secondv").tags["stream"], "2")
-        self.assertEqual(t.metadata.device_activity[f"{PID}/cuda"]["precedes_submission"], 1)
+        e = build(lines).metadata.device_activity[f"{PID}/cuda"]
+        self.assertEqual((e["precedes_submission"], e["correlated"]), (1, 3))
 
     def test_clock_mapping_error_is_tolerated(self):
         # Device start mapped 5 us before its (only) submission: offset-
@@ -320,6 +325,123 @@ class TestReusedCorrelationIds(unittest.TestCase):
         # graph nodes run on internal streams: not forced onto the launch stream
         self.assertEqual(a.tags["stream"], "n12")
         self.assertEqual(b.tags["stream"], "n13")
+
+
+class TestDeviceClockDrift(unittest.TestCase):
+    """A drifting GPU->host clock mapping (gpu_activity.device_clock_corrections):
+    a unique correlation is always linked, and each device's timestamps are
+    shifted just enough that nothing precedes its own submission."""
+
+    def test_unique_correlation_77us_early_is_linked_and_flagged(self):
+        t = build([
+            host("cuLaunchKernel", 1_000_000, 2_000, lid=1, corr=41, stream=1, mod="0123456789abcdef"),
+            cupti_kernel(41, 5, 923_000, 950_000, submitted=922_600),   # 77 us before the call
+        ])
+        k, h = one(t, "_Z4axpyPf"), one(t, "cuLaunchKernel")
+        self.assertEqual(k.parent_span_id, h.span_id)
+        self.assertEqual(k.tags["mod"], "0123456789abcdef")
+        self.assertIn("launch_ns", k.tags)
+        e = t.metadata.device_activity[f"{PID}/cuda"]
+        self.assertEqual((e["correlated"], e["precedes_submission"]), (1, 1))
+        self.assertEqual(int(k.tags["submitted"]), 1_000_000)          # corrected onto the call start
+        self.assertEqual((e["clock_corrected_spans"], e["clock_correction_max_ns"]), (1, 77_400))
+        self.assertTrue(any("drifted behind the host clock by up to 77.4 us" in w
+                            for w in ga.degraded_warnings(t.metadata.device_activity)))
+
+    def test_two_candidates_after_a_wrap_time_decides(self):
+        hour = 3_600 * 10 ** 9
+        lines = [
+            host("cuLaunchKernel", 1_000_000, 1_000, lid=1, corr=7, stream=1),
+            host("cuLaunchKernel", hour, 1_000, lid=2, corr=7, stream=2),      # the id wrapped
+            cupti_kernel(7, 5, hour - 60_000, hour - 50_000, name="_Z5driftv"),  # 60 us early
+            cupti_kernel(7, 6, 1_030_000, 1_040_000, name="_Z5firstv"),
+        ]
+        raw = build(lines, assemble=False)
+        corr = ga.correlate(raw.spans)
+        drift, first = (raw.spans.index(one(raw, n)) for n in ("_Z5driftv", "_Z5firstv"))
+        self.assertEqual(raw.spans[corr.host_of[drift]].start_ns, hour)      # nearest, not the hour-old one
+        self.assertEqual(raw.spans[corr.host_of[first]].start_ns, 1_000_000)
+        self.assertEqual(corr.confidence[drift], "high")
+        self.assertEqual(corr.precedes_submission, [drift])
+
+    def _drift(self, with_submitted=True, drift_ns=-80_000, n=300, span_s=3.0):
+        lines, step = [], int(span_s * 1e9 / n)
+        for k in range(n):
+            h = 10_000_000 + k * step
+            err = int(drift_ns * k / (n - 1))                  # 0 -> drift_ns, linearly
+            start = h + 500 + err                              # 0.5 us true launch latency
+            extra = {"submitted": start - 400, "queued": h + 100} if with_submitted else {}
+            lines.append(host("cuLaunchKernel", h, 3_000, lid=k + 1, corr=k + 1, stream=1))
+            lines.append(cupti_kernel(k + 1, 5, start, start + 1_000_000, name=f"_Z1k{k}v", **extra))
+        return build(lines)
+
+    def _check_corrected(self, t, max_ns):
+        hosts = {s.span_id: s for s in t.spans if s.tags.get("side") == "cpu"}
+        dev = sorted((s for s in t.spans if s.tags.get("side") == "gpu"), key=lambda s: s.start_ns)
+        self.assertEqual(len(dev), 300)
+        for d in dev:
+            h = hosts[d.parent_span_id]                         # every one linked
+            self.assertGreaterEqual(d.start_ns, h.start_ns)
+            if "submitted" in d.tags:
+                self.assertGreaterEqual(int(d.tags["submitted"]), h.start_ns)
+                self.assertLessEqual(int(d.tags["queued"]), int(d.tags["submitted"]))  # queued: host clock
+        for a, b in zip(dev, dev[1:]):                          # one stream: still in order, no overlap
+            self.assertLessEqual(a.end_ns, b.start_ns)
+        e = t.metadata.device_activity[f"{PID}/cuda"]
+        self.assertAlmostEqual(e["clock_correction_max_ns"], max_ns, delta=1_000)
+        self.assertTrue(all(int(d.tags["launch_ns"]) >= 0 for d in dev))
+        return e
+
+    def test_linear_drift_is_corrected(self):
+        e = self._check_corrected(self._drift(), 80_000)
+        self.assertGreater(e["clock_corrected_spans"], 290)
+
+    def test_linear_drift_without_cupti_submitted_timestamps(self):
+        self._check_corrected(self._drift(with_submitted=False), 79_500)
+
+    def test_no_drift_changes_nothing(self):
+        t = self._drift(drift_ns=0)
+        e = t.metadata.device_activity[f"{PID}/cuda"]
+        self.assertNotIn("clock_correction_max_ns", e)
+        self.assertNotIn("precedes_submission", e)
+        self.assertFalse(any("clock_corr_ns" in s.tags for s in t.spans))
+        first = min((s for s in t.spans if s.tags.get("side") == "gpu"), key=lambda s: s.start_ns)
+        self.assertEqual(first.start_ns, 10_000_500)
+        self.assertEqual(ga.degraded_warnings(t.metadata.device_activity), [])
+
+    def test_real_drift_from_a_mixbench_run(self):
+        # Timestamps of a real run (tests/fixtures/cupti_drift_mixbench.json):
+        # the last 16 kernels started up to 78 us before their own submission
+        # and lost their link, module id and launch metrics.
+        import json
+        fx = json.loads((Path(__file__).parent / "fixtures" / "cupti_drift_mixbench.json").read_text())
+        base = 10 ** 12
+        lines = []
+        for hs, hd, lid, corr, ds, dd, sub, q, ns, mod, stream in fx["rows"]:
+            lines.append(host("cuLaunchKernel", base + hs, hd, lid=lid, corr=corr, stream=stream, mod=mod))
+            lines.append(cupti_kernel(corr, ns, base + ds, base + ds + dd, name="_Z6kernelv",
+                                      submitted=base + sub, queued=base + q))
+        raw = build(lines, assemble=False)
+        self.assertEqual(len(ga.correlate(raw.spans).precedes_submission), 16)
+        t = build(lines)
+        hosts = {s.span_id: s for s in t.spans if s.tags.get("side") == "cpu"}
+        dev = [s for s in t.spans if s.tags.get("side") == "gpu"]
+        self.assertEqual(len(dev), 298)
+        self.assertTrue(all(d.parent_span_id in hosts and d.tags.get("mod") and "launch_ns" in d.tags for d in dev))
+        self.assertTrue(all(d.start_ns >= hosts[d.parent_span_id].start_ns for d in dev))
+        self.assertTrue(all(int(d.tags["queued"]) <= int(d.tags["submitted"]) for d in dev))
+        e = t.metadata.device_activity[f"{PID}/cuda"]
+        self.assertEqual((e["correlated"], e["precedes_submission"]), (298, 16))
+        self.assertAlmostEqual(e["clock_correction_max_ns"], 79_661, delta=1_000)
+        untouched = [d for d in dev if "clock_corr_ns" not in d.tags]
+        self.assertGreater(len(untouched), 200)            # the first 8 s needed nothing
+
+    def test_an_outlier_only_moves_its_neighbourhood(self):
+        c = ga.ClockCorrection([(5_000_000_000, 50_000)])
+        self.assertEqual(c.at(5_000_000_000), 50_000)
+        self.assertEqual(c.at(5_100_000_000), 40_000)            # 100 ppm
+        self.assertEqual(c.at(4_000_000_000), 0)
+        self.assertEqual(c.at(6_000_000_000), 0)
 
 
 class TestBufferOverflow(unittest.TestCase):

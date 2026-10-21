@@ -25,7 +25,7 @@ ColumnLayout {
                     Text {
                         text: modelData.activePct.toFixed(1) + "% active   " +
                               modelData.syncPct.toFixed(1) + "% sync   eff " + modelData.efficiency.toFixed(0) + "%"
-                        color: modelData.color
+                        color: AppTheme.categoryColor(modelData.category, AppTheme.dark)
                         font.bold: true
                         font.pixelSize: AppTheme.typeBody
                     }
@@ -65,14 +65,14 @@ ColumnLayout {
                         Layout.fillWidth: true
                         spacing: AppTheme.spacingXs
                         RowLayout {
-                            Text { text: modelData.category; color: modelData.color; font.bold: true; font.pixelSize: AppTheme.typeBody; Layout.preferredWidth: 80 }
+                            Text { text: modelData.category; color: AppTheme.categoryColor(modelData.category, AppTheme.dark); font.bold: true; font.pixelSize: AppTheme.typeBody; Layout.preferredWidth: 80 }
                             Text { text: modelData.pct.toFixed(1) + "%"; color: AppTheme.text; font.pixelSize: AppTheme.typeBody; Layout.preferredWidth: 50 }
                             Text { text: modelData.total; color: AppTheme.textMuted; font.pixelSize: AppTheme.typeLabel }
                         }
                         ProgressBar {
                             Layout.fillWidth: true
                             pct: modelData.pct
-                            barColor: modelData.color
+                            barColor: AppTheme.categoryColor(modelData.category, AppTheme.dark)
                         }
                     }
                 }

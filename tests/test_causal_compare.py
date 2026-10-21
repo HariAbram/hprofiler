@@ -413,8 +413,12 @@ class TestInvariance(unittest.TestCase):
             self.assertEqual(f[label][0], -r[label][0], label)
             self.assertEqual(f[label][1], r[label][1], label)
         self.assertEqual(f["compute"], (50_000_000, False))
-        recv = next(x for x in rev["improvements"] if x["label"] == "MPI_Recv")
+        # the wait passed its whole change on to the compute: listed as
+        # propagated, in both directions (not as its own improvement)
+        recv = next(x for x in rev["propagated"] if x["label"] == "MPI_Recv")
         self.assertIn("origin: compute less work (-50.00ms", recv["explanation"])
+        recv = next(x for x in fwd["propagated"] if x["label"] == "MPI_Recv")
+        self.assertIn("origin: compute increased work (+50.00ms", recv["explanation"])
         for name, (x, y) in _scenarios().items():
             p, q = cc.compare_traces(x, y), cc.compare_traces(y, x)
             self.assertEqual(p["wallTime"]["deltaNs"], -q["wallTime"]["deltaNs"], name)

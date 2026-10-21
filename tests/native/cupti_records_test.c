@@ -8,10 +8,11 @@
  * Build: gcc -DHP_HAVE_CUPTI -DHP_CUPTI_UNIT_TEST [-DHP_CUPTI_MEMCPY6 -DHP_CUPTI_SYNC2]
  *        -I<cupti include> -Ihooks/cuda_hook this.c hooks/cuda_hook/cupti_trace.c -ldl -lpthread
  */
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cupti.h>
+#include <cupti.h>          /* also the generated *_params layouts */
 #include "hp_cupti.h"
 
 __thread int hp_cuda_in_hook = 0;
@@ -29,6 +30,15 @@ void hp_cuda_emit_line(const char *line) {
 void hp_cuda_pc_record(const void *record, uint32_t kind) {
     (void)record;
     printf("pcrecord:%u\n", kind);
+}
+/* cuda_hook.c's function table: two known handles (cuModuleGetFunction'd
+ * from captured modules), anything else unknown. */
+#define FN_TRITON ((const void *)0x7f0010)
+#define FN_LOADED ((const void *)0x7f0020)
+uint64_t hp_cuda_function_module(const void *fn) {
+    if (fn == FN_TRITON) return 0x0123456789abcdefULL;
+    if (fn == FN_LOADED) return 0xfedcba9876543210ULL;
+    return 0;
 }
 
 #ifdef HP_CUPTI_MEMCPY6
@@ -65,6 +75,46 @@ static void cb(int runtime, CUpti_ApiCallbackSite site, const char *fn, uint32_t
     d.correlationId = corr;
     d.correlationData = slot;
     hp_cupti_test_api_callback(runtime, &d);
+}
+
+/* cupti_trace.c's launch callback ids are plain numbers: they must be the
+ * header's. */
+_Static_assert(CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel == 307 && CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz == 442
+               && CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel == 477
+               && CUPTI_DRIVER_TRACE_CBID_cuLaunchCooperativeKernel_ptsz == 478
+               && CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx == 652 && CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx_ptsz == 653,
+               "driver launch callback ids");
+_Static_assert(CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000 == 211
+               && CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_ptsz_v7000 == 214
+               && CUPTI_RUNTIME_TRACE_CBID_cudaLaunchCooperativeKernel_v9000 == 269
+               && CUPTI_RUNTIME_TRACE_CBID_cudaLaunchCooperativeKernel_ptsz_v9000 == 270
+               && CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060 == 430
+               && CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_ptsz_v11060 == 431,
+               "runtime launch callback ids");
+/* ... and the function handle where cupti_trace.c reads it */
+_Static_assert(offsetof(cuLaunchKernel_params, f) == 0 && offsetof(cuLaunchKernel_ptsz_params, f) == 0
+               && offsetof(cuLaunchCooperativeKernel_params, f) == 0
+               && offsetof(cuLaunchCooperativeKernel_ptsz_params, f) == 0
+               && offsetof(cudaLaunchKernel_v7000_params, func) == 0
+               && offsetof(cudaLaunchKernel_ptsz_v7000_params, func) == 0
+               && offsetof(cudaLaunchCooperativeKernel_v9000_params, func) == 0
+               && offsetof(cudaLaunchCooperativeKernel_ptsz_v9000_params, func) == 0, "f first");
+_Static_assert(offsetof(cuLaunchKernelEx_params, f) == sizeof(void *)
+               && offsetof(cuLaunchKernelEx_ptsz_params, f) == sizeof(void *)
+               && offsetof(cudaLaunchKernelExC_v11060_params, func) == sizeof(void *)
+               && offsetof(cudaLaunchKernelExC_ptsz_v11060_params, func) == sizeof(void *), "config, f");
+
+/* A launch callback with its id and parameters (the real param structs). */
+static void cb_params(int runtime, CUpti_ApiCallbackSite site, uint32_t cbid, const char *fn,
+                      uint32_t corr, uint64_t *slot, const void *params) {
+    CUpti_CallbackData d;
+    memset(&d, 0, sizeof(d));
+    d.callbackSite = site;
+    d.functionName = fn;
+    d.correlationId = corr;
+    d.correlationData = slot;
+    d.functionParams = params;
+    hp_cupti_test_api_callback_id(runtime, cbid, &d);
 }
 
 int main(void) {
@@ -209,5 +259,47 @@ int main(void) {
     slot_a = 0;
     cb(1, CUPTI_API_ENTER, "cudaStreamWaitEvent_v3020", 751, &slot_a);
     cb(1, CUPTI_API_EXIT,  "cudaStreamWaitEvent_v3020", 751, &slot_a);
+    hp_cupti_test_set_cb_syncs(0);
+
+    /* Launches with their parameters: the function's module id on the span.
+     * cuLaunchKernelEx through dlsym (Triton): config first, then f. */
+    CUlaunchConfig lc;
+    memset(&lc, 0, sizeof(lc));
+    cuLaunchKernelEx_params ex = { &lc, (CUfunction)FN_TRITON, NULL, NULL };
+    slot_a = 0;
+    cb_params(0, CUPTI_API_ENTER, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx, "cuLaunchKernelEx", 760, &slot_a, &ex);
+    cb_params(0, CUPTI_API_EXIT,  CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx, "cuLaunchKernelEx", 760, &slot_a, &ex);
+    cuLaunchKernel_params lk = { (CUfunction)FN_LOADED, 1, 1, 1, 32, 1, 1, 0, NULL, NULL, NULL };
+    slot_a = 0;
+    cb_params(0, CUPTI_API_ENTER, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, "cuLaunchKernel", 761, &slot_a, &lk);
+    cb_params(0, CUPTI_API_EXIT,  CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, "cuLaunchKernel", 761, &slot_a, &lk);
+    cuLaunchKernelEx_ptsz_params exp = { &lc, (CUfunction)FN_LOADED, NULL, NULL };
+    slot_a = 0;
+    cb_params(0, CUPTI_API_ENTER, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx_ptsz, "cuLaunchKernelEx_ptsz", 762,
+              &slot_a, &exp);
+    cb_params(0, CUPTI_API_EXIT,  CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx_ptsz, "cuLaunchKernelEx_ptsz", 762,
+              &slot_a, &exp);
+    /* runtime launch of a host stub the table knows; an unknown function */
+    cudaLaunchKernel_v7000_params rk;
+    memset(&rk, 0, sizeof(rk));
+    rk.func = FN_TRITON;
+    slot_a = 0;
+    cb_params(1, CUPTI_API_ENTER, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, "cudaLaunchKernel_v7000", 763,
+              &slot_a, &rk);
+    cb_params(1, CUPTI_API_EXIT,  CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, "cudaLaunchKernel_v7000", 763,
+              &slot_a, &rk);
+    cudaLaunchKernelExC_v11060_params rx = { NULL, (const void *)0x1, NULL };
+    slot_a = 0;
+    cb_params(1, CUPTI_API_ENTER, CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060, "cudaLaunchKernelExC_v11060",
+              764, &slot_a, &rx);
+    cb_params(1, CUPTI_API_EXIT,  CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060, "cudaLaunchKernelExC_v11060",
+              764, &slot_a, &rx);
+    /* not a launch: a copy's parameters are never read as a launch's */
+    cuLaunchKernel_params bogus = { (CUfunction)FN_LOADED, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL };
+    slot_a = 0;
+    cb_params(0, CUPTI_API_ENTER, CUPTI_DRIVER_TRACE_CBID_cuMemcpyHtoDAsync_v2, "cuMemcpyHtoDAsync_v2", 765,
+              &slot_a, &bogus);
+    cb_params(0, CUPTI_API_EXIT,  CUPTI_DRIVER_TRACE_CBID_cuMemcpyHtoDAsync_v2, "cuMemcpyHtoDAsync_v2", 765,
+              &slot_a, &bogus);
     return 0;
 }

@@ -223,6 +223,102 @@ class TestGuiBridge(unittest.TestCase):
                     offenders.append(f"{qml_file.relative_to(qml_dir)}:{lineno}: {line.strip()}")
         self.assertEqual(offenders, [], "raw hex color literal(s) found outside theme.py:\n" + "\n".join(offenders))
 
+    # ── Colours follow a light/dark toggle ───────────────────────────────
+    # A binding re-evaluates only when a property it read changes. A theme
+    # slot call (AppTheme.categoryColor(cat)) reads none, and a colour baked
+    # into a bridge's data (modelData.color) is fixed at load -- after a
+    # toggle both kept the starting theme's colour (the dark theme's
+    # near-white "sync" lane label on the light background).
+
+    _COLOR_SLOTS = ("categoryColor", "severityColor", "bucketColor", "changeColor", "causeColor",
+                    "itypeColor", "boundColor", "adviceColor", "confidenceColor")
+
+    def _qml_files(self):
+        return list((Path(__file__).resolve().parent.parent / "src" / "gui" / "qml").rglob("*.qml"))
+
+    def test_qml_color_slot_calls_pass_the_theme(self):
+        import re
+        call = re.compile(r"AppTheme\.(%s)\(" % "|".join(self._COLOR_SLOTS))
+        offenders = []
+        for f in self._qml_files():
+            text = f.read_text()
+            for m in call.finditer(text):
+                line_start = text.rfind("\n", 0, m.start()) + 1
+                if "//" in text[line_start:m.start()]:
+                    continue
+                depth, j = 1, m.end()
+                while depth:
+                    depth += {"(": 1, ")": -1}.get(text[j], 0)
+                    j += 1
+                if not text[m.end():j - 1].rstrip().endswith("AppTheme.dark"):
+                    offenders.append(f"{f.name}:{text.count(chr(10), 0, m.start()) + 1}: {text[m.start():j]}")
+        self.assertEqual(offenders, [], "colour slot calls without AppTheme.dark:\n" + "\n".join(offenders))
+
+    def test_qml_never_paints_a_colour_baked_into_bridge_data(self):
+        import re
+        # the Timeline's sp/view/w.color come from TimelineModel, which
+        # recomputes them on a toggle (colorsChanged)
+        baked = re.compile(r"\b(modelData|node|row|rowData|p|c)\.color\b")
+        offenders = [f"{f.name}:{n}: {line.strip()}" for f in self._qml_files()
+                     for n, line in enumerate(f.read_text().splitlines(), start=1)
+                     if baked.search(line) and not line.lstrip().startswith("//")]
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def test_color_slots_take_an_explicit_theme(self):
+        from src.gui import theme as T
+        theme = self._theme()          # dark
+        for slot, fn, key in (("categoryColor", T.category_color, "cpu"), ("severityColor", T.severity_color, "red"),
+                              ("bucketColor", T.bucket_color, "Idle"), ("changeColor", T.change_color, "improved"),
+                              ("causeColor", T.cause_color, "lost_overlap"), ("itypeColor", T.itype_color, "memory"),
+                              ("boundColor", T.bound_color, "compute"), ("adviceColor", T.advice_color, "warn"),
+                              ("confidenceColor", T.confidence_color, "certain")):
+            self.assertEqual(getattr(theme, slot)(key), fn(key, True), slot)
+            self.assertEqual(getattr(theme, slot)(key, False), fn(key, False), slot)
+            self.assertNotEqual(fn(key, True), fn(key, False), slot)
+
+    @staticmethod
+    def _contrast(a: str, b: str) -> float:
+        def lum(h):
+            c = [int(h.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+            c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+            return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+        la, lb = lum(a), lum(b)
+        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+    def test_theme_colours_are_legible_on_their_background(self):
+        # The Source tab's instruction-type and advice colours and the
+        # connector colours were dark-theme hex fixed in the bridge: amber or
+        # cyan text was ~1.7:1 on the light background, a "certain"
+        # connector near-white on white. The controls' palette: text on a
+        # button face, disabled text on every surface it can sit on.
+        from src.gui import theme as T
+        for dark in (True, False):
+            pal = T._DARK if dark else T._LIGHT
+            grounds = (pal["background"], pal["surface"])
+            def worst(colours):
+                return min(self._contrast(c, g) for c in colours for g in grounds)
+            self.assertGreaterEqual(worst([T.itype_color(k, dark) for k in T._ITYPE_COLORS]), 4.5, dark)
+            self.assertGreaterEqual(worst([T.confidence_color(k, dark) for k in ("certain", "high", "medium")]), 4.5, dark)
+            self.assertGreaterEqual(worst([T.advice_color(k, dark) for k in ("crit", "warn", "info", "?")]), 3.0, dark)
+            self.assertGreaterEqual(worst([T.category_color(k, dark) for k in T._CATEGORY_COLORS]), 3.0, dark)
+            self.assertGreaterEqual(self._contrast(pal["text"], pal["control"]), 7.0, dark)
+            for ground in grounds + (pal["control"],):
+                self.assertGreaterEqual(self._contrast(pal["textDisabled"], ground), 3.0, (dark, ground))
+            self.assertLess(self._contrast(pal["textDisabled"], pal["control"]),
+                            self._contrast(pal["text"], pal["control"]) / 2)     # still reads as disabled
+
+    def test_dashboard_diagnosis_color_follows_a_toggle(self):
+        from src.gui.bridge import DashboardBridge
+        theme = self._theme()
+        b = DashboardBridge(_mk_trace([_span(1, 1, Category.CPU, 0, 100, "main")]), theme)
+        seen = []
+        b.colorsChanged.connect(lambda: seen.append(b.property("diagnosisColor")))
+        dark = b.property("diagnosisColor")
+        theme.dark = False
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0], theme.severityColor(b._diagnosis_severity))
+        self.assertNotEqual(seen[0], dark)
+
     def test_light_mpi_no_longer_collides_with_old_dark_mpi(self):
         # Light-mode mpi must not equal #2563eb (the dark-mode mpi value):
         # light/dark palettes are checked independently, so both sides
@@ -477,6 +573,16 @@ class TestGuiBridge(unittest.TestCase):
         fgb = FlameGraphBridge(trace, self._theme())
         self.assertEqual(fgb.totalNs, 0)
         self.assertEqual(fgb.tree["children"], [])
+
+    def test_flame_graph_total_past_32_bits_reaches_qml(self):
+        # QML reads the property through the meta-object: as a Qt int, 3 s
+        # overflowed there (an OverflowError, the value -1294967296) and the
+        # Flame Graph header and empty state got an error (8-thread LULESH)
+        from src.gui.bridge import FlameGraphBridge
+        span = SpanEvent(name="work", category=Category.CPU, start_ns=0, duration_ns=3_000_000_000,
+                         pid=1, tid=1, tags={}, stack_frames=["main"])
+        fgb = FlameGraphBridge(_mk_trace([span], backends=["cpu"]), self._theme())
+        self.assertEqual(fgb.property("totalNs"), 3_000_000_000)
 
     def test_flame_graph_bridge_tree_shape_and_color(self):
         from src.gui.bridge import FlameGraphBridge

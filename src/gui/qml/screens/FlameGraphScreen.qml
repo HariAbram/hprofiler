@@ -21,9 +21,10 @@ import "../components"
 //     and gets clamped off-screen;
 //   - never name a property "data" (collides with Item's own default
 //     property).
-// Color comes from the bridge (theme.categoryColor, resolved in Python),
-// the same category color language as Call Tree/Timeline/every other
-// screen.
+// Frames are coloured by category at paint time
+// (AppTheme.categoryColor(node.category, AppTheme.dark)), the same category
+// colour language as Call Tree/Timeline/every other screen, for the current
+// theme.
 ColumnLayout {
     id: root
     spacing: 6
@@ -135,6 +136,7 @@ ColumnLayout {
                 // comment for why this is required, not cosmetic.
                 y: Math.max(0, flick.height - height)
 
+                Connections { target: AppTheme; function onThemeChanged() { canvas.requestPaint() } }
                 Connections {
                     target: root
                     function onSearchTextChanged() { canvas.requestPaint() }
@@ -173,11 +175,12 @@ ColumnLayout {
                         var y = H - (f.depth + 1) * root.frameH
                         f.y = y
 
-                        // AppTheme.* is readable live inside Canvas.onPaint, so the
-                        // canvas repaints correctly on the light/dark toggle; never
-                        // hardcode hex here.
+                        // Colours from AppTheme for the current theme (the
+                        // Connections above repaint on a light/dark toggle --
+                        // onPaint is no binding); never hardcode hex here.
                         var matched = !searchRe || searchRe.test(f.node.name)
-                        ctx.fillStyle = matched ? f.node.color : AppTheme.panelBorder
+                        ctx.fillStyle = matched ? AppTheme.categoryColor(f.node.category, AppTheme.dark)
+                                                : AppTheme.panelBorder
                         // Plain fillRect, not roundedRect -- QML's Canvas
                         // 2D context doesn't implement that method
                         // (throws and silently aborts the rest of the

@@ -96,6 +96,13 @@ _ANNOTATION_TYPES = frozenset({
     "nvtx_mark", "nvtx_range", "roctx_mark", "roctx_range",
 })
 
+
+def is_annotation(span) -> bool:
+    """An NVTX/ROCTX range or mark: the program's own labels, not work. They
+    contribute nothing to any time breakdown and are not nodes of the
+    dependency graph (analysis/criticalpath.py)."""
+    return span.category.value == "nvtx" or span.tags.get("type") in _ANNOTATION_TYPES
+
 # Fallback when a span carries no `type` tag at all (e.g. a plain CPU
 # function-call span, or hooks/os_tracer's sched-trace spans, which have no
 # type sub-tag by design).

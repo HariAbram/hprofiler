@@ -80,11 +80,14 @@ with a report note -- defensive, not silently assumed.
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+import os
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ..core import gpu_activity as ga
+from .activity_buckets import is_annotation
+from .span_links import SpanIdResolver, id_family
 
 if TYPE_CHECKING:
     from ..core.trace import Trace
@@ -139,6 +142,7 @@ _GPU_CATS = frozenset({"cuda", "rocm"})
 _MPI_COLLECTIVE_TYPES = frozenset({
     "allreduce", "bcast", "reduce", "alltoall", "allgather",
     "scatter", "gather", "barrier", "scan", "exscan",
+    "allgatherv", "alltoallv", "gatherv", "scatterv", "reduce_scatter", "reduce_scatter_block",
 })
 _NCCL_COLLECTIVE_TYPES = frozenset({
     "allreduce", "broadcast", "reduce", "allgather", "reduce_scatter",
@@ -176,6 +180,22 @@ class CriticalPathReport:
     # device_wait hops. Empty for reports built without kinds.
     path_edge_kinds: list[str] = field(default_factory=list)
     path_credited_ns: list[int] = field(default_factory=list)
+    # Idle time before each path span (0 for the first): sum(path_gap_ns) +
+    # sum(path_credited_ns) == total_path_ns. See attribute_blame.
+    path_gap_ns: list[int] = field(default_factory=list)
+    # The longest-path DP's own value for this path (accounted[] of its last
+    # span): what the DP maximizes, >= total_path_ns -- start-gated hops
+    # (rendezvous, p2p) let a successor overlap its predecessor in wall
+    # time, and the DP counts both. 0 for reports built without edge kinds.
+    dp_accounted_ns: int = 0
+    # Path time (credited + idle before it) inside each annotation range
+    # (NVTX/ROCTX, by name) open on a path span's thread when it started:
+    # display only -- ranges are never path nodes and carry no path time of
+    # their own (annotation_time_on_path). Nested ranges each count it.
+    path_time_by_annotation: dict[str, int] = field(default_factory=dict)
+    # Known holes in the graph (mpi_dependency_diagnostics): receives with
+    # no point-to-point edge, Test*-only and orphan completions, ...
+    diagnostics: dict = field(default_factory=dict)
 
     def top_blame(self, n: int = 10) -> list[tuple[str, int]]:
         return sorted(self.wait_caused_by_category.items(), key=lambda kv: -kv[1])[:n]
@@ -259,7 +279,11 @@ def _add_program_order_edges(preds: dict[int, list[tuple[int, str, str]]], spans
     for i, s in _items(spans):
         # CUDA/ROCm device spans (side=gpu) ran on a stream, not on the
         # thread whose id they carry; launch edges connect them instead.
-        if ga.is_device_span(s):
+        # Annotation ranges (NVTX/ROCTX) are labels, not work: a closed
+        # top-level range would become the predecessor of everything after
+        # it, and its duration -- all of its children's -- would make the
+        # chain of enclosing ranges the longest path.
+        if ga.is_device_span(s) or is_annotation(s):
             continue
         by_thread[(s.pid, s.tid)].append(i)
     # Predecessor = the most recently COMPLETED span on the thread (latest
@@ -350,7 +374,8 @@ def _sync_kind(s: "SpanEvent") -> str | None:
     return None
 
 
-def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["SpanEvent"]) -> None:
+def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["SpanEvent"],
+                   lossy: "set[int] | str | None" = None) -> None:
     """CUDA/ROCm host/device model (spans carrying rt=, see
     core/gpu_activity.py):
 
@@ -367,6 +392,20 @@ def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["Sp
 
     Event syncs whose record call was never seen fall back to the
     device-wide rule at "medium" confidence (it might have waited for less).
+
+    Streams are keyed by device too: the default (NULL) stream exists once
+    per GPU, so two devices' default-stream work is not one stream. The
+    device is the host call's hdev= (the hooks' current device), else the
+    native record's dev= (mapped to hdev= where correlated launches show
+    the mapping); a device-wide sync waits for its own device's streams,
+    and only at "medium" when its device is unknown and the process used
+    several. Kernels of one graph launch are not chained to each other (the
+    graph may run them concurrently and its edges are not recorded): the
+    stream orders them after the previous work and before the next.
+
+    In a process that lost CUDA/ROCm events (`lossy`, event_loss_pids) the
+    event-record lookups (event sync, stream wait) are "low": a lost
+    cudaEventRecord makes the latest record seen an older one.
     """
     if not any(ga.is_new_format(s) for _i, s in _items(spans)):
         return
@@ -375,6 +414,26 @@ def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["Sp
     corr = ga.correlate(spans)
     for d, h in corr.host_of.items():
         preds[d].append((h, "launch", corr.confidence[d]))
+
+    # native device id -> host-side device ordinal, learned from launches
+    native_to_host: dict[tuple, set[str]] = defaultdict(set)
+    for d, h in corr.host_of.items():
+        nd, hd = spans[d].tags.get("dev"), spans[h].tags.get("hdev")
+        if nd is not None and hd is not None:
+            native_to_host[(spans[d].pid, spans[d].tags["rt"], str(nd))].add(str(hd))
+
+    def device_of(i: int) -> str | None:
+        s = spans[i]
+        hd = s.tags.get("hdev")
+        if hd is None and i in corr.host_of:
+            hd = spans[corr.host_of[i]].tags.get("hdev")
+        if hd is not None:
+            return "h" + str(hd)
+        nd = s.tags.get("dev")
+        if nd is None:
+            return None
+        mapped = native_to_host.get((s.pid, s.tags["rt"], str(nd)))
+        return "h" + next(iter(mapped)) if mapped and len(mapped) == 1 else "n" + str(nd)
 
     work = [i for i, s in _items(spans)
             if ga.is_device_span(s) and ga.op_of(s) in ga.DEVICE_WORK_OPS]
@@ -385,16 +444,45 @@ def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["Sp
         st = spans[i].tags.get("stream")
         if st is None:
             continue
-        key = (spans[i].pid, spans[i].tags["rt"], st)
+        key = (spans[i].pid, spans[i].tags["rt"], device_of(i), st)
         if key not in by_stream:
             streams_of[key[:2]].append(key)
         by_stream[key].append(i)
+
+    def graph_of(i: int):
+        """The graph launch a device span belongs to (its host submission),
+        or None."""
+        h = corr.host_of.get(i)
+        return h if h is not None and ga.op_of(spans[h]) == "graph" and ga.op_of(spans[i]) != "graph" \
+            else None
+
     sub_sorted: dict[tuple, list[int]] = {}
     for key, lst in by_stream.items():
         lst.sort(key=lambda i: (sub[i], _effective_start_ns(spans[i])))
         sub_sorted[key] = [sub[i] for i in lst]
-        for a, b in zip(lst, lst[1:]):
-            preds[b].append((a, "sequential", "certain"))
+        # consecutive work, one graph launch's kernels forming one group
+        groups: list[list[int]] = []
+        for i in lst:
+            g = graph_of(i)
+            if groups and g is not None and graph_of(groups[-1][0]) == g:
+                groups[-1].append(i)
+            else:
+                groups.append([i])
+        for ga_, gb in zip(groups, groups[1:]):
+            # the stream waits for the whole previous group: its last to finish
+            a = max(ga_, key=lambda j: _effective_end_ns(spans[j])) if len(ga_) > 1 else ga_[0]
+            for b in gb:
+                preds[b].append((a, "sequential", "certain"))
+
+    def stream_keys(pid: int, rt: str, dev: str | None, st) -> list[tuple[tuple, str]]:
+        """The stream keys a host call naming stream `st` on device `dev`
+        refers to, with the confidence that it is that one."""
+        if st is None:
+            return []
+        if dev is not None and (pid, rt, dev, st) in by_stream:
+            return [((pid, rt, dev, st), "certain")]
+        cands = [k for k in streams_of.get((pid, rt), ()) if k[3] == st]
+        return [(k, "certain" if len(cands) == 1 else "medium") for k in cands]
 
     def last_before(key: tuple, cutoff: int, end_limit: int) -> int | None:
         """Last work on `key` submitted strictly before `cutoff` that had
@@ -429,6 +517,13 @@ def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["Sp
         pos = bisect.bisect_left(rec_starts.get(key, []), t) - 1
         return records[key][pos] if pos >= 0 else None
 
+    def host_dev(j: int) -> str | None:
+        hd = spans[j].tags.get("hdev")
+        return None if hd is None else "h" + str(hd)
+
+    def weaker(a: str, b: str) -> str:
+        return a if _CONFIDENCE_RANK[a] <= _CONFIDENCE_RANK[b] else b
+
     for i, s in _items(spans):
         if s.tags.get("side") != "cpu" or not ga.is_new_format(s):
             continue
@@ -443,27 +538,38 @@ def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["Sp
                 if st is None:   # e.g. a CUPTI-callback span: use its sync record
                     st = next((spans[d].tags.get("stream") for d in corr.devices_of.get(i, ())
                                if ga.op_of(spans[d]) == "sync" and spans[d].tags.get("stream")), None)
-                if st is not None:
-                    j = last_before((pid, rt, st), s.start_ns, end_limit)
+                for key, conf in stream_keys(pid, rt, host_dev(i), st):
+                    j = last_before(key, s.start_ns, end_limit)
                     if j is not None:
-                        targets.append((j, "certain"))
+                        targets.append((j, conf))
             elif kind == "event":
                 rec = record_before(pid, rt, s.tags.get("event"), s.start_ns)
                 if rec is not None:
-                    st = spans[rec].tags.get("stream")
-                    j = last_before((pid, rt, st), spans[rec].start_ns, end_limit) if st is not None else None
-                    if j is not None:
-                        targets.append((j, "certain"))
+                    for key, conf in stream_keys(pid, rt, host_dev(rec), spans[rec].tags.get("stream")):
+                        j = last_before(key, spans[rec].start_ns, end_limit)
+                        if j is not None:
+                            targets.append((j, "low" if _lossy(lossy, pid) else conf))
                 else:
                     for key in streams_of.get((pid, rt), ()):
                         j = last_before(key, s.start_ns, end_limit)
                         if j is not None:
                             targets.append((j, "medium"))
             elif kind == "device":
-                for key in streams_of.get((pid, rt), ()):
+                keys = streams_of.get((pid, rt), ())
+                devices = {k[2] for k in keys}
+                dev = host_dev(i)
+                for key in keys:
+                    if len(devices) <= 1:
+                        conf = "certain"              # one device: it is this one
+                    elif dev is not None and key[2] == dev:
+                        conf = "certain"
+                    elif dev is not None and key[2] is not None and key[2].startswith("h"):
+                        continue                      # another device's stream
+                    else:
+                        conf = "medium"               # which device was synced is unknown
                     j = last_before(key, s.start_ns, end_limit)
                     if j is not None:
-                        targets.append((j, "certain"))
+                        targets.append((j, conf))
             for j, conf in targets:
                 preds[i].append((j, "device_wait", conf))
         elif op == "stream_wait":
@@ -471,14 +577,49 @@ def _add_gpu_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["Sp
             waiting = s.tags.get("stream")
             if rec is None or waiting is None or spans[rec].tags.get("stream") is None:
                 continue
-            producer = last_before((pid, rt, spans[rec].tags["stream"]), spans[rec].start_ns,
-                                   1 << 62)
-            wkey = (pid, rt, waiting)
+            pkeys = stream_keys(pid, rt, host_dev(rec), spans[rec].tags["stream"])
+            wkeys = stream_keys(pid, rt, host_dev(i), waiting)
+            if len(pkeys) != 1 or len(wkeys) != 1:
+                continue
+            (pkey, pconf), (wkey, wconf) = pkeys[0], wkeys[0]
+            producer = last_before(pkey, spans[rec].start_ns, 1 << 62)
             pos = bisect.bisect_left(sub_sorted.get(wkey, []), s.start_ns)
             if producer is not None and pos < len(by_stream.get(wkey, ())):
                 consumer = by_stream[wkey][pos]
                 if consumer != producer:
-                    preds[consumer].append((producer, "sequential", "certain"))
+                    conf = "low" if _lossy(lossy, pid) else weaker(pconf, wconf)
+                    preds[consumer].append((producer, "sequential", conf))
+
+
+class _SpanIdIndex:
+    """span_id -> ordinal. Hooks number requests and regions per process
+    (MPI request ids and OpenMP parallel-region ids restart in every rank in
+    traces from older hooks), so a parent id is looked up in the child's own
+    process first (span_links.SpanIdResolver: when two hooks gave one id to
+    two spans -- MPI requests and CUDA host calls did, before hp_ids.h --
+    the child's own hook family decides, never "the last span wins"); an
+    id from another process is used only when exactly one process carries
+    it (hand-built traces)."""
+
+    _AMBIGUOUS = object()
+
+    def __init__(self) -> None:
+        self.by_pid = SpanIdResolver()
+        self.by_id: dict[str, object] = {}       # span_id -> (pid, ordinal) | _AMBIGUOUS
+
+    def add(self, s: "SpanEvent", i: int) -> None:
+        self.by_pid.add_span(s, i)
+        entry = self.by_id.get(s.span_id)
+        if entry is None or (entry is not self._AMBIGUOUS and entry[0] == s.pid):
+            self.by_id[s.span_id] = (s.pid, i)
+        else:
+            self.by_id[s.span_id] = self._AMBIGUOUS
+
+    def get(self, pid: int, span_id: str, start_ns: int, family: str) -> int | None:
+        if (pid, span_id) in self.by_pid._by:
+            return self.by_pid.resolve(pid, span_id, start_ns, family)
+        entry = self.by_id.get(span_id)
+        return None if entry is None or entry is self._AMBIGUOUS else entry[1]
 
 
 def _add_explicit_span_id_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["SpanEvent"]) -> None:
@@ -495,126 +636,450 @@ def _add_explicit_span_id_edges(preds: dict[int, list[tuple[int, str, str]]], sp
     those calls were silently never linked to the Isend/Irecv spans that
     created the requests they waited on.
     """
-    by_span_id: dict[str, int] = {}
+    ids = _SpanIdIndex()
     for i, s in _items(spans):
-        if s.span_id:
-            by_span_id[s.span_id] = i
+        # An annotation range is the psid= of the calls inside it (their
+        # calling context), never a dependency.
+        if s.span_id and not is_annotation(s):
+            ids.add(s, i)
     for i, s in _items(spans):
         # A CUDA/ROCm device span's parent is its host submission, already
         # linked by a "launch" edge with the right (start-gated) semantics.
-        if not s.parent_span_id or ga.is_device_span(s):
+        if not s.parent_span_id or ga.is_device_span(s) or is_annotation(s):
             continue
+        family = id_family(s)
         for req_id in _parse_multi(s.parent_span_id):
-            parent_idx = by_span_id.get(req_id)
+            parent_idx = ids.get(s.pid, req_id, s.start_ns, family)
             if parent_idx is not None and parent_idx != i:
                 preds[i].append((parent_idx, "explicit_span_id", "certain"))
 
 
-def _index_mpi_completers(spans: list["SpanEvent"]) -> dict[str, tuple[int, str | None, str | None]]:
-    """Maps a request id (as emitted in sid= on its originating MPI_Isend/
-    MPI_Irecv span) to (completer_span_idx, resolved_peer_or_None,
-    resolved_tag_or_None) for whichever MPI_Wait/Waitall/Waitany/Waitsome
-    span later observed it completing. resolved_peer/tag are populated only
-    when that request was a wildcard receive AND the completer resolved it
-    (rpeer=/rtag= for Wait/Waitany, or its entry in rmatches= for
-    Waitall/Waitsome) -- see mpi_hook.c's file header comment. A request
-    with no entry here was never observed completing via Wait/Waitall/
-    Waitany/Waitsome in this trace (e.g. completed via MPI_Test instead --
-    see the module docstring -- or is still in flight at the end of the
-    trace)."""
-    out: dict[str, tuple[int, str | None, str | None]] = {}
-    for i, s in _items(spans):
-        if s.category.value != "mpi" or s.name not in _MPI_WAIT_NAMES or not s.parent_span_id:
-            continue
-        req_ids = _parse_multi(s.parent_span_id)
-        rmatches = _parse_rmatches(s.tags["rmatches"]) if "rmatches" in s.tags else {}
-        single_rpeer, single_rtag = s.tags.get("rpeer"), s.tags.get("rtag")
-        for req_id in req_ids:
-            if req_id in rmatches:
-                out[req_id] = (i, rmatches[req_id][0], rmatches[req_id][1])
-            elif len(req_ids) == 1 and single_rpeer is not None:
-                out[req_id] = (i, single_rpeer, single_rtag)
-            else:
-                out.setdefault(req_id, (i, None, None))
+# ── MPI point-to-point matching ──────────────────────────────────────────────
+#
+# Keys. MPI pairs a message with a receive by (communicator, sender,
+# receiver, tag) in posting order (non-overtaking). The hook reports rank=
+# (the caller's MPI_COMM_WORLD rank), peer= (the other side as a rank of the
+# call's communicator), wpeer= (that rank translated to MPI_COMM_WORLD) and
+# commid= (a communicator id agreed by its members). Messages are matched on
+#     send:    (rank,  wpeer, tag, commid)
+#     receive: (wpeer, rank,  tag, commid)      -- wpeer = resolved source
+# so sub-communicators whose ranks are renumbered pair correctly. Traces
+# recorded before wpeer= existed fall back to the old key (rank, peer, tag)
+# -- correct on MPI_COMM_WORLD only -- with a one-time warning and a
+# `legacy_key` diagnostic.
+#
+# Cancelled requests (cancelled=1 on a single completion, cpsid= on a
+# multi-completion) neither send nor receive: they are dropped before
+# pairing, so they create no edge and do not shift later pairs.
+
+_P2P_SEND_TYPES = frozenset({"send", "isend", "ssend", "bsend", "rsend", "issend", "ibsend", "irsend"})
+_legacy_key_warned = False
+
+
+def _warn_legacy_key_once() -> None:
+    global _legacy_key_warned
+    if _legacy_key_warned:
+        return
+    _legacy_key_warned = True
+    import sys
+    print("[hprofiler][warn] this trace has no wpeer= tags (recorded by an older MPI hook): "
+          "point-to-point messages are matched on (sender world rank, receiver-side peer, tag) "
+          "without the communicator, which is correct on MPI_COMM_WORLD only -- messages on "
+          "sub-communicators with renumbered ranks are not paired", file=sys.stderr)
+
+
+def _parse_rwmatches(value: str) -> dict[str, str]:
+    """rwmatches=<req_id>/<world source>;... -> {req_id: world source}."""
+    out: dict[str, str] = {}
+    for entry in _parse_multi(value):
+        parts = entry.split("/")
+        if len(parts) == 2:
+            out[parts[0]] = parts[1]
     return out
 
 
-def _add_mpi_p2p_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["SpanEvent"]) -> None:
-    """Pair each receive event (blocking MPI_Recv, or a non-blocking
-    MPI_Irecv's *completer* -- see _index_mpi_completers) with the Nth send
-    for its (sender, receiver, tag) key, in each side's own post/arrival
-    order -- NOT "the latest send that had already started by the time
-    this recv started". MPI guarantees FIFO delivery for messages between
-    the same ordered pair with the same tag, so Nth-with-Nth is always the
-    semantically correct pairing regardless of which span happens to start
-    first in wall-clock time; a "the send must already have started"
-    precondition would silently miss the dependency entirely for the
-    common "post an early receive, then block" pattern.
+ALL_PROCESSES = "all"
 
-    This covers:
-      1. Non-blocking MPI_Isend/MPI_Irecv pairs across ranks (the same-rank
-         Isend->Wait "explicit_span_id" link says nothing about *when the
-         remote sender's data arrived* -- the reason a Wait takes as long
-         as it does). The edge lands on the *completer*
-         (Wait/Waitall/Waitany/Waitsome), not the Irecv call itself,
-         since the Irecv returns almost instantly and isn't what blocks.
-      2. Wildcard (MPI_ANY_SOURCE/MPI_ANY_TAG) receives, matched using the
-         *resolved* real peer/tag from MPI_Status (mpi_hook.c resolves
-         this on every completion path) rather than a sentinel value.
-    Confidence is "high" when the match used resolved wildcard status data,
-    "medium" for ordinary exact-tag call-order matching.
-    """
-    sends: dict[tuple, list[int]] = defaultdict(list)
-    for i, s in _items(spans):
-        if s.category.value != "mpi":
-            continue
-        t = s.tags.get("type", "")
-        if t in ("send", "isend") and "peer" in s.tags:
-            key = (s.tags.get("rank"), s.tags.get("peer"), s.tags.get("tag"))
-            sends[key].append(i)
+# ── Exact Nth-with-Nth matching (opt-in, HPROFILER_EXACT_P2P_HIGH=1) ─────────
+# MPI's non-overtaking rule pairs the k-th send with the k-th receive of a
+# (sender, receiver, tag, communicator) channel exactly -- when the capture of
+# that channel is complete. Under the flag an exact (non-wildcard) match is
+# "high" instead of "medium" only when all of these hold:
+#   * the trace is keyed by world ranks and communicator ids (wpeer=);
+#   * neither process lost MPI events (event_loss_pids: those are "low");
+#   * both processes' hooks declare a complete point-to-point capture
+#     (counter mpi_p2p_capture_complete = 1: every send/receive call of the
+#     runtime's MPI version is wrapped or marked -- traces of older hooks never
+#     qualify);
+#   * the channel has as many sends as receives;
+#   * the communicator had no cancelled send, and in neither process any
+#     matched probe (MPI_Mprobe/Improbe: their messages are not paired) or
+#     persistent request (*_init: not paired), and it is a registered
+#     communicator (commid != -1, which can mix several).
+EXACT_P2P_ENV = "HPROFILER_EXACT_P2P_HIGH"
+_PERSISTENT_TYPES = frozenset({"send_init", "bsend_init", "ssend_init", "rsend_init", "recv_init"})
 
-    # (key, post_order_start_ns, target_span_idx, confidence)
-    recv_events: list[tuple[tuple, int, int, str]] = []
 
-    for i, s in _items(spans):
-        if s.category.value != "mpi" or s.tags.get("type") != "recv" or "peer" not in s.tags:
-            continue
-        # Blocking MPI_Recv: already carries the *resolved* peer/tag
-        # directly (mpi_hook.c resolves wildcards before emitting the
-        # span), so no extra lookup is needed even for a wildcard call.
-        key = (s.tags.get("peer"), s.tags.get("rank"), s.tags.get("tag"))
-        conf = "high" if s.tags.get("wildcard") == "1" else "medium"
-        recv_events.append((key, s.start_ns, i, conf))
+def exact_p2p_enabled() -> bool:
+    return os.environ.get(EXACT_P2P_ENV, "") not in ("", "0")
 
-    completers = _index_mpi_completers(spans)
-    for i, s in _items(spans):
-        if s.category.value != "mpi" or s.tags.get("type") != "irecv" or not s.span_id:
+
+def _exact_capture_facts(trace: "Trace") -> dict:
+    """{"complete": {pid}, "tainted": {(pid, commid)}}: the hooks' capture
+    counters (mpi_p2p_capture_complete) and matched-probe instants;
+    persistent requests are added by the matcher from the spans."""
+    complete: set[int] = set()
+    tainted: set[tuple[int, str]] = set()
+    for c in trace.iter_counters():
+        if c.name == "mpi_p2p_capture_complete" and c.value == 1:
+            complete.add(c.pid)
+    for i in trace.iter_instants():
+        if i.category.value == "mpi" and i.name in ("MPI_Mprobe", "MPI_Improbe"):
+            tainted.add((i.pid, str(i.tags.get("commid", "*"))))
+    return {"complete": complete, "tainted": tainted}
+
+
+def event_loss_pids(trace: "Trace", hooks: tuple[str, ...]) -> "set[int] | str":
+    """Processes whose `hooks` lost events in this capture (dropped or lost
+    records, oversize/unformattable records, a connection that ended
+    without its final drain, records sent but not received), as a set of
+    pids -- or ALL_PROCESSES when a loss cannot be tied to a process of the
+    trace (unreadable records, a connection without a status, or a pid
+    not in the trace, e.g. renumbered by merge-nodes).
+
+    Order-based pairing (the k-th send with the k-th receive of a channel,
+    an event sync with the latest record of its event) shifts after one
+    lost call: those edges are downgraded to "low" in such processes."""
+    health = getattr(trace.metadata, "capture_health", None) or {}
+    rec = health.get("receiver") or {}
+    if any(rec.get(k) for k in ("malformed", "errors", "partial_tails", "connections_without_status")):
+        return ALL_PROCESSES
+    lossy: set[int] = set()
+    for key, t in (health.get("transport") or {}).items():
+        pid_s, _, hook = key.partition("/")
+        if hook.split("#")[0] not in hooks:
             continue
-        completer = completers.get(s.span_id)
-        if completer is None:
-            continue
-        target_idx, resolved_peer, resolved_tag = completer
-        if s.tags.get("wildcard") == "1":
-            if resolved_peer is None:
-                continue  # never observed resolving -- nothing safe to match against
-            key = (resolved_peer, s.tags.get("rank"), resolved_tag)
-            conf = "high"
-        else:
-            if "peer" not in s.tags:
+        lost = (any(t.get(k) for k in ("dropped_full", "dropped_lost", "oversize", "format_errors"))
+                or t.get("ended_without_final")
+                or (t.get("final") == 1 and "sent" in t and t.get("received", 0) < t["sent"]))
+        if lost:
+            try:
+                lossy.add(int(pid_s))
+            except ValueError:
+                return ALL_PROCESSES
+    if lossy and not lossy <= set(trace.store.pids()):
+        return ALL_PROCESSES
+    return lossy
+
+
+def _lossy(lossy, *pids: int) -> bool:
+    return bool(lossy) and (lossy == ALL_PROCESSES or any(p in lossy for p in pids))
+
+
+class _P2PMatcher:
+    """Collects MPI spans in ordinal order (add) and yields the point-to-point
+    edges (edges) plus what could not be paired (diagnostics). Shared by
+    build_dependency_graph and the streamed build_edges, so both produce the
+    same edges in the same order. `lossy` (event_loss_pids): processes whose
+    pairings are order-based guesses after lost events -- "low"."""
+
+    def __init__(self, lossy: "set[int] | str | None" = None, exact: dict | None = None) -> None:
+        self.lossy = lossy or set()
+        self.exact = exact                 # _exact_capture_facts(), or None: rule off
+        self.pid_of: dict[int, int] = {}
+        # (ordinal, start, span_id, rank, peer, wpeer, tag, commid)
+        self.sends: list[tuple] = []
+        # (ordinal, start, conf, rank, peer, wpeer, tag, commid)  blocking receives
+        self.blocking: list[tuple] = []
+        # ((pid, span_id), ordinal, start, wildcard, rank, peer, wpeer, tag, commid)
+        self.irecvs: list[tuple] = []
+        # Request ids are unique per process only: everything is keyed (pid, id).
+        # (pid, req_id) -> (completer ordinal, rpeer, rtag, rwpeer)
+        self.completers: dict[tuple[int, str], tuple[int, str | None, str | None, str | None]] = {}
+        self.cancelled: set[tuple[int, str]] = set()
+        self.world_info = False
+        self.diag: dict = {}
+
+    def add(self, i: int, s: "SpanEvent") -> None:
+        tags = s.tags
+        t = tags.get("type", "")
+        if self.lossy or self.exact is not None:
+            self.pid_of[i] = s.pid
+        if self.exact is not None and t in _PERSISTENT_TYPES:
+            self.exact["tainted"].add((s.pid, str(tags.get("commid", "*"))))
+        if "wpeer" in tags or "rwpeer" in tags or "rwmatches" in tags:
+            self.world_info = True
+        if t in _P2P_SEND_TYPES and "peer" in tags and tags.get("null") != "1":
+            self.sends.append((i, s.start_ns, (s.pid, s.span_id) if s.span_id else None,
+                               tags.get("rank"), tags.get("peer"),
+                               tags.get("wpeer"), tags.get("tag"), tags.get("commid")))
+        elif t == "recv" and "peer" in tags and tags.get("null") != "1":
+            self.blocking.append((i, s.start_ns, "high" if tags.get("wildcard") == "1" else "medium",
+                                  tags.get("rank"), tags.get("peer"), tags.get("wpeer"),
+                                  tags.get("tag"), tags.get("commid")))
+        elif t == "irecv" and s.span_id and tags.get("null") != "1":
+            self.irecvs.append(((s.pid, s.span_id), i, s.start_ns, tags.get("wildcard") == "1",
+                                tags.get("rank"), tags.get("peer") if "peer" in tags else None,
+                                tags.get("wpeer"), tags.get("tag"), tags.get("commid")))
+        if s.name in _MPI_WAIT_NAMES and s.parent_span_id:              # completions
+            req_ids = _parse_multi(s.parent_span_id)
+            pid = s.pid
+            if "cpsid" in tags:
+                self.cancelled.update((pid, r) for r in _parse_multi(tags["cpsid"]))
+            elif tags.get("cancelled") == "1" and len(req_ids) == 1:
+                self.cancelled.add((pid, req_ids[0]))
+            rmatches = _parse_rmatches(tags["rmatches"]) if "rmatches" in tags else {}
+            rw = _parse_rwmatches(tags["rwmatches"]) if "rwmatches" in tags else {}
+            single_rpeer, single_rtag = tags.get("rpeer"), tags.get("rtag")
+            single_rw = tags.get("rwpeer")
+            for req_id in req_ids:
+                if req_id in rmatches:
+                    self.completers[(pid, req_id)] = (i, rmatches[req_id][0], rmatches[req_id][1],
+                                                      rw.get(req_id))
+                elif len(req_ids) == 1 and single_rpeer is not None:
+                    self.completers[(pid, req_id)] = (i, single_rpeer, single_rtag, single_rw)
+                else:
+                    self.completers.setdefault((pid, req_id), (i, None, None, None))
+
+    def _key(self, src_world, src_local, dst_world, tag, commid, world: bool):
+        """(src, dst, tag[, commid]); None when a world rank is unknown."""
+        if not world:
+            return (src_world, src_local, tag) if src_local is not None else None
+        return (src_world, dst_world, tag, commid) if src_world is not None and dst_world is not None \
+            else None
+
+    def edges(self) -> list[tuple[int, int, str]]:
+        """[(dst ordinal, src ordinal, confidence)] in deterministic order."""
+        world = self.world_info
+        diag = self.diag
+        diag["key"] = "world+commid" if world else "legacy"
+        if not world and (self.sends or self.blocking or self.irecvs):
+            _warn_legacy_key_once()
+            diag["legacy_key"] = True
+
+        def world_of(w, local, commid):
+            # wpeer is missing on MPI_COMM_WORLD only in hand-built traces;
+            # there the local rank is the world rank.
+            return w if w is not None else (local if commid == "0" else None)
+
+        sends: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
+        cancelled_sends = 0
+        unkeyed = Counter()
+        cancelled_comms: set[str] = set()
+        for i, start, span_key, rank, peer, wpeer, tag, commid in self.sends:
+            if span_key is not None and span_key in self.cancelled:
+                cancelled_sends += 1
+                cancelled_comms.add(str(commid))
                 continue
-            key = (s.tags.get("peer"), s.tags.get("rank"), s.tags.get("tag"))
-            conf = "medium"
-        recv_events.append((key, s.start_ns, target_idx, conf))
+            if world:
+                key = self._key(rank, None, world_of(wpeer, peer, commid), tag, commid, True)
+            else:
+                key = (rank, peer, tag)
+            if key is None:
+                unkeyed[str(commid)] += 1
+                continue
+            sends[key].append((start, i))
 
-    by_key_recvs: dict[tuple, list[tuple[int, int, str]]] = defaultdict(list)
-    for key, order_ns, target_idx, conf in recv_events:
-        by_key_recvs[key].append((order_ns, target_idx, conf))
+        # (key, order_ns, target ordinal, confidence, commid)
+        recv_events: list[tuple] = []
+        for i, start, conf, rank, peer, wpeer, tag, commid in self.blocking:
+            key = (world_of(wpeer, peer, commid), rank, tag, commid) if world else (peer, rank, tag)
+            if world and key[0] is None:
+                unkeyed[str(commid)] += 1
+                continue
+            recv_events.append((key, start, i, conf, commid))
+        cancelled_recvs = 0
+        unfinished = 0
+        for span_key, _i, start, wildcard, rank, peer, wpeer, tag, commid in self.irecvs:
+            if span_key in self.cancelled:
+                cancelled_recvs += 1
+                continue
+            completer = self.completers.get(span_key)
+            if completer is None:
+                unfinished += 1          # completed by Test* only, or never
+                continue
+            target, rpeer, rtag, rwpeer = completer
+            if wildcard:
+                if rpeer is None:
+                    unfinished += 1
+                    continue
+                src_local, src_tag, src_world = rpeer, rtag, rwpeer
+                conf = "high"
+            else:
+                if peer is None:
+                    continue
+                src_local, src_tag, src_world = peer, tag, wpeer
+                conf = "medium"
+            if world:
+                sw = world_of(src_world, src_local, commid)
+                if sw is None:
+                    unkeyed[str(commid)] += 1
+                    continue
+                key = (sw, rank, src_tag, commid)
+            else:
+                key = (src_local, rank, src_tag)
+            recv_events.append((key, start, target, conf, commid))
 
-    for key, recv_list in by_key_recvs.items():
-        recv_list.sort(key=lambda t: t[0])
-        send_idxs = sorted(sends.get(key, []), key=lambda i: spans[i].start_ns)
-        for (_order_ns, target_idx, conf), si in zip(recv_list, send_idxs):
-            preds[target_idx].append((si, "p2p", conf))
+        by_key: dict[tuple, list[tuple[int, int, str, str]]] = defaultdict(list)
+        for key, order_ns, target, conf, commid in recv_events:
+            by_key[key].append((order_ns, target, conf, commid))
+        out: list[tuple[int, int, str]] = []
+        unmatched = Counter(unkeyed)
+        ex = self.exact
+        for key, recv_list in by_key.items():
+            recv_list.sort(key=lambda r: r[0])
+            send_list = [i for _st, i in sorted(sends.get(key, []), key=lambda r: r[0])]
+            channel_complete = ex is not None and world and len(send_list) == len(recv_list)
+            for k, (_order, target, conf, commid) in enumerate(recv_list):
+                if k < len(send_list):
+                    src = send_list[k]
+                    if channel_complete and conf == "medium":
+                        c = str(commid)
+                        sp, rp = self.pid_of.get(src, -1), self.pid_of.get(target, -1)
+                        if (c not in cancelled_comms and c != "-1"
+                                and sp in ex["complete"] and rp in ex["complete"]
+                                and not {(sp, c), (rp, c), (sp, "*"), (rp, "*")} & ex["tainted"]):
+                            conf = "high"
+                            diag["exact_high"] = diag.get("exact_high", 0) + 1
+                    if self.lossy and _lossy(self.lossy, self.pid_of.get(target, -1), self.pid_of.get(src, -1)):
+                        conf = "low"
+                        diag["matched_after_loss"] = diag.get("matched_after_loss", 0) + 1
+                    out.append((target, src, conf))
+                else:
+                    unmatched[str(commid)] += 1
+        diag["receives"] = len(recv_events) + sum(unkeyed.values())
+        diag["matched"] = len(out)
+        if unmatched:
+            diag["unmatched_by_comm"] = dict(sorted(unmatched.items()))
+        if unkeyed:
+            diag["no_world_rank_by_comm"] = dict(sorted(unkeyed.items()))
+        if cancelled_sends or cancelled_recvs:
+            diag["cancelled"] = cancelled_sends + cancelled_recvs
+        if unfinished:
+            diag["irecv_without_wait"] = unfinished
+        return out
+
+
+_MPI_TEST_NAMES = frozenset({"MPI_Test", "MPI_Testany", "MPI_Testsome", "MPI_Testall"})
+
+
+def mpi_dependency_diagnostics(trace: "Trace") -> dict:
+    """Known holes in the MPI part of the dependency graph, counted (one
+    pass over MPI spans and instants -- no full graph build):
+
+      receives / matched      receive completions, and those that got a
+                              point-to-point edge
+      unmatched_by_comm       {commid: receive completions with no edge}
+      no_world_rank_by_comm   {commid: messages without a world rank to key
+                              on} (part of unmatched)
+      legacy_key              the trace predates wpeer= (old matching key)
+      test_only_completions   requests completed only via MPI_Test* (no
+                              edge, by design: instants are not graph nodes)
+      orphan_completions      Wait*/Waitall/... spans that name no request
+                              the hook saw posted (e.g. a request from an
+                              unhooked call) -- their waits have no
+                              upstream edge
+      cancelled               cancelled requests (excluded from matching)
+      matched_after_loss      pairings in processes that lost MPI events
+                              (event_loss_pids): order-based, possibly
+                              shifted -- their edges are "low"
+      exact_high              (HPROFILER_EXACT_P2P_HIGH only) exact matches
+                              graded "high": their channel's capture is
+                              complete (see EXACT_P2P_ENV)
+    Empty for a trace without MPI."""
+    m = _P2PMatcher(event_loss_pids(trace, ("mpi",)),
+                    _exact_capture_facts(trace) if exact_p2p_enabled() else None)
+    posted: set[tuple[int, str]] = set()             # (pid, request id): per process
+    completed_by_wait: set[tuple[int, str]] = set()
+    orphan = 0
+    n = 0
+    for s in trace.iter_spans(categories=("mpi",)):
+        m.add(n, s)
+        n += 1
+        if s.span_id:
+            posted.add((s.pid, s.span_id))
+        if s.name in _MPI_WAIT_NAMES:
+            ids = _parse_multi(s.parent_span_id) if s.parent_span_id else []
+            if not ids:
+                if s.tags.get("completed_index") != "none":
+                    orphan += 1
+            completed_by_wait.update((s.pid, r) for r in ids)
+    if not n:
+        return {}
+    m.edges()
+    out = dict(m.diag)
+    test_ids: set[tuple[int, str]] = set()
+    for ev in trace.iter_instants():
+        if ev.name not in _MPI_TEST_NAMES:
+            continue
+        tags = ev.tags
+        if ev.name in ("MPI_Test", "MPI_Testany", "MPI_Testall") and tags.get("flag") != "1":
+            continue
+        if tags.get("psid"):
+            test_ids.update((ev.pid, r) for r in _parse_multi(str(tags["psid"])))
+    test_only = len(test_ids - completed_by_wait)
+    if test_only:
+        out["test_only_completions"] = test_only
+    unknown = len(completed_by_wait - posted)
+    if orphan or unknown:
+        out["orphan_completions"] = orphan + unknown
+    if not (m.sends or m.blocking or m.irecvs or orphan or unknown or test_only):
+        return {}
+    return out
+
+
+def dependency_warnings(diag: dict) -> list[str]:
+    """Human-readable warnings for mpi_dependency_diagnostics() (shown by
+    `critical-path`, after a run and by `summary`/GUI via run_warnings)."""
+    out: list[str] = []
+    if not diag:
+        return out
+    um = diag.get("unmatched_by_comm") or {}
+    if um:
+        per = ", ".join(f"{k}: {v}" for k, v in sorted(um.items(), key=lambda kv: -kv[1])[:6])
+        out.append(f"{sum(um.values())} of {diag.get('receives', 0)} MPI receive completion(s) got no "
+                   f"point-to-point edge (per communicator id: {per})"
+                   + ("; no world rank to key on for "
+                      f"{sum((diag.get('no_world_rank_by_comm') or {}).values())} of them"
+                      if diag.get("no_world_rank_by_comm") else "")
+                   + " -- the sender is missing (unhooked call, lost events) or not identifiable")
+    if diag.get("legacy_key"):
+        out.append("trace recorded without wpeer= tags (older MPI hook): messages were paired on "
+                   "(sender world rank, receiver-side peer, tag) without the communicator, which is "
+                   "correct on MPI_COMM_WORLD only")
+    if diag.get("test_only_completions"):
+        out.append(f"{diag['test_only_completions']} MPI request(s) completed only via MPI_Test* "
+                   "polling: no dependency edge (by design)")
+    if diag.get("orphan_completions"):
+        out.append(f"{diag['orphan_completions']} MPI wait(s) completed request(s) the hook never saw "
+                   "initiated (unhooked call, or posted before profiling): no upstream edge")
+    if diag.get("matched_after_loss"):
+        out.append(f"{diag['matched_after_loss']} MPI message pairing(s) involve a process that lost MPI "
+                   "events: messages are paired in order per (sender, receiver, tag, communicator), so "
+                   "one lost call shifts every later pair on its channel -- these edges are 'low' "
+                   "confidence")
+    return out
+
+
+def _add_mpi_p2p_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["SpanEvent"],
+                       lossy: "set[int] | str | None" = None, exact: dict | None = None) -> dict:
+    """Point-to-point edges into each receive completion (a blocking
+    MPI_Recv or the Wait*/Waitall/Waitany/Waitsome that completed an
+    MPI_Irecv) from the send it received -- the Nth send to the Nth
+    receive of each (sender, receiver, tag, communicator), in posting order
+    (MPI's non-overtaking rule), NOT "the latest send that had already
+    started": a receive posted early, then blocking, still pairs. The edge
+    lands on the completer, not on MPI_Irecv (which returns at once).
+    Confidence: "high" for a wildcard receive resolved from MPI_Status,
+    "medium" for an exact receive, "low" in processes that lost MPI events
+    (`lossy`, event_loss_pids). Returns the matcher's diagnostics."""
+    m = _P2PMatcher(lossy, exact)
+    for i, s in _items(spans):
+        if s.category.value == "mpi":
+            m.add(i, s)
+    for target, src, conf in m.edges():
+        preds[target].append((src, "p2p", conf))
+    return m.diag
 
 
 def _add_last_arriver_edges(
@@ -656,34 +1121,50 @@ def _add_rendezvous_edges(
     per-type-only clustering when it
     isn't (commid absent, or the sentinel -1 "unregistered": MPI_COMM_SELF
     or a communicator created via an API mpi_hook.c doesn't intercept).
-    NCCL has no equivalent identity mechanism, so it always uses the
-    per-type-only fallback. commid-scoped clusters are "high" confidence
-    (a cross-rank-agreed identity backs the grouping, not just overlapping
-    timestamps of the same call type); unscoped ones are "medium".
+    The NCCL hook names a communicator the same way on every rank (commid=,
+    from the ncclUniqueId) and numbers its collectives (seq=): NCCL requires
+    all ranks to issue them in the same order, so (commid, seq) is one call
+    and is grouped exactly, overlapping or not. Traces without commid= (older
+    NCCL hook) use the per-type-only fallback. commid-scoped groups are
+    "high" confidence (a cross-rank-agreed identity backs the grouping, not
+    just overlapping timestamps of the same call type); unscoped ones are
+    "medium".
     """
-    by_type: dict[tuple[str, str | None], list[tuple[int, int, int]]] = defaultdict(list)
+    by_type: dict[tuple, list[tuple[int, int, int]]] = defaultdict(list)
     for i, s in _items(spans):
         if s.category.value != category:
             continue
-        t = s.tags.get("type", "")
-        if t not in collective_types or s.duration_ns <= 0:
-            continue
-        commid = s.tags.get("commid")
-        scoped = commid is not None and commid != "-1"
-        by_type[(t, commid if scoped else None)].append((s.start_ns, s.end_ns, i))
+        key = _collective_group(s, collective_types)
+        if key is not None:
+            by_type[key].append((s.start_ns, s.end_ns, i))
 
-    for (t, commid), items in by_type.items():
-        confidence = "high" if commid is not None else "medium"
-        for cluster in _cluster_rendezvous(items):
-            _add_last_arriver_edges(preds, spans, cluster, confidence)
+    for key, items in by_type.items():
+        for cluster in _rendezvous_clusters(key, items):
+            _add_last_arriver_edges(preds, spans, cluster, key[-1])
+
+
+def _omp_barrier_group(s: "SpanEvent") -> tuple | None:
+    """(name, team) of an OpenMP barrier span, None for anything else.
+
+    Only barriers are rendezvous (every thread of the team must arrive);
+    omp_critical_wait, omp_taskwait, omp_taskgroup and omp_reduction are
+    not: a thread waits there for a lock holder or its own child tasks, not
+    for the last arriver. The team is the parallel region -- the OMPT tool's
+    psid= (its parallel id), the GNU libgomp hook's team= -- so concurrent
+    teams' barriers stay apart; without either (older traces) barriers of
+    one name are grouped per process, as before."""
+    if s.category.value != "sync" or not s.name.startswith("omp_barrier") or s.duration_ns <= 0:
+        return None
+    return (s.name, s.tags.get("team") or s.parent_span_id or None)
 
 
 def _add_omp_barrier_edges(preds: dict[int, list[tuple[int, str, str]]], spans: list["SpanEvent"]) -> None:
-    by_pid_name: dict[tuple[int, str], list[tuple[int, int, int]]] = defaultdict(list)
+    by_group: dict[tuple, list[tuple[int, int, int]]] = defaultdict(list)
     for i, s in _items(spans):
-        if s.category.value == "sync" and s.name.startswith("omp_") and s.duration_ns > 0:
-            by_pid_name[(s.pid, s.name)].append((s.start_ns, s.end_ns, i))
-    for key, items in by_pid_name.items():
+        g = _omp_barrier_group(s)
+        if g is not None:
+            by_group[(s.pid, *g)].append((s.start_ns, s.end_ns, i))
+    for key, items in by_group.items():
         for cluster in _cluster_rendezvous(items):
             _add_last_arriver_edges(preds, spans, cluster, "certain")
 
@@ -695,9 +1176,10 @@ def build_dependency_graph(trace: "Trace") -> tuple[list["SpanEvent"], dict[int,
     _add_program_order_edges(preds, spans)
     _add_stream_order_edges(preds, spans)
     _add_device_sync_edges(preds, spans)
-    _add_gpu_edges(preds, spans)
+    _add_gpu_edges(preds, spans, event_loss_pids(trace, ("cuda", "rocm")))
     _add_explicit_span_id_edges(preds, spans)
-    _add_mpi_p2p_edges(preds, spans)
+    _add_mpi_p2p_edges(preds, spans, event_loss_pids(trace, ("mpi",)),
+                       _exact_capture_facts(trace) if exact_p2p_enabled() else None)
     _add_rendezvous_edges(preds, spans, "mpi", _MPI_COLLECTIVE_TYPES)
     _add_rendezvous_edges(preds, spans, "nccl", _NCCL_COLLECTIVE_TYPES)
     _add_omp_barrier_edges(preds, spans)
@@ -819,11 +1301,16 @@ def _compute_critical_path_dp_full(
     accounted = [0] * n
     chosen: list[tuple[int, str, str] | None] = [None] * n
     gpu_model = [ga.is_new_format(s) for s in spans]
+    annotation = [is_annotation(s) for s in spans]
     for v in order:
+        if annotation[v]:          # not a node (no builder links one; edges persisted
+            continue               # by older builders are ignored)
         dur_v = spans[v].duration_ns
         best = dur_v
         best_choice = None
         for (u, kind, conf) in preds.get(v, []):
+            if annotation[u]:
+                continue
             gate, limit, gap = _edge_gap_and_gate(spans, u, v, kind)
             if gate > limit:
                 continue
@@ -847,9 +1334,9 @@ def _compute_critical_path_dp_full(
         accounted[v] = best
         chosen[v] = best_choice
 
-    if n == 0:
+    end_idx = max((i for i in range(n) if not annotation[i]), key=lambda i: accounted[i], default=None)
+    if end_idx is None:                           # annotations only
         return [], [], []
-    end_idx = max(range(n), key=lambda i: accounted[i])
     path = [end_idx]
     edge_confidence: list[str] = []
     edge_kinds: list[str] = []
@@ -880,9 +1367,10 @@ def _compute_critical_path_greedy(
 def _compute_critical_path_greedy_full(
     spans: list["SpanEvent"], preds: dict[int, list[tuple[int, str, str]]]
 ) -> tuple[list[int], list[str], list[str]]:
-    if not spans:
+    nodes = [i for i in range(len(spans)) if not is_annotation(spans[i])]
+    if not nodes:
         return [], [], []
-    end_idx = max(range(len(spans)), key=lambda i: spans[i].end_ns)
+    end_idx = max(nodes, key=lambda i: spans[i].end_ns)
     path = [end_idx]
     edge_confidence: list[str] = []
     edge_kinds: list[str] = []
@@ -892,7 +1380,7 @@ def _compute_critical_path_greedy_full(
         candidates = preds.get(cur, [])
         best_idx, best_gate, best_conf, best_kind = None, -1, None, None
         for p_idx, kind, conf in candidates:
-            if p_idx in visited:
+            if p_idx in visited or is_annotation(spans[p_idx]):
                 continue
             gate, limit, _gap = _edge_gap_and_gate(spans, p_idx, cur, kind)
             if gate <= limit and gate > best_gate:
@@ -942,38 +1430,55 @@ def _compute_path_full(
 def attribute_blame(spans: list["SpanEvent"], path: list[int], wall_ns: int,
                     path_edge_confidence: list[str] | None = None,
                     path_edge_kinds: list[str] | None = None) -> CriticalPathReport:
+    """The time the path covers, split into each span's own new time and the
+    idle gaps before them.
+
+    The path is walked keeping a frontier, the latest end reached so far:
+    a span adds only the part of it beyond the frontier (own), and an idle
+    gap only from the frontier to its start -- each wall-clock instant
+    counts once, so total_path_ns <= the path's extent <= wall time. This
+    is what makes overlap correct on every hop: a sync call overlapping the
+    work it waited for, device work overlapping the call that launched it
+    (launch/device_wait), and start-gated hops (rendezvous, p2p), whose
+    successor may start before its predecessor -- or an earlier path span
+    on another rank -- ended; measured from the immediate predecessor only,
+    a zig-zag between two ranks counted the same wall time twice. Idle time
+    is blamed on the predecessor's category (what the path waited for).
+
+    dp_accounted_ns is the DP's value along this path (gap + duration per
+    hop, as the DP adds them): what the longest-path search maximizes, an
+    upper bound of total_path_ns that counts overlapping time on both sides
+    of a start-gated hop. The report shows total_path_ns."""
     time_on_path: dict[str, int] = defaultdict(int)
     wait_caused: dict[str, int] = defaultdict(int)
     total_path_ns = 0
     kinds = list(path_edge_kinds or [])
     credited_ns: list[int] = []
+    gap_ns: list[int] = []
 
+    frontier = None
     for i, idx in enumerate(path):
         s = spans[idx]
-        kind = kinds[i - 1] if 0 < i <= len(kinds) else None
-        if kind in _OVERLAP_KINDS:
-            # Only the part of s beyond its predecessor's end is new path
-            # time (a sync call overlaps the work it waited for; device work
-            # may overlap the call that launched it).
-            prev = spans[path[i - 1]]
-            gap = s.start_ns - prev.end_ns
-            own = max(0, s.end_ns - max(s.start_ns, prev.end_ns))
-            if gap > 0:
-                wait_caused[prev.category.value] += gap
-                total_path_ns += gap
-            time_on_path[s.category.value] += own
-            total_path_ns += own
-            credited_ns.append(own)
-            continue
-        time_on_path[s.category.value] += s.duration_ns
-        total_path_ns += s.duration_ns
-        credited_ns.append(s.duration_ns)
-        if i > 0:
-            prev = spans[path[i - 1]]
-            gap = s.start_ns - prev.end_ns
-            if gap > 0:
-                wait_caused[prev.category.value] += gap
-                total_path_ns += gap
+        if frontier is None:
+            gap, own = 0, s.duration_ns
+            frontier = s.end_ns
+        else:
+            gap = max(0, s.start_ns - frontier)
+            own = max(0, s.end_ns - max(s.start_ns, frontier))
+            frontier = max(frontier, s.end_ns)
+        if gap:
+            wait_caused[spans[path[i - 1]].category.value] += gap
+        time_on_path[s.category.value] += own
+        total_path_ns += gap + own
+        credited_ns.append(own)
+        gap_ns.append(gap)
+
+    dp_accounted = 0
+    if path and len(kinds) == len(path) - 1:
+        dp_accounted = spans[path[0]].duration_ns
+        for i in range(1, len(path)):
+            _gate, _limit, gap = _edge_gap_and_gate(spans, path[i - 1], path[i], kinds[i - 1])
+            dp_accounted += gap + spans[path[i]].duration_ns
 
     return CriticalPathReport(
         path_span_indices=path,
@@ -984,8 +1489,48 @@ def attribute_blame(spans: list["SpanEvent"], path: list[int], wall_ns: int,
         total_path_ns=total_path_ns,
         path_edge_confidence=list(path_edge_confidence or []),
         path_edge_kinds=kinds,
-        path_credited_ns=credited_ns if kinds else [],
+        path_credited_ns=credited_ns,
+        path_gap_ns=gap_ns,
+        dp_accounted_ns=dp_accounted,
     )
+
+
+def annotation_time_on_path(trace: "Trace", report: CriticalPathReport) -> dict[str, int]:
+    """{range name: path time inside it}: each path step's credited time
+    and the idle gap before it go to every annotation range (NVTX/ROCTX)
+    open on the step's thread when it started -- a device span's thread is
+    the one that launched it. The ranges themselves are no path nodes
+    (annotations contribute nothing); this only tells which program phases
+    the path ran through."""
+    path = report.path_span_indices
+    if not path:
+        return {}
+    ranges: dict[tuple[int, int], list[tuple[int, int, str]]] = defaultdict(list)
+    for a in trace.iter_spans(categories=("nvtx", "other")):
+        if is_annotation(a) and a.duration_ns > 0:
+            ranges[(a.pid, a.tid)].append((a.start_ns, a.end_ns, a.name))
+    if not ranges:
+        return {}
+    steps: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    credited, gaps = report.path_credited_ns, report.path_gap_ns
+    for i, idx in enumerate(path):
+        s = report.spans[idx]
+        if (s.pid, s.tid) in ranges:
+            steps[(s.pid, s.tid)].append((s.start_ns, credited[i] + gaps[i]))
+    out: dict[str, int] = defaultdict(int)
+    for key, pts in steps.items():
+        rs = sorted(ranges[key])
+        pts.sort()
+        open_: list[tuple[int, str]] = []       # (end, name) of ranges begun so far
+        j = 0
+        for t, ns in pts:
+            while j < len(rs) and rs[j][0] <= t:
+                open_.append((rs[j][1], rs[j][2]))
+                j += 1
+            open_ = [r for r in open_ if r[0] > t]
+            for _end, name in open_:
+                out[name] += ns
+    return dict(out)
 
 
 def _wall_ns(spans: list["SpanEvent"]) -> int:
@@ -1013,6 +1558,7 @@ def analyze(trace: "Trace") -> CriticalPathReport:
     ext = trace.store.span_extent(timed_only=True)
     wall_ns = max(1, ext[1] - ext[0]) if ext else 1
     report = attribute_blame(spans, path, wall_ns, path_edge_confidence, path_edge_kinds)
+    report.path_time_by_annotation = annotation_time_on_path(trace, report)
     n_pids = len(trace.store.pids())
     if n_pids == 0:
         report.notes.append("No spans in this trace -- nothing to analyze.")
@@ -1021,15 +1567,13 @@ def analyze(trace: "Trace") -> CriticalPathReport:
             "Only one process observed -- cross-rank/collective edges did not apply; "
             "this is an intra-process (thread/stream) critical path only."
         )
-    if report.total_path_ns > wall_ns * 1.05:
+    if report.dp_accounted_ns > report.total_path_ns * 1.01:
         report.notes.append(
-            "Time accounted for exceeds wall time: the path passes through "
-            "'arrival'-gated rendezvous edges (OpenMP barriers / MPI-NCCL "
-            "collectives), which by construction connect spans that overlap "
-            "in real time across different threads/ranks -- each still "
-            "contributes its own full duration to the category breakdown, "
-            "so overlapping segments are counted once per thread/rank, not "
-            "merged into one wall-clock interval."
+            f"The longest-path search's own value for this path ({report.dp_accounted_ns / 1e6:.2f} ms) "
+            f"exceeds the time it covers ({report.total_path_ns / 1e6:.2f} ms): it passes through "
+            "start-gated hops (MPI/NCCL collectives, OpenMP barriers, point-to-point messages) whose "
+            "successor overlaps its predecessor in wall time on another rank/thread, and the search "
+            "counts that overlap on both sides. Totals and breakdowns count each instant once."
         )
     ka = ga.kernel_activity(trace.iter_spans(categories=("cuda", "rocm", "opencl")))
     if ka.source == "proxy":
@@ -1040,6 +1584,11 @@ def analyze(trace: "Trace") -> CriticalPathReport:
             "invisible and stream-order/launch edges can be dropped where queued "
             "work appears to overlap."
         )
+    try:
+        report.diagnostics = mpi_dependency_diagnostics(trace)
+    except Exception:          # diagnostics must never cost the analysis
+        report.diagnostics = {}
+    report.notes.extend(dependency_warnings(report.diagnostics))
     breakdown = report.confidence_breakdown_ns()
     medium_or_below = sum(ns for tier, ns in breakdown.items() if _CONFIDENCE_RANK.get(tier, 0) <= 1)
     if report.total_path_ns > 0 and medium_or_below / report.total_path_ns > 0.3:
@@ -1070,7 +1619,10 @@ _KIND_CODE = {k: i for i, k in enumerate(EDGE_KINDS)}
 _CONF_CODE = {c: i for i, c in enumerate(EDGE_CONFS)}
 # Bumped whenever an edge builder changes what it emits: persisted edges
 # with another version are rebuilt.
-EDGES_VERSION = "cp-1"
+# cp-2: world-rank MPI keys, per-device streams, graphs, teams, loss, NCCL seq
+# cp-3: annotation ranges (NVTX/ROCTX) are no graph nodes
+# cp-4: a span id shared by two hooks' spans resolves by the child's hook family
+EDGES_VERSION = "cp-4"
 
 
 class _EdgeSink:
@@ -1175,16 +1727,22 @@ class Graph:
         return _dp_arrays(self.trace, self.seqs, self.edges)
 
 
+def edges_version() -> str:
+    """Persisted edges' version: the exact-match rule changes them."""
+    return EDGES_VERSION + ("+exact" if exact_p2p_enabled() else "")
+
+
 def load_or_build_graph(trace: "Trace") -> Graph:
     """Persisted edges when the store has them for the current events and
     builder version, else build (streaming) and persist them."""
     import numpy as np
     store = trace.store
     seqs = store.span_seqs()
-    edges = store.load_edges(EDGES_VERSION)
+    version = edges_version()
+    edges = store.load_edges(version)
     if edges is None:
         edges = build_edges(trace, seqs)
-        store.save_edges(EDGES_VERSION, edges)
+        store.save_edges(version, edges)
     return Graph(trace, seqs, edges)
 
 
@@ -1197,7 +1755,7 @@ def load_comm_graph(trace: "Trace", max_build_spans: int | None = None) -> "Grap
     import numpy as np
     store = trace.store
     kinds = (_KIND_CODE["p2p"], _KIND_CODE["arrival"])
-    edges = store.load_edges(EDGES_VERSION, kinds=kinds)
+    edges = store.load_edges(edges_version(), kinds=kinds)
     if edges is None:
         if max_build_spans is not None and store.span_count() > max_build_spans:
             return None
@@ -1240,8 +1798,10 @@ def build_edges(trace: "Trace", seqs=None):
         _add_stream_order_edges(sink, gpu_legacy)
         _add_device_sync_edges(sink, gpu_legacy)
         del gpu_legacy
+    gpu_lossy = event_loss_pids(trace, ("cuda", "rocm"))
     for pid in pids:
-        _add_gpu_edges(sink, {ordinal_of(s.seq): s for s in trace.iter_spans(pid=pid, gpu_model=True)})
+        _add_gpu_edges(sink, {ordinal_of(s.seq): s for s in trace.iter_spans(pid=pid, gpu_model=True)},
+                       gpu_lossy)
     _add_explicit_span_id_edges_compact(sink, trace, ordinal_of)
     _add_mpi_edges_compact(sink, trace, ordinal_of)
     nccl: dict[tuple, list[tuple[int, int, int]]] = defaultdict(list)
@@ -1268,107 +1828,87 @@ def _add_clustered_arrival_edges(preds, groups: dict[tuple, list[tuple[int, int,
     for key, items in groups.items():
         confidence = key[-1]
         start_of = {i: st for st, _en, i in items}
-        for cluster in _cluster_rendezvous(items):
+        clusters = _rendezvous_clusters(key, items) if len(key) == 4 else _cluster_rendezvous(items)
+        for cluster in clusters:
             last = max(cluster, key=start_of.__getitem__)
             for i in cluster:
                 if i != last:
                     preds[i].append((last, "arrival", confidence))
 
 
-def _collect_collective(groups, s: "SpanEvent", types: frozenset[str], ordinal_of) -> None:
-    """One span's contribution to _add_rendezvous_edges' by_type grouping
-    (key gains the confidence that grouping implies)."""
+def _collective_group(s: "SpanEvent", types: frozenset[str]) -> tuple | None:
+    """(type, commid, seq, confidence) rendezvous group of a collective span
+    (see _add_rendezvous_edges), None for anything else. seq is set only
+    for NCCL calls with commid= and seq=: an exact group."""
     t = s.tags.get("type", "")
     if t not in types or s.duration_ns <= 0:
-        return
+        return None
     commid = s.tags.get("commid")
-    if commid is not None and commid != "-1":
-        groups[(t, commid, "high")].append((s.start_ns, s.end_ns, ordinal_of(s.seq)))
-    else:
-        groups[(t, None, "medium")].append((s.start_ns, s.end_ns, ordinal_of(s.seq)))
+    if commid is None or commid == "-1":
+        return (t, None, None, "medium")
+    seq = s.tags.get("seq") if s.category.value == "nccl" else None
+    return (t, commid, seq, "high")
+
+
+def _rendezvous_clusters(key: tuple, items: list[tuple[int, int, int]]) -> list[list[int]]:
+    """An exact (commid, seq) group is one rendezvous; otherwise clusters of
+    overlapping calls (_cluster_rendezvous)."""
+    if key[2] is not None:
+        return [[i for _st, _en, i in items]] if len(items) > 1 else []
+    return _cluster_rendezvous(items)
+
+
+def _collect_collective(groups, s: "SpanEvent", types: frozenset[str], ordinal_of) -> None:
+    """One span's contribution to _add_rendezvous_edges' by_type grouping
+    (key ends with the confidence that grouping implies)."""
+    key = _collective_group(s, types)
+    if key is not None:
+        groups[key].append((s.start_ns, s.end_ns, ordinal_of(s.seq)))
 
 
 def _add_explicit_span_id_edges_compact(preds, trace: "Trace", ordinal_of) -> None:
     """_add_explicit_span_id_edges: span ids -> ordinal (last wins, as
     there), then links in arrival order."""
-    by_span_id: dict[str, int] = {}
-    children: list[tuple[int, str]] = []
+    ids = _SpanIdIndex()
+    children: list[tuple[int, int, str, int, str]] = []
     for s in trace.iter_spans(with_ids=True):
+        if is_annotation(s):
+            continue
         i = ordinal_of(s.seq)
         if s.span_id:
-            by_span_id[s.span_id] = i
+            ids.add(s, i)
         if s.parent_span_id and not ga.is_device_span(s):
-            children.append((i, s.parent_span_id))
-    for i, psid in children:
+            children.append((i, s.pid, s.parent_span_id, s.start_ns, id_family(s)))
+    for i, pid, psid, start, family in children:
         for req_id in _parse_multi(psid):
-            parent_idx = by_span_id.get(req_id)
+            parent_idx = ids.get(pid, req_id, start, family)
             if parent_idx is not None and parent_idx != i:
                 preds[i].append((parent_idx, "explicit_span_id", "certain"))
 
 
-def _add_mpi_edges_compact(preds, trace: "Trace", ordinal_of) -> None:
+def _add_mpi_edges_compact(preds, trace: "Trace", ordinal_of) -> dict:
     """_add_mpi_p2p_edges then _add_rendezvous_edges(..., "mpi", ...) from
-    one pass over the MPI spans."""
-    sends: dict[tuple, list[tuple[int, int]]] = defaultdict(list)       # key -> [(start, ordinal)]
-    blocking: list[tuple[tuple, int, int, str]] = []
-    irecvs: list[tuple[str, bool, tuple, str | None, int]] = []
-    completers: dict[str, tuple[int, str | None, str | None]] = {}
+    one pass over the MPI spans. Returns the matcher's diagnostics."""
+    m = _P2PMatcher(event_loss_pids(trace, ("mpi",)),
+                    _exact_capture_facts(trace) if exact_p2p_enabled() else None)
     colls: dict[tuple, list[tuple[int, int, int]]] = defaultdict(list)
     for s in trace.iter_spans(categories=("mpi",)):
-        tags = s.tags
-        t = tags.get("type", "")
         i = ordinal_of(s.seq)
-        if t in ("send", "isend") and "peer" in tags:
-            sends[(tags.get("rank"), tags.get("peer"), tags.get("tag"))].append((s.start_ns, i))
-        if t == "recv" and "peer" in tags:
-            blocking.append(((tags.get("peer"), tags.get("rank"), tags.get("tag")), s.start_ns, i,
-                             "high" if tags.get("wildcard") == "1" else "medium"))
-        if t == "irecv" and s.span_id:
-            irecvs.append((s.span_id, tags.get("wildcard") == "1",
-                           (tags.get("peer"), tags.get("rank"), tags.get("tag")) if "peer" in tags else None,
-                           tags.get("rank"), s.start_ns))
-        if s.name in _MPI_WAIT_NAMES and s.parent_span_id:              # _index_mpi_completers
-            req_ids = _parse_multi(s.parent_span_id)
-            rmatches = _parse_rmatches(tags["rmatches"]) if "rmatches" in tags else {}
-            single_rpeer, single_rtag = tags.get("rpeer"), tags.get("rtag")
-            for req_id in req_ids:
-                if req_id in rmatches:
-                    completers[req_id] = (i, rmatches[req_id][0], rmatches[req_id][1])
-                elif len(req_ids) == 1 and single_rpeer is not None:
-                    completers[req_id] = (i, single_rpeer, single_rtag)
-                else:
-                    completers.setdefault(req_id, (i, None, None))
+        m.add(i, s)
         _collect_collective(colls, s, _MPI_COLLECTIVE_TYPES, ordinal_of)
-
-    recv_events = list(blocking)
-    for span_id, wildcard, exact_key, rank, start in irecvs:
-        completer = completers.get(span_id)
-        if completer is None:
-            continue
-        target_idx, resolved_peer, resolved_tag = completer
-        if wildcard:
-            if resolved_peer is None:
-                continue
-            recv_events.append(((resolved_peer, rank, resolved_tag), start, target_idx, "high"))
-        elif exact_key is not None:
-            recv_events.append((exact_key, start, target_idx, "medium"))
-    by_key_recvs: dict[tuple, list[tuple[int, int, str]]] = defaultdict(list)
-    for key, order_ns, target_idx, conf in recv_events:
-        by_key_recvs[key].append((order_ns, target_idx, conf))
-    for key, recv_list in by_key_recvs.items():
-        recv_list.sort(key=lambda t: t[0])
-        send_idxs = [i for _st, i in sorted(sends.get(key, []), key=lambda t: t[0])]
-        for (_order_ns, target_idx, conf), si in zip(recv_list, send_idxs):
-            preds[target_idx].append((si, "p2p", conf))
+    for target, src, conf in m.edges():
+        preds[target].append((src, "p2p", conf))
     _add_clustered_arrival_edges(preds, colls)
+    return m.diag
 
 
 def _add_omp_barrier_edges_compact(preds, trace: "Trace", pid: int, ordinal_of) -> None:
     """_add_omp_barrier_edges for one process."""
     by_name: dict[tuple, list[tuple[int, int, int]]] = defaultdict(list)
     for s in trace.iter_spans(pid=pid, categories=("sync",)):
-        if s.name.startswith("omp_") and s.duration_ns > 0:
-            by_name[(s.name, "certain")].append((s.start_ns, s.end_ns, ordinal_of(s.seq)))
+        g = _omp_barrier_group(s)
+        if g is not None:
+            by_name[(*g, "certain")].append((s.start_ns, s.end_ns, ordinal_of(s.seq)))
     _add_clustered_arrival_edges(preds, by_name)
 
 
@@ -1380,7 +1920,7 @@ def _add_program_order_edges_streaming(preds, trace: "Trace", ordinal_of) -> Non
         pending: list[tuple[int, int, int]] = []
         best: tuple[int, int, int] | None = None
         for s in trace.iter_spans(order="start", pid=pid, tid=tid):
-            if ga.is_device_span(s):
+            if ga.is_device_span(s) or is_annotation(s):
                 continue
             b = ordinal_of(s.seq)
             b_start = s.start_ns
@@ -1409,12 +1949,14 @@ def _dp_arrays(trace: "Trace", seqs, edges) -> tuple[list[int], list[str], list[
     end = array.array("q", bytes(8 * n))
     eff = array.array("q", bytes(8 * n))
     gpu = bytearray(n)
+    annot = bytearray(n)
     i = 0
     for s in trace.iter_spans():           # seq order == ordinal order
         start[i] = s.start_ns
         end[i] = s.end_ns
         eff[i] = _effective_start_ns(s)
         gpu[i] = 1 if ga.is_new_format(s) else 0
+        annot[i] = 1 if is_annotation(s) else 0
         i += 1
 
     # Typed arrays, not lists: per-node/per-edge Python ints would cost
@@ -1458,12 +2000,16 @@ def _dp_arrays(trace: "Trace", seqs, edges) -> tuple[list[int], list[str], list[
     acc = array.array("q", bytes(8 * n))
     chosen = array.array("q", [-1]) * n
     for v in topo:
+        if annot[v]:                              # not a node (see the full DP)
+            continue
         dur_v = end[v] - start[v]
         best = dur_v
         best_e = -1
         eff_v = eff[v]
         for e in range(indptr[v], indptr[v + 1]):
             u = src[e]
+            if annot[u]:
+                continue
             k = kind[e]
             eff_u = eff[u]
             eff_end_u = eff_u + (end[u] - start[u])
@@ -1493,7 +2039,9 @@ def _dp_arrays(trace: "Trace", seqs, edges) -> tuple[list[int], list[str], list[
         acc[v] = best
         chosen[v] = best_e
 
-    end_idx = max(range(n), key=acc.__getitem__)
+    end_idx = max((v for v in range(n) if not annot[v]), key=acc.__getitem__, default=None)
+    if end_idx is None:                           # annotations only
+        return [], [], []
     path = [end_idx]
     confs: list[str] = []
     kinds: list[str] = []

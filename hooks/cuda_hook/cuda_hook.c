@@ -8,8 +8,9 @@
  * sync calls, event record / stream wait (to resolve event syncs),
  * allocations (device and pinned_memory_bytes counters), NVTX v1/v2 ranges
  * (libnvToolsExt is replaced), module loads (kernel names for
- * cuLaunchKernel; JIT blobs saved for disassembly), optional CUPTI PC
- * sampling.
+ * cuLaunchKernel; JIT blobs saved for disassembly; launches carry mod=, the
+ * id of the module they ran, see hp_module.h), NVRTC compilation (front-end
+ * JIT, stage=frontend), optional CUPTI PC sampling.
  */
 
 #define _GNU_SOURCE
@@ -73,6 +74,9 @@ static void *find_cuda_sym(const char *name) {
 
 #include "../common/hp_transport.h"
 #include "../common/callstack.h"
+#include "../common/hp_module.h"
+#include "../common/hp_ids.h"
+#include "../common/hp_acpp.h"
 
 static pid_t gettid_compat(void) { return hp_tx_tid(); }
 
@@ -160,29 +164,145 @@ static int handle_id(const void *h) {
     return (int)(v % 999983) + 1;
 }
 
-/* ── Kernel name table (cuModuleGetFunction → name) ─────────────────────── */
-#define KNAME_MAP_CAP 512
-typedef struct { CUfunction fn; char name[256]; } KNameEntry;
-static KNameEntry      g_knames[KNAME_MAP_CAP];
-static int             g_kname_n = 0;
-static pthread_mutex_t g_kname_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* ── Kernel names (cuModuleGetFunction -> name + module, hp_module.h) ──── */
 
-static const char *resolve_kernel_name(const void *fn) {
+/* Full name of a launched kernel (any length) and the id of its module (0
+ * when the kernel is not from a captured module). The returned pointer is a
+ * per-thread copy valid until this thread's next call. */
+static const char *resolve_kernel_name(const void *fn, uint64_t *mod) {
+    if (mod) *mod = 0;
     if (!fn) return "<unknown>";
-    /* Check cuModuleGetFunction table first — works for JIT/driver-API kernels */
-    pthread_mutex_lock(&g_kname_mutex);
-    for (int i = 0; i < g_kname_n; i++) {
-        if (g_knames[i].fn == (CUfunction)fn) {
-            const char *p = g_knames[i].name;   /* stable pointer; array never shrinks */
-            pthread_mutex_unlock(&g_kname_mutex);
-            return p;
-        }
-    }
-    pthread_mutex_unlock(&g_kname_mutex);
+    /* cuModuleGetFunction table first -- works for JIT/driver-API kernels */
+    const char *known = hp_function_lookup(fn, mod);
+    if (known) return known;
     Dl_info info;
     if (dladdr(fn, &info) && info.dli_sname)
         return info.dli_sname;
     return "<jit-kernel>";
+}
+
+uint64_t hp_cuda_function_module(const void *fn) {
+    uint64_t mod = 0;
+    if (fn) hp_function_lookup(fn, &mod);
+    return mod;
+}
+
+/* ── Ahead-of-time kernels: the runtime's start-up registration ────────────
+ * nvcc's code registers each translation unit's fat binary (in the
+ * executable's .nv_fatbin section) with __cudaRegisterFatBinary, then every
+ * kernel with __cudaRegisterFunction (host stub -> device name). With a
+ * shared cudart those calls go through the PLT, so they are interposed here:
+ * the fat binary's module id is the hash of its bytes (header + payload, as
+ * in the file -- src/disasm/extractor.py computes the same id for each fat
+ * binary of the executable, so its disassembly carries it too) and each
+ * kernel is recorded under its host stub, so cudaLaunchKernel names the
+ * kernel and its module (mod=). Only the main executable's fat binaries are
+ * recorded: the extractor reads that file, and libraries can register tens
+ * of thousands of kernels (hashing and tabling those would slow start-up and
+ * every launch lookup). A static cudart registers inside the program --
+ * nothing to interpose; its launches are counted by kernel name.
+ * __cudaUnregisterFatBinary is not interposed: nvcc's code hands it to
+ * atexit, so libc calls it and nothing tells which of several cudarts the
+ * handle belongs to; and the main executable's fat binaries are only ever
+ * unregistered at exit. */
+typedef struct {
+    int magic;                       /* 0x466243b1 */
+    int version;
+    const void *data;                /* the fat binary */
+    void *filename_or_fatbins;
+} hp_fatbin_wrapper;
+
+typedef struct { const void *addr; int hit; } hp_exe_probe;
+
+static int hp_exe_cb(struct dl_phdr_info *info, size_t size, void *arg) {
+    (void)size;
+    hp_exe_probe *p = (hp_exe_probe *)arg;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+        uintptr_t lo = (uintptr_t)info->dlpi_addr + ph->p_vaddr;
+        if ((uintptr_t)p->addr >= lo && (uintptr_t)p->addr - lo < ph->p_memsz) p->hit = 1;
+    }
+    return 1;                        /* the first object visited is the main program */
+}
+
+static int in_main_executable(const void *addr) {
+    hp_exe_probe p = { addr, 0 };
+    dl_iterate_phdr(hp_exe_cb, &p);
+    return p.hit;
+}
+
+/* The definition of `name` the caller would have called without the hook:
+ * a library registers its fat binaries with the cudart IT links, and a
+ * process can hold several (a CUDA 13 PyTorch next to the 12.x cudart this
+ * hook's constructor may have loaded) -- RTLD_NEXT would hand all of them
+ * to whichever comes first, which breaks the others. So: look `name` up in
+ * the caller's own object and its dependencies (a preloaded library is not
+ * one of them); the main executable's own cudart is RTLD_NEXT. Cached per
+ * caller object. */
+#define HP_REG_CACHE 32
+typedef struct { const void *base; void *fn; } hp_reg_entry;
+
+static void *caller_definition(const void *ret_addr, const char *name, hp_reg_entry *cache,
+                               int *ncache, pthread_mutex_t *mu) {
+    Dl_info info;
+    if (!ret_addr || !dladdr(ret_addr, &info) || !info.dli_fname || !info.dli_fname[0]
+            || in_main_executable(ret_addr))
+        return dlsym(RTLD_NEXT, name);
+    void *fn = NULL;
+    pthread_mutex_lock(mu);
+    for (int i = 0; i < *ncache; i++)
+        if (cache[i].base == info.dli_fbase) { fn = cache[i].fn; break; }
+    pthread_mutex_unlock(mu);
+    if (fn) return fn;
+    void *h = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (h) {
+        fn = dlsym(h, name);
+        dlclose(h);
+    }
+    if (!fn) fn = dlsym(RTLD_NEXT, name);
+    pthread_mutex_lock(mu);
+    if (*ncache < HP_REG_CACHE) {
+        cache[*ncache].base = info.dli_fbase;
+        cache[*ncache].fn = fn;
+        (*ncache)++;
+    }
+    pthread_mutex_unlock(mu);
+    return fn;
+}
+
+#define CALLER_DEFINITION(type, name) ({                                        \
+        static hp_reg_entry cache_[HP_REG_CACHE];                                \
+        static int ncache_ = 0;                                                  \
+        static pthread_mutex_t mu_ = PTHREAD_MUTEX_INITIALIZER;                  \
+        (type)caller_definition(__builtin_return_address(0), name, cache_, &ncache_, &mu_); })
+
+void **__cudaRegisterFatBinary(void *fatCubin) {
+    typedef void **(*fn_t)(void *);
+    fn_t real = CALLER_DEFINITION(fn_t, "__cudaRegisterFatBinary");
+    if (!real) return NULL;
+    void **handle = real(fatCubin);
+    const hp_fatbin_wrapper *w = (const hp_fatbin_wrapper *)fatCubin;
+    if (handle && w && w->magic == 0x466243b1 && w->data && in_main_executable(w->data)) {
+        size_t sz = hp_fatbin_size(w->data, 1ULL << 30);
+        if (sz) hp_module_add(handle, hp_fnv1a64(w->data, sz));
+    }
+    return handle;
+}
+
+void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun, char *deviceFun,
+                            const char *deviceName, int thread_limit, void *tid, void *bid,
+                            void *bDim, void *gDim, int *wSize) {
+    typedef void (*fn_t)(void **, const char *, char *, const char *, int, void *, void *,
+                         void *, void *, int *);
+    fn_t real = CALLER_DEFINITION(fn_t, "__cudaRegisterFunction");
+    if (!real) return;
+    real(fatCubinHandle, hostFun, deviceFun, deviceName, thread_limit, tid, bid, bDim, gDim, wSize);
+    uint64_t mod = 0;
+    pthread_mutex_lock(&g_hpm_mutex);
+    mod = hp_module_id_locked(fatCubinHandle);
+    pthread_mutex_unlock(&g_hpm_mutex);
+    if (mod) hp_function_add(hostFun, fatCubinHandle, deviceName ? deviceName : deviceFun);
 }
 
 /* ── GPU device memory tracking (dynamic growing table) ─────────────────── */
@@ -359,8 +479,8 @@ typedef struct {
     cudaEvent_t  ev_end;
     cudaStream_t stream;
     char         cat[32];    /* span category: "cuda" for kernels, "memory" for copies */
-    char         kname[256];
-    char         extra[256];
+    char        *kname;      /* heap copy (names have no length limit) */
+    char         extra[320];
     uint64_t     cpu_start_ns;
     pid_t        tid;
 } PendingKernel;
@@ -374,7 +494,7 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
 
     typedef struct {
         cudaEvent_t ev_s, ev_e;
-        char cat[32], kname[256], extra[256];
+        char cat[32], *kname, extra[320];
         uint64_t t0;
         pid_t tid;
     } Local;
@@ -393,8 +513,8 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
             l->ev_s = pk->ev_start; l->ev_e = pk->ev_end;
             l->t0   = pk->cpu_start_ns; l->tid  = pk->tid;
             strncpy(l->cat,   pk->cat,   31);  l->cat[31]   = '\0';
-            strncpy(l->kname, pk->kname, 255); l->kname[255] = '\0';
-            strncpy(l->extra, pk->extra, 255); l->extra[255] = '\0';
+            l->kname = pk->kname;          /* ownership moves to todo[] */
+            strncpy(l->extra, pk->extra, sizeof(l->extra) - 1); l->extra[sizeof(l->extra) - 1] = '\0';
         }
     }
     g_pk_n = keep;
@@ -417,7 +537,7 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
         if (ok) {
             /* timing=proxy_event: the duration is GPU-measured (event pair)
              * but the span starts at the host submission time t0. */
-            char final_extra[340];
+            char final_extra[400];
             const char *sep = l->extra[0] ? "," : "";
             if (has_xs)
                 snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event,xs=%llu",
@@ -426,19 +546,21 @@ static void pk_flush(cudaStream_t flush_stream, int all_streams) {
                 snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event",
                          l->extra, sep);
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
-                      l->kname, final_extra);
+                      l->kname ? l->kname : "<unknown>", final_extra);
         } else {
             /* Sync/elapsed-time query failed (e.g. an event from another
              * context): keep the kernel, timed from launch to this flush --
              * an upper bound that can include later queued kernels
              * (timing=proxy_flush, unlike the launch-time proxy_host). */
-            char marked[300];
+            char marked[360];
             if (l->extra[0])
                 snprintf(marked, sizeof(marked), "%s,timing=proxy_flush", l->extra);
             else
                 snprintf(marked, sizeof(marked), "timing=proxy_flush");
-            emit_span(l->cat, l->tid, l->t0, now_ns() - l->t0, l->kname, marked);
+            emit_span(l->cat, l->tid, l->t0, now_ns() - l->t0,
+                      l->kname ? l->kname : "<unknown>", marked);
         }
+        free(l->kname);
     }
 }
 
@@ -473,7 +595,7 @@ static void pk_commit(cudaEvent_t ev_s, cudaEvent_t ev_e,
         pk->ev_start = ev_s; pk->ev_end = ev_e;
         pk->stream = stream; pk->cpu_start_ns = t0; pk->tid = tid;
         snprintf(pk->cat,   sizeof(pk->cat),   "%s", cat);
-        snprintf(pk->kname, sizeof(pk->kname), "%s", kname);
+        pk->kname = strdup(kname ? kname : "<unknown>");
         snprintf(pk->extra, sizeof(pk->extra), "%s", extra);
         pthread_mutex_unlock(&g_pk_mutex);
     } else {
@@ -483,7 +605,7 @@ static void pk_commit(cudaEvent_t ev_s, cudaEvent_t ev_e,
          * e.g. a pipelined iterative solver) -- fall back to CPU-side
          * timing, clearly marked so it isn't mistaken for a GPU-accurate
          * measurement. */
-        char marked[300];
+        char marked[360];
         if (extra && *extra)
             snprintf(marked, sizeof(marked), "%s,timing=proxy_host", extra);
         else
@@ -499,8 +621,24 @@ typedef struct {
     pid_t       tid;
     uint32_t    corr, corr2;
     int         proxy, gpu_ok;
+    int         dev;        /* current device after the call (-1: none) -> hdev= */
     cudaEvent_t ev_s, ev_e;
 } Sub;
+
+/* Device of the calling thread's current context, as hdev=: the NULL stream
+ * exists once per device, so stream order and device-wide syncs need it to
+ * keep two GPUs apart. cuCtxGetDevice has no side effects (a runtime call
+ * could create a context); it is read after the real call, when a lazily
+ * initialising runtime has made its context current. -1 when there is none. */
+static int current_device(void) {
+    typedef int (*fn_t)(int *);
+    static fn_t f = NULL;
+    static int tried = 0;
+    if (!tried) { f = (fn_t)find_cuda_sym("cuCtxGetDevice"); tried = 1; }
+    int d = -1;
+    if (!f || f(&d) != 0) return -1;
+    return d;
+}
 
 /* device_work: the call submits GPU work that a proxy span should time. */
 static void sub_begin(Sub *u, cudaStream_t stream, int device_work) {
@@ -508,6 +646,7 @@ static void sub_begin(Sub *u, cudaStream_t stream, int device_work) {
     u->lid   = __atomic_add_fetch(&g_lid_counter, 1, __ATOMIC_RELAXED);
     u->tid   = gettid_compat();
     u->corr  = u->corr2 = 0;
+    u->dev   = -1;
     u->proxy = device_work && want_proxy();
     u->gpu_ok = u->proxy ? pk_try_begin(stream, &u->ev_s, &u->ev_e) : 0;
     hp_cupti_arm();            /* after pk_try_begin: its CUDA calls aren't ours to correlate */
@@ -517,6 +656,7 @@ static void sub_begin(Sub *u, cudaStream_t stream, int device_work) {
 static void sub_end(Sub *u) {
     u->t1 = now_ns();
     hp_cupti_disarm(&u->corr, &u->corr2);
+    u->dev = current_device();   /* after disarm: not a call of the program's */
 }
 
 /* Host API span. `tags` starts with type=...,op=... */
@@ -525,11 +665,14 @@ static void sub_host(const Sub *u, const char *cat, const char *api,
     char x[512];
     int n = snprintf(x, sizeof(x), "%s,side=cpu,rt=cuda,timing=host,lid=%llu,sid=%llu",
                      tags, (unsigned long long)u->lid,
-                     (unsigned long long)(((uint64_t)(uint32_t)getpid() << 32) | (u->lid & 0xffffffffULL)));
+                     (unsigned long long)hp_span_id(HP_ID_CUDA, (uint32_t)getpid(),
+                                                    (uint32_t)(u->lid & 0x7fffffffULL)));
     if (u->corr && n > 0 && n < (int)sizeof(x))
         n += snprintf(x + n, sizeof(x) - (size_t)n, ",corr=%u", u->corr);
     if (u->corr2 && n > 0 && n < (int)sizeof(x))
         n += snprintf(x + n, sizeof(x) - (size_t)n, ",corr2=%u", u->corr2);
+    if (u->dev >= 0 && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",hdev=%d", u->dev);
     if (tls_nvtx_span_id && n > 0 && n < (int)sizeof(x))
         n += snprintf(x + n, sizeof(x) - (size_t)n, ",psid=%llu", (unsigned long long)tls_nvtx_span_id);
     if (ret != 0 && n > 0 && n < (int)sizeof(x))
@@ -542,17 +685,19 @@ static void sub_host(const Sub *u, const char *cat, const char *api,
 static void sub_proxy(Sub *u, cudaStream_t stream, const char *cat,
                       const char *name, const char *tags) {
     if (!u->proxy) return;
-    char x[256];
+    char x[320];
     int n = snprintf(x, sizeof(x), "%s,side=gpu,rt=cuda,lid=%llu", tags, (unsigned long long)u->lid);
     if (u->corr && n > 0 && n < (int)sizeof(x))
         n += snprintf(x + n, sizeof(x) - (size_t)n, ",corr=%u", u->corr);
     if (u->corr2 && n > 0 && n < (int)sizeof(x))
-        snprintf(x + n, sizeof(x) - (size_t)n, ",corr2=%u", u->corr2);
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",corr2=%u", u->corr2);
+    if (u->dev >= 0 && n > 0 && n < (int)sizeof(x))
+        snprintf(x + n, sizeof(x) - (size_t)n, ",hdev=%d", u->dev);
     if (u->gpu_ok) {
         pk_commit(u->ev_s, u->ev_e, stream, cat, name, x, u->t0, u->tid);
     } else {
         /* No GPU timing possible: the host call's own interval. */
-        char y[300];
+        char y[360];
         snprintf(y, sizeof(y), "%s,timing=proxy_host", x);
         emit_span(cat, u->tid, u->t0, u->t1 - u->t0, name, y);
     }
@@ -582,12 +727,14 @@ cudaError_t cudaLaunchKernel(
     if (in_hook) return real(func, gridDim, blockDim, args, sharedMem, stream);
     in_hook = 1;
 
-    const char *kname = resolve_kernel_name(func);
+    uint64_t mod;
+    const char *kname = resolve_kernel_name(func, &mod);
     int sid = get_stream_id(stream);
-    char host[64], dev[160];
-    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
-    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u",
-             sid, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z);
+    char host[96], dev[192], modtag[24];
+    hp_mod_tag(modtag, sizeof(modtag), mod);
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d%s", sid, modtag);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u%s",
+             sid, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, modtag);
 
     Sub u;
     sub_begin(&u, stream, 1);
@@ -988,26 +1135,20 @@ cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t 
 
 /* ── CUDA Driver API ────────────────────────────────────────────────────── */
 
-static void _save_cubin(const void *image) {
-    if (!image) return;
+/* Save the module image passed to cuModuleLoadData* for disassembly; returns
+ * its module id (hp_module.h: FNV-1a of exactly the bytes saved) and the
+ * saved path in path[cap], or 0 and "" when the image size is unknown. */
+static uint64_t _save_cubin(const void *image, char *path, size_t cap) {
+    path[0] = '\0';
+    if (!image) return 0;
     static int cubin_counter = 0;
-    char path[256];
-    snprintf(path, sizeof(path), "/tmp/hprofiler_cubin_%d_%d.bin",
-             (int)getpid(),
-             __atomic_fetch_add(&cubin_counter, 1, __ATOMIC_RELAXED));
     size_t sz = 0;
     const uint8_t *p = (const uint8_t *)image;
 
     if (p[0]==0x50 && p[1]==0xED && p[2]==0x55 && p[3]==0xBA) {
-        uint64_t fsz;
-        memcpy(&fsz, p + 8, 8);
-        if (fsz > 32 && fsz < 512ULL*1024*1024) sz = (size_t)fsz;
+        sz = hp_fatbin_size(image, 512ULL*1024*1024);   /* header + payload */
     } else if (p[0]==0x7f && p[1]=='E' && p[2]=='L' && p[3]=='F' && p[4]==2) {
-        uint64_t shoff; memcpy(&shoff, p+40, 8);
-        uint16_t shesz; memcpy(&shesz, p+58, 2);
-        uint16_t shnum; memcpy(&shnum, p+60, 2);
-        size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
-        if (end > 64 && end < 512ULL*1024*1024) sz = end;
+        sz = hp_elf64_image_size(image, 512ULL*1024*1024);
     } else if ((p[0]=='/' && p[1]=='/') || p[0]=='.') {
         /* PTX text: include the terminator only if it lies within the
          * limit; at the limit the string may be unterminated and +1 would
@@ -1015,8 +1156,26 @@ static void _save_cubin(const void *image) {
         sz = strnlen((const char *)image, 64*1024*1024);
         if (sz > 0 && sz < 64*1024*1024) sz++;
     }
+    if (sz == 0) return 0;
+    snprintf(path, cap, "/tmp/hprofiler_cubin_%d_%d.bin",
+             (int)getpid(),
+             __atomic_fetch_add(&cubin_counter, 1, __ATOMIC_RELAXED));
     FILE *f = fopen(path, "wb");
-    if (f) { fwrite(image, 1, sz, f); fclose(f); }
+    if (!f) { path[0] = '\0'; return 0; }
+    fwrite(image, 1, sz, f);
+    fclose(f);
+    return hp_fnv1a64(image, sz);
+}
+
+/* jit span of a module load: path= of the saved image and its mod= id. */
+static void _module_load_span(const char *api, uint64_t t0, const char *path, uint64_t mod) {
+    char extra[640], modtag[24];
+    if (path[0])
+        snprintf(extra, sizeof(extra), "type=jit_compile,stage=backend,path=%s%s", path,
+                 hp_mod_tag(modtag, sizeof(modtag), mod));
+    else
+        snprintf(extra, sizeof(extra), "type=jit_compile,stage=backend");
+    emit_span("jit", gettid_compat(), t0, now_ns() - t0, api, extra);
 }
 
 CUresult cuModuleLoadData(CUmodule_t *module, const void *image) {
@@ -1024,11 +1183,12 @@ CUresult cuModuleLoadData(CUmodule_t *module, const void *image) {
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_cuda_sym("cuModuleLoadData");
     if (!real) return -1;
-    _save_cubin(image);
+    char path[256];
+    uint64_t mod = _save_cubin(image, path, sizeof(path));
     uint64_t t0 = now_ns();
     CUresult ret = real(module, image);
-    emit_span("jit", gettid_compat(), t0, now_ns() - t0,
-              "cuModuleLoadData", "type=jit_compile");
+    _module_load_span("cuModuleLoadData", t0, path, mod);
+    if (ret == 0 && module) hp_module_add(*module, mod);
     return ret;
 }
 
@@ -1039,11 +1199,12 @@ CUresult cuModuleLoadDataEx(CUmodule_t *module, const void *image,
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_cuda_sym("cuModuleLoadDataEx");
     if (!real) return -1;
-    _save_cubin(image);
+    char path[256];
+    uint64_t mod = _save_cubin(image, path, sizeof(path));
     uint64_t t0 = now_ns();
     CUresult ret = real(module, image, numOptions, options, optionValues);
-    emit_span("jit", gettid_compat(), t0, now_ns() - t0,
-              "cuModuleLoadDataEx", "type=jit_compile");
+    _module_load_span("cuModuleLoadDataEx", t0, path, mod);
+    if (ret == 0 && module) hp_module_add(*module, mod);
     return ret;
 }
 
@@ -1055,14 +1216,11 @@ CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule_t hmod,
     if (!real) return -1;
     CUresult ret = real(hfunc, hmod, name);
     if (ret == 0 && hfunc && *hfunc && name) {
-        pthread_mutex_lock(&g_kname_mutex);
-        if (g_kname_n < KNAME_MAP_CAP) {
-            g_knames[g_kname_n].fn = *hfunc;
-            strncpy(g_knames[g_kname_n].name, name, 255);
-            g_knames[g_kname_n].name[255] = '\0';
-            g_kname_n++;
-        }
-        pthread_mutex_unlock(&g_kname_mutex);
+        hp_function_add(*hfunc, hmod, name);
+        /* A launch of it may come through a path no wrapper sees
+         * (cuLaunchKernelEx from dlsym, as Triton does): only CUPTI's
+         * callback and activity record it, so start CUPTI now. */
+        native_ensure();
     }
     return ret;
 }
@@ -1073,14 +1231,27 @@ CUresult cuModuleUnload(CUmodule_t hmod) {
     if (!real) real = (fn_t)find_cuda_sym("cuModuleUnload");
     if (!real) return -1;
     CUresult ret = real(hmod);
-    /* The driver may reuse a freed CUfunction address for another kernel,
-     * and g_knames does not record modules, so clear the whole table;
-     * entries come back with the next cuModuleGetFunction. */
-    if (ret == 0) {
-        pthread_mutex_lock(&g_kname_mutex);
-        g_kname_n = 0;
-        pthread_mutex_unlock(&g_kname_mutex);
-    }
+    /* The driver may reuse a freed CUfunction address for another kernel:
+     * drop this module's functions (they come back with the next
+     * cuModuleGetFunction). */
+    if (ret == 0) hp_module_remove(hmod);
+    return ret;
+}
+
+/* NVRTC front-end compilation (CUDA C++ -> PTX). Only calls bound to
+ * libnvrtc's exported symbol are seen; a program that dlsym()s it from its
+ * own handle bypasses this wrapper. */
+typedef void *nvrtcProgram_t;
+int nvrtcCompileProgram(nvrtcProgram_t prog, int numOptions, const char *const *options) {
+    typedef int (*fn_t)(nvrtcProgram_t, int, const char *const *);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "nvrtcCompileProgram");
+    if (!real) return 7;   /* NVRTC_ERROR_BUILTIN_OPERATION_FAILURE */
+    uint64_t t0 = now_ns();
+    int ret = real(prog, numOptions, options);
+    emit_span("jit", gettid_compat(), t0, now_ns() - t0, "nvrtcCompileProgram",
+              ret == 0 ? "type=jit_compile,stage=frontend,status=ok"
+                       : "type=jit_compile,stage=frontend,status=err");
     return ret;
 }
 
@@ -1099,13 +1270,15 @@ CUresult cuLaunchKernel(
     if (in_hook) return real(f, gx,gy,gz, bx,by,bz, sharedMem, hStream, kernelParams, extra_params);
     in_hook = 1;
 
-    const char *kname = resolve_kernel_name(f);
+    uint64_t mod;
+    const char *kname = resolve_kernel_name(f, &mod);
     cudaStream_t stream = (cudaStream_t)hStream;
     int sid = get_stream_id(stream);
-    char host[64], dev[160];
-    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
-    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u",
-             sid, gx, gy, gz, bx, by, bz);
+    char host[96], dev[192], modtag[24];
+    hp_mod_tag(modtag, sizeof(modtag), mod);
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d%s", sid, modtag);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u%s",
+             sid, gx, gy, gz, bx, by, bz, modtag);
 
     Sub u;
     sub_begin(&u, stream, 1);
@@ -1382,7 +1555,9 @@ int nvtxRangePushA(const char *message) {
     if (nvtx_depth < MAX_NVTX_DEPTH) {
         NvtxEntry *e = &nvtx_stack[nvtx_depth];
         e->start_ns = now_ns();
-        e->span_id  = e->start_ns;   /* unique: nanosecond timestamp */
+        static uint32_t nvtx_seq = 0;
+        e->span_id  = hp_span_id(HP_ID_NVTX, (uint32_t)getpid(),
+                                 __atomic_add_fetch(&nvtx_seq, 1, __ATOMIC_RELAXED));
         e->tid      = gettid_compat();
         strncpy(e->name, message ? message : "<nvtx>", sizeof(e->name) - 1);
         e->name[sizeof(e->name) - 1] = '\0';

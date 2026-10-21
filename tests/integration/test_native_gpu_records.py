@@ -156,9 +156,27 @@ class TestCuptiDecoder(unittest.TestCase):
             ("cuLaunchKernel", "launch", "740"),
             ("cudaStreamSynchronize", "sync", "750"),   # static-runtime mode only
             ("cudaStreamWaitEvent", "stream_wait", "751"),
+            ("cuLaunchKernelEx", "launch", "760"),
+            ("cuLaunchKernel", "launch", "761"),
+            ("cuLaunchKernelEx_ptsz", "launch", "762"),
+            ("cudaLaunchKernel", "launch", "763"),
+            ("cudaLaunchKernelExC", "launch", "764"),
+            ("cuMemcpyHtoDAsync", "launch", "765"),
         ])
         self.assertEqual(cb[4].tags["sync"], "stream")
         self.assertTrue(all(s.tags["side"] == "cpu" and s.tags["timing"] == "host" for s in cb))
+
+    def test_callback_launches_name_their_module(self):
+        """A launch the hook did not intercept (cuLaunchKernelEx via dlsym, as
+        Triton does): the function handle from the callback's parameters gives
+        its module id; no parameters / an unknown handle / not a launch: none."""
+        mods = {s.tags["corr"]: s.tags.get("mod") for s in self.spans if s.tags.get("src") == "cupti_cb"}
+        self.assertEqual({c: mods[c] for c in ("700", "740", "760", "761", "762", "763", "764", "765")}, {
+            "700": None, "740": None,                                 # no functionParams
+            "760": "0123456789abcdef", "761": "fedcba9876543210", "762": "fedcba9876543210",
+            "763": "0123456789abcdef",                               # a registered host stub
+            "764": None, "765": None,
+        })
 
     def test_end_to_end_correlation_with_hook_host_spans(self):
         """Decoder output + the host spans cuda_hook.c would have emitted."""

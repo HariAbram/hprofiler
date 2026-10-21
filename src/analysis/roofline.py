@@ -425,7 +425,11 @@ def analyze_trace(trace: "Trace") -> list[tuple[DevicePeak, KernelMetrics]]:
     if not devices or not trace.disasm:
         return []
 
-    disasm = trace.disasm
+    # canonical entries: "name@module" for module code, else the name
+    disasm = {k: kd for k, kd in trace.disasm.items() if k == kd.key}
+    by_name: dict[str, str] = {}
+    for key, kd in disasm.items():
+        by_name.setdefault(kd.name, key)
 
     # Build a secondary lookup: short/demangled name → disasm key.
     # ACPP stores disasm under _acpp_kernel_short() names (e.g. "test_Relax")
@@ -433,29 +437,33 @@ def analyze_trace(trace: "Trace") -> list[tuple[DevicePeak, KernelMetrics]]:
     # Also index by any suffix after the last '::' for general C++ demangling.
     from ..disasm.extractor import _acpp_kernel_short
     _short_to_key: dict[str, str] = {}
-    for key in disasm:
-        _short_to_key[_acpp_kernel_short(key)] = key
-        if "::" in key:
-            _short_to_key[key.rsplit("::", 1)[-1]] = key
+    for name, key in by_name.items():
+        _short_to_key[_acpp_kernel_short(name)] = key
+        if "::" in name:
+            _short_to_key[name.rsplit("::", 1)[-1]] = key
 
-    def _disasm_key(span_name: str) -> str | None:
-        if span_name in disasm:
-            return span_name
-        short = _acpp_kernel_short(span_name)
-        if short in disasm:
-            return short
-        if short in _short_to_key:
-            return _short_to_key[short]
-        # fallback: check if any disasm key is a substring of the span name
-        for key in disasm:
-            if key in span_name or span_name in key:
-                return key
-        return None
+    memo: dict[tuple[str, str], str | None] = {}
 
-    # Group spans by name, pick the one with max duration per name
+    def _disasm_key(span: "SpanEvent") -> str | None:
+        # the launch's module first (Trace.disasm_for), then name heuristics
+        mk = (span.name, span.tags.get("mod", ""))
+        if mk in memo:
+            return memo[mk]
+        kd, _how = trace.disasm_for(*mk)
+        key = kd.key if kd is not None else None
+        if key is None:
+            short = _acpp_kernel_short(span.name)
+            key = by_name.get(short) or _short_to_key.get(short)
+        if key is None:
+            # fallback: any disasm name that is a substring of the span name
+            key = next((k for n, k in by_name.items() if n in span.name or span.name in n), None)
+        memo[mk] = key
+        return key
+
+    # Group spans by code, pick the one with max duration per entry
     best_span: dict[str, "SpanEvent"] = {}
     for span in trace.iter_spans():
-        key = _disasm_key(span.name)
+        key = _disasm_key(span)
         if key is None:
             continue
         prev = best_span.get(key)

@@ -193,6 +193,16 @@ hprofiler run [OPTIONS] -- COMMAND [ARGS...]
 | `--call-tree / --no-call-tree` | `--no-call-tree` | Capture C++ call stacks at every API interception point; adds the Call Tree tab to the TUI and a CCT hotspot section to the text summary. When libunwind is available (detected at build time), unwinding is accurate without requiring `-fno-omit-frame-pointer`. Source file:line annotations are resolved automatically via `addr2line` / `llvm-symbolizer` when available. Adds roughly 5–15 µs (libunwind) to 50–90 µs (glibc `backtrace()`) per intercepted call — do not use during benchmarking ([Overhead](#overhead)). |
 | `--gui` | off | Open the native Qt/QML GUI instead of the TUI after profiling (falls back to the TUI automatically if PySide6/X11 aren't available). See [GUI](#gui). |
 | `--otlp-endpoint URL`, `--otlp-file PATH` | — | Also export to an OTLP collector or file ([OpenTelemetry export](#opentelemetry-export)) |
+| `--exit-status` | off | Exit with the profiled command's exit status (`128+N` when it was killed by signal N) instead of 0. Without it `hprofiler run` exits 0 as before; the status is printed and stored either way. |
+| `--python-jit` | off | Python programs: record a Python JIT compiler's own compilation as jit spans -- Triton's Python → … → cubin, per stage, and its cache hits ([What the jit spans cover](#what-the-jit-spans-cover)). Puts `src/instrument/pysite/` first on `PYTHONPATH` (the program's own `sitecustomize` still runs). Also on `hprofiler exec`. |
+
+The profiled command's exit status is recorded in the trace
+(`metadata.exitStatus`: the code, or `-N` when killed by signal N) and a
+non-zero status is printed (`[hprofiler] Profiled command exited with
+status N`) and listed among the capture warnings. The program inherits
+every file descriptor `hprofiler run` was given, exactly as without
+hprofiler (MPI launchers pass their PMI connection that way, `PMI_FD`);
+hprofiler's own descriptors are never inherited.
 
 Always separate the profiler's options from the target program with `--`:
 
@@ -230,28 +240,48 @@ index are built once and persisted, so viewers open it immediately.
 
 ### Selecting backends
 
-Without `--backend` (or with `--backend auto`) every backend whose
-availability check passes is enabled; `hprofiler backends` shows the result
-and an install hint for each missing dependency. Aliases are accepted
-everywhere a backend name is.
+A backend is **installed** when its hook or tool and the library it needs
+are present, and **usable** when a cheap probe (`src/backends/probes.py`,
+in a subprocess with a timeout) shows it can work here. Without `--backend`
+(or with `--backend auto`) only usable backends are enabled, and the
+installed-but-unusable ones are named with the reason; a backend requested
+explicitly is used even when the probe fails (with a warning). `hprofiler
+backends` shows each backend's state and the probe's reason:
+
+| Backend | Usable when |
+|---|---|
+| `cuda` | `cuInit` and `cuDeviceGetCount` succeed with at least one device (a driver/library mismatch fails here, e.g. with error 803/804) |
+| `rocm` | `/dev/kfd` is accessible and the KFD topology lists a GPU agent (a desktop `libamdhip64` without an AMD GPU is installed only) |
+| `opencl` | some platform has at least one device |
+| `nccl` | NCCL is installed and CUDA is usable |
+| `likwid` | `likwid-perfctr -C 0 -g <group> true` succeeds (no PMU access, e.g. `perf_event_paranoid` > 0 without the access daemon, is installed only) |
+| `cpu` | `perf stat true` succeeds |
+| `openmp`, `mpi` | installed |
 
 ```bash
 hprofiler backends
 ```
 
 ```
-Available backends:
+Backends (auto-detection uses the usable ones):
 
-  cpu         ✗  unavailable  CPU sampling via Linux perf (DWARF call-graph, JIT-aware)  [alias: perf]
-  cuda        ✓  available    CUDA Runtime + Driver API tracing via LD_PRELOAD
-  opencl      ✓  available    OpenCL command-queue profiling via LD_PRELOAD  [alias: cl]
-  rocm        ✓  available    ROCm/HIP kernel tracing via LD_PRELOAD hook  [alias: hip]
-  openmp      ✓  available    OpenMP parallel region / task tracing — OMPT (clang libomp) + direct GOMP_* interception (GCC libgomp)  [alias: omp]
-  likwid      ✓  available    Hardware PMU counters via likwid-perfctr (FLOPS, bandwidth, cache, CPI)  [alias: hwc]
-  mpi         ✓  available    MPI call tracing via PMPI wrapper (Send/Recv/Allreduce/Barrier/…)
-  nccl        ✗  unavailable  NCCL collective tracing via LD_PRELOAD (AllReduce, Broadcast, Send/Recv, …)
+  cpu         !  installed    CPU sampling via Linux perf (DWARF call-graph, JIT-aware)  [alias: perf]
+                               → perf stat fails (perf_event_paranoid=4)
+  cuda        ✓  usable       CUDA Runtime + Driver API tracing via LD_PRELOAD
+                               → 1 CUDA device(s)
+  opencl      ✓  usable       OpenCL command-queue profiling via LD_PRELOAD  [alias: cl]
+                               → 2 OpenCL device(s)
+  rocm        !  installed    ROCm/HIP kernel tracing via LD_PRELOAD hook  [alias: hip]
+                               → no /dev/kfd (no AMD GPU kernel driver)
+  openmp      ✓  usable       OpenMP parallel region / task tracing — OMPT (clang libomp) + direct GOMP_* interception (GCC libgomp)  [alias: omp]
+  likwid      !  installed    Hardware PMU counters via likwid-perfctr (FLOPS, bandwidth, cache, CPI)  [alias: hwc]
+                               → no PMU access (perf_event_paranoid=4): Cannot use performance monitoring with perf_event_paranoid = 4
+  mpi         ✓  usable       MPI call tracing via PMPI wrapper (Send/Recv/Allreduce/Barrier/…)
+  nccl        ✗  missing      NCCL collective tracing via LD_PRELOAD (AllReduce, Broadcast, Send/Recv, …)
                                → libnccl not found — install NCCL from developer.nvidia.com/nccl
 ```
+
+Aliases are accepted everywhere a backend name is.
 
 | Backend | Attached to the program by | Library or tool |
 |---|---|---|
@@ -262,11 +292,7 @@ Available backends:
 
 Whenever `perf` is installed and any CPU-side backend is active, `perf stat`
 is also attached for IPC, cache-miss and branch-miss counters (shown in the
-summary and System tab). Auto-detection checks only that `likwid-perfctr`
-is installed: if it cannot access the PMUs it refuses to start the program
-at all, and the run captures nothing (see
-[Known limitations](#known-limitations)) — list backends explicitly in that
-case.
+summary and System tab).
 
 ### Launchers and MPI jobs
 
@@ -282,7 +308,10 @@ command, so the trace above would otherwise be called
 `mpirun.hprofiler.json`.
 
 The collector is an `AF_UNIX` socket in a private temporary directory on
-the node that runs `hprofiler run`. Every rank must receive
+the node that runs `hprofiler run` (a socket path is limited to 107 bytes:
+when `$TMPDIR` is too deep, a short directory under `/tmp` is used, and if
+none fits either, a Linux abstract socket, accepting only connections from
+the same user). Every rank must receive
 `HPROFILER_SOCKET`, `LD_PRELOAD`, `OMP_TOOL_LIBRARIES` and any `HPROFILER_*`
 settings. Launchers that start ranks on the local node normally pass their
 environment through (MPICH/Hydra, Open MPI for local ranks, `srun` with its
@@ -298,14 +327,52 @@ resolved in (`symfile=`), and the collector records each connected
 process's real executable, so the launcher's own binary is never
 disassembled by mistake.
 
-A run that ends with zero events from every backend prints a warning that
-the hooks never reached the collector, with launcher-specific advice when
+A run that ends with zero events from every backend prints a warning: when
+the program exited with a non-zero status, that it failed before making any
+profiled call; otherwise that the hooks never reached the collector, with launcher-specific advice when
 the command starts with `srun`, `mpirun`, `mpiexec`, `aprun`, `jsrun` or
 `ibrun`. With SLURM this has been seen to be intermittent (the identical
 command capturing tens of thousands of events on the next invocation),
 which points at the site's environment-export configuration rather than at
 the hooks: a hook retries its connection on every event, so a startup race
 would lose only the first few events.
+
+#### Node-collector mode: `hprofiler collect` + `hprofiler exec`
+
+Per-rank capture (one `hprofiler run` around each rank, e.g. so that every
+rank on every node has a collector) runs one Python collector per rank; on
+a full node those collectors compete with the ranks for cores. Instead,
+one collector per node:
+
+```bash
+# Slurm: one collector per node (a step of its own), then the program
+srun --ntasks-per-node=1 --overlap hprofiler collect -b mpi,openmp -o trace.%h.json &
+srun hprofiler exec -b mpi,openmp -- ./app
+wait                                        # each collector ends by itself
+hprofiler merge-nodes trace.*.json -o merged.json
+```
+
+- `hprofiler collect` listens on a node-local socket — inside a Slurm or
+  PBS job `@hprofiler-<job id>` (an abstract socket: nothing on disk, one
+  per node automatically), or `--socket @name` / `--socket PATH` — and
+  writes one trace per node (`-o`: `%h` hostname, `%j` job id, `%p` pid). It
+  ends `--idle-exit` seconds (default 10) after the last hook connection
+  closed, once at least one has been seen, or on SIGINT/SIGTERM.
+- `hprofiler exec` sets the hooks' environment (`LD_PRELOAD`,
+  `OMP_TOOL_LIBRARIES`, `HPROFILER_SOCKET`, the backends' variables) and
+  replaces itself with the program (`exec`): nothing of hprofiler keeps
+  running in the rank. It waits (`--wait`, default 30 s) until the node's
+  collector is listening (checked in `/proc/net/unix`, without
+  connecting), so a rank started before its collector loses nothing.
+- Use the same `--backend` list for both. Backends that attach a tool
+  (`cpu`, `likwid`) are not available in this mode.
+
+LULESH (8 ranks, `-s 8 -i 20`, one node, 3 runs): the program's own
+elapsed time is 0.02 s unprofiled, 0.03 s in job mode (`hprofiler run --
+mpirun ...`), 0.16 s in per-rank mode and 0.03 s with a node collector; the
+application phase took 1.9–2.4 s per-rank (eight collectors starting and
+draining) and 0.56–0.60 s with the node collector, which then needs no
+per-rank merge (one trace per node).
 
 ### Output files
 
@@ -340,6 +407,18 @@ Nothing that is lost or degraded during a capture is dropped silently:
 - **GPU tracers** report whether native device activity was active, how
   timestamps were mapped, and dropped or untimed records
   ([CUDA and ROCm](#cuda-and-rocm-host-calls-and-device-work)).
+- **The program's exit status** (non-zero: the trace covers a failed or
+  interrupted run).
+- **Holes in the MPI dependency graph** (`metadata.dependencyDiagnostics`,
+  computed after every run with the MPI backend and by `critical-path`):
+  receive completions that got no point-to-point edge, per communicator id
+  (sender not recorded or not identifiable); requests completed only by
+  `MPI_Test*` polling (no edge, by design); waits on requests the hook
+  never saw posted; cancelled requests; a trace without `wpeer=` (older
+  hook, communicator-blind pairing); and message pairings in processes
+  that lost MPI events (order-based, so possibly shifted: their edges are
+  "low"). `hprofiler critical-path` prints the same counts as "MPI
+  dependency coverage".
 
 All of it is stored with the trace (`metadata.captureHealth`,
 `metadata.deviceActivity`) and turned into one-line warnings, printed at
@@ -495,9 +574,14 @@ span**, linked by a correlation id:
 All of them carry `rt=cuda|rocm`, `op=` (`kernel`, `memcpy`, `memset`,
 `graph`, `sync`, `event_record`, `stream_wait`) and `stream=` (the
 program's stream handle, hashed -- the same id in the CUDA, ROCm and NCCL
-hooks). Native device spans add `dev=`, `ctx=` (CUDA), `nstream=` (the
-vendor's stream id) or `queue=`/`dispatch=` (ROCm), and `src=cupti` /
-`src=rocprofiler`.
+hooks). Host spans and proxy device spans add `hdev=`, the calling thread's
+current device after the call (`cuCtxGetDevice` / `hipGetDevice`; absent
+when there is none). Kernel launches whose kernel came from a captured
+module add `mod=`, that module's id ([Disassembly](#disassembly)), copied
+to the native device span at correlation. Native device spans add `dev=`
+(CUDA: device ordinal; ROCm: agent handle), `ctx=` (CUDA), `nstream=` (the
+vendor's stream id) or `queue=`/`dispatch=` (ROCm), `graph=` (CUDA, a
+kernel of a graph launch), and `src=cupti` / `src=rocprofiler`.
 
 #### Native tracing (preferred) and the proxy fallback
 
@@ -581,11 +665,32 @@ spans they belong to, so the Runner correlates once on the complete trace
 
 * **Matching.** `lid` first (hook-assigned, exact; ROCm records carry it as
   the external id), otherwise the union of hosts sharing `corr`/`corr2`.
-  A correlation id can repeat (CUPTI's are 32-bit and wrap): the latest
-  submission that started no later than the device operation wins. Only if
-  every candidate started after it is a 50 µs clock-mapping tolerance
-  allowed; beyond that the record is counted as `precedes_submission`.
-  Graph launches legitimately have many device operations per host call.
+  One candidate is always linked: the id says which submission it was,
+  whatever the timestamps say. A correlation id can repeat (CUPTI's are
+  32-bit and wrap, the repeats hours apart), so among several candidates
+  time decides: the latest submission that started no later than the
+  device operation, unless a later one is nearer (only a clock-mapping
+  error explains that). A device record starting more than 50 µs before
+  its submission is still linked and counted as `precedes_submission` (a
+  clock diagnostic). Graph launches legitimately have many device
+  operations per host call.
+* **Device clock drift.** The tracer maps GPU timestamps onto the host
+  clock, and that mapping can drift: on the development machine's MX550,
+  after long GPU-idle phases, device records ran up to 78 µs before their
+  own submission (≈ 26 ppm) in 1 of 30 AdaptiveCpp-on-CUDA runs. A device
+  operation cannot be submitted before its API call entered, so every
+  linked pair bounds the error from below: host start − the record's
+  CUPTI `submitted` (its start where absent); CUPTI's `queued`, which it
+  takes on the host during the call, replaces the host start as the
+  tighter bound when it lies within the call. Per process and device the
+  correction is the smallest that meets every bound and changes by at most
+  100 ppm (`max(0, maxᵢ(needᵢ − 10⁻⁴·|t − tᵢ|))`): zero where no record
+  needs one -- a correct trace is unchanged -- and order-preserving. It is
+  added to that device's measured spans (start, end and `submitted`; not
+  `queued`) before the latencies below are derived; each shifted span
+  carries `clock_corr_ns=`. Only a drift that makes records precede their
+  submission is visible; a drift the other way is indistinguishable from
+  launch latency.
 * **De-duplication.** A proxy device span whose host call also has a
   native record (`both` mode) is removed (`deduplicated_proxy`); identical
   native records delivered twice are removed (`duplicate_records`). In
@@ -596,7 +701,7 @@ spans they belong to, so the Runner correlates once on the complete trace
   from 1:1 submissions; anything else keeps a vendor lane (`stream=n7`,
   `stream=q160`). HIP streams that share one HSA queue are never merged.
 * The device span gets the launching thread as `tid`, its host span as
-  `parent_span_id`, and the derived tags above.
+  `parent_span_id`, its `mod=`, and the derived tags above.
 
 **GPU-active time never mixes sources.** `gpu_activity.kernel_activity`
 uses device-measured kernels when the trace has any, otherwise
@@ -614,7 +719,10 @@ reports which source it used and how many kernel spans it left out.
 `host_without_device` (a submission whose device record never arrived
 while native tracing was producing records -- e.g. dropped),
 `dropped`, `notime` (records without timestamps from the at-exit forced
-flush), `bad_records`, and `timing` (`device`, `proxy`, `device+proxy`).
+flush), `bad_records`, `precedes_submission`, `clock_corrected_spans` and
+`clock_correction_max_ns` (the device-clock correction above; above 10 µs
+it is also a capture warning), and `timing` (`device`, `proxy`,
+`device+proxy`).
 `hprofiler summary` prints it; the GUI Inspector shows per-span provenance
 ("Device timing: measured on the device (cupti)" vs. "estimated").
 
@@ -790,7 +898,7 @@ buffer-transfer timestamps via event callbacks, and emits `jit` spans for
 | `clCreateCommandQueue` / `clCreateCommandQueueWithProperties` | — | Forces `CL_QUEUE_PROFILING_ENABLE` on every queue |
 | `clEnqueueNDRangeKernel` | `opencl` | GPU-side kernel duration from `CL_PROFILING_COMMAND_START/END` |
 | `clEnqueueReadBuffer` / `clEnqueueWriteBuffer` / `clEnqueueSVMMemcpy` | `memory` | Buffer/SVM transfer timing (GPU-accurate when non-blocking; see below) |
-| `clBuildProgram` / `clCompileProgram` | `jit` | JIT compile time; `clBuildProgram` also extracts the compiled binary for disassembly |
+| `clBuildProgram` / `clCompileProgram` / `clLinkProgram` | `jit` | JIT compile time, `stage=source` (from OpenCL C) or `backend` (IL/binary); `clBuildProgram` and `clLinkProgram` also extract the compiled binary for disassembly |
 | `clCreateBuffer` / `clReleaseMemObject` | `memory` | Allocation spans and the `opencl_memory_bytes` counter (live buffer bytes) |
 | `dlopen` / `dlsym` | `jit`, `opencl` | ACPP SSCP `.jit.so` CPU kernels, which never go through an enqueue call: a `jit` span per loaded module and an `opencl` span (`type=jit_kernel,side=cpu`) per kernel call via a trampoline (up to 256 kernels) |
 | `clFinish` / `clWaitForEvents` | `sync` | Host-side synchronisation barriers |
@@ -799,7 +907,16 @@ buffer-transfer timestamps via event callbacks, and emits `jit` spans for
 `clEnqueueNDRangeKernel` call produces a CPU-side span (`type=kernel,
 side=cpu` — enqueue/scheduling latency) and a GPU-side span (`type=kernel,
 side=gpu` — the real execution time, from the async completion callback),
-both category `opencl`, distinguished by `side=`. A memory transfer
+both category `opencl`, distinguished by `side=`, and named by the kernel's
+full name (`clGetKernelInfo` is asked for its size first, so names of any
+length come back whole). Both carry `mod=`, the id of the program binary
+built for the queue's device that the kernel ran (`CL_KERNEL_PROGRAM`,
+`CL_QUEUE_DEVICE`; [Module identity](#module-identity-which-code-a-launch-ran)).
+`clFinish` can return before the driver thread has run a finished command's
+completion callback, so at exit the hook waits for the callbacks still
+pending (at most 2 s) -- a program's last kernels used to lose their device
+span when it exited right after them under load.
+A memory transfer
 (`clEnqueueReadBuffer`/`WriteBuffer`/`SVMMemcpy`) emits only **one**: for a
 **blocking** call the CPU-side span alone already spans the full transfer
 (the call doesn't return until it's done), so the GPU-event callback isn't
@@ -808,9 +925,14 @@ instead, giving GPU-accurate timing. Either way there's exactly one span
 per transfer, never both.
 
 **JIT binary extraction for disassembly:** After every successful `clBuildProgram`
-call the hook calls `clGetProgramInfo(CL_PROGRAM_BINARIES)` to retrieve the
-compiled binary. The binary is saved to `/tmp/hprofiler_ocl_<pid>_<n>.bin` and
-a `jit_load` span is emitted so the disassembly extractor picks it up.
+(and `clLinkProgram` without a callback) the hook calls
+`clGetProgramInfo(CL_PROGRAM_BINARIES)` to retrieve the compiled binary of
+each device. An ELF binary is saved to `/tmp/hprofiler_ocl_<pid>_<n>.bin` and
+a `jit_load` span (`stage=load,path=,mod=`) is emitted so the disassembly
+extractor picks it up; a non-ELF (GPU ISA) binary is not saved but still
+gets a module id for its launches. A build with a completion callback may
+still be running when the call returns; its binary is then not available
+and its launches carry no `mod=`.
 
 - **ACPP SSCP / POCL:** the binary is a standard ELF relocatable — `objdump`
   reads it directly.
@@ -858,8 +980,13 @@ exported at all on Ubuntu 24.04/GCC 13). Registered callbacks:
 | `ompt_callback_implicit_task` | `openmp` | `omp_implicit_task` spans — each thread's own share of a region (`type=implicit_task`, `index=`, `psid=` region id); the initial task is skipped |
 | `ompt_callback_work` | `openmp` | `omp_loop`, `omp_sections`, `omp_taskloop`, etc. |
 | `ompt_callback_task_create` | `openmp` | `omp_task_create` spans (one per `#pragma omp task`) |
-| `ompt_callback_task_schedule` | `openmp` | `omp_task` execution spans (start → complete/yield) |
+| `ompt_callback_task_schedule` | `openmp` | `omp_task`: explicit tasks only (ids from `ompt_callback_task_create`; an implicit task's time is `omp_implicit_task`). One span per execution fragment on its thread: a fragment that ends in a suspension (`taskyield`, a task switch at `taskwait` or another scheduling point) carries `fragment=1`, the last one the status that ended it (`status=1` complete). So the `omp_task` spans without `fragment=1` are the tasks executed, one each, and a task's fragments (same `id=`) add up to its execution time, the tasks it waited for not included |
 | `ompt_callback_sync_region` | `sync` | Barriers, `taskwait`, `taskgroup` |
+| `ompt_callback_mutex_acquire` / `_acquired` / `_released` | `sync` + `openmp` | Critical sections: `omp_critical_wait` (acquire → acquired) + `omp_critical_hold` (acquired → released); locks (`omp_set_lock`, nest locks: `nest=1`): `omp_lock_wait` + `omp_lock_hold`; a successful `omp_test_lock`: `omp_lock_hold` (`test=1`) only; `ordered`: `omp_ordered_wait` + `omp_ordered`. Tags `mutex=`, `wait_id=` (the mutex), call site. Atomics are not recorded (one callback per update would dominate what is measured) |
+| `ompt_callback_nest_lock` | `openmp` | `omp_nest_lock` instant (`endpoint=begin|end`): a nest lock re-acquired / partly released by its owner |
+| `ompt_callback_lock_init` / `_destroy` | `openmp` | `omp_lock_init` / `omp_lock_destroy` instants (`wait_id=`, `nest=1`) |
+| `ompt_callback_dependences` | `openmp` | `omp_task_dependences` instant per task created with `depend` clauses (`task=` id as in `omp_task_create`'s `id=`, `ndeps=`, `in=`/`out=`/`inout=`/`other=`) |
+| `ompt_callback_task_dependence` | `openmp` | `omp_task_dependence` instant (`src=`, `sink=` task ids): the runtime made `sink` wait for `src` |
 | `ompt_callback_target begin/end` | `openmp` | GPU offload spans |
 
 **Note on task callbacks:** `task_create` and `task_schedule` use enum values 5 and 6 per the OpenMP 5.0 specification. `task_create` is called from user-code context so call-tree capture works for it. `task_schedule` is called from the runtime worker thread, so its call stack does not include `main` even with `--call-tree`.
@@ -934,11 +1061,30 @@ bug. `schedule(dynamic)`/`schedule(guided)`/`schedule(runtime)` — which
 inherently require runtime dispatch, unlike static — are unaffected and
 fully captured.
 
-**Not covered:** `GOMP_task`/`GOMP_taskwait` (the
-task ABI has changed more across GCC versions than the constructs above;
-getting a calling-convention wrong risks crashing the profiled program,
-and this was not verified against a specific enough range of GCC
-versions to risk it), `sections`, `doacross`, `target` offload, and the
+**Tasks** (`GOMP_task`, the 10-argument signature of GCC 11 and later;
+older libgomp versions take fewer arguments and ignore the rest):
+`omp_task_create` (zero-length, `id=`, `team=`, `undeferred=1` for
+`if(0)`, `depend=1`) and `omp_task` — the task's execution, on the thread
+that ran it. libgomp copies a task's arguments (the compiler's copy
+function, or a `memcpy` of `arg_size` bytes) and later calls its body on the
+copy; the hook hands libgomp its own body and copier instead, which build
+the copy as a header (the real body, the task id) followed by the real
+arguments, made by the real copier — so the real body runs on exactly the
+arguments it would have had, and is timed. `GOMP_taskwait` /
+`GOMP_taskwait_depend`: `omp_taskwait` (`sync`); `GOMP_taskgroup_start` …
+`_end`: `omp_taskgroup` (`sync`, the end waits for the group's tasks).
+
+**Locks** (`omp_set_lock`, `omp_unset_lock`, `omp_test_lock` and the nest
+variants): `omp_lock_wait` (`sync`: the `omp_set_*lock` call, for an
+acquisition the thread does not already own) and `omp_lock_hold`
+(`openmp`: from the acquisition — or a successful test, `test=1` — to the
+release that frees it; a nest lock: its outermost level, `nest=1`); the
+same names as the OMPT mutex callbacks. Tasks and locks are recorded only
+when the real function is libgomp's: libomp exports the same symbols, and
+under libomp its OMPT callbacks already report them.
+
+**Not covered:** `taskloop`, `sections`, `doacross` and `ordered`,
+`target` offload, the Fortran lock API (`omp_set_lock_`, ...), and the
 legacy split `GOMP_parallel_start`/`_end` ABI (superseded by combined
 `GOMP_parallel` since GCC 4.9).
 
@@ -967,11 +1113,21 @@ all NCCL symbols at runtime via `dlsym(RTLD_NEXT, ...)`.
 | `ncclSend` | `type=send,peer=N` | Point-to-point send |
 | `ncclRecv` | `type=recv,peer=N` | Point-to-point receive |
 | `ncclGroupStart` / `ncclGroupEnd` | `type=group` | Group-operation boundary span |
-| `ncclCommInitRank` / `ncclCommInitAll` / `ncclCommDestroy` | `type=comm_init` / `comm_init_all` / `comm_destroy` | Communicator lifecycle, host time (`rank=`/`nranks=`, `ndev=`) |
+| `ncclCommInitRank` / `ncclCommInitRankConfig` / `ncclCommInitAll` / `ncclCommSplit` / `ncclCommDestroy` | `type=comm_init` / `comm_init_all` / `comm_split` / `comm_destroy` | Communicator lifecycle, host time (`rank=`/`nranks=`, `ndev=`, `color=`) |
+| `ncclCommAbort` | — | Not recorded; forgets the communicator's id |
 
 Every operation span carries `bytes=N` (count × dtype size), `stream=ID`,
 `rank=` and `nranks=` (from `ncclCommUserRank`/`ncclCommCount`, `-1` when
-unavailable), and `root=` for broadcast/reduce. A span
+unavailable), and `root=` for broadcast/reduce. **`commid=`** names the
+communicator identically on every rank — the hash of the `ncclUniqueId`
+all ranks passed to `ncclCommInitRank[Config]`; for `ncclCommSplit` the
+hash of the parent's id and the color; for `ncclCommInitAll`, of this
+process and call — and collectives add **`seq=`**, the call's number on its
+communicator. NCCL requires every rank to issue a communicator's
+collectives in the same order, so (`commid`, `seq`) is the same call on
+every rank; the critical path groups collectives by it. A communicator
+created before the hook was loaded, or with an unwrapped API, has neither
+tag. A span
 whose duration came from CPU wall-clock timing rather than a synced GPU
 event pair (event creation/recording/sync failed) additionally carries
 `timing=cpu`, so a degraded measurement is never silently indistinguishable
@@ -1016,17 +1172,79 @@ too.
 
 | Category | Functions |
 |----------|----------|
-| Point-to-point | `MPI_Send`, `MPI_Recv`, `MPI_Isend`, `MPI_Irecv`, `MPI_Ssend`, `MPI_Bsend`, `MPI_Wait`, `MPI_Waitall`, `MPI_Waitany`, `MPI_Waitsome`, `MPI_Test`, `MPI_Testany`, `MPI_Testsome`, `MPI_Testall`, `MPI_Cancel` |
-| Non-blocking collectives | `MPI_Ibcast`, `MPI_Iallreduce`, `MPI_Ireduce`, `MPI_Iallgather`, `MPI_Ialltoall`, `MPI_Iscatter`, `MPI_Igather` |
-| Persistent requests | `MPI_Send_init`, `MPI_Recv_init`, `MPI_Start`, `MPI_Startall` |
-| Collectives | `MPI_Bcast`, `MPI_Reduce`, `MPI_Allreduce`, `MPI_Alltoall`, `MPI_Allgather`, `MPI_Scatter`, `MPI_Gather`, `MPI_Barrier`, `MPI_Scan`, `MPI_Exscan` |
+| Point-to-point | `MPI_Send`, `MPI_Ssend`, `MPI_Bsend`, `MPI_Rsend`, `MPI_Recv`, `MPI_Isend`, `MPI_Issend`, `MPI_Ibsend`, `MPI_Irsend`, `MPI_Irecv`, `MPI_Sendrecv`, `MPI_Sendrecv_replace`, `MPI_Probe`, `MPI_Iprobe`, `MPI_Wait`, `MPI_Waitall`, `MPI_Waitany`, `MPI_Waitsome`, `MPI_Test`, `MPI_Testany`, `MPI_Testsome`, `MPI_Testall`, `MPI_Cancel`; `MPI_Mprobe`, `MPI_Improbe`, `MPI_Mrecv`, `MPI_Imrecv` as instants (their messages are not paired) |
+| Non-blocking collectives | `MPI_Ibarrier`, `MPI_Ibcast`, `MPI_Iallreduce`, `MPI_Ireduce`, `MPI_Iallgather`, `MPI_Ialltoall`, `MPI_Iscatter`, `MPI_Igather` |
+| Persistent requests | `MPI_Send_init`, `MPI_Bsend_init`, `MPI_Ssend_init`, `MPI_Rsend_init`, `MPI_Recv_init` (with `commid=`; their messages are not paired), `MPI_Start`, `MPI_Startall` |
+| Collectives | `MPI_Bcast`, `MPI_Reduce`, `MPI_Allreduce`, `MPI_Alltoall`, `MPI_Allgather`, `MPI_Scatter`, `MPI_Gather`, `MPI_Allgatherv`, `MPI_Alltoallv`, `MPI_Gatherv`, `MPI_Scatterv`, `MPI_Reduce_scatter`, `MPI_Reduce_scatter_block`, `MPI_Barrier`, `MPI_Scan`, `MPI_Exscan` |
 | One-sided | `MPI_Put`, `MPI_Get`, `MPI_Accumulate`, `MPI_Win_fence`, `MPI_Win_flush`, `MPI_Win_flush_all`, `MPI_Win_lock`, `MPI_Win_lock_all`, `MPI_Win_unlock`, `MPI_Win_unlock_all` |
 | Lifecycle | `MPI_Init`, `MPI_Init_thread`, `MPI_Finalize` |
-| Communicators | `MPI_Comm_dup`, `MPI_Comm_split`, `MPI_Comm_create` (hooked only to assign `commid=`, see below) |
+| Communicators | `MPI_Comm_dup`, `MPI_Comm_split`, `MPI_Comm_create`, `MPI_Comm_free` (hooked only for `commid=` and rank translation, see below) |
+
+**Not wrapped** (calls to them are not recorded, and messages they carry
+get no dependency edge): the `v`/`w` variants of the non-blocking and
+neighborhood collectives (`MPI_Iallgatherv`, `MPI_Ialltoallw`,
+`MPI_Neighbor_*`, ...), `MPI_Iscan`/`MPI_Iexscan`, `MPI_Ireduce_scatter*`,
+the MPI-4 `MPI_Isendrecv`, partitioned and large-count (`_c`) functions,
+and every other one-sided call (`MPI_Rput`, `MPI_Get_accumulate`,
+`MPI_Fetch_and_op`, `MPI_Compare_and_swap`,
+`MPI_Win_post`/`start`/`complete`/`wait`).
+
+**Capture coverage:** at `MPI_Init` each rank emits two counters,
+`mpi_version` (the runtime's, major×100+minor) and
+`mpi_p2p_capture_complete`: 1 when every point-to-point send and receive
+call of that MPI version is wrapped or recorded as a marker (MPI 3.x), 0 on
+an MPI-4 runtime (its large-count, partitioned and `MPI_Isendrecv` calls
+are not wrapped). The opt-in exact
+matching rule ([Edge confidence](#edge-confidence-how-directly-each-dependency-is-proven)) relies on it.
 
 Every span is in category `mpi` and carries `type=<call>`, `bytes=N`
-(count × datatype size), `rank=<own rank>`, and where applicable `peer=<rank>`,
-`tag=N`, and `commid=<N>`.
+(count × datatype size; the `v` collectives sum their counts),
+`rank=<MPI_COMM_WORLD rank>`, and where applicable `peer=<rank>`, `tag=N`
+and `commid=<N>`.
+
+**Ranks:** `peer=` is the peer's rank *in the call's communicator*, as the
+program passed it; `wpeer=` is the same process's `MPI_COMM_WORLD` rank
+(translated with `MPI_Comm_group` + `MPI_Group_translate_ranks`, cached per
+communicator and dropped at `MPI_Comm_free`; for an intercommunicator the
+remote group is used). A receive resolved at completion carries `rwpeer=`
+(single) or `rwmatches=<req_id>/<world src>;...` (multiple). `null=1` marks
+`MPI_PROC_NULL` (no message, no edge). The critical path pairs messages on
+(sender world rank, receiver world rank, tag, `commid`), so messages on
+sub-communicators with renumbered ranks and on concurrent duplicates of one
+communicator pair correctly. A trace without `wpeer=` (older hook) falls
+back to the former (rank, peer, tag) key, which is correct on
+`MPI_COMM_WORLD` only, and a warning says so once.
+
+**Statuses:** a status or status array the program passes goes to `PMPI_*`
+unchanged, so the program sees exactly what the library writes
+(`MPI_SOURCE`, `MPI_TAG`, per-request `MPI_ERROR` under
+`MPI_ERR_IN_STATUS`, the cancelled flag) for every completion call
+(`Wait*`, `Test*`, `Recv`, `Sendrecv*`, `Probe`/`Iprobe`). Only when the
+program passes `MPI_STATUS_IGNORE`/`MPI_STATUSES_IGNORE` and the hook
+needs a status (a wildcard receive's matched source, or a request with
+`MPI_Cancel` pending) does it pass its own buffer, invisible to the
+program; in that case only, a failing request makes the call return
+`MPI_ERR_IN_STATUS`, the value the library returns when given statuses.
+
+**Cancellation:** every completion call checks `MPI_Test_cancelled` for
+requests with `MPI_Cancel` pending. A cancelled request is reported as
+`cancelled=1` (single completion) or in `cpsid=<id;...>` (multiple), with
+no `rpeer=`/`rtag=`/`rmatches=` entry, and the critical path never pairs a
+message with it.
+
+**`MPI_Sendrecv` / `MPI_Sendrecv_replace`** emit two spans: a zero-length
+`MPI_Sendrecv.send` (`type=send,op=sendrecv`) at the call's start for the
+outgoing message, and `MPI_Sendrecv` (`type=recv,op=sendrecv`) for the whole
+call — what it waited for. Two spans keep the dependency graph acyclic when
+two ranks exchange with each other. **Probes:** `MPI_Probe` is a span and
+`MPI_Iprobe` an instant (`flag=`), both with the probed `rpeer=`/`rtag=`
+(`rwpeer=`); they create no edges. **`MPI_Rsend`/`MPI_Issend`** are sends
+like `MPI_Send`/`MPI_Isend` (`type=rsend`/`issend`); **`MPI_Ibarrier`** is a
+non-blocking collective whose completing `Wait*` links back to it.
+
+**Request ids** (`sid=`, `psid=`) are unique per process and lie in the
+MPI hook's own id space, never equal to another hook's span id
+([Span ids](#span-ids)); analyses key requests by (process, id).
 
 **One-sided (RMA) completion tracking:** the MPI standard permits an
 implementation to let `MPI_Put`/`MPI_Get`/`MPI_Accumulate` return before the
@@ -1067,10 +1285,14 @@ appears on whichever call later observes completion:
 |------|---------------------|
 | `MPI_Recv` | `peer=`/`tag=` in the span itself are the *resolved* values, plus `wildcard=1` |
 | `MPI_Wait` | `rpeer=`/`rtag=` (only present if the awaited request was a wildcard recv) |
-| `MPI_Waitall` | `rmatches=<req_id>/<peer>/<tag>;...` — one entry per wildcard request that completed |
-| `MPI_Waitany` | `completed_index=`, plus `rpeer=`/`rtag=` if that one request was a wildcard |
-| `MPI_Waitsome` | `rmatches=` list, same format as `MPI_Waitall` |
-| `MPI_Test` / `MPI_Testany` | `flag=0` (checked, not ready — itself a real causal signal, not silence) or `flag=1` with `rpeer=`/`rtag=` |
+| `MPI_Waitall` | `rmatches=<req_id>/<peer>/<tag>;...` — one entry per wildcard request that completed — and `rwmatches=<req_id>/<world peer>;...` |
+| `MPI_Waitany` | `completed_index=`, plus `rpeer=`/`rtag=`/`rwpeer=` if that one request was a wildcard |
+| `MPI_Waitsome` | `rmatches=`/`rwmatches=` lists, same format as `MPI_Waitall` |
+| `MPI_Test` / `MPI_Testany` | `flag=0` (checked, not ready — itself a real causal signal, not silence) or `flag=1` with `rpeer=`/`rtag=`/`rwpeer=` |
+| `MPI_Testsome` / `MPI_Testall` | the completed requests' `psid=` and `rmatches=`/`rwmatches=` lists (`flag=` on `MPI_Testall`) |
+
+An *exact* receive needs no resolution: its `MPI_Recv`/`MPI_Irecv` span
+already carries the source's world rank (`wpeer=`).
 
 `rmatches=` entries use `/` (not `:`) between `req_id`, `peer`, and `tag` —
 tag *values* must never contain a colon, since the wire parser
@@ -1097,8 +1319,10 @@ cannot collide on the same id even though each starts counting from 1
 independently (see `comm_id_register()` in `mpi_hook.c`). `commid=-1` means
 "unregistered": `MPI_COMM_SELF` or a communicator created via an API this
 hook doesn't intercept (`MPI_Comm_create_group`, `MPI_Cart_create`,
-`MPI_Intercomm_create`, …) — matching for those falls back to the
-call-order-only heuristic.
+`MPI_Intercomm_create`, …). Messages on such communicators are still paired
+on world ranks and tag, but under the one id `-1`: two unregistered
+communicators between the same ranks with the same tag cannot be told
+apart.
 
 **Build and use:** `hprofiler build` builds the library when MPI is found
 (CMake target `hprofiler_mpi`); `hprofiler run --backend mpi` preloads it.
@@ -1275,7 +1499,13 @@ target (built without GPU backend support).
 ACPP_VISIBILITY_MASK=omp hprofiler run --backend openmp -- ./acpp_omp_program
 ```
 
-ACPP maps SYCL kernels to `#pragma omp parallel for` in its runtime library.
+Kernels run through the `.jit.so` files ACPP SSCP generates: the OpenCL
+hook copies each one at `dlopen` (module id = hash of the copy) and wraps
+the kernel symbols looked up with `dlsym`, so every call is an `opencl`
+span (`type=jit_kernel,side=cpu,mod=`) named by its kernel — the short name
+for `ZZ<len><name>` symbols, otherwise the whole symbol (templated kernels
+in one function share every prefix). ACPP maps SYCL kernels to `#pragma omp
+parallel for` in its runtime library.
 You will see `parallel_region` and `omp_loop` spans. The Source tab shows the
 ACPP runtime's OMP dispatch function (resolved via a VMA cache built from
 `/proc/self/maps` — the cache is populated once and reused across all callbacks
@@ -1296,8 +1526,10 @@ spans. After each successful build the hook extracts the compiled binary via
 **ACPP SSCP generic target:** ACPP compiles each SYCL lambda to a separate
 `clBuildProgram` call. Five kernels produce five `.bin` files, each containing
 one ACPP kernel symbol (`_Z18__acpp_sscp_kernel...`). The disasm extractor
-uses `nm` to find the symbol and `objdump` to disassemble it, then
-`_acpp_kernel_short()` produces a readable short name (e.g.
+uses `nm` to find, in each binary, the kernels launched from it (their
+spans carry the binary's `mod=`) and `objdump` to disassemble them, under
+the launches' own name; for a binary no launch names (older hooks), the
+first function, named by `_acpp_kernel_short()` (e.g.
 `curvilinear4sg_ci::$_0`).
 
 **Intel CPU OCL (`libintelocl.so`):** The Intel driver returns a proprietary
@@ -1324,6 +1556,66 @@ This combination gives you:
 - **Per-kernel disassembly** (x86-64 assembly extracted from `clGetProgramInfo`)
 - **CPU sampling** (which CPU functions are hot during kernel execution)
 - **Instruction heat** (per-instruction sample % for the JIT-compiled kernel body)
+
+#### What the jit spans cover
+
+Every jit span carries `stage=`, and the text summary totals them by stage
+("JIT spans by stage", `src/analysis/jit_coverage.py`):
+
+| `stage=` | Spans | What it is |
+|---|---|---|
+| `frontend` | `nvrtcCompileProgram`, `hiprtcCompileProgram`; `triton_jit_compile` (with `--python-jit`) | Source → PTX / code object inside the program |
+| `runtime` | `acpp_jit_compile` | AdaptiveCpp SSCP stage 2: the runtime lowers the kernel's LLVM IR to SPIR-V, PTX, AMDGCN or a host `.jit.so`, before any driver call |
+| `source` | `clBuildProgram`, `clCompileProgram` on a program created from OpenCL C | The driver's whole build, front and back end |
+| `backend` | `cuModuleLoadData*`, `hipModuleLoadData*`, `clBuildProgram` on IL (SPIR-V) or binaries, `clLinkProgram` | Driver compilation / load of IR, PTX or code objects |
+| `load` | `.jit.so` `dlopen`, saved program binaries (`ocl_kernel.bin`), `__hipRegisterFatBinary` | Ready-made code, no compilation |
+| `build` | OpenCL builds in traces recorded before `stage=` | Source or IL unknown |
+
+**AdaptiveCpp stage 2** (`hooks/common/hp_acpp.h`, in the OpenCL, CUDA and
+ROCm hooks): every AdaptiveCpp backend compiles a kernel through
+`kernel_cache::get_or_construct_jit_code_object`, which asks the persistent
+on-disk cache (`persistent_cache_lookup`), compiles on a miss and stores the
+result (`persistent_cache_store`). Both are exported members of
+`libacpp-rt.so` that the backend libraries (loaded with `dlopen(RTLD_NOW)`,
+no `RTLD_DEEPBIND`) call through the PLT, so the hooks interpose them. A
+miss followed by its store on the same thread is the span `acpp_jit_compile`
+(`type=jit_compile,stage=runtime,cache=miss,id=<binary id>,bytes=`); a hit
+is the instant `acpp_jit_cache` (`cache=hit`, no compilation). The real
+functions are resolved inside `libacpp-rt.so` itself, so with several
+hooks preloaded nothing is counted twice. Checked with counters on
+BabelStream SYCL: 8 compile spans cold and none warm (8 cache hits) on the
+OpenMP and OpenCL backends, 7 on CUDA (7 modules); the JIT studies cover
+the measured cold−warm cost to 0.99–1.16. A runtime that lowers its own IR
+in no hooked call (Numba, ...; Triton without `--python-jit`) is still in
+no span.
+
+**Triton** (`hprofiler run --python-jit`, also on `exec`): Triton compiles
+a kernel at its first launch -- Python → TTIR → TTGIR → LLIR → PTX → ptxas
+→ cubin -- in Python and its own libraries; only the final
+`cuModuleLoadData` is hooked. With the flag, `src/instrument/pysite/` is put
+first on `PYTHONPATH`: its `sitecustomize` runs the program's own
+`sitecustomize` (the next one on the path) and, when the program imports
+`triton`, registers a `triton.knobs.compilation.listener`, chained to a
+listener the program set before (one it sets later replaces it). Each
+compile is a span `triton_jit_compile` (`stage=frontend,cache=miss,
+cache_hit=0,hash=<kernel hash>,kernel=<name>`, the stage durations as
+`ir_init_ns=`, `ttir_ns=`, `ttgir_ns=`, `llir_ns=`, `ptx_ns=`, `cubin_ns=`,
+`store_ns=` and their order as `stages=ttir/ttgir/...`), ending when Triton
+called the listener (right after its timer stopped) on CLOCK_MONOTONIC; a
+cache hit is an instant `triton_jit_cache` (`cache_hit=1,lookup_ns=`).
+Records reach the collector over `HPROFILER_SOCKET` like a hook's (one
+connection per process, ended by a final transport status, hook `pyjit`).
+Checked on the MX550 with Triton 3.6: a cold vector add records a 274 ms
+`triton_jit_compile` (and its launches the cubin's `mod=`), a warm one one
+`triton_jit_cache` and no front-end span. Programs that are not Python, or
+do not import Triton, are untouched.
+
+When a trace has back-end or load spans but no front-end or runtime ones,
+the summary says so: either everything came from a persistent cache (a
+warm run) or a runtime compiled in no hooked call, so the jit totals are
+not the program's JIT cost. NVRTC/HIPRTC calls are seen only when the
+program calls the libraries' exported symbols (not through a handle of
+its own from `dlopen`/`dlsym`).
 
 ---
 
@@ -1684,9 +1976,13 @@ annotation, and static optimization hints. `j`/`k` (or `↑`/`↓`) select a
 kernel in the left pane.
 
 **Left pane** — kernel list:
-- `✓` prefix when disassembly is available
+- `✓` prefix when disassembly is available, `~` when it was matched by
+  kernel name only — the header then says why the code may not be what
+  ran ([Module identity](#module-identity-which-code-a-launch-ran))
+- a kernel defined by several captured modules is followed by one row per
+  module, `name @<module id>`, each with its own code and launch count
 - **Arch** column: `ptx`, `sass`, `amdgcn`, `x86-64`, `aarch64`, `rv64`, or `—` while loading
-- **Total** — cumulative profiled time
+- **Total** — cumulative profiled time (a module row: its launch count)
 
 **Right pane** — annotated assembly, color-coded by instruction type:
 
@@ -1879,7 +2175,7 @@ convention throughout.
 | 2 | Timeline | Real vector Gantt view, not character cells — see Timeline exploration below for filtering/grouping/search/bookmarks, all GUI-only |
 | 3 | Kernels | Same aggregated stats as a sortable/filterable/exportable table — see Tables below |
 | 4 | Call Tree | Same stack-frame tree, proportional-width tree rows instead of ASCII indentation, plus a text filter (keeps ancestors of a match, not a flat hide) and per-level sort |
-| 5 | Flame Graph | Same tree as Call Tree (same `_ct_build` call, via `analysis/flamegraph_tree.py`), rendered as a Canvas-drawn proportional icicle chart instead of character-cell blocks — same interaction model as the TUI's Flame Graph tab |
+| 5 | Flame Graph | Same tree as Call Tree (same `_ct_build` call, via `analysis/flamegraph_tree.py`), rendered as a Canvas-drawn proportional icicle chart instead of character-cell blocks — same interaction model as the TUI's Flame Graph tab. The total reaches QML as a number (`FlameGraph.totalNs`): as a Qt int it overflowed past 2.1 s and the header and empty state broke |
 | 6 | Roofline | Canvas-drawn scatter instead of a Plotly-rendered static image |
 | 7 | Source | Same per-kernel disassembly, plus a third panel (see below) not present in the TUI |
 | 8 | System | Same hardware info as sortable tables for devices and CPU metrics (unavailable metrics show *why*, e.g. "no PMU counters captured", instead of silently vanishing) |
@@ -1898,8 +2194,8 @@ same hue as on the sync lane, so the rows still correlate); work that ran
 again. Zoomed out (occupancy bins), each column's busy share is the lane's
 occupancy minus the wait occupancy (`tests/test_gui_timeline_waits.py`
 checks the rendered pixels). A
-legend ("waiting (barrier / lock), not working") appears in the status row
-when at least one lane has this pairing. The TUI does the same ([Terminal UI](#terminal-ui)).
+legend ("waiting (barrier / lock), not working") appears in the second
+toolbar row (with the bookmarks) when at least one lane has this pairing. The TUI does the same ([Terminal UI](#terminal-ui)).
 
 **Source tab, GUI-specific addition:** a third panel (kernel list |
 assembly+source | mix+analysis) beyond what the TUI's Source tab shows —
@@ -1908,7 +2204,8 @@ instruction-type mix breakdown (vector/memory/branch/etc. percentages,
 (`analysis/asm_advisor.py`'s `advise()` — the same deterministic,
 threshold-based advisor described in [Disassembly](#disassembly)) rendered
 side-by-side with the assembly instead of requiring a separate summary
-view.
+view. Module variants and name-only matches are listed and flagged as in
+the TUI (`~`, `name @<module id>` rows, a warning line above the code).
 
 #### Timeline exploration
 
@@ -1919,7 +2216,12 @@ answer is those exact spans (an indexed window query against the trace
 store, [Trace store](#trace-store)). Otherwise it is one occupancy value per pixel column from the
 multiresolution activity index built at finalization (union busy time per
 bin, so overlapping spans never read as more than 100%), painted as bars —
-zoomed-out views never create one object per event. Zooming in until the
+zoomed-out views never create one object per event. A column is resampled
+from the index's finest level that still has at most one bin per column:
+busy time is assumed uniform inside a source bin, so a bin straddling a
+column edge leaks into the next column, and the coarsest level (the old
+choice, bins up to a column wide) showed idle columns as busy until zooming
+in switched the lane to exact spans. Zooming in until the
 window holds few enough spans switches the lane back to exact, hoverable
 spans. With event-level filters active (name, duration, bucket, range),
 occupancy is binned from the filtered window instead, since the
@@ -1959,8 +2261,30 @@ with more lanes than fit the window), the Timeline tab supports:
   query; at most 10,000 matches are collected) rather than a linear scan
   of every span held in memory. Matches are outlined on the Canvas; ◂/▸ step
   through them (wrapping), recentering the view at the *current* zoom
-  level (search stepping never also changes zoom) and scrolling the
-  matched row into view.
+  level (search stepping never also changes zoom), scrolling the
+  matched row into view and pointing the hover tooltip at the match.
+- **Spans cut by the view's edges** are drawn from where the view starts
+  to where the span ends. A span that began left of the view used to keep
+  its full width from x = 0: an `MPI_Barrier` ending 7% into a Comb window
+  filled the whole lane, and the busy region grew or shrank as zoom and pan
+  moved the span's start on or off screen.
+- **Hover**: the span under the cursor -- name, start, duration -- in a
+  tooltip beside the cursor (`Tooltip.qml`, as in the Flame Graph tab). It
+  floats over the lanes, and the two toolbar rows shrink to the screen
+  (their texts elide), so neither hovering nor the window width changes
+  the lanes' width. The detail used to be a label in the status row: that
+  row was already wider than a 1280 px window, the lanes were widened to
+  match (running under the Inspector), and every hover widened them
+  further, so the timeline jumped under the cursor.
+- **Span ids in QML**: a span is addressed by its store event id
+  (`spanIdx`, `(shard << 38) | row` -- past 2^31 for every span of a disk
+  store), so QML holds it as a number, never an `int` (which kept only the
+  row: clicking a span selected nothing, double-click zoom did nothing),
+  and the slots taking one declare it `float`. The hovered span's MPI/NCCL
+  connectors come from `TimelineModel.connectorsOf(lane, spanIdx)`, an
+  index built once: the overlay used to read the whole `connectors` list,
+  which QML re-read from Python on each element access (minutes per hover
+  on an OSU multi-pair bandwidth trace with 44k connectors).
 - **Color mode** (the "Color" button in `TimelineViewControls.qml`):
   cycles function-name coloring (the default, stable per-function hash)
   with activity-bucket coloring (`BucketLegend.qml` appears alongside)
@@ -2128,6 +2452,34 @@ tools can see them.
 **What persists between sessions** — see the note at the end of Timeline
 exploration above: window geometry, theme, legend state, dismissed tips and
 table layouts globally; Timeline view state per profile.
+
+#### Colours and themes
+
+Every colour comes from `src/gui/theme.py` (a test bans hex literals in the
+QML), in a dark and a light variant; the ☀/☾ button switches them in place.
+
+- **Controls** (buttons, tabs, menus, check boxes, text fields, tool tips,
+  dialogs) use the palette `Main.qml` sets from the theme, with the
+  Fusion style (`app.py`; an explicit `QT_QUICK_CONTROLS_STYLE` is kept).
+  Without it they took the desktop's palette: on a light desktop the
+  toolbar buttons were near-black on the dark background (about 1.1:1)
+  under light tab and menu bars. Disabled controls use `textDisabled`:
+  dimmer, still at least 3:1.
+- **Following a toggle**: QML colours a category, severity, bucket,
+  instruction type, roofline bound or connector confidence at draw time
+  with `AppTheme.<kind>Color(key, AppTheme.dark)` -- passing the theme makes
+  the binding re-evaluate (a slot call alone does not), and canvases
+  repaint on `AppTheme.themeChanged`. The Timeline's model recomputes its
+  lane, bucket, category and connector colours and emits `colorsChanged`.
+  Before, these kept the colours of the theme the window opened in (the
+  dark theme's near-white `sync` label on white). The bridges' `"color"`
+  fields remain as data, but no screen paints with them.
+- **Legibility** (`tests/test_gui_bridge.py`): instruction types and
+  connectors at least 4.5:1 and categories and advice at least 3:1 on
+  either theme's background and surface. The Source tab's instruction and
+  advice colours used to be dark-theme values in every theme (amber or cyan
+  text, about 1.7:1 on white). The GUI test measures every visible
+  control's text from rendered pixels in both themes (at least 3:1).
 
 ### Text summary
 
@@ -2417,7 +2769,7 @@ synchronization semantics:
 
 | Edge kind | Meaning | Source |
 |---|---|---|
-| Program order | Sequential spans on the same OS thread | Timestamps only |
+| Program order | Sequential spans on the same OS thread (annotation ranges excluded, see below) | Timestamps only |
 | Stream order | Sequential CUDA/ROCm spans on the same `stream=N` | `stream=` tag |
 | Device sync | `cudaDeviceSynchronize`/`hipDeviceSynchronize` depends on every GPU span since the last device sync on that process | Category/name matching |
 | Point-to-point | The Nth send-side event pairs with the Nth matching receive-side event for a given `(rank, peer, tag)` key, in each side's own post/arrival order — **not** "whichever send had already started" (MPI guarantees FIFO delivery per ordered pair+tag, so this holds regardless of which span starts first; a recv is commonly posted well before its matching send, to overlap communication setup with compute). Covers both blocking `MPI_Send`/`MPI_Recv` and non-blocking `MPI_Isend`/`MPI_Irecv` — for the latter, the edge lands on whichever call actually observes completion (`MPI_Wait`/`Waitall`/`Waitany`/`Waitsome`), not the `Irecv` itself, which returns almost instantly and isn't what blocks. A receive posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG` is matched using the *resolved* real peer/tag mpi_hook.c reports ([`mpi` backend](#mpi-backend)), not a sentinel. Gated by the send's **start**, evaluated against the completing event's **end**. `Isend`/`Irecv` → their own `Wait`/`Waitall`/`Waitany`/`Waitsome` additionally get a same-rank `explicit_span_id` edge via `sid=`/`psid=` ([Wire protocol](#wire-protocol)), including through a `;`-separated multi-request `psid=` on `Waitall`/`Waitsome` | `rank=`/`peer=`/`tag=`/`wildcard=`/`rpeer=`/`rtag=` tags, `span_id`/`parent_span_id` |
@@ -2426,6 +2778,23 @@ synchronization semantics:
 This does **not** attempt arbitrary data-flow analysis (e.g. "this kernel
 depends on that MPI recv because it reads the buffer it filled") — only
 these structural cases. The same scoping choice CASITA and Score-P make.
+
+**Annotation ranges are not nodes.** NVTX/ROCTX ranges and marks
+(`type=nvtx_range|nvtx_mark|roctx_range|roctx_mark`, category `nvtx`) are
+the program's own labels, not work, and contribute nothing to any time
+breakdown: no builder links them (program order skips them, and the calls
+whose `psid=` names an enclosing range get no edge to it), and neither DP
+uses one as a node or path end. Before (`cp-2` edges), a closed top-level
+range became the program-order predecessor of everything after it, and
+the chain of enclosing ranges -- each as long as all its children -- was
+the longest path: on LLNL Comb (MPI + OpenMP + CUDA with NVTX phase
+ranges) 86 of 91 path spans were ranges, with no p2p, launch or
+device_wait hop; now the path is the one of the same trace with its NVTX
+events removed. Which ranges the path ran through is still reported, for
+display only: `path_time_by_annotation` (and "Path time inside annotation
+ranges" in the terminal output) gives, per range name, the path time of
+the steps that started on a thread inside that range (a device span: on
+its launching thread); nested ranges each count it.
 
 One stated gap: `MPI_Test`/`MPI_Testany`/`MPI_Testsome`/`MPI_Testall`/
 `MPI_Cancel` are emitted as instant events, not spans (they're meant to be
@@ -2443,7 +2812,24 @@ hardware-enforced ordering can be told apart from a best-effort match:
 |---|---|
 | `certain` | Enforced by the runtime/hardware itself (same-thread program order; CUDA/HIP stream & event semantics), or an explicit id the hook itself assigned and later referenced (`sid=`/`psid=`) |
 | `high` | MPI point-to-point matched using *resolved* `MPI_ANY_SOURCE`/`ANY_TAG` status data, or collective/barrier rendezvous scoped by a real communicator id (`commid=`) |
-| `medium` | The same kind of matching without that extra evidence: exact (non-wildcard) tag matching by call order only, or rendezvous clustering with no `commid=` available |
+| `medium` | The same kind of matching without that extra evidence: exact (non-wildcard) tag matching by call order only, or rendezvous clustering with no `commid=` available; a device-wide sync or stream id whose device is ambiguous |
+| `low` | Order-based pairing in a process that lost events of the hook that produced it ([Event loss and order-based matching](#event-loss-and-order-based-matching)) |
+
+**Opt-in: exact matches as `high`** (`hprofiler critical-path
+--exact-p2p-high`, or `HPROFILER_EXACT_P2P_HIGH=1` for every analysis).
+MPI's non-overtaking rule makes the k-th send / k-th receive pairing of a
+(sender, receiver, tag, communicator) channel exact when the capture of
+that channel is complete. Under the flag an exact (non-wildcard) match is
+graded `high` instead of `medium` only if all of these hold: the trace is
+keyed by world ranks and communicator ids; neither process lost MPI events
+(those edges are `low` regardless); both processes' hooks declare a
+complete point-to-point capture (counter `mpi_p2p_capture_complete` = 1 —
+traces of older hooks never qualify); the channel has as many sends as receives; and
+the communicator is registered (`commid` ≠ -1) and had no cancelled send,
+matched probe (`MPI_Mprobe`/`MPI_Improbe`) or persistent request in either
+process. The count of upgraded edges is in the MPI dependency diagnostics
+(`exact_high`). Off by default; persisted edges built with it are kept
+apart (`<version>+exact`).
 
 `hprofiler critical-path`'s terminal output shows a "Path evidence
 strength" breakdown (ns and % of the reported path at each tier); `--export`
@@ -2501,7 +2887,11 @@ and paths against the dict-based pipeline, including MPI wildcard /
 same way.
 
 The edges are persisted in the trace store (table `edges`, tagged with the
-builder version `cp-1` and the store's content version), so a second
+builder version -- `cp-4` since a span id shared by two hooks' spans
+resolves by hook family ([Span ids](#span-ids)), `cp-3` when annotation
+ranges stopped being nodes --
+and the store's content version; edges of another version are rebuilt),
+so a second
 `critical-path`, `efficiency` (which uses the critical path by default) or the timelines' MPI
 connectors reuse them; any change to the events (e.g. disassembly added
 later) invalidates them. On a 1M-span disk store: 16 s and +171 MB peak
@@ -2533,17 +2923,25 @@ from the same correlation `src/core/gpu_activity.py` uses everywhere:
 | Edge | From → to | Semantics | Confidence |
 |---|---|---|---|
 | `launch` | host submission → its device work (by `lid` / `corr` / `corr2`) | The work cannot start before the call started; it **may** start before the call returns. Gate: call start ≤ work start. | `certain` for a unique id; `high` when a reused id was resolved by time |
-| `sequential` | device op → next device op on the same program stream, in submission (= FIFO) order | Stream order | `certain` |
-| `device_wait` | device work → the sync call that waited for it | Stream sync: the last work submitted to that stream before the call. Device/context sync: the last work on each stream. Event sync: the last work submitted to the event's stream before the matching `cudaEventRecord`/`hipEventRecord`. The call starts before the work ends -- that is the wait -- so the gate is work end ≤ call end. | `certain`; `medium` for an event sync whose record call was never seen (falls back to the device-wide rule) |
-| `sequential` | last work before an event record → first work submitted to the waiting stream after `cudaStreamWaitEvent`/`hipStreamWaitEvent` | Cross-stream dependency | `certain` |
+| `sequential` | device op → next device op on the same program stream **of the same device**, in submission (= FIFO) order; the kernels of one graph launch are not chained to each other (the graph may run them concurrently, and its internal edges are not recorded): the stream orders them after the previous work, and the next work after the graph's last kernel to finish | Stream order | `certain` |
+| `device_wait` | device work → the sync call that waited for it | Stream sync: the last work submitted to that stream before the call. Device/context sync: the last work on each stream of the calling thread's device. Event sync: the last work submitted to the event's stream before the matching `cudaEventRecord`/`hipEventRecord`. The call starts before the work ends -- that is the wait -- so the gate is work end ≤ call end. | `certain`; `medium` for an event sync whose record call was never seen (falls back to the device-wide rule), for a device sync whose device is unknown in a process that used several, and for a stream id seen on several devices without the call's device; `low` for event-record lookups in a process that lost CUDA/ROCm events (an older record would be found) |
+| `sequential` | last work before an event record → first work submitted to the waiting stream after `cudaStreamWaitEvent`/`hipStreamWaitEvent` | Cross-stream dependency | `certain`; `low` after lost CUDA/ROCm events |
+
+**Streams are per device.** A stream is keyed (process, runtime, device,
+`stream=`): the default (NULL) stream exists once per GPU, so two GPUs'
+default-stream work is not one stream. The device is the host call's
+`hdev=`, else the native record's `dev=`, mapped to the host ordinal where
+correlated launches show the mapping (ROCm's `dev=` is an agent handle).
+Traces from hooks without `hdev=` still separate native records by `dev=`;
+proxy spans from such hooks carry no device and stay keyed by stream only.
 
 Device spans are left out of their launching thread's program order (they
 did not run on it), and a sync call made from a CUPTI callback without a
 `stream=` tag takes its stream from the correlated CUPTI synchronization
 record. `launch` and `device_wait` hops add only the part of the successor
 that lies beyond its predecessor's end (the queueing delay plus the work,
-or the sync call's tail after the work finished), so on these edges the
-reported path time never exceeds wall time. These edges make many chains
+or the sync call's tail after the work finished) -- the general rule of
+[How much time the path covers](#how-much-time-the-path-covers). These edges make many chains
 between the same two points account exactly the same time (a sync's full
 duration via program order equals the work it waited for plus its tail);
 among such ties the DP picks the predecessor that finished last -- the
@@ -2566,6 +2964,37 @@ cross-node gaps are only as accurate as the clock offsets used.
 Ranks are assumed to call the Nth collective of a given type in the same
 relative order, and one round finishes before the next starts on most ranks
 — true for typical GROMACS-style loop structure, not guaranteed in general.
+MPI collectives are grouped per (type, `commid=`) by overlapping time
+("high"; per type only, "medium", without a communicator id). NCCL
+collectives carry a cross-rank communicator id and a per-communicator
+sequence number (`commid=`, `seq=`): NCCL requires every rank to issue them
+in the same order, so the same (`commid`, `seq`) is one call and is grouped
+exactly, overlapping or not ("high"). NCCL traces from the older hook have
+neither and fall back to per-type overlap grouping ("medium"), in which two
+concurrent communicators' collectives of one type can be merged.
+
+OpenMP: only barriers (`omp_barrier*`) are rendezvous — `omp_critical_wait`,
+`omp_taskwait`, `omp_taskgroup` and `omp_reduction` are not (a thread waits
+there for a lock holder or for its own child tasks). Barriers are grouped
+per team: the parallel region id (`psid=` from the OMPT tool, `team=` from
+the GNU libgomp hook), so the barriers of concurrent teams (nested
+parallelism) stay apart. Traces without either keep the former grouping by
+name per process.
+
+#### Event loss and order-based matching
+
+Several edges pair calls by order: the k-th send with the k-th receive of
+a (sender, receiver, tag, communicator) channel, an event sync with the
+latest record of its event. One lost call shifts every later pairing of
+its channel, and nothing in the trace shows where. When the capture health
+records lost events for a process's hook (dropped or lost records,
+oversize or unformattable records, a connection that ended without its
+final drain, records sent but not received), those edges in that process
+are "low"; when a loss cannot be tied to a process of the trace
+(unreadable records, a connection without a status, a pid not in the
+trace), in every process. The count is in the MPI dependency diagnostics
+(`matched_after_loss`) and a capture warning. Correlation-id matching
+(launch → device work) and NCCL's (`commid`, `seq`) grouping do not shift.
 
 #### Reading the output
 
@@ -2598,14 +3027,29 @@ data; a large `medium` share means more of it depends on call-order
 matching without that stronger evidence, worth keeping in mind before
 treating the exact reported chain as precise.
 
-If `Time accounted for` in the header exceeds `Wall time`, `notes` will say
-so explicitly: this happens when the path passes through multiple
-rendezvous (`arrival`-gated) edges whose spans genuinely overlap in
-wall-clock time across different threads/ranks — each still contributes its
-own full duration to the category breakdown rather than being merged into
-one interval, a known consequence of modeling dependencies at span
-granularity rather than splitting every span into separate start/end
-events.
+#### How much time the path covers
+
+`Time accounted for` (`total_path_ns`) is the wall-clock time the path
+covers, each instant once, so it never exceeds the path's extent (first
+start to last end) nor the wall time. The path is walked keeping a
+frontier, the latest end reached so far: a span adds only its part beyond
+the frontier (`path_credited_ns`), and an idle gap only from the frontier
+to the span's start (`path_gap_ns`, blamed on the predecessor's category);
+credited + gaps = total, and the category tables add up to it. This
+matters for start-gated hops (collectives and barriers, point-to-point
+messages): their successor may start before its predecessor -- or an
+earlier path span on another rank -- ended, e.g. a wait posted early, or
+the other rank's `MPI_Reduce` that started 1.3 µs before the last arriver.
+Measuring each hop from its immediate predecessor counted the wall time a
+zig-zag between two ranks covers twice: on Comb's CPU runs the reported
+path was 7.90 ms in a 7.65 ms run (path extent 7.56 ms, the new total).
+
+The DP itself maximizes `accounted[]` (gap + full duration per hop, with
+no gap on start-gated hops), which counts such overlap on both sides of a
+hop: it is the search objective, not a duration. The report keeps the
+DP's value for the chosen path as `dp_accounted_ns` ("Longest-path value"
+in the terminal output, and a note when it exceeds the covered time by
+more than 1%); totals and breakdowns use the covered time.
 
 #### `--export`: highlighting the critical path in Perfetto
 
@@ -2760,11 +3204,18 @@ context, role):
   delay (from native device timing), and the time it overlapped work on
   another stream (device) or thread (top-level host calls), found by a sweep
   over each process.
-- **Graph-derived values per node**: the critical-path time credited to it,
-  and idle time on the path blamed on it. When the path runs through an
-  enclosing call (an NVTX range, a parallel region), its credit is spread
-  over the self time of that call and everything inside it, so the
-  enclosing range is not blamed for its children.
+- **Graph-derived values per node**: the critical-path time credited to it
+  (the report's covered-time split, [How much time the path covers](#how-much-time-the-path-covers)),
+  and idle time on the path blamed on it -- the gap before a hop that waits
+  on something else (a message, a rendezvous, device work, a request);
+  the gap between two consecutive calls on one thread is that thread's own
+  uninstrumented work, counted in its phase's critical time but blamed on
+  no node, so reordering independent calls moves no blame. When the path
+  runs through an enclosing call (a parallel region; annotation ranges are
+  never on it), its credit is spread over the self time of that call and
+  everything inside it, so the enclosing call is not blamed for its
+  children; a node's calling context still names its enclosing NVTX
+  ranges.
 - **Node-level dependency edges**: the span-level edges of [Critical path](#critical-path) aggregated
   per node pair and kind, with their best confidence.
 
@@ -2864,8 +3315,10 @@ identity:
   whose end moved earliest, to an origin whose own time improved — a wait
   that shrank because its sender got faster is credited to the sender.
 - **Critical-path impact** = Δ(critical-path time credited + idle time
-  blamed). The critical path credits a blocking wait's whole duration to
-  the wait, e.g. an `MPI_Recv` waiting for a late sender. So a wait's
+  blamed). The critical path can credit a blocking wait's time to the
+  wait, e.g. an `MPI_Recv` waiting for a late sender when the path reaches
+  it on its own thread (reached from the sender, only its tail after the
+  send is new path time). So a wait's
   impact is moved to its origin, capped at the origin's own measured
   change; anything beyond the cap stays with the wait. The same transfer
   applies per phase, and to improvements with the sign reversed, so
@@ -2877,7 +3330,9 @@ by impact; on equal impact, origins come before the waits they caused. The
 report also lists waits and delays caused upstream (with their origin),
 regressions off the critical path (own time grew with no measured
 wall-time effect), new and removed work, improvements (mirrored labels:
-*less work*, *fewer invocations*, *moved off the critical path*…), and per
+*less work*, *fewer invocations*, *moved off the critical path*…; a wait
+whose whole change went to its origin is listed with the waits caused
+upstream, in both directions), and per
 phase the changed duration and its top contributors. The **critical-path
 change** is decomposed into ranked contributors, work that left or shrank on
 the path, and the remainder below the noise floor.
@@ -3122,6 +3577,79 @@ passed. Collection runs in a background thread — the TUI is not blocked.
 | OpenMP / MPI / CPU | ELF symbol at the call-site return address | `capstone` (fast) or `objdump` | `x86-64` / `aarch64` / `rv64` |
 
 > **Requirement for source-line annotation:** compile your binary with `-g` (full debug) or at minimum `-lineinfo` (`nvcc -lineinfo`) to embed DWARF line tables. Without debug info, source file:line annotations are silently skipped — disassembly still works, but no `// file.cpp:42` comments appear in the Source tab.
+
+#### Module identity: which code a launch ran
+
+Code captured at run time — a JIT or module image (`cuModuleLoadData*`,
+`hipModuleLoadData*`, a HIP fat binary), an OpenCL program binary, an ACPP
+`.jit.so` — gets a **module id**: the 64-bit FNV-1a hash of exactly the
+bytes saved for disassembly, as 16 hex digits
+(`hooks/common/hp_module.h`; `module_id()` in `src/disasm/extractor.py`
+computes the same from the file). The hook puts it on the module's jit
+span (`mod=`, next to `path=`) and on every launch of a kernel from that
+module: `CUfunction` → `CUmodule` through `cuModuleGetFunction`,
+`hipFunction_t` → `hipModule_t` through `hipModuleGetFunction` (and a
+registered HIP kernel → its fat binary), `cl_kernel` → `cl_program` (and
+the queue's device) through `CL_KERNEL_PROGRAM`, an ACPP host kernel → its
+`.jit.so`. Kernel names in these tables are kept whole (no length limit),
+and unloading a module drops its kernels, so a reused handle never reports
+an earlier kernel.
+
+Ahead-of-time CUDA code gets module ids too, with a shared cudart: the hook
+interposes the runtime's start-up registration (`__cudaRegisterFatBinary`,
+`__cudaRegisterFunction`) for the fat binaries of the main executable, so
+`cudaLaunchKernel` names the kernel and its fat binary's id -- the hash of
+its header and payload, the bytes in the executable's `.nv_fatbin` section,
+which `extractor.cuda_fatbins()` hashes too. When any launch carries one,
+every fat binary is disassembled on its own and its code keyed
+`name@module`; otherwise (a static cudart, whose registration happens
+inside the program, or older traces) the executable's code stays under its
+names. Each registration call is forwarded to the cudart its caller links
+(a process can hold several: a CUDA 13 PyTorch next to a 12.x runtime),
+not to whichever comes first. Launches no wrapper sees -- `cuLaunchKernelEx`
+obtained with `dlopen`/`dlsym`, as Triton does, or a library's own --
+are recorded through CUPTI's callback, and the function handle in the
+call's parameters gives their `mod=` (the hook starts CUPTI by the time a
+program gets a function from `cuModuleGetFunction`).
+
+The executables the AoT code is read from are those of the processes that
+emitted kernel launches or device work (a wrapper, `env` or a launcher
+connects too when the hooks are preloaded into it, and has no GPU code),
+else every connected executable; all of them are disassembled and merged
+(by `name@module` key), in a fixed order -- the process's last image (the
+program, after an `exec`) first. Each entry's `source` names its
+executable.
+
+Disassembly of module code is stored under **`name@module`**; code from
+the program's own binary or from a call site stays under its name. So two
+programs that both define `benchmark_func` keep two entries, and every
+kernel launched from a multi-kernel OpenCL program is disassembled (the
+kernels launched from each binary are looked up in it). Each entry records
+its kernel spans (`launches`, `extractor.attribute_launches`) and how they
+were counted (`launchBasis`):
+
+| `launchBasis` | `launches` |
+|---|---|
+| `module` | the spans carrying the entry's module id (0: none of its launches ran) |
+| `name` | the spans of its name that carry no module id, or one no entry of that name has -- code without a module id (the program's own binary, a static cudart), or a single module whose launches carried none (older traces) |
+| `unknown` | `null`: spans of that name ran but cannot be split among several entries (e.g. 24 autotuned Triton variants in a trace without module ids) |
+| (absent) | older traces: spans carrying the module id, 0 otherwise |
+
+A kernel that ran never shows 0. `hprofiler disasm` and the TUI say when a
+count is by name. Viewers look a kernel up by its launches' module first
+(`Trace.disasm_for`) and say how they found the code:
+
+| Match | Meaning | Shown |
+|---|---|---|
+| `module` | The launches' module id names this code (or a `name@module` row was picked) | ✓ |
+| `symbol` | The program's own code (AoT binary, call site), by its symbol | ✓ |
+| `name` | Matched by kernel name only: the launches carried no module id for this code (older hooks, an asynchronous OpenCL build, a module whose image size was unknown) | `~` and a warning |
+| `name-ambiguous` | Several modules define the name and the lookup had none: the most-launched one is shown; each is listed separately as `name @<id>` | `~` and a warning |
+
+A launch named `<jit-kernel>` (neither its name nor its module could be
+resolved) gets no disassembly: the former fallback that attached the first
+GPU kernel's code to it is gone. Traces written before module ids load
+with their name keys (match `symbol`/`name`).
 
 #### CPU / OpenMP / MPI disasm pipeline
 
@@ -3369,8 +3897,10 @@ hprofiler disasm app.hprofiler.hpstore -k omp_barrier  # kernels whose name cont
 hprofiler disasm app.hprofiler.json -o kernels.asm     # everything, to a file
 ```
 
-`-k` is a case-insensitive substring match; output is one block per kernel
-with its architecture, source binary and instruction listing.
+`-k` is a case-insensitive substring match; output is one block per entry
+with its architecture, source binary and instruction listing. Module code
+is listed as `name@<module id>` with the number of launches that carried
+that id ([Module identity](#module-identity-which-code-a-launch-ran)).
 
 ### Multi-node traces
 
@@ -3383,7 +3913,8 @@ hprofiler merge-nodes [OPTIONS] TRACE_FILES...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-o`, `--output` | *(required)* | Where to write the merged trace: a `.json` path writes the merged trace store `<name>.hpstore` plus the JSON export, a `.hpstore` path only the store. Events are streamed node by node into the store, never all held in memory. |
-| `--offset-ns NS` | none | Explicit per-node clock offset in ns, repeatable, same order as `TRACE_FILES` — overrides embedded `HPROFILER_CLOCK_SYNC` counters for that node |
+| `--offset-ns NS` | none | Explicit per-node clock offset in ns, repeatable, same order as `TRACE_FILES` — applied as given (no estimate, no tightening) |
+| `--ignore-boot-id` | off | Never treat traces with the same kernel `boot_id` as one clock (to exercise the estimates on one host) |
 
 ```bash
 hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
@@ -3394,48 +3925,52 @@ hprofiler critical-path merged.json   # analyze across node boundaries
 hprofiler's collector is a local `AF_UNIX` socket ([Wire protocol](#wire-protocol)), so a single trace
 is inherently single-node regardless of clock synchronization — a
 multi-node job produces one independent trace file per node (profile each
-node separately, e.g. via your job launcher's per-node wrapper). This
-section covers aligning and combining those per-node traces.
+node separately, e.g. via your job launcher's per-node wrapper, or per
+rank). This section covers aligning and combining those traces.
 
 #### Clock offset estimation: `HPROFILER_CLOCK_SYNC`
 
 Set `HPROFILER_CLOCK_SYNC=1` when launching a multi-node MPI job to have
-`mpi_hook.c` estimate each rank's clock offset relative to rank 0's clock,
-once, during `MPI_Init`/`MPI_Init_thread`. **Off by default** — this adds
-a real, blocking round-trip exchange to a function every MPI program
-calls, so it must never run unless explicitly requested.
+`mpi_hook.c` measure each rank's clock offset relative to rank 0's clock,
+in `MPI_Init`/`MPI_Init_thread` and again in `MPI_Finalize` (for drift).
+**Off by default** — it adds a blocking exchange to both calls.
 
-**Protocol** (Cristian's algorithm — the same round-trip technique NTP
-itself is built on): rank R sends a zero-byte ping to rank 0 at its own
-local time `T1`; rank 0 records its own local times `T2` (ping received)
-and `T3` (about to reply) and returns both to R; R records `T4` (reply
-received). Assuming symmetric network latency (a real approximation, not
-an exact guarantee):
+**Protocol** (NTP-style), on a private duplicate of `MPI_COMM_WORLD`, so
+no application tag can interfere: rank 0 serves one rank at a time and
+first hands it a turn token, so a rank's pings never queue behind
+another's (the effect of a barrier before each rank's turn, at the cost of
+one message). Rank R then does `HPROFILER_CLOCK_SYNC_ROUNDS` rounds
+(default 16, rank 0's value is used everywhere): R sends at `T1`, rank 0
+receives at `T2` and replies at `T3` (both returned), R receives at `T4`:
 
 ```
-round_trip  = T4 - T1
-offset      = (T2+T3)/2 - (T1 + round_trip/2)   # rank 0's clock minus R's, same instant
-error_bound = round_trip / 2                     # standard bound under the symmetry assumption
+delay  = (T4 - T1) - (T3 - T2)
+offset = ((T2 - T1) + (T3 - T4)) / 2     # rank 0's clock minus R's
+bound  = delay / 2                       # holds for any latency asymmetry
 ```
 
-Rank 0 loops over every other rank sequentially (O(size) round trips —
-simple to reason about correctly; this runs once per job, not once per
-profiled call). Each non-root rank emits three counters into its own
-trace: `clock_offset_vs_rank0_ns`, `clock_offset_error_bound_ns`,
-`clock_sync_round_trip_ns` (category `mpi`).
+and keeps the round with the smallest delay (the one least delayed by
+queueing). **Same clock:** rank 0 broadcasts its clock domain — the
+kernel `boot_id` and the time namespace's `CLOCK_MONOTONIC` offset. A rank
+in the same domain reads the very same clock: its offset is exactly 0,
+reported as 0 with bound 0, and the measurement is kept only for
+diagnostics (`HPROFILER_CLOCK_SYNC_IGNORE_BOOT_ID=1` reports the
+measurement instead, to exercise it on one host).
 
-**Verification status:** the offset/error-bound *arithmetic* is
-independently, fully unit-tested (`tests/test_multinode.py`) against
-hand-derived synthetic `(T1,T2,T3,T4)` scenarios — including one with
-asymmetric forward/return latency, confirming the error bound correctly
-brackets the actual estimation error rather than the point estimate being
-silently treated as exact. The C-side round-trip *capture itself*
-(`clock_sync_if_requested` in `mpi_hook.c`) is compiled and its
-zero-effect-when-disabled and size-under-2 no-op paths are exercised, but
-the real 2-or-more-rank exchange has never executed on this development
-machine, which cannot form a real multi-rank `MPI_COMM_WORLD` at all (see
-[Known limitations](#known-limitations)) — the same limitation already affecting
-cross-process `commid=` agreement ([`mpi` backend](#mpi-backend)).
+Each rank emits an instant `clock_sync` per measurement (category `mpi`;
+tags `phase=init|finalize`, `rank=`, `offset=`, `bound=`, `delay=`, `at=`
+— the local midpoint of the kept round —, `rounds=`, `same_clock=`,
+`est_offset=`/`est_bound=` — the measurement —, `boot_id=`, `timens=`,
+`clocksource=`; rank 0's has `reference=1`), and ranks other than 0 the
+counters `clock_offset_vs_rank0_ns`, `clock_offset_error_bound_ns`,
+`clock_sync_round_trip_ns` as older hooks did. Every trace's metadata also
+records its clock (`metadata.clock`: `CLOCK_MONOTONIC`, `boot_id`,
+`clocksource`, time-namespace offset).
+
+On one host (4 and 8 Intel MPI ranks, shared memory) the measurement
+comes out within 41 ns of the true 0 with bounds of 0.15–0.7 µs; the
+former single ping per rank, served while other ranks' pings queued, gave
+9 µs to 4.2 ms.
 
 #### Merging: `hprofiler merge-nodes`
 
@@ -3444,11 +3979,42 @@ hprofiler merge-nodes node0.json node1.json node2.json -o merged.json
 hprofiler critical-path merged.json   # analyzes across node boundaries
 ```
 
-The first file is the reference node (offset 0). Each other node's offset
-comes from its embedded `HPROFILER_CLOCK_SYNC` counters, or `--offset-ns`
-if given explicitly. `src/analysis/multinode.py`'s `merge_traces()`:
+The trace holding MPI rank 0 is the reference (offset 0; the first file
+when no trace has rank 0). Every other trace's offset, decided by
+`multinode.plan_offsets()` before merging and printed one line per trace:
 
-- Shifts every span/instant/counter timestamp by that node's offset.
+1. `--offset-ns` if given: used as is.
+2. **Same clock** — the same kernel `boot_id` and time-namespace offset as
+   the reference (from `metadata.clock` or the `clock_sync` instants):
+   exactly 0, no estimate applied. Per-rank traces of one host always
+   merge at 0.
+3. Otherwise the **estimate**: the `clock_sync` measurements — offset plus
+   linear drift between the `MPI_Init` and `MPI_Finalize` measurements,
+   held constant outside that window —, or the counters of older hooks.
+4. **Tightened with the message order**: the matched MPI send/receive
+   pairs between traces (the critical path's own matcher, whose pairing
+   depends only on each side's own call order, not on offsets) require
+   that a send start before its matched receive ends. When the estimates
+   violate any, the offsets are corrected by the smallest fraction of
+   each trace's bound that satisfies all of them (a system of difference
+   constraints, solved by Bellman-Ford), taking the middle of the offsets
+   still possible. A trace with no clock data at all gets its offset from
+   the message order alone. When no offsets within the bounds satisfy
+   the message order, the estimates are applied as measured and the
+   remaining problems reported: an offset outside its measured bound is
+   never applied.
+
+The decision of every trace is stored in the merged trace
+(`metadata.clock.merge`: method, estimate, bound, drift, correction,
+number of matched messages). On one host, round-1 per-rank traces whose
+one-ping estimates gave 711 (LULESH, 8 ranks) and 326 (OSU latency)
+violations merge with none: the tightening moves every offset to within
+1 µs of the true 0.
+
+`src/analysis/multinode.py`'s `merge_traces()` then:
+
+- Shifts every span/instant/counter timestamp by its trace's offset at
+  that time (span ends too, so drift corrects durations).
 - Remaps `pid` into a per-node-unique namespace (`node_index *
   10_000_000`) — pid 1234 on node A and pid 1234 on node B are unrelated
   processes; without this, every `(pid, tid)`-keyed piece of existing
@@ -3462,10 +4028,7 @@ if given explicitly. `src/analysis/multinode.py`'s `merge_traces()`:
   unique across a job regardless of which node a rank runs on, so
   `criticalpath.py`'s cross-rank P2P/collective matching (built on those
   tags, not `pid`/`tid`) works across a merge unchanged.
-- Adds a `node=<index>` tag to every merged event, and warns (rather than
-  silently proceeding) about any non-reference node merged at an
-  uncorrected 0 offset because no `HPROFILER_CLOCK_SYNC` data or
-  `--offset-ns` was available for it.
+- Adds a `node=<index>` tag to every merged event.
 
 Events are streamed node by node into the output's trace store (`<output
 stem>.hpstore`, or the output itself when it ends in `.hpstore`) in bounded
@@ -3718,21 +4281,36 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | CUDA/ROCm host & device spans | `lid=`, `corr=`, `corr2=` | Correlation ids: hook-assigned launch id; CUPTI correlation ids (runtime/driver) or ROCprofiler's internal id |
 | CUDA/ROCm device spans | `dev=`, `ctx=`, `nstream=`, `queue=`, `dispatch=`, `graph=`, `queued=`, `submitted=` | Native record fields (device/agent, context, vendor stream id, HSA queue, dispatch id, CUDA graph id, CUPTI latency timestamps) |
 | CUDA/ROCm device spans (added by the Runner) | `api_ns`, `queue_ns`, `launch_ns`, `submit_ns` | Host call duration, call-end→start, call-start→start, submitted→start |
+| CUDA/ROCm device spans (added by the Runner) | `clock_corr_ns=N` | Shifted N ns later to correct a drifting device-clock mapping ([Correlation, de-duplication and streams](#correlation-de-duplication-and-streams-srccoregpu_activitypy)) |
 | CUDA/ROCm sync / event spans | `sync=device\|stream\|event`, `event=` | Which wait; event handle hash (same scheme as `stream=`) |
+| CUDA/ROCm host & proxy device spans | `hdev=N` | The calling thread's current device after the call; streams and device-wide syncs are per device |
+| `cuda`, `rocm`, `opencl` kernel spans | `mod=<16 hex>` | Module id of the code the launch ran ([Module identity](#module-identity-which-code-a-launch-ran)) |
 | `memory` | `type=memcpy,bytes=N` | Transfer size |
 | `memory` | `type=alloc,bytes=N` | Device allocation |
 | `openmp` | `sym=<mangled>` | Symbol resolved via `dladdr()` |
 | `openmp` | `symfile=<path>` | The ELF file `dladdr()` actually found `sym=` in (its own `dli_fname`) -- NOT necessarily the profiled command's own binary, since that command is routinely a launcher (`srun`/`mpirun`) wrapping the real one; absent means an older hook build, and disasm falls back to the command's own binary |
 | `openmp` | `lib=<path>,offset=0x<n>` | Library + static offset (fallback) |
 | `openmp` | `type=work,count=N` | Work-sharing iteration count |
+| `openmp`, `sync` | `mutex=critical\|lock\|nest_lock\|ordered\|…`, `wait_id=N` (OMPT) or `lock=<address>` (GNU libgomp hook), `nest=1`, `test=1` | Critical-section / lock / `ordered` wait and hold spans: the mutex kind and object; a nest lock; acquired by a successful `omp_test_*lock` |
+| `openmp` | `type=task,id=N,status=S`, `fragment=1` | OMPT `omp_task`: an explicit task's execution fragment; `fragment=1` when it ended in a suspension (yield/switch), else the final one (`status=1` complete) |
+| `openmp` | `type=task_create,id=N,team=T`, `undeferred=1`, `depend=1` | GNU libgomp task creation (`if(0)` task; task with dependences) |
+| `openmp` | `type=task_dependences,task=N,ndeps=,in=,out=,inout=,other=`; `type=task_dependence,src=,sink=` | OMPT task-dependence instants |
 | `nvtx` | `type=nvtx_range` | NVTX push/pop range |
 | `jit` | `type=jit_load,path=<file>` | ACPP SSCP `.jit.so` or Intel CPU OCL `.bin` extracted from `clGetProgramInfo` |
+| `jit` | `stage=frontend\|runtime\|source\|backend\|load`, `mod=` | Compilation stage ([What the jit spans cover](#what-the-jit-spans-cover)); module id of a saved image |
+| `jit` | `cache=miss\|hit`, `id=<32 hex>`, `bytes=N` | AdaptiveCpp kernel cache: `acpp_jit_compile` span (a miss and the compilation up to its store; size of the code object) or `acpp_jit_cache` instant (a hit); the kernel's code-object id |
+| `jit` | `cache_hit=0\|1`, `hash=`, `kernel=`, `ir_init_ns=`, `<stage>_ns=`, `store_ns=`, `stages=a/b/...`, `lookup_ns=` | Triton (`--python-jit`): `triton_jit_compile` span per compile, `triton_jit_cache` instant per cache hit; per-stage durations |
 | `nccl` | `type=allreduce\|broadcast\|...` | Collective type |
 | `nccl` | `bytes=N,stream=ID,rank=R,nranks=N` | Transfer size, CUDA stream, communicator rank and size |
 | `nccl` | `type=group` | `ncclGroupStart/End` boundary |
 | `nccl` | `peer=N` | Target rank for `ncclSend`/`ncclRecv` |
+| `nccl` | `commid=<16 hex>`, `seq=N` | Communicator id, the same on every rank; collective's number on that communicator |
 | `mpi` | `type=send\|recv\|allreduce\|...` | MPI call type |
-| `mpi` | `bytes=N,rank=R,peer=P,tag=T,commid=C` | Message size, own rank, remote rank, communicator identity |
+| `mpi` | `bytes=N,rank=R,peer=P,tag=T,commid=C` | Message size, own (world) rank, remote rank in the call's communicator, communicator identity |
+| `mpi` | `wpeer=W`, `null=1` | The peer's `MPI_COMM_WORLD` rank; `MPI_PROC_NULL` |
+| `mpi` | `rwpeer=W`, `rwmatches=<req_id>/<world peer>;...` | World rank of a resolved wildcard source |
+| `mpi` | `cancelled=1`, `cpsid=<req_id>;...` | Completed request(s) that `MPI_Test_cancelled` reports cancelled (no match) |
+| `mpi` | `op=sendrecv` | The `MPI_Sendrecv[_replace]` pair (`.send` half `type=send`, the call `type=recv`) |
 | `mpi` | `wildcard=1` | `MPI_Irecv` posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG`; real peer/tag not yet known (see [`mpi` backend](#mpi-backend)) |
 | `mpi` | `rpeer=P,rtag=T` | Resolved wildcard match, on the completing `Wait`/`Waitany`/`Test`/`Testany` span |
 | `mpi` | `rmatches=<req_id>/<peer>/<tag>;...` | Resolved wildcard matches for `MPI_Waitall`/`MPI_Waitsome` (multiple requests at once) |
@@ -3742,6 +4320,34 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | all | `codeptr=truncated` | The call-site tags did not fit the record and were left out rather than cut (any name or path is either complete or absent) |
 | `mpi` | `symfile=<path>` | Same meaning as `openmp`'s `symfile=` above |
 | `mpi` | `lib=<path>,offset=0x<n>` | Library + static offset (fallback, same as `openmp`'s) |
+
+#### Span ids
+
+`sid=` is a span's own id; `psid=` names another span's (several,
+`;`-separated, on a completion of several MPI requests). They are joined by
+value within one process: an MPI completion names its request, a device
+span its host call, an OpenMP span its parallel region, a host call the NVTX
+range open around it. Each hook numbers its spans in its own id space
+(`hooks/common/hp_ids.h`): bits 56–62 name the hook (1 CUDA host calls --
+CUPTI callback spans with bit 31 set --, 2 ROCm, 3 MPI, 4 OMPT parallel
+regions, 5 NVTX ranges, 6 OpenCL), bits 32–55 hold the pid, the hook's own
+counter the low 32 bits; an id stays below 2^63.
+
+Traces recorded by earlier hooks have every hook's ids as `(pid << 32) | n`,
+n counted from 1 by each hook (NVTX and OpenCL: a timestamp), so one id can
+sit on, e.g., an MPI request and a CUDA host call in the same process (816
+such ids in one LLNL Comb MPI + CUDA trace). The analyses resolve such an id
+(`src/analysis/span_links.py`, used by the call tree, the flame graph and
+the critical path) to the span of the child's own hook family (MPI, GPU
+runtimes, OpenMP), else to an enclosing annotation range, and among several
+of that family to the latest one that started no later than the child;
+nothing is guessed across families. Without it the call tree shared one
+node per id: where that closed a cycle, `hprofiler gui` stopped at
+"Building flame graph…" with "maximum recursion depth exceeded"; where it
+hung one subtree under several parents, building the tree grew without
+bound (a 22k-span OSU CUDA trace: ~90 MB/s until killed; OSU CUDA and
+8-thread LULESH LLVM traces passed a 6 GB cap). The critical path linked a
+completion to whichever span with the id came last.
 
 **Names containing `:`:** hook-side names (e.g. demangled C++ kernel names
 like `Namespace::kernel`, or NVTX labels) are not escaped before being
@@ -4189,7 +4795,7 @@ does with a store:
 |---------|-------|--------------|-------------|
 | `SCHEMA_VERSION` (now 1) | `store_info.schema_version` | The meaning or columns of an existing table, the event-id encoding or the tag encoding change | Newer than supported: refused with "upgrade hprofiler". Older: `disk.migrate()` upgrades in place, one step per version |
 | `DERIVED_VERSION` (now 1) | `store_info.derived_version` | A derived table (lanes, activity, aggregates, exclusive, extents) changes meaning | Derived tables are rebuilt on open; events are untouched |
-| `EDGES_VERSION` (`cp-1`) | `edges.version` | A critical-path edge builder changes what it emits | Edges are rebuilt on next use |
+| `EDGES_VERSION` (`cp-4`) | `edges.version` | A critical-path edge builder changes what it emits | Edges are rebuilt on next use |
 | `hprofilerJsonLayout` (1) | First line of exported JSON | The streamed JSON layout changes | Unknown layouts fall back to the whole-file parser |
 
 Policy for future changes: adding a table needs no version bump, because
@@ -4286,7 +4892,7 @@ only, without changing the trace.
 | Path | Role |
 |---|---|
 | `hprofiler` | The CLI (click): every command, option and help text |
-| `hooks/common/` | `hp_transport.h` (per-thread rings + drain thread), `ringbuffer.h`, `callstack.h` (`stk:` records), `codeptr_resolve.h` (call-site `sym=`/`lib=`/`symfile=` tags) |
+| `hooks/common/` | `hp_transport.h` (per-thread rings + drain thread), `hp_ids.h` (each hook's span-id space), `ringbuffer.h`, `callstack.h` (`stk:` records), `codeptr_resolve.h` (call-site `sym=`/`lib=`/`symfile=` tags) |
 | `hooks/<runtime>_hook/`, `hooks/ompt_tool/` | One preloaded library per runtime; `cupti_trace.c` / `rocprof_trace.c` hold the native GPU tracers |
 | `hooks/os_tracer/` | eBPF scheduler tracer (separate privileged process) |
 | `src/backends/` | One `Backend` class per backend: availability check, libraries to preload, environment, command wrapping |
@@ -4296,7 +4902,7 @@ only, without changing the trace.
 | `src/core/store/` | `MemoryTraceStore` and the SQLite `DiskTraceStore` behind one API |
 | `src/core/trace_io.py` | `open_trace()` (which store a file opens with), disk captures, JSON export |
 | `src/core/gpu_activity.py` | CUDA/ROCm host/device correlation, de-duplication, `kernel_activity()` |
-| `src/analysis/` | Critical path, POP efficiency, CCT and GPU starvation, call tree, flame-graph tree, activity buckets / exclusive time, projection and causal comparison, roofline, hardware counters, device peaks, assembly advisor, multi-node merge |
+| `src/analysis/` | Critical path, POP efficiency, CCT and GPU starvation, call tree, flame-graph tree, activity buckets / exclusive time, projection and causal comparison, roofline, hardware counters, device peaks, assembly advisor, multi-node merge, span-id resolution (`span_links.py`) |
 | `src/disasm/` | Disassembly extraction (`extractor.py`), instruction classifier, source annotation |
 | `src/output/` | Chrome Trace JSON, text summary, roofline HTML/TUI, OTLP |
 | `src/ui/` | Textual TUI (`app.py`) and the Braille canvas |
@@ -4425,7 +5031,8 @@ search `Input` and `_FlameCanvas`, a separate `Widget` so it can implement
 otherwise temporal containment (`_ct_build_raw` + `_ct_aggregate`: a
 per-thread stack infers parents from start/end nesting, then same-named
 siblings are aggregated; a span with an explicit `parent_span_id` is
-placed under that parent and still pushed on the containment stack so its
+placed under that parent (the span of its own hook family when two hooks'
+spans share the id: [Span ids](#span-ids)) and still pushed on the containment stack so its
 own nested children land under it). The Source tab's mix bar orders
 `VEC_SP, VEC_DP, VEC_MEM, VECTOR, COMPUTE, MEMORY, SCALAR, CONTROL, SYNC`.
 
@@ -4591,34 +5198,52 @@ are in [Experimental validation](#8-experimental-validation)):
 ### Verification status
 
 What was verified, how, and what was not. "Development machine" is an
-Intel i7-1265U laptop with a GeForce MX550 (driver 580.173.02, CUDA 12.9),
+Intel i7-1265U laptop (2 performance + 8 efficiency cores) with a GeForce MX550,
 no AMD GPU, an MPICH/Hydra installation that cannot form a multi-rank
 `MPI_COMM_WORLD` (every rank of `mpirun -np N` sees size 1 — a PMI/KVS
 rank-discovery failure in its MPICH/UCX/PMIx setup, confirmed with
 `UCX_LOG_LEVEL=info` and reproducible with the plain `mpi_mini.c` fixture,
-unrelated to hprofiler), `kernel.perf_event_paranoid=4`, and no root/`CAP_BPF`.
-Evidence details are in [Experimental validation](#8-experimental-validation).
+unrelated to hprofiler) plus Intel MPI (oneAPI, MPICH ABI) whose own Hydra
+starts real multi-rank jobs, `kernel.perf_event_paranoid=4`, and no
+root/`CAP_BPF`. On 2026-10-14 the NVIDIA driver and library versions did
+not match (CUDA unusable); since a reboot on 2026-10-15 (driver 580.178.04,
+CUDA 13.0) the MX550 works again, and the CUDA items below that say so were
+run on it. ROCm and NCCL remain compile-checked and unit-tested on
+synthetic traces only. Evidence details are in
+[Experimental validation](#8-experimental-validation); a separate benchmark
+harness (`Benchmarks/`: hprofiler-fixtures, IMB, OSU, BabelStream, EPCC,
+LULESH, mixbench) checks traces against each benchmark's own ground truth.
 
 | Component | Status | Evidence | Not covered |
 |---|---|---|---|
 | Hook transport (per-thread rings) | ✅ Verified | Native scenario tests plain, ASan+UBSan and TSan (order, overflow accounting, bounded wait, fork, exec, no collector); all hook integration tests; a 480,008-event GNU libgomp run with none lost | GPU-heavy and multi-node workloads |
 | Collector (spooling receiver, capture health) | ✅ Unit tested | `tests/test_receiver.py` | — |
-| OpenMP via OMPT (LLVM libomp) | ✅ Verified against ground truth | `tests/integration/test_profiling_accuracy.py` | — |
-| OpenMP via GNU libgomp interception | ✅ Verified against ground truth; confirmed at an HPC site | Ground-truth suite, `test_gomp_hook.py`, `run_matrix.sh`; a GROMACS run on the Dardel cluster (`srun`, 4 ranks) produced populated OpenMP/sync/MPI lanes | The exact Cray `cpeGNU` code paths beyond what the local GCC emits |
-| MPI hook semantics (wildcard resolution, `Waitany`/`Waitsome`/`Test*`/`Cancel`, `commid=`, RMA synchronization) | ✅ Verified end to end in one process | `test_mpi_protocol.py`, `test_mpi_rma.py`: real hook, real wire bytes, production parser; ground-truth suite (1 rank to itself) | Any real multi-rank exchange, including cross-process `commid=` agreement; the 4-rank fixture `tests/fixtures/mpi_proto.c` is compile-checked only |
+| OpenMP via OMPT (LLVM libomp) | ✅ Verified against ground truth | `tests/integration/test_profiling_accuracy.py`; critical sections, locks, nest locks, `ordered` and task dependences in `test_openmp_sync.py` (`tests/fixtures/omp_sync_counts.c`: exact counts); harness EPCC syncbench (T threads, I = total inner repetitions, Q = T·I): `omp_critical_hold` = Q (CRITICAL), `omp_lock_hold` = Q (LOCK_CONTENDED) and = I (LOCK_UNCONTENDED: 3190 = 5·640 − 10), `omp_ordered` = I (ORDERED); explicit tasks only (`tests/fixtures/omp_task_counts.c`, leaf tasks, a nested task waited for, taskyield: 27 created = 27 non-fragment `omp_task` with status complete, no `id=0`, suspension fragments tagged; EPCC's 3156 implicit-task segments, `id=0`, are gone at the source) | Atomics (not recorded); untied tasks migrating threads (not exercised) |
+| OpenMP via GNU libgomp interception | ✅ Verified against ground truth; confirmed at an HPC site | Ground-truth suite, `test_gomp_hook.py`, `run_matrix.sh`; tasks, `taskwait`, `taskgroup` and the lock API in `test_openmp_sync.py` (task bodies run on their real arguments, exact counts); harness EPCC taskbench/syncbench: `omp_task_create` = T·I (PARALLEL_TASK), `omp_taskwait` = T·I (TASK_WAIT), `omp_lock_hold` = Q (LOCK_CONTENDED) and = I (LOCK_UNCONTENDED: 1590 = 5·320 − 10); a GROMACS run on the Dardel cluster (`srun`, 4 ranks) produced populated OpenMP/sync/MPI lanes | The exact Cray `cpeGNU` code paths beyond what the local GCC emits; `taskloop`, `sections`, `ordered` (not intercepted) |
+| MPI hook semantics (wildcard resolution, `Waitany`/`Waitsome`/`Test*`/`Cancel`, `commid=`, RMA synchronization) | ✅ Verified end to end in one process | `test_mpi_protocol.py`, `test_mpi_rma.py`: real hook, real wire bytes, production parser; ground-truth suite (1 rank to itself) | — |
+| MPI with real ranks (statuses, cancellation, sub-communicators, `Comm_dup`, `Sendrecv*`, newly wrapped calls, wildcard resolution, `Test` polling, `commid=` agreement, dependency diagnostics) | ✅ Verified with 4 Intel MPI ranks | `test_mpi_multirank.py` (`tests/fixtures/mpi_status.c`): the program's output equals the unprofiled run; every receive paired, including renumbered sub-communicators and two concurrent duplicates; (`tests/fixtures/mpi_proto.c`): the output against its ground truth unprofiled and profiled, `rpeer`/`rtag` and `rmatches` resolving exactly the three wildcard messages, `polls + 1` `MPI_Test` instants with one `flag=1`, the cancelled receive without a match or edge, one `commid=` per `Comm_split` half shared by its two ranks, three high/certain phase-A edges and one `Test`-only completion counted; harness: hprofiler-fixtures MPI protocol checks, IMB `-multi` groups (1272/1272 receives matched), OSU per-rank | Open MPI, Cray MPICH, Slurm/PMIx launches, more than one node |
+| File-descriptor inheritance, exit status, collector socket fallback | ✅ Verified | `test_runner_process.py`: an inherited pipe is usable in the program and no descriptor is added; exit codes and signals; the abstract socket with the real GNU libgomp hook; harness OSU per-rank (`PMI_FD`) | — |
 | Call-site attribution and disassembly (OMPT, libgomp, MPI) | ✅ Verified end to end | `test_callsite_e2e.py` on MPICH, LLVM libomp, GNU libgomp, launched through a wrapper | — |
-| CUDA native device activity (CUPTI) | ✅ Functionally verified on one GPU | `test_cuda_native_activity.py` on the MX550 in all three `HPROFILER_DEVICE_ACTIVITY` modes plus a static-runtime build | Any comparison against Nsight Systems or other vendor tools; other GPUs |
+| CUDA native device activity (CUPTI) | ✅ Functionally verified on one GPU | `test_cuda_native_activity.py` on the MX550 in all three `HPROFILER_DEVICE_ACTIVITY` modes plus a static-runtime build (again on 2026-10-15, driver 580.178.04); harness vendor-samples: 298/298 `cuLaunchKernel` with `mod=` and `hdev=`, device spans carrying the launch's module; correlation and device-clock correction: `test_gpu_activity.py` (a unique id 77 µs early is linked, a wrapped id decided by time, a synthetic 0 → −80 µs drift corrected without reordering, no drift → unchanged) and the timestamps of the one real drifting run (`tests/fixtures/cupti_drift_mixbench.json`, also re-assembled from that run's store): all 298 kernels linked with `mod=` and launch metrics, maximum correction 79.7 µs, none before its submission afterwards | Any comparison against Nsight Systems or other vendor tools; other GPUs; drift ahead of the host (undetectable) |
 | CUDA PC sampling (`--gpu-pc-sampling`) | ❌ Not working on the development machine | On the MX550 (CUDA 12.9) enabling it made CUPTI refuse kernel activity (`enable_kernel_activity_failed_14`): device timing fell back to proxies (with a capture warning) and no samples were attributed to instructions | Other GPUs and drivers |
 | CUDA proxy exec-start estimate (`xs=`) | ⚠️ Observed inaccurate | One MX550 run: ~2.4 ms late for 8 of 9 kernels vs. CUPTI | ROCm |
 | ROCm native device activity (ROCprofiler-SDK) | ⚠️ Decoder tested only | Compiled against ROCprofiler-SDK 1.0 headers (ROCm 7.1), synthetic records | Registration, external correlation and the hipEvent proxy have never run (no AMD GPU) |
 | GPU record decoders and correlation | ✅ Unit tested | `test_native_gpu_records.py` (real vendor headers, synthetic records), `test_gpu_activity.py` | — |
-| OpenCL | ✅ Verified on an Intel CPU OpenCL device | Ground truth: kernel device time equals `CL_PROFILING` exactly | GPU OpenCL devices |
-| NCCL | ❌ Not run | Compile only | Everything at run time (no NCCL, no multi-GPU) |
+| OpenCL | ✅ Verified on an Intel CPU OpenCL device | Ground truth: kernel device time equals `CL_PROFILING` exactly; `test_opencl_names.py` (a 330-character kernel name), `test_opencl_modules.py` (two programs defining one kernel, multi-kernel programs, `stage=`); harness: BabelStream sycl-ocl kernel counts, mixbench ocl/sycl-ocl/sycl-omp; the last kernel's device span at exit: `test_opencl_modules.py` run alongside the GPU tests failed 2 of 5 times without the exit wait, 0 of 5 with it | GPU OpenCL devices |
+| Disassembly keyed by module (`mod=`, `name@module`) | ✅ Verified for OpenCL (CPU and NVIDIA GPU), ACPP `.jit.so` and CUDA `cuModuleLoadData`; ⚠️ ROCm compile-checked and unit-tested | Real OpenCL runs (above; mixbench-ocl: 133 programs → 133 entries; sycl-omp: all 100 kernels matched by module; BabelStream on NVIDIA OpenCL: the program's PTX, 6 launched kernels, launch counts equal per module); CUDA on the MX550: 100 module loads with `path=`+`mod=`, the NVRTC sample started through a wrapper script → SASS linked to its launch by module; the shared C code `hp_module.h` (function table, module hash, in-memory ELF image size) under plain and ASan+UBSan builds (`test_disasm_modules.py`), its hash equal to the Python one, the image size equal to the file size of a host ELF, a ptxas cubin and an nvcc fat binary; AoT CUDA with a shared cudart on the MX550 (`test_cuda_module_launches.py`): the launch's module id equals the extractor's hash of the executable's fat binary, code keyed by it, 1 launch by module; Triton's pattern (`tests/fixtures/cuda_launch_ex.c`: `cuLaunchKernelEx` from `dlsym` 3x + `cuLaunchKernel`): all 4 kernel spans with `mod=`, 4 launches by module; a real Triton 3.6 vector add (3/3); the CUPTI callback's parameter decoding natively (`cupti_records_test.c`: `cuLaunchKernel[Ex][_ptsz]`, `cudaLaunchKernel[ExC]`, ids and layouts asserted against the headers); launch counts by name re-attributed offline on the harness traces: BabelStream CUDA 6/6 (were 0), the 5 AoT vendor samples, mixbench CUDA 141/141, static-cudart BabelStream; a static cudart behind a forking wrapper and behind `env`, 5 runs, identical disassembly | ROCm (`hipModuleGetFunction`, fat binaries) at run time; CUDA 12 `cuLibrary*` loading (not wrapped); fat binaries in shared libraries (no module id) |
+| JIT stage labels (`stage=`), NVRTC/HIPRTC spans, AdaptiveCpp runtime compilation | ✅ OpenCL, ACPP and NVRTC verified; ⚠️ HIPRTC compile-checked | mixbench: ocl → "driver build from source"; ACPP kernel-cache hooks (`acpp_jit_compile`, `stage=runtime`): cold runs BabelStream sycl-omp/sycl-ocl 8 misses (sycl-cuda 7), mixbench 100 (the kernels the runtime compiled, counted independently), warm runs hits only (`acpp_jit_cache`) and no runtime-stage span, JIT coverage of the cold-start cost 0.99–1.16 for sycl-omp, sycl-ocl and (on the MX550) sycl-cuda; NVRTC on the MX550: `nvrtcCompileProgram` (`stage=frontend`) in vectorAdd_nvrtc; Triton (`--python-jit`): `test_python_jit.py` with a stub `triton` (stage durations, cache hits, the program's own `sitecustomize` and listener still called, the span ending in the program's own clock window) and Triton 3.6 on the MX550 (cold: one 274 ms `triton_jit_compile`; warm: a cache-hit instant, no front-end span) | `hiprtcCompileProgram` and ACPP's HIP back end at run time (no AMD GPU); Triton on AMD; other Python JITs |
+| NCCL | ❌ Not run | Compile only; `commid=`/`seq=` grouping unit-tested on synthetic traces (`test_criticalpath_predictions.py`) | Everything at run time (no NCCL, no multi-GPU) |
 | `perf` CPU sampling | ⚠️ Parser tested only | `test_perf_script_parsing.py` with synthetic `perf script` text | Real `perf record` (blocked by `perf_event_paranoid=4`) |
 | LIKWID, hardware-counter roofline (ncu, rocprof, perf stat) | ❌ Not run on the development machine | Output parsers | PMU access denied; `ncu` and `rocprof` not installed |
+| Backend probes (`hprofiler backends`, `--backend auto`) | ✅ Unit tested; run on the development machine | `test_backend_probes.py` (driver mismatch, no device, no `/dev/kfd`, no PMU access, auto-detection skipping installed-but-unusable backends, explicit use with a warning; probes mocked); here: cuda/opencl/openmp/mpi usable, cpu and likwid installed but not usable (`perf_event_paranoid=4`), rocm installed without `/dev/kfd` | The probes on a real ROCm or NCCL system |
 | Critical-path DAG (confidence tiers, longest-path DP) | ✅ Verified | Hand-computed unit tests (`test_criticalpath.py`), including a case where the DP finds 650 ns vs. a greedy walk's 60 ns; precision/recall suite | — |
+| Critical-path edge rules for devices, graphs, OpenMP teams, event loss, NCCL communicators | ✅ Unit tested (synthetic); OpenMP teams also with the real GNU libgomp hook | `test_criticalpath_predictions.py` (both edge builders), `test_gomp_teams.py` (two concurrent nested teams) | `hdev=` and graph kernels on real multi-GPU / CUDA-graph runs |
+| Critical path with annotation ranges and overlapping hops | ✅ Unit tested; checked on saved LLNL Comb traces | `test_criticalpath_comb.py`: two ranks with nested NVTX phase ranges around pack kernel / stream sync / `MPI_Isend` / `MPI_Waitall` -- no annotation on the path, p2p + launch + device_wait hops, no `nvtx` time, the same path as without the ranges, both builders equal, old-version edges rebuilt; covered time in an arrival hop, a p2p hop into an earlier completion and a ping-pong (total ≤ extent ≤ wall, credited + gaps = total). Comb (MPI + OpenMP + CUDA, 2 ranks; read-only copies): CUDA runs 0 ms on NVTX (were 23.6–136.1 ms), path through launch/device_wait/p2p, identical to the NVTX-stripped control, within wall (383.6/384.9, 353.6/353.8, 46.8/48.6 ms); CPU runs 7.56/7.65, 10.26/11.07, 6.81/7.33 ms (were 7.90, 11.61, 7.60); 408 p2p edges, all receives matched, every row of the harness checker OK | Comb at scale / more ranks; enclosing *work* spans (Known limitations) |
+| Span ids shared by two hooks (older traces) and per-hook id spaces | ✅ Unit tested; checked on a saved LLNL Comb trace and real CUDA / MPI runs | `test_span_links.py`: resolution by family / enclosing range / time, no guess across families; a thread whose CUDA launch, device kernel, `MPI_Irecv` and `MPI_Wait` share one id gives a forest with the right links in both call-tree builders and the flame graph (1500 such iterations: was a RecursionError); MPI completion → MPI request, not the later CUDA call, in both edge builders; `hp_ids.h` ids of the six hooks differ. Comb CUDA trace copy (816 shared ids): call tree 0.2 s, depth 9, all three GUI loader steps OK (was the error); the harness's GUI self-test on the 8 clean-test traces that failed (OSU CUDA ibcast / iallreduce / bw / mbw_mr, Comb CUDA ×2, LULESH LLVM c1 / c8 -- recursion error or killed at a 6 GB cap) passes under a 3 GB cap, peaks 93–831 MB, 1–17 s (the old call tree on OSU iallreduce: ~90 MB/s until killed); all 816 explicit MPI links MPI → MPI (281 went to a CUDA call); path unchanged, 383.6/384.9 ms. New hooks: CUDA and MPI fixture runs carry hook tags 1 and 3; CUDA / MPI / OpenMP / OpenCL integration tests pass | ROCm id space compile-checked only (no AMD GPU here) |
 | Run comparison | ✅ Verified on constructed scenarios | `test_causal_compare.py` scenarios with known single differences; GUI interaction test | Real program pairs beyond the scenarios |
-| Multi-node merge and clock offsets | ✅ Python side verified; ⚠️ C-side exchange compile-checked | Offset/error-bound unit tests incl. asymmetric latency; a real CLI merge of two traces | A real 2+-rank clock exchange |
+| Multi-node merge and clock offsets | ✅ Verified on one host (true offset 0); ⚠️ multi-host pending | `test_multinode.py`: known offsets, asymmetric latency, 50 ppm drift, three coupled nodes, no clock data, older counters, same `boot_id`, CLI; harness per-rank OSU latency/allreduce and LULESH gnu-c1 with `HPROFILER_CLOCK_SYNC=1`: offsets 0, 0 violations (were 326 and 711); the forced estimate path (`HPROFILER_CLOCK_SYNC_IGNORE_BOOT_ID=1`) within 41 ns of 0, 0 violations | A real multi-host run (Vera/Dardel): network latency asymmetry, real drift, different boot_ids |
+| Node-collector mode (`collect` + `exec`) | ✅ Verified on one node | `test_node_collector.py`: 4 Intel MPI ranks started with `mpirun … hprofiler exec` into one trace, every receive paired, idle exit; `exec` started before its collector waits and loses nothing; harness LULESH 8 ranks: per-rank vs. node-collector overhead (see [Node-collector mode](#node-collector-mode-hprofiler-collect--hprofiler-exec)) | Slurm (`srun`, PMIx), more than one node |
+| Opt-in exact point-to-point rule (`--exact-p2p-high`) | ✅ Unit tested; tier mix measured | `test_exact_p2p_rule.py` (both edge builders: complete channel, older hooks, unequal counts, Mprobe/persistent requests, cancelled sends, unregistered communicators, event loss, off by default); harness traces osu/imb/hprofiler-fixtures before → after | Whether "high" on these edges is warranted on MPI libraries other than Intel MPI / MPICH |
 | eBPF scheduler tracer | ⚠️ Compiled, linked, run to the privilege check — never loaded | `bpftool gen skeleton` structure check; `EPERM` exactly where `unprivileged_bpf_disabled=2` puts it | The kernel BPF verifier, event correctness, attaching to an `hprofiler run` capture |
 | Trace store | ✅ Verified at scale | Memory/disk parity test; 2M/5M-span stress test | — |
 | TUI | ✅ Interaction tests | Textual `run_test()` tests (dashboard, timeline, connectors, flame graph, disassembly messages) | — |
@@ -4629,36 +5254,48 @@ Evidence details are in [Experimental validation](#8-experimental-validation).
 
 | Area | Limitation | Workaround |
 |---|---|---|
-| **Program exit status** | `hprofiler run` does not report the profiled command's exit status; a crash or a launcher that never started the program shows up only as missing events (and the zero-event warning). | Check the program's own output; rerun without hprofiler if events are missing. |
-| **LIKWID in auto-detection** | `likwid` is auto-selected whenever `likwid-perfctr` is installed. Without PMU access `likwid-perfctr` refuses to start the program, so the run captures nothing. | Pass `--backend` without `likwid`, or grant PMU access. |
+| **Program exit status** | The profiled command's status is recorded, printed and warned about, but `hprofiler run` itself exits 0 unless `--exit-status` is given (unchanged default, for existing scripts). Under a launcher it is the launcher's status. | Pass `--exit-status` in scripts and CI. |
+| **Backend probes** | Auto-detection enables a backend only when its probe passes (a CUDA device answers `cuInit`, `/dev/kfd` lists a GPU, `likwid-perfctr` can measure, an OpenCL device exists). A probe proves the hardware answers, not that every feature works (e.g. CUPTI activity on that device), and a backend requested explicitly is used even when its probe fails (with a warning). | `hprofiler backends` shows each probe's reason. |
 | **Collector ingestion rate** | The Python collector ingests ~35k events/s after the run; tens of millions of events take minutes to ingest (memory stays bounded). If it falls behind *during* the run long enough to fill a thread's ring, producers wait (bounded) and then drop — always counted and warned about. | Raise `HPROFILER_RING_KB`, or narrow the backends or region. |
-| **Single-node capture** | The collector socket is reachable only on the node running `hprofiler run`. Multi-node traces need one capture per node plus `merge-nodes`, whose clock-offset capture (`HPROFILER_CLOCK_SYNC`) has never run against a real multi-node job. | Treat cross-node edges as unverified until confirmed; `merge-nodes` checks send/receive causality and warns. |
+| **Single-node capture** | The collector socket is reachable only on the node running `hprofiler run`. Multi-node traces need one capture per node plus `merge-nodes`. Its clock alignment is verified on one host only (same clock, and the estimate path forced); across hosts the offsets rest on the measurement bound and the message order, never validated against an independent clock. The drift model is linear between the `MPI_Init` and `MPI_Finalize` measurements. Processes of one host in different time namespaces are distinguished only through the collector's own namespace. | Treat cross-node edges as unverified until a multi-host run confirms them; read the per-trace decisions `merge-nodes` prints. |
 | **OpenCL GPU timing** | Device timestamps are converted with one calibration sample at the first event; sub-millisecond kernels may carry ±50 µs timestamp error. | Use the CUDA or ROCm backend for short-kernel timing. |
 | **OpenCL depth** | Only host-API events (kernel name, transfer size); no intra-kernel constructs. | Inherent: OpenCL has no construct callback API. |
 | **CUDA/ROCm records arrive late** | Native records come in buffers (CUPTI flushes every `HPROFILER_CUPTI_FLUSH_MS` and at exit); correlation runs once after the run. | Expected. |
 | **Abnormal exit loses GPU records** | Records still buffered in CUPTI/ROCprofiler-SDK are lost if the process dies (signal, `_exit`); the trace says so (missing `final_flush`). | Let the program exit normally. |
 | **One CUPTI subscriber per process** | Under Nsight Systems, or in an application that uses CUPTI itself, correlation is unavailable (`correlation=unavailable`) and device spans stay uncorrelated. | Profile with one tool at a time. |
 | **Newer CUPTI record layouts** | Layouts newer than the compiled headers are assumed to extend the old ones (true for every version pair in the CUDA 12.9 headers); implausible records are skipped and counted. | Rebuild against current headers. |
-| **Static CUDA runtime** | `libcudart_static.a` cannot be intercepted; CUPTI is started at load time instead, without stream/event handles (event syncs use the device-wide wait rule). Without libcupti: 0 CUDA events. | Build with `-cudart shared` (no run-time cost). |
+| **Static CUDA runtime** | `libcudart_static.a` cannot be intercepted; CUPTI is started at load time instead, without stream/event handles (event syncs use the device-wide wait rule). Without libcupti: 0 CUDA events. The static runtime is detected in the command and in every executable named among its arguments (`env`, `mpirun`, a wrapper script given the binary); a script that names the binary only inside itself is not looked into. | Build with `-cudart shared` (no run-time cost); behind such a script set `HPROFILER_CUPTI_EAGER=1`. |
 | **CUDA/ROCm proxy timing** | Without a native tracer, device spans start at the host launch time; the `xs=` exec-start estimate was ~2.4 ms late in the one measured run. | Use native tracing (CUPTI / ROCprofiler-SDK). |
 | **ROCm** | Native tracing has never run on an AMD GPU; `--gpu-pc-sampling` is ignored for ROCm. | Check `hprofiler summary` for the device-activity status. |
 | **CUDA PC sampling** | AoT-compiled kernels only: JIT-compiled PTX has no SASS addresses to match samples to (a warning is printed). On the development machine's MX550 it also disabled native device activity (`enable_kernel_activity_failed_14`, reported as a capture warning) and attributed no samples. | Compile with embedded SASS; check the capture warnings. |
-| **NCCL** | Each wrapper waits for its end event, serializing NCCL operations with the host (perturbs overlap). Durations of operations issued inside `ncclGroupStart`/`ncclGroupEnd` are unverified (NCCL defers their launch to `ncclGroupEnd`). If the end-event wait or elapsed-time query fails, no span is emitted and the loss is not counted. Never run on real hardware. | Treat NCCL timings as unverified. |
+| **NCCL** | Each wrapper waits for its end event, serializing NCCL operations with the host (perturbs overlap). Durations of operations issued inside `ncclGroupStart`/`ncclGroupEnd` are unverified (NCCL defers their launch to `ncclGroupEnd`). If the end-event wait or elapsed-time query fails, no span is emitted and the loss is not counted. Communicators created before the hook was loaded, or by an unwrapped API, have no `commid=`/`seq=`, so their collectives are grouped by type and overlap only. Never run on real hardware. | Treat NCCL timings and groupings as unverified. |
 | **NVTX v3** | Header-only NVTX v3 is inlined and cannot be intercepted; only NVTX v2 (library-dispatched) calls are captured. | Compile with `NVTX_DISABLE`, or use `nvtxRangePushA` (the v2 path). |
-| **GNU libgomp coverage** | `schedule(static)` loops are computed inline by GCC (no `GOMP_loop_*` call), so they get no loop span (their implicit barrier is still seen). Tasks, `sections`, `doacross`, `target` and the legacy `GOMP_parallel_start`/`_end` ABI are not intercepted. | Use an LLVM libomp build for full construct coverage. |
+| **GNU libgomp coverage** | `schedule(static)` loops are computed inline by GCC (no `GOMP_loop_*` call), so they get no loop span (their implicit barrier is still seen). Tasks, `taskwait`, `taskgroup`, critical sections and the C lock API are recorded; `taskloop`, `sections`, `doacross`, `ordered`, `target`, the Fortran lock API and the legacy `GOMP_parallel_start`/`_end` ABI are not intercepted. Each task's argument block is 64 bytes larger (more for arguments aligned beyond 16 bytes): the hook's header precedes the real arguments. | Use an LLVM libomp build for full construct coverage. |
+| **OpenMP atomics** | `#pragma omp atomic` is not recorded by either runtime path (OMPT: one callback per update would dominate what is measured; GCC: inline hardware atomics, no runtime call). | — |
+| **OMPT task spans** | `omp_task` is one span per execution fragment of an explicit task: a task that is suspended (taskyield, a task switch at a scheduling point) has `fragment=1` spans before its last one, so the number of `omp_task` spans exceeds the tasks executed when tasks suspend. A task ended by `detach` has a final status other than 1. Traces recorded before this change also contain implicit-task segments (`id=0`). | Count tasks with the `omp_task` spans without `fragment=1`; ignore `id=0` in older traces. |
 | **Call-site resolution** | A call site in a non-exported function of an executable built without `-rdynamic` resolves as `lib=`+offset and is disassembled only if the binary has a symbol table. | Build with `-rdynamic` or keep symbols. |
 | **`view`/`gui --disasm` on stores** | Background disassembly is collected only for JSON traces that open without a store; opening a `.hpstore`, or a run's JSON whose store is next to it, does not collect. | Record with `hprofiler run --disasm`. |
 | **`hprofiler roofline <trace>` in the TUI** | The TUI path for a saved trace fails with `AttributeError: 'Trace' object has no attribute 'kernel_counters'` after the HTML file has been written. | Use `--html` (or open the written HTML file). |
 | **Disassembly-based roofline** | Each static instruction is counted once per thread, so looping kernels are under-estimated roughly by their trip count. | Prefer hardware-counter mode. |
+| **Disassembly: name-only matches** | Code is tied to launches by module id where the hook captured the module -- AoT CUDA code too, for the main executable's fat binaries with a shared cudart. AoT HIP code, a static cudart's and fat binaries in shared libraries are matched by symbol, their launches counted by kernel name (`launchBasis=name`); code whose launches carried no module id (traces from older hooks, an OpenCL build with a completion callback, CUDA 12 `cuLibrary*` loading, which is not wrapped) is matched by kernel name and flagged `~` in the Source tab, and where several entries share that name the launch count is unknown (`null`). Launches named `<jit-kernel>` get no disassembly. CUPTI PC samples are attached by function name, not module. | Check the match shown in the Source tab header and `launchBasis`. |
+| **Device clock drift** | A drifting GPU→host clock mapping is corrected only where it makes device records precede their own submission, and only as far as needed (a lower bound: launch latencies in such a phase can be under-estimated by what is left of the error). A drift that puts device times later is indistinguishable from launch latency and is not corrected. | `clock_correction_max_ns` in `metadata.deviceActivity` and the capture warning say when it happened. |
+| **JIT cost coverage** | Only compilation inside hooked calls is timed: NVRTC/HIPRTC (`stage=frontend`), AdaptiveCpp's runtime compilation (`acpp_jit_compile`, `stage=runtime`), OpenCL builds, module loads. The AdaptiveCpp hook interposes `kernel_cache::persistent_cache_lookup`/`_store` by their mangled names, written against AdaptiveCpp 25.10 (develop); a version whose signatures differ is silently not seen (back-end/load spans only, and the summary says so), nor is a compilation that fails (no store follows its miss). Triton's own compile is recorded with `--python-jit` only (off by default; a listener the program installs after Triton's import replaces hprofiler's). Other runtimes that generate their own IR (Numba, ...) do that in no span. NVRTC/HIPRTC called through a program's own `dlopen` handle are not seen. | Time the first iteration separately when JIT cold start matters; `--python-jit` for Triton. |
 | **Roofline ceiling** | DRAM bandwidth is the memory ceiling; L2-resident kernels appear memory-bound. | Read it as a conservative bound for cache-resident work. |
 | **Device peak values** | Computed from driver attributes (DRAM: memory clock × bus width × data-rate factor ×2, ×4 for CDNA3/MI300), datasheet tables only as fallback; L2/L3 bandwidths are architecture estimates; CPU DRAM bandwidth falls back to 50 GB/s without readable `dmidecode` (root). Each value carries its provenance, shown in the System tab: `detected` (read from the driver/OS), `computed` (exact formula from detected values), `datasheet` (vendor peak for the model), `estimate` (architecture-level rule of thumb), `fallback` (generic default). Only the MX550 value was checked against real hardware. | Check provenance before treating ceilings as exact. |
 | **Record size** | Records up to 64 KiB are sent intact; larger ones are rejected and counted (`oversize`). Stacks over 16 KiB end in a `[truncated]` frame; frame names are capped at 1 KiB; call-site tags that do not fit become `codeptr=truncated`. | — |
-| **Critical path: `Test*`-only completion** | `MPI_Test*`/`MPI_Cancel` are instant events; a non-blocking receive completed only by `Test*` polling gets no cross-rank edge. | — |
-| **Critical path: SPMD assumption** | Collective/barrier pairing assumes ranks call the Nth collective of a type in the same order. | — |
-| **Critical path: overlapping rendezvous** | At span granularity, a path through several overlapping rendezvous waits can account more time than wall time (reported in the notes). | — |
+| **Critical path: `Test*`-only completion** | `MPI_Test*`/`MPI_Cancel` are instant events; a non-blocking receive completed only by `Test*` polling gets no cross-rank edge. Such requests are counted (`test_only_completions`) and warned about. | — |
+| **Critical path: SPMD assumption** | MPI collective and OpenMP barrier pairing assumes ranks/threads call the Nth collective of a type (per communicator / team) in the same order and that rounds hardly overlap. NCCL calls with `commid=`/`seq=` are paired exactly. | — |
+| **Critical path: holes in the MPI graph** | Calls that are not wrapped (see the [`mpi` backend](#mpi-backend)'s list), events lost in the capture, and requests posted before the hook was loaded leave receives without an edge. They are counted per communicator in `metadata.dependencyDiagnostics` and warned about, not hidden. Messages on unregistered communicators (`commid=-1`) between the same ranks with one tag can be confused with each other. | Check "MPI dependency coverage" in `hprofiler critical-path`. |
+| **Critical path: order-based pairing after event loss** | Point-to-point messages and event syncs are paired by order; after a lost event the pairing of that channel may be shifted. Such edges are only *marked* "low" in processes with recorded loss; they are not corrected (that would need per-channel sequence numbers in the hook). | Avoid drops (`HPROFILER_RING_KB`); read "low" edges with care. |
+| **Critical path: GPU devices and graphs** | A device-wide sync is tied to its device through `hdev=`, read with `cuCtxGetDevice`/`hipGetDevice` after the call — never run on real multi-GPU hardware. Proxy device spans from hooks without `hdev=` carry no device and share a stream key across GPUs. Kernels of one CUDA graph launch get no edges among themselves (the graph's internal dependencies are not recorded). | — |
+| **Critical path: OpenMP teams without an id** | Barriers are grouped per team via OMPT's parallel id or the GNU libgomp hook's `team=`; traces recorded without either group barriers of one name per process, so concurrent (nested) teams' barriers can be merged. | Re-record with the current hooks. |
+| **Critical path: overlapping rendezvous** | The path's reported time counts each instant once, but the longest-path search maximizes a value that counts the overlap on both sides of start-gated hops (rendezvous, point-to-point), so among paths of equal covered time it can prefer one zig-zagging between ranks; its value is kept as `dp_accounted_ns` (and noted when larger). | Read the covered time and the hop kinds, not `dp_accounted_ns`. |
+| **Critical path: enclosing work spans** | Program order links a call to the latest-completed span on its thread (ties: the outermost), so a long work span that encloses others -- e.g. a parallel region around MPI calls in a funneled program -- is the only program-order exit from what ran inside it: a cross-rank chain that reaches a wait inside the region cannot continue to the work after the region (the path then ends at the wait). Annotation ranges no longer do this; work spans still can (not observed in Comb, whose MPI calls run outside its regions). | — |
 | **POP Transfer Efficiency** | Fitted from the trace's own messages (latency/bandwidth model), not a network replay. | Treat it as a proxy; see the report's notes. |
 | **Run comparison** | See [Comparing runs](#comparing-runs) → Limitations. | — |
-| **eBPF tracer** | Never loaded into a kernel. `hprofiler run` creates its collector socket in a private temporary directory, so there is currently no supported way to point `os_tracer` at a run's collector. | — |
+| **Per-rank capture** | One `hprofiler run` per rank starts one Python collector per rank, which compete with the ranks for cores: LULESH, 8 ranks on one node, application phase 1.9–2.4 s vs. 0.56–0.60 s with one node collector. Node-collector mode has been run on one node with Intel MPI's `mpirun` only (not under Slurm); it collects no disassembly and cannot use the `cpu`/`likwid` backends. | Use [node-collector mode](#node-collector-mode-hprofiler-collect--hprofiler-exec); run `hprofiler view --disasm` on its trace afterwards on the same node. |
+| **Saved code blobs** | The hooks save JIT/module code to `/tmp/hprofiler_{cubin,rocm,ocl,jit}_<pid>_<n>.*` for disassembly. A run that collects disassembly deletes its own; one that does not (`--no-disasm`, `hprofiler collect`, a killed run) leaves them for a later `view --disasm`. | Delete stale `/tmp/hprofiler_*` files when no trace needs them. |
+| **eBPF tracer** | Never loaded into a kernel. `hprofiler run` creates its collector socket in a private temporary directory; `hprofiler collect --socket` gives a collector a fixed address `os_tracer` could connect to, but that has never been tried. | — |
 | **What still scales with trace size** | Viewers read windows and aggregates from the store, but some whole-trace analyses hold a subset in memory: the call tree without stacks (one thread's light spans at a time), the stack-based call tree and flame graph (the stacked spans), the critical path (~170 bytes/span: +171 MB at 1M spans, plus each process's CUDA/ROCm host/device spans) and the OTLP exporter. 1M spans: overview ~2.5 s, call tree ~4.6 s, critical path ~16 s cold / ~7 s with persisted edges. | Capture with `--no-json` and open the `.hpstore`; run `hprofiler critical-path` once to persist edges. |
 | **OTLP export** | Spans are exported flat (no parent links); the payload is built in memory. | — |
 
@@ -4669,7 +5306,7 @@ Evidence details are in [Experimental validation](#8-experimental-validation).
 ### Running the tests
 
 ```bash
-# Unit tests (pure Python + headless Qt; ~12 s)
+# Unit tests (pure Python + headless Qt + native C builds; ~2 min)
 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p 'test_*.py'
 
 # Integration tests -- build and run real programs through the hooks.
@@ -4680,7 +5317,14 @@ python3 -m unittest tests.integration.test_profiling_accuracy \
     tests.integration.test_mpi_rma tests.integration.test_gui_cancel \
     tests.integration.test_native_gpu_records \
     tests.integration.test_cuda_native_activity \
-    tests.integration.test_callsite_e2e
+    tests.integration.test_callsite_e2e \
+    tests.integration.test_mpi_multirank tests.integration.test_opencl_names \
+    tests.integration.test_opencl_modules tests.integration.test_gomp_teams \
+    tests.integration.test_openmp_sync tests.integration.test_node_collector \
+    tests.integration.test_cuda_module_launches
+# test_mpi_multirank needs an MPI whose launcher starts 4 real ranks; it
+# sources HPROFILER_TEST_MPIVARS (default: Intel MPI's
+# /opt/intel/oneapi/mpi/latest/env/vars.sh) when that file exists.
 # test_callsite_e2e rebuilds the hook libraries in build/ (cmake), then runs
 # the real CLI on MPI / LLVM-libomp / GNU-libgomp fixtures started through
 # `env` and checks call-site tags, symfile= and the attached disassembly.
@@ -4794,7 +5438,10 @@ for ctr in trace.iter_counters():
 # `trace.spans` / `trace.counters` still work and return lists -- fine for
 # small traces, but they materialize every event.
 
-# Access disassembly (may need a short wait if called right after load)
+# Access disassembly (may need a short wait if called right after load).
+# Keys are names, or "name@module" for code from a captured module;
+# trace.disasm_for(name, mod) looks a launch's code up and says how
+# ("module", "symbol", "name", "name-ambiguous", "none").
 import time; time.sleep(2)
 for name, kd in trace.disasm.items():
     mix = kd.itype_pcts()
@@ -4843,9 +5490,10 @@ transport that the ring transport replaced; the current hot path is in
 [Overhead](#overhead)).
 
 Not covered by this suite: CUDA/ROCm/NCCL (no ground-truth fixture; CUDA
-has functional checks, below), real multi-rank MPI (the development
-machine's MPICH/Hydra cannot form a multi-process communicator), and perf
-sampling (`perf_event_paranoid=4`).
+has functional checks, below), real multi-rank MPI (one self-communicating
+rank, so it runs with any MPI; 4 real ranks are checked against their
+fixtures' ground truth by `tests/integration/test_mpi_multirank.py` with
+Intel MPI), and perf sampling (`perf_event_paranoid=4`).
 
 ### Causal-graph accuracy
 
@@ -4934,11 +5582,18 @@ the event pair). One run on one GPU — not an accuracy study.
 - **MPI.** `tests/integration/test_mpi_protocol.py` builds the real hook,
   preloads it into a fixture that exercises every completion path, and
   asserts on the wire bytes captured over a real `AF_UNIX` socket, parsed
-  by the production parser. Because the development machine cannot form a
-  multi-rank communicator, the fixture (`tests/fixtures/mpi_proto_self.c`)
-  communicates with itself: real `PMPI_*` completion semantics, but no
-  genuine cross-process `commid=` agreement. `tests/fixtures/mpi_proto.c`
-  is the 4-rank version for a working cluster. The RMA synchronization
+  by the production parser. That fixture (`tests/fixtures/mpi_proto_self.c`)
+  communicates with itself, so it runs with any MPI (Ubuntu's MPICH starts
+  singletons): real `PMPI_*` completion semantics, but no cross-process
+  `commid=` agreement. The 4-rank version, `tests/fixtures/mpi_proto.c`,
+  runs on 4 real Intel MPI ranks in `tests/integration/test_mpi_multirank.py`
+  (`TestMPIProto`): its output against the ground truth, unprofiled and
+  profiled, wildcard matches resolved by `MPI_Waitany` and repeated
+  `MPI_Waitsome` calls over an array with completed slots, the `MPI_Test`
+  instants of the polling loop, the cancelled receive, `commid=` agreement
+  across processes, and the dependency edges (three phase-A messages; none
+  for the cancelled receive nor, by design, for the `Test`-only
+  completion). The RMA synchronization
   wrappers have the equivalent `tests/integration/test_mpi_rma.py`
   (`tests/fixtures/mpi_win_self.c`: a fence/Put/Get active-target epoch
   and a lock/Accumulate/flush/unlock passive-target epoch).

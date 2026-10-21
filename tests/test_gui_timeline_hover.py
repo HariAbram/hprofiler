@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QUrl, QObject, QPoint, QPointF, Property, Qt, QSettings
+    from PySide6.QtCore import QUrl, QObject, QPoint, QPointF, QRectF, Property, Qt, QSettings
     from PySide6.QtGui import QGuiApplication, QWheelEvent, QColor
     from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
     from PySide6.QtQuick import QQuickWindow, QQuickItem
@@ -235,6 +235,25 @@ class TestTimelineHover(unittest.TestCase):
         # the synthesized cursor sitting on target_event's span, which
         # would otherwise leak a nonzero hoverLane into whatever test
         # happens to sort right after it).
+        # The window's size sets every pixel position the input tests use;
+        # nothing may carry a different one over from an earlier test.
+        if (self._window.width(), self._window.height()) != (1280, 800):
+            self._window.resize(1280, 800)
+            QTest.qWait(30)
+        # The first-use card (TimelineFirstUseOverlay, top-right of the
+        # Timeline) lets hover through to the lanes but takes clicks: a
+        # click test whose target lies under it dismissed it for good --
+        # and the overlay test, sorting after, then found it gone. Hidden
+        # for every test; test_timeline_first_use_overlay_... shows it.
+        self._set_overlay_dismissed(True)
+        # Start every test with the cursor parked where nothing reacts to
+        # it, and past the double-click interval: otherwise the item a
+        # previous test left under the cursor never sees a fresh enter /
+        # hover, and this test's first click can pair with that test's
+        # last one into a double-click (synthetic input timestamps advance
+        # by ~1 ms per event, so consecutive tests' clicks are "close").
+        QTest.mouseMove(self._window, QPoint(2, self._window.height() - 2),
+                        QGuiApplication.styleHints().mouseDoubleClickInterval() + 100)
         self._timeline_root.setProperty("zoom", 1.0)
         self._timeline_root.setProperty("viewStartNs", self._timeline_model.viewStartNs)
         self._flick.setProperty("contentY", 0)
@@ -292,6 +311,17 @@ class TestTimelineHover(unittest.TestCase):
         for _ in range(3):
             self._app.processEvents()
 
+    def _set_overlay_dismissed(self, dismissed: bool) -> None:
+        """Workspace.timelineOverlayDismissed, through the settings (the
+        bridge has no "undismiss" slot: for a user dismissal is permanent)."""
+        if self._workspace.timelineOverlayDismissed == dismissed:
+            return
+        self._workspace_settings.save_timeline_overlay_dismissed(dismissed)
+        self._workspace._timeline_overlay_dismissed = dismissed
+        self._workspace.timelineOverlayDismissedChanged.emit()
+        for _ in range(5):
+            self._app.processEvents()
+
     def _move_to(self, point: QPoint) -> None:
         QTest.mouseMove(self._window, point)
         for _ in range(3):
@@ -337,23 +367,61 @@ class TestTimelineHover(unittest.TestCase):
                     return QPoint(x, y)
         return None
 
+    def _find_items(self, root: QQuickItem, object_name: str) -> list:
+        """Delegate items by objectName, walked through childItems() --
+        ListView/Repeater delegates are not QObject children of the view,
+        so findChild() cannot reach them. Several when a view has just
+        rebuilt its delegates and the old one is not deleted yet."""
+        found, stack = [], [root]
+        while stack:
+            item = stack.pop()
+            if item.objectName() == object_name:
+                found.append(item)
+            stack.extend(item.childItems())
+        return found
+
     def _find_target_event_point(self) -> QPoint | None:
-        """Sweeps for the short "target_event" span (3rd lane row),
-        shared by both the double-click-to-zoom and click-to-select
-        tests. Wrapped in a bounded outer retry: with the fixture's many
-        lanes (see _build_trace()), the per-move Canvas repaint cost makes
-        a single-pass sweep occasionally miss -- synthetic input isn't 100%
-        deterministic on the first pass under offscreen QPA (same remedy as
-        the FlameGraph-tooltip and Call-Tree-click tests). The range starts
-        at 150 and extends to 420: the lanes area sits below the
-        bookmarks/legend row + TimeRuler, and under grouping target_event's
-        row can sit several rows deeper than in the flat case."""
-        for _attempt in range(3):
-            for y in range(150, 420, 10):
-                for x in range(140, int(self._window.width() * 0.9), 20):
-                    self._move_to(QPoint(x, y))
-                    if self._timeline_root.property("hoverText").startswith("target_event"):
-                        return QPoint(x, y)
+        """Where the short "target_event" span is on screen, shared by the
+        double-click-to-zoom, click-to-select and grouping tests: computed
+        from the model and the view, not swept for. The span is ~17 px wide
+        at the default zoom -- narrower than a 20 px sweep step -- so a
+        sweep hit or missed it depending on sub-pixel layout (a different
+        lane-area width, scrollbar or legend wrap), i.e. on what earlier
+        tests in the same process had left behind. Its lane's row is
+        scrolled into view, the span's mid-time is mapped onto that lane's
+        canvas, and the cursor is moved there (with a couple of nearby
+        points, and a bounded retry that lets the canvas repaint first --
+        its hover handler only knows the spans of its last paint)."""
+        span = next(s for s in self._trace.iter_spans() if s.name == "target_event")
+        lane = self._timeline_model._lane_of_span(span)
+        row = self._timeline_model.rowIndexForLane(lane)
+        row_h = self._timeline_root.property("rowHeight")
+        flick_h = self._flick.property("height")
+        content_y = self._flick.property("contentY")
+        if row * row_h < content_y or (row + 1) * row_h > content_y + flick_h:
+            self._flick.setProperty("contentY", max(0.0, row * row_h - flick_h / 2))
+            QTest.qWait(20)
+        # the live canvas of that row: visible, and where the row is
+        row_y = (self._flick.mapToScene(QPointF(0, 0)).y() + row * row_h
+                 - self._flick.property("contentY") + row_h / 2)
+        canvases = [c for c in self._find_items(self._flick, f"laneCanvas_{lane}")
+                    if c.isVisible() and c.width() > 0]
+        if not canvases:
+            return None
+        canvas = min(canvases, key=lambda c: abs(c.mapToScene(QPointF(0, c.height() / 2)).y() - row_y))
+        mid = span.start_ns + span.duration_ns / 2
+        for attempt in range(6):
+            # the lane's hover handler searches the spans its canvas cached
+            # at its last paint: after a filter/grouping change, give the
+            # render loop time to repaint (processEvents() alone does not)
+            QTest.qWait(25 * (attempt + 1))
+            frac = (mid - self._timeline_root.property("viewStartNs")) / self._timeline_root.property("visibleNs")
+            center = canvas.mapToScene(QPointF(frac * canvas.width(), canvas.height() / 2))
+            for dx in (0, -3, 3):
+                point = QPoint(round(center.x()) + dx, round(center.y()))
+                self._move_to(point)
+                if self._timeline_root.property("hoverText").startswith("target_event"):
+                    return point
         return None
 
     def test_hovering_over_a_span_reports_it_with_no_warnings(self):
@@ -380,6 +448,216 @@ class TestTimelineHover(unittest.TestCase):
         self.assertEqual(self._warnings, [])
         self.assertEqual(self._timeline_root.property("hoverLane"), -1)
         self.assertEqual(self._timeline_root.property("hoverText"), "")
+
+    # ── Hovering never moves the lanes ──────────────────────────────────
+    # The hover detail used to be a label in the status row. That row was
+    # already wider than the Timeline in a 1280 px window, and a
+    # ColumnLayout widens every child to its widest child's minimum: the
+    # lanes ran under the Inspector, and each hover widened them further,
+    # so the spans jumped (a Jacobi CUDA trace at 1920 px: lanes 1704 ->
+    # 1927 px wide on hovering a mangled kernel name).
+
+    def _lane_geometry(self) -> tuple:
+        canvas = next(c for c in self._find_items(self._flick, "laneCanvas_0")
+                      if c.isVisible() and c.width() > 0)
+        return (round(canvas.mapToScene(QPointF(0, 0)).x()), round(canvas.width()),
+                round(self._flick.width()))
+
+    def test_hover_shows_a_tooltip_and_never_moves_the_lanes(self):
+        QTest.qWait(30)
+        before = self._lane_geometry()
+        hit = self._find_hover_point()
+        self.assertIsNotNone(hit, "setup: hovering never registered a hit anywhere")
+        QTest.qWait(30)
+        self.assertEqual(self._lane_geometry(), before)
+        tip = self._root.findChild(QObject, "timelineHoverTooltip")
+        text = self._root.findChild(QObject, "timelineHoverTooltipText")
+        self.assertTrue(tip.property("visible"))
+        self.assertEqual(text.property("text"), self._timeline_root.property("hoverText"))
+        top_left = tip.mapToScene(QPointF(0, 0))
+        self.assertTrue(hit.x() <= top_left.x() <= hit.x() + 30, (top_left, hit))   # beside the cursor,
+        self.assertLessEqual(top_left.y() + tip.height(), hit.y())                    # above it
+
+        # a name far wider than the window: elided inside the Timeline, lanes unmoved
+        self._timeline_root.setProperty("hoverText", "_Z" + "x" * 600 + "  @1.00ms  dur 2.00ms")
+        QTest.qWait(30)
+        self.assertEqual(self._lane_geometry(), before)
+        x = tip.mapToItem(self._timeline_root, QPointF(0, 0)).x()
+        self.assertGreaterEqual(x, 0)
+        self.assertLessEqual(x + tip.width(), self._timeline_root.width())
+        self.assertEqual(self._warnings, [])
+
+    def test_hover_span_index_keeps_disk_store_ids(self):
+        # A span's index is its store event id, (shard << 38) | row: past
+        # 2^31 for every span of a disk store (what `hprofiler run` writes).
+        # As a QML int it kept only the row, so clicking a span selected
+        # nothing (or another span), double-click zoom did nothing and the
+        # hover's repeat guard never matched (a Jacobi trace: 274877906950
+        # became 6). This test class's in-memory trace has small ids, so the
+        # property is checked directly.
+        big = float((1 << 38) | 6)
+        self._timeline_root.setProperty("hoverSpanIdx", big)
+        self.assertEqual(self._timeline_root.property("hoverSpanIdx"), big)
+        self._timeline_root.setProperty("hoverSpanIdx", -1)
+
+    def test_toolbar_rows_never_widen_the_lanes(self):
+        tl = self._timeline_root
+        try:
+            for size in ((1280, 800), (900, 700)):
+                self._window.resize(*size)
+                QTest.qWait(60)
+                right = tl.mapToScene(QPointF(tl.width(), 0)).x()
+                lanes = [c for c in self._find_items(self._flick, "laneCanvas_0") if c.isVisible()]
+                self.assertTrue(lanes)
+                for c in lanes + [self._flick]:
+                    self.assertLessEqual(c.mapToScene(QPointF(c.width(), 0)).x(), right + 0.5, size)
+                for name in ("timelineStatusRow", "timelineSecondRow"):
+                    row = self._root.findChild(QObject, name)
+                    self.assertLessEqual(row.mapToScene(QPointF(row.width(), 0)).x(), right + 0.5, (size, name))
+                if size == (1280, 800):     # the default window: every control on screen
+                    reset = self._root.findChild(QObject, "timelineResetButton")
+                    self.assertLessEqual(reset.mapToScene(QPointF(reset.width(), 0)).x(), right + 0.5)
+        finally:
+            self._window.resize(1280, 800)
+            QTest.qWait(30)
+        self.assertEqual(self._warnings, [])
+
+    # ── Colours: controls readable, everything follows the theme ────────
+    # The Qt Quick Controls drew with the desktop's palette, not the theme:
+    # on a light desktop near-black text on the dark background -- Filters,
+    # Group, Color, -, +, Fit, Reset, + Bookmark, the theme toggle ~1.1:1,
+    # the search field 1.5:1 -- under light tab and menu bars. Measured from
+    # the rendered pixels: the strongest pixel against the control's median.
+
+    @staticmethod
+    def _pixel_contrast(img, rect) -> float:
+        def lum(c):
+            v = [x / 255 for x in (c.red(), c.green(), c.blue())]
+            v = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in v]
+            return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+        ls = sorted(lum(img.pixelColor(x, y))
+                    for y in range(int(rect.top()) + 2, int(rect.bottom()) - 1)
+                    for x in range(int(rect.left()) + 2, int(rect.right()) - 1)
+                    if 0 <= x < img.width() and 0 <= y < img.height())
+        if not ls:
+            return 0.0
+        bg = ls[len(ls) // 2]
+        fg = max(ls, key=lambda v: abs(v - bg))
+        return (max(fg, bg) + 0.05) / (min(fg, bg) + 0.05)
+
+    def _visible_controls(self) -> list:
+        kinds = ("ToolButton", "Button", "TabButton", "CheckBox", "MenuBarItem", "TextField")
+        out = []
+        for item in self._walk_items(self._window.contentItem()):
+            name = item.metaObject().className().split("_QMLTYPE")[0].split("_QML_")[0].replace("QQuick", "")
+            if name in kinds and item.isVisible() and item.width() > 4 and item.height() > 4:
+                out.append((name, item))
+        return out
+
+    @staticmethod
+    def _walk_items(root) -> list:
+        out, stack = [], [root]
+        while stack:
+            item = stack.pop()
+            out.append(item)
+            stack.extend(item.childItems())
+        return out
+
+    def test_controls_text_is_readable_in_both_themes(self):
+        try:
+            for dark in (True, False):
+                self._theme.dark = dark
+                QTest.qWait(150)
+                img = self._window.grabWindow()
+                controls = self._visible_controls()
+                self.assertGreaterEqual(len(controls), 15, dark)
+                weak = []
+                for name, item in controls:
+                    p = item.mapToScene(QPointF(0, 0))
+                    c = self._pixel_contrast(img, QRectF(p.x(), p.y(), item.width(), item.height()))
+                    if c < 3.0:
+                        weak.append((name, item.property("text"), item.property("enabled"), round(c, 2)))
+                self.assertEqual(weak, [], "dark" if dark else "light")
+        finally:
+            self._theme.dark = True
+            QTest.qWait(50)
+        self.assertEqual(self._warnings, [])
+
+    def test_theme_toggle_recolors_lane_labels(self):
+        # Lane label colours were computed once: after a toggle a lane kept
+        # the starting theme's colour (a "sync" lane's near-white label on
+        # the light background).
+        from src.gui.theme import category_color
+        label = next(i for i in self._find_items(self._flick, "laneLabel_0") if i.isVisible())
+        cat = self._timeline_model.lanes[0]["category"]
+        try:
+            for dark in (False, True):
+                self._theme.dark = dark
+                QTest.qWait(30)
+                self.assertEqual(label.property("color"), QColor(category_color(cat, dark)), dark)
+        finally:
+            self._theme.dark = True
+        self.assertEqual(self._warnings, [])
+
+    def test_empty_state_uses_the_application_font(self):
+        # font.family "" is not "the default": fontconfig's first match, a
+        # serif or even a script font on some desktops (the Inspector's
+        # "Select a kernel..." hint).
+        hint = next(i for i in self._walk_items(self._window.contentItem())
+                    if str(i.property("text") or "").startswith("Select a kernel"))
+        self.assertEqual(hint.property("font").family(), QGuiApplication.font().family())
+
+    def test_a_span_starting_left_of_the_view_paints_only_its_visible_part(self):
+        # A span that began before the view was drawn from x=0 with its FULL
+        # width: an MPI_Barrier ending 7% into a Comb window filled the whole
+        # lane, and the "busy" part shrank or grew as zoom/pan moved its
+        # start on screen (idle shown as busy, then busy turning idle).
+        # Here target_event (490..510 us) in a 100 us view starting at
+        # 500 us: busy for the first 10% only (the old code painted 20%).
+        span = next(s for s in self._trace.iter_spans() if s.name == "target_event")
+        lane = self._timeline_model._lane_of_span(span)
+        self._timeline_root.setProperty("zoom", 10.0)
+        self._timeline_root.setProperty("viewStartNs", self._timeline_model.viewStartNs + 500_000)
+        QTest.qWait(150)
+        canvas = next(c for c in self._find_items(self._flick, f"laneCanvas_{lane}")
+                      if c.isVisible() and c.width() > 0)
+        img = self._window.grabWindow()
+        colour = QColor(self._timeline_model.laneView(
+            lane, span.start_ns, span.end_ns, 10, 2000)["spans"][0]["color"])
+
+        def at(frac):
+            p = canvas.mapToScene(QPointF(frac * canvas.width(), canvas.height() / 2)).toPoint()
+            return img.pixelColor(p.x(), p.y())
+
+        def near(c):
+            return max(abs(c.red() - colour.red()), abs(c.green() - colour.green()), abs(c.blue() - colour.blue())) < 24
+
+        self.assertTrue(near(at(0.05)), at(0.05).name())
+        for frac in (0.15, 0.5, 0.95):
+            self.assertFalse(near(at(frac)), (frac, at(frac).name()))
+        self.assertEqual(self._warnings, [])
+
+    def test_search_jump_points_the_tooltip_at_the_match(self):
+        field = self._root.findChild(QObject, "timelineSearchField")
+        next_btn = self._root.findChild(QObject, "timelineSearchNext")
+        field.setProperty("text", "target_event")
+        for _ in range(5):
+            self._app.processEvents()
+        center = self._stable_center(next_btn)
+        self._move_to(center)
+        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, center)
+        QTest.qWait(30)
+        self.assertIn("target_event", self._timeline_root.property("hoverText"))
+        lane = self._timeline_root.property("hoverLane")
+        canvas = next(c for c in self._find_items(self._flick, f"laneCanvas_{lane}") if c.isVisible())
+        at = canvas.mapFromItem(self._timeline_root, QPointF(self._timeline_root.property("hoverX"),
+                                                              self._timeline_root.property("hoverY")))
+        self.assertTrue(0 <= at.y() <= canvas.height(), at)
+        span = next(s for s in self._trace.iter_spans() if s.name == "target_event")
+        frac = (span.start_ns - self._timeline_root.property("viewStartNs")) / self._timeline_root.property("visibleNs")
+        self.assertAlmostEqual(at.x(), frac * canvas.width(), delta=2)
+        self.assertTrue(self._root.findChild(QObject, "timelineHoverTooltip").property("visible"))
+        self.assertEqual(self._warnings, [])
 
     # ── Navigation overhaul: call-graph panel removal, zoom-to-cursor,
     #    keyboard controls, double-click-to-event, vertical-scroll
@@ -495,10 +773,16 @@ class TestTimelineHover(unittest.TestCase):
         self.assertIn("Reset", texts)
 
         zoom0 = self._timeline_root.property("zoom")
-        plus_btn = next(b for b in buttons if b.property("text") == "+")
-        center = plus_btn.mapToScene(QPointF(plus_btn.property("width") / 2, plus_btn.property("height") / 2))
-        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, center.toPoint())
-        self._app.processEvents()
+        # the Timeline's own "+" (other tabs, built when first visited, have
+        # theirs: the first "+" found depended on which tabs earlier tests
+        # had opened)
+        plus_btn = self._root.findChild(QObject, "timelineZoomInButton")
+        self.assertEqual(plus_btn.property("text"), "+")
+        center = self._stable_center(plus_btn)
+        self._move_to(center)
+        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, center)
+        for _ in range(5):
+            self._app.processEvents()
         self.assertGreater(self._timeline_root.property("zoom"), zoom0)
 
     def test_double_click_on_empty_area_resets(self):
@@ -520,7 +804,8 @@ class TestTimelineHover(unittest.TestCase):
 
         zoom_before = self._timeline_root.property("zoom")
         QTest.mouseDClick(self._window, Qt.LeftButton, Qt.NoModifier, found)
-        self._app.processEvents()
+        for _ in range(5):
+            self._app.processEvents()
         self.assertGreater(self._timeline_root.property("zoom"), zoom_before)
         # Centered roughly on the span: its midpoint (500_000ns) should
         # now be within the new (much narrower) visible window.
@@ -858,10 +1143,9 @@ class TestTimelineHover(unittest.TestCase):
         self.assertEqual(self._warnings, [])
 
     def test_timeline_first_use_overlay_dismisses_and_persists(self):
-        # A fresh temp-file-backed WorkspaceSettings (this shared engine's
-        # own setup) means Workspace.timelineOverlayDismissed starts
-        # False -- the overlay should be visible by default here, exactly
-        # as a genuinely first-ever launch would show it.
+        # setUp() hides the overlay for every test; a genuinely first-ever
+        # launch (fresh settings) shows it -- recreated here explicitly.
+        self._set_overlay_dismissed(False)
         card = self._root.findChild(QObject, "timelineFirstUseCard")
         self.assertIsNotNone(card)
         try:
@@ -880,17 +1164,7 @@ class TestTimelineHover(unittest.TestCase):
             self.assertFalse(card.property("visible"))
             self.assertEqual(self._warnings, [])
         finally:
-            if self._workspace.timelineOverlayDismissed:
-                # Reset directly through settings -- WorkspaceBridge
-                # itself has no "undismiss" Slot (dismissal is meant to
-                # be permanent for a user; only test
-                # cleanup needs to undo it so later tests in this shared-
-                # engine class see the overlay in its original state).
-                self._workspace_settings.save_timeline_overlay_dismissed(False)
-                self._workspace._timeline_overlay_dismissed = False
-                self._workspace.timelineOverlayDismissedChanged.emit()
-                for _ in range(5):
-                    self._app.processEvents()
+            self._set_overlay_dismissed(True)          # the state every other test runs in
 
     def test_legend_collapse_toggle_hides_swatches_and_persists(self):
         color_btn = self._root.findChild(QObject, "timelineColorModeButton")
@@ -1736,10 +2010,14 @@ class TestTimelineHover(unittest.TestCase):
             for _ in range(5):
                 self._app.processEvents()
 
-            details_toggle = self._root.findChild(QObject, "errorDetailsToggle")
-            copy_btn = self._root.findChild(QObject, "errorCopyDiagnostics")
-            open_log_btn = self._root.findChild(QObject, "errorOpenLog")
-            details_pane = self._root.findChild(QObject, "errorDetailsPane")
+            # Every tab's ScreenState has its own ErrorState with these
+            # objectNames, and tabs are built when first visited: looked up
+            # from the root, the first one found was whichever screen
+            # earlier tests had opened first. Compare's own, from its state.
+            details_toggle = state_item.findChild(QObject, "errorDetailsToggle")
+            copy_btn = state_item.findChild(QObject, "errorCopyDiagnostics")
+            open_log_btn = state_item.findChild(QObject, "errorOpenLog")
+            details_pane = state_item.findChild(QObject, "errorDetailsPane")
             self.assertIsNotNone(details_toggle)
             self.assertIsNotNone(copy_btn)
             self.assertIsNotNone(open_log_btn)

@@ -139,6 +139,17 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
         for cat, (n, total) in sorted(by_cat.items(), key=lambda kv: -kv[1][1]):
             print(f"    {cat:<12} {n:>6} events   {_fmt_ns(total):>12}")
 
+    # ── JIT: what the jit spans cover (analysis/jit_coverage.py) ─────────────
+    from ..analysis.jit_coverage import STAGES, jit_coverage
+    jc = jit_coverage(trace)
+    if jc:
+        print(f"\n  JIT spans by stage:")
+        for st, e in sorted(jc["stages"].items(), key=lambda kv: -kv[1]["total_ns"]):
+            names = ", ".join(sorted(e["names"])[:3]) + (", ..." if len(e["names"]) > 3 else "")
+            print(f"    {STAGES[st]:<36} {e['count']:>6} spans {_fmt_ns(e['total_ns']):>12}   {names}")
+        if jc["note"]:
+            print(f"    ! {jc['note']}")
+
     stats = trace.aggregated_stats()
     timed  = [r for r in stats if r["total_ns"] > 0]
     samples = [r for r in stats if r["total_ns"] == 0 and r["category"] == "cpu"]

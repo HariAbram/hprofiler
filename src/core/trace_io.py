@@ -37,7 +37,16 @@ def metadata_from_json(d: dict) -> TraceMetadata:
 
 
 def disasm_to_json(kd) -> dict:
+    """Stored under kd.key; "name"/"module"/"launches" are absent in traces
+    written before disassembly was keyed by module (read back as name-only).
+    "launches" is null when the count is unknown (several entries of one
+    name, launches without a module id); "launchBasis" says how it was
+    counted (extractor.attribute_launches), absent in older traces."""
     return {
+        "name": kd.name,
+        "module": kd.module,
+        "launches": kd.launches,
+        "launchBasis": kd.launch_basis,
         "arch": kd.arch,
         "source": kd.source,
         "mangledName": kd.mangled_name,
@@ -55,7 +64,7 @@ def disasm_to_json(kd) -> dict:
     }
 
 
-def disasm_from_json(name: str, kd_raw: dict):
+def disasm_from_json(key: str, kd_raw: dict):
     from ..disasm.extractor import KernelDisasm, DisasmLine
     from ..disasm.classifier import InsnType
     lines = [
@@ -68,9 +77,20 @@ def disasm_from_json(name: str, kd_raw: dict):
         )
         for ln in kd_raw.get("lines", [])
     ]
-    return KernelDisasm(name=name, arch=kd_raw.get("arch", ""), source=kd_raw.get("source", ""),
+    return KernelDisasm(name=kd_raw.get("name") or key, arch=kd_raw.get("arch", ""),
+                        source=kd_raw.get("source", ""),
                         mangled_name=kd_raw.get("mangledName", ""),
-                        ptxas_derived=kd_raw.get("ptxasDerived", False), lines=lines)
+                        ptxas_derived=kd_raw.get("ptxasDerived", False), lines=lines,
+                        module=kd_raw.get("module", "") or "",
+                        launches=(None if "launches" in kd_raw and kd_raw["launches"] is None
+                                  else int(kd_raw.get("launches", 0) or 0)),
+                        launch_basis=kd_raw.get("launchBasis", "") or "")
+
+
+def disasm_entries(trace: Trace) -> dict:
+    """{key: json} for every disassembly entry (not the 255-character
+    aliases add_disasm() makes; loading recreates them)."""
+    return {key: disasm_to_json(kd) for key, kd in trace.disasm.items() if key == kd.key}
 
 
 def restore_disasm(trace: Trace, disasm_raw: dict | None) -> None:
@@ -98,8 +118,7 @@ def save_trace_meta(trace: Trace) -> None:
     store.save_meta("metadata", metadata_to_json(trace.metadata))
     store.save_meta("flags", {"has_stacks": trace._has_stacks, "has_cpu": trace._has_cpu})
     store.save_meta("devices", [d.to_dict() for d in trace.devices])
-    store.save_meta("disasm", {name: disasm_to_json(kd) for name, kd in trace.disasm.items()
-                               if kd.name == name})
+    store.save_meta("disasm", disasm_entries(trace))
     store.save_meta("pc_samples", {k: [list(t) for t in v] for k, v in trace._pc_samples.items()})
 
 

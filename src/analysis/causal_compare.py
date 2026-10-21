@@ -208,10 +208,18 @@ def _same_class_neighbour(pairs, k: int, cls: list[int], side: int) -> bool:
 # ── node matching ────────────────────────────────────────────────────────────
 
 def _neighbourhood(proj: TraceProjection, nid: int) -> frozenset:
+    """(direction, edge kind, neighbour) of a node's edges; an edge to the
+    same call in another phase or iteration (same key: one instance followed
+    by the next) is "<self>", so a renamed node still has its own
+    neighbourhood."""
     ins, outs = proj.adjacency()
     nodes = proj.nodes
-    return frozenset([("in", kind, nodes[o].key.leaf) for o, kind, _c, _cf in ins.get(nid, ())] +
-                     [("out", kind, nodes[o].key.leaf) for o, kind, _c, _cf in outs.get(nid, ())])
+    key = nodes[nid].key
+
+    def other(o: int) -> str:
+        return "<self>" if nodes[o].key == key else nodes[o].key.leaf
+    return frozenset([("in", kind, other(o)) for o, kind, _c, _cf in ins.get(nid, ())] +
+                     [("out", kind, other(o)) for o, kind, _c, _cf in outs.get(nid, ())])
 
 
 def node_score(a: ProjectedNode, b: ProjectedNode, na: frozenset, nb: frozenset) -> float:
@@ -787,7 +795,10 @@ def compare_projections(pa: TraceProjection, pb: TraceProjection, *, trace_a=Non
             contributors.append(r)
         elif r["status"] == cmp.STATUS_REGRESSED and r["propagatedFrom"] is None:
             off_path.append(r)
-        if r["status"] == cmp.STATUS_IMPROVED or r["impactStatus"] == cmp.STATUS_IMPROVED:
+        # the mirror of contributors + off-path regressions: a row whose
+        # change was passed on to its origin (propagated) is listed there
+        if r["impactStatus"] == cmp.STATUS_IMPROVED or (
+                r["status"] == cmp.STATUS_IMPROVED and r["propagatedFrom"] is None):
             improvements.append(r)
     propagated.sort(key=lambda r: -max(abs(r["ownDeltaNs"]), abs(r["criticalDeltaNs"])))
     d_cp = pb.critical_total_ns - pa.critical_total_ns

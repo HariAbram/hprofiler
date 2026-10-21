@@ -76,7 +76,9 @@ Item {
                     spacing: AppTheme.spacingXs
                     RowLayout {
                         Text {
-                            text: (modelData.hasDisasm ? "✓ " : "  ") + modelData.name
+                            // ~ : matched by kernel name only (see matchNote)
+                            text: (modelData.hasDisasm ? (modelData.matchNote ? "~ " : "✓ ") : "  ")
+                                  + modelData.name
                             color: AppTheme.text
                             font.pixelSize: AppTheme.typeBody
                             elide: Text.ElideRight
@@ -139,6 +141,18 @@ Item {
                 }
             }
 
+            // A name-only match (Trace.disasm_for): the code shown may not
+            // be what this kernel's launches ran -- say so, every time.
+            Text {
+                Layout.fillWidth: true
+                visible: !!(root.selectedKernel && root.selectedKernel.matchNote)
+                text: root.selectedKernel && root.selectedKernel.matchNote
+                      ? "⚠ " + root.selectedKernel.matchNote : ""
+                color: AppTheme.warningColor
+                font.pixelSize: AppTheme.typeLabel
+                wrapMode: Text.WordWrap
+            }
+
             ListView {
                 id: asmView
                 Layout.fillWidth: true
@@ -182,7 +196,7 @@ Item {
                         }
                         Text {
                             text: modelData.mnemonic
-                            color: modelData.color
+                            color: AppTheme.itypeColor(modelData.itype, AppTheme.dark)
                             font.family: "monospace"
                             font.bold: true
                             font.pixelSize: AppTheme.typeLabel
@@ -281,7 +295,7 @@ Item {
                             Layout.fillWidth: true
                             Text {
                                 text: modelData.label
-                                color: modelData.color
+                                color: AppTheme.itypeColor(modelData.type, AppTheme.dark)
                                 font.pixelSize: AppTheme.typeLabel
                                 Layout.fillWidth: true
                             }
@@ -301,7 +315,7 @@ Item {
                         ProgressBar {
                             Layout.fillWidth: true
                             pct: modelData.pct
-                            barColor: modelData.color
+                            barColor: AppTheme.itypeColor(modelData.type, AppTheme.dark)
                         }
                     }
                 }
@@ -326,12 +340,12 @@ Item {
                         spacing: AppTheme.spacingXs
                         RowLayout {
                             spacing: AppTheme.spacingSm
-                            Text { text: modelData.icon; color: modelData.color; font.pixelSize: AppTheme.typeLabel; font.bold: true }
+                            Text { text: modelData.icon; color: AppTheme.adviceColor(modelData.severity, AppTheme.dark); font.pixelSize: AppTheme.typeLabel; font.bold: true }
                             Text { text: modelData.category; color: AppTheme.textMuted; font.pixelSize: AppTheme.typeCaption }
                         }
                         Text {
                             text: modelData.message
-                            color: modelData.color
+                            color: AppTheme.adviceColor(modelData.severity, AppTheme.dark)
                             font.pixelSize: AppTheme.typeLabel
                             font.bold: true
                             wrapMode: Text.WordWrap

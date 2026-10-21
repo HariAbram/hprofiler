@@ -84,6 +84,13 @@ class ROCmBackend(Backend):
             return False
         return _hip_lib_exists()
 
+    def usability(self) -> tuple[str, str]:
+        if not self.is_available():
+            return "missing", ""
+        from . import probes
+        ok, why = probes.rocm()
+        return ("usable" if ok else "installed"), why
+
     def preload_libs(self) -> list[str]:
         if _HOOK_LIB.exists():
             return [str(_HOOK_LIB)]

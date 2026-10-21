@@ -345,7 +345,9 @@ def resample_occupancy(level: dict, t0: int, start: float, end: float, n_out: in
     within a source bin)."""
     busy = np.asarray(level["busy"], dtype=np.float64)
     w = level["bin_ns"]
-    cum = np.concatenate(([0.0], np.cumsum(busy)))
+    cum = level.get("cum")                  # cached: levels are cached per lane, never persisted with it
+    if cum is None:
+        cum = level["cum"] = np.concatenate(([0.0], np.cumsum(busy)))
     edges = np.linspace(start - t0, end - t0, n_out + 1)
     pos = np.clip(edges / w, 0, len(busy))
     i = np.clip(pos.astype(np.int64), 0, len(busy) - 1)

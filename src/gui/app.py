@@ -89,6 +89,13 @@ def main() -> int:
     from src.gui.logging_setup import setup_logging, get_logger, log_error, current_log_path
     from src.gui.shortcuts import ShortcutsBridge
 
+    # Fusion draws every control from the palette Main.qml sets from the
+    # theme. A desktop-chosen style (e.g. KDE's org.kde.desktop) can bring
+    # its own colours instead; an explicit QT_QUICK_CONTROLS_STYLE is kept.
+    if not os.environ.get("QT_QUICK_CONTROLS_STYLE"):
+        from PySide6.QtQuickControls2 import QQuickStyle
+        QQuickStyle.setStyle("Fusion")
+
     app = QGuiApplication(sys.argv[:1])
     app.setApplicationName("hprofiler")
     app.setOrganizationName("hprofiler")

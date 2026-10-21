@@ -55,6 +55,24 @@ class KernelDisasm:
     lines:         list[DisasmLine] = field(default_factory=list)
     ptxas_derived: bool = False              # True when SASS was compiled from PTX via ptxas
     mangled_name:  str  = ""                 # original mangled symbol (for pc_sample lookup)
+    # Identity of the code blob this came from: module_id() of the saved
+    # JIT/module image ("" for code taken from the program's own binary or
+    # a call site). Disassembly is keyed by (name, module) -- see key.
+    module:        str  = ""
+    # Kernel spans of this code (set by the runner, attribute_launches()),
+    # and how they were counted (launch_basis): "module" -- spans carrying
+    # this module id, linked to this exact code; "name" -- spans of this
+    # name that no other entry's module claims (code without a module id,
+    # or launches without one); "unknown" (launches None) -- spans of this
+    # name ran but cannot be split among several entries; "" -- not counted
+    # (older traces).
+    launches:      Optional[int] = 0
+    launch_basis:  str  = ""
+
+    @property
+    def key(self) -> str:
+        """Trace.disasm key: "name@module" for module code, else the name."""
+        return f"{self.name}@{self.module}" if self.module else self.name
 
     def itype_counts(self) -> dict[InsnType, int]:
         counts: dict[InsnType, int] = {}
@@ -73,6 +91,84 @@ class KernelDisasm:
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
+
+def module_id(data: bytes) -> str:
+    """Module id of a saved code blob: 64-bit FNV-1a of its bytes as 16 hex
+    digits -- the hooks' hp_fnv1a64 (hooks/common/hp_module.h), which put
+    the same id on the module's jit span and on every launch from it."""
+    h = 0xcbf29ce484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+
+
+GPU_ARCHS = frozenset({"sass", "ptx", "amdgcn", "gcn", "rocm", "hip"})
+
+
+def attribute_launches(entries, launches) -> None:
+    """Set launches and launch_basis on every entry from the trace's kernel
+    spans; `launches` maps (span name, mod= or "") to a span count.
+
+      * code with a module id: the spans carrying that id ("module"); when
+        none does, no span of that name carries any module id and this is
+        the only entry of that name, those spans by name ("name");
+      * code without a module id (the program's own binary, a static
+        runtime, older hooks): the spans of its name that carry no module
+        id, or one no entry of that name has ("name");
+      * spans that ran but cannot be split among several entries of one
+        name: launches None ("unknown") -- never a 0 for a kernel that ran.
+
+    An entry is matched under its name and its mangled name."""
+    entries = list(entries)
+
+    def names_of(kd) -> set:
+        return {n for n in (kd.name, kd.mangled_name) if n}
+
+    by_name: dict[str, list] = {}
+    mods: dict[str, set] = {}
+    for kd in entries:
+        for n in names_of(kd):
+            by_name.setdefault(n, []).append(kd)
+            if kd.module:
+                mods.setdefault(n, set()).add(kd.module)
+    unclaimed: dict[str, int] = {}
+    with_mod: dict[str, int] = {}
+    for (n, m), c in launches.items():
+        if m:
+            with_mod[n] = with_mod.get(n, 0) + c
+        if not m or m not in mods.get(n, ()):
+            unclaimed[n] = unclaimed.get(n, 0) + c
+    for kd in entries:
+        ns = names_of(kd)
+        if kd.module:
+            c = sum(launches.get((n, kd.module), 0) for n in ns)
+            no_mod = sum(launches.get((n, ""), 0) for n in ns)
+            if c or not no_mod:
+                kd.launches, kd.launch_basis = c, "module"
+            elif all(len(by_name[n]) == 1 and not with_mod.get(n) for n in ns):
+                kd.launches, kd.launch_basis = no_mod, "name"
+            else:
+                kd.launches, kd.launch_basis = None, "unknown"
+            continue
+        u = sum(unclaimed.get(n, 0) for n in ns)
+        plain = {id(k) for n in ns for k in by_name[n] if not k.module}
+        if u and len(plain) > 1:
+            kd.launches, kd.launch_basis = None, "unknown"
+        elif u or kd.arch in GPU_ARCHS:
+            kd.launches, kd.launch_basis = u, "name"
+        else:                                   # CPU code: no kernel spans to count
+            kd.launches, kd.launch_basis = 0, ""
+
+
+def _file_module_id(path: str, known: "dict[str, str] | None" = None) -> str:
+    """The mod= a hook reported for `path`, else computed from the file."""
+    if known and known.get(path):
+        return known[path]
+    try:
+        with open(path, "rb") as f:
+            return module_id(f.read())
+    except OSError:
+        return ""
 
 def _run(cmd: list[str], timeout: int = 45) -> str:
     try:
@@ -398,6 +494,48 @@ def disasm_cuda_sass(binary_path: str) -> dict[str, KernelDisasm]:
         for name, lns in _parse_sass(text).items()
         if lns
     }
+
+
+def cuda_fatbins(binary_path: str) -> list[bytes]:
+    """The fat binaries nvcc embedded in an executable's .nv_fatbin section,
+    each its header plus payload -- exactly the bytes the CUDA hook hashes
+    when the runtime registers it (__cudaRegisterFatBinary), so
+    module_id() of one is the mod= on launches of its kernels. [] if the
+    file has no such section."""
+    import struct
+    try:
+        with open(binary_path, "rb") as f:
+            elf = f.read()
+    except OSError:
+        return []
+    if elf[:4] != b"\x7fELF" or len(elf) < 64 or elf[4] != 2:
+        return []
+    shoff, = struct.unpack_from("<Q", elf, 40)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", elf, 58)
+    if not shoff or shentsize < 64 or shoff + shnum * shentsize > len(elf) or shstrndx >= shnum:
+        return []
+
+    def section(i):
+        name, typ = struct.unpack_from("<II", elf, shoff + i * shentsize)
+        off, size = struct.unpack_from("<QQ", elf, shoff + i * shentsize + 24)
+        return name, typ, off, size
+
+    _n, _t, str_off, str_size = section(shstrndx)
+    for i in range(shnum):
+        name, typ, off, size = section(i)
+        end = elf.find(b"\0", str_off + name, str_off + str_size)
+        if typ == 8 or elf[str_off + name:end] != b".nv_fatbin" or off + size > len(elf):
+            continue
+        blob, out, o = elf[off:off + size], [], 0
+        while o + 16 <= len(blob):
+            magic, hdr, payload = struct.unpack_from("<I2xHQ", blob, o)
+            if magic != 0xBA55ED50 or hdr < 16 or o + hdr + payload > len(blob):
+                o += 8                                   # padding between fat binaries
+                continue
+            out.append(blob[o:o + hdr + payload])
+            o += hdr + payload
+        return out
+    return []
 
 
 def disasm_cuda_cubin(cubin_path: str) -> dict[str, KernelDisasm]:
@@ -818,6 +956,38 @@ def _acpp_kernel_short(mangled: str) -> str:
     return mangled
 
 
+def _hook_kernel_name(mangled: str) -> str:
+    """The span name the OpenCL hook gives an ACPP SSCP host kernel
+    (opencl_hook.c extract_kernel_name): <name> from the first
+    "ZZ<len><name>", else the whole symbol."""
+    idx = mangled.find("ZZ")
+    if idx >= 0:
+        p = mangled[idx + 2:]
+        i = 0
+        while i < len(p) and p[i].isdigit():
+            i += 1
+        if i and 0 < int(p[:i]) <= len(p) - i:
+            return p[i:i + int(p[:i])]
+    return mangled
+
+
+def dedupe_unlinked(result: dict[str, KernelDisasm]) -> dict[str, KernelDisasm]:
+    """Drop a name-keyed entry whose code also exists module-keyed (an AoT
+    HIP kernel disassembled from the binary and from its registered fat
+    binary): one variant, not two."""
+    by_name: dict[str, list[KernelDisasm]] = {}
+    for kd in result.values():
+        if kd.module:
+            by_name.setdefault(kd.name, []).append(kd)
+    for key, kd in list(result.items()):
+        if kd.module or kd.name not in by_name:
+            continue
+        text = [ln.text for ln in kd.lines]
+        if any([ln.text for ln in m.lines] == text for m in by_name[kd.name]):
+            del result[key]
+    return result
+
+
 # ── PTX → SASS via ptxas ─────────────────────────────────────────────────────
 
 def ptxas_compile_to_sass(ptx_path: str, sm_arch: str) -> dict[str, KernelDisasm]:
@@ -868,6 +1038,38 @@ def ptxas_compile_to_sass(ptx_path: str, sm_arch: str) -> dict[str, KernelDisasm
 
 # ── Top-level collection ──────────────────────────────────────────────────────
 
+def _cuda_aot_code(binary: str, launched_by_module: dict) -> dict[str, KernelDisasm]:
+    """An executable's own CUDA code: SASS, PTX where there is no SASS.
+
+    With a shared cudart the hook gives each of its fat binaries a module id
+    (its hash, see cuda_fatbins()) and puts it on the launches of its
+    kernels; when any launch carries one, every fat binary is disassembled
+    on its own and its code keyed by that id. Otherwise (a static cudart,
+    older traces) the binary's code is keyed by name. `source` is the
+    executable either way."""
+    out: dict[str, KernelDisasm] = {}
+    fatbins = cuda_fatbins(binary)
+    if any(module_id(b) in launched_by_module for b in fatbins):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, blob in enumerate(fatbins):
+                mod = module_id(blob)
+                path = os.path.join(tmp, f"fatbin{i}.bin")
+                with open(path, "wb") as f:
+                    f.write(blob)
+                code = disasm_cuda_ptx(path)
+                code.update(disasm_cuda_sass(path))          # SASS where there is some
+                for kd in code.values():
+                    kd.module = mod if mod in launched_by_module else ""
+                    kd.source = binary
+                    out.setdefault(kd.key, kd)
+        return out
+    out.update(disasm_cuda_sass(binary))
+    for name, kd in disasm_cuda_ptx(binary).items():    # PTX for kernels without SASS
+        out.setdefault(name, kd)
+    return out
+
+
 def collect_disasm(
     command:      list[str],
     backends:     list[str],
@@ -877,6 +1079,9 @@ def collect_disasm(
     cpu_names:    set[str] | None = None,  # CPU function names from perf sampling
     sm_version:   str = "",             # e.g. "sm_86" — enables ptxas PTX→SASS for JIT kernels
     real_binary:  str = "",             # actual profiled exe (SO_PEERCRED-resolved), see below
+    module_ids:   dict[str, str] | None = None,       # saved path -> mod= its hook reported
+    launched_by_module: dict[str, set[str]] | None = None,  # mod -> kernel span names launched from it
+    real_binaries: list[str] | None = None,  # every exe to read AoT GPU code from, in order
 ) -> dict[str, KernelDisasm]:
     """
     Collect disassembly for all profiled kernels.
@@ -889,8 +1094,16 @@ def collect_disasm(
       OpenCL JIT — objdump on the .jit.so symbol
       OpenMP/CPU — objdump on the specific function containing codeptr_ra
 
-    Returns {kernel_name: KernelDisasm}.
+    Code from a captured JIT/module blob carries that blob's module id
+    (module_id(); the hooks put the same mod= on its launches) and is keyed
+    "name@module", so two programs defining the same kernel name keep
+    separate entries. Code from the program's own binary or a call site is
+    keyed by name.
+
+    Returns {KernelDisasm.key: KernelDisasm}.
     """
+    module_ids = module_ids or {}
+    launched_by_module = launched_by_module or {}
     result: dict[str, KernelDisasm] = {}
     binary = command[0] if command else ""
     # command[0] is wrong whenever the profiled command is launcher-wrapped
@@ -902,30 +1115,40 @@ def collect_disasm(
     # connection, runner.py's _peer_real_exe) is the actual profiled exe
     # however it was launched, so it takes priority for every use of
     # `binary` below.
-    if real_binary and Path(real_binary).exists():
-        binary = real_binary
+    # real_binaries (runner.disasm_binaries): several connected executables,
+    # the ones that launched GPU work first; their ahead-of-time GPU code is
+    # merged (by key: name and module), the first one's taking precedence.
+    aot = [b for b in (real_binaries or []) if b and Path(b).exists()]
+    if real_binary and Path(real_binary).exists() and real_binary not in aot:
+        aot.insert(0, real_binary)
+    if aot:
+        binary = aot[0]
+    elif binary and Path(binary).exists():
+        aot = [binary]
     if omp_syms is None:
         omp_syms = {}
     if cpu_names is None:
         cpu_names = set()
 
-    # ── CUDA AoT: SASS + PTX from the main binary ────────────────────────────
-    if "cuda" in backends and binary and Path(binary).exists():
-        sass = disasm_cuda_sass(binary)
-        result.update(sass)
-        # Fill in PTX for kernels we didn't get SASS for
-        ptx = disasm_cuda_ptx(binary)
-        for name, kd in ptx.items():
-            result.setdefault(name, kd)
+    # ── CUDA AoT: SASS + PTX from the program's executable(s) ───────────────
+    for exe in (aot if "cuda" in backends else ()):
+        for kd in _cuda_aot_code(exe, launched_by_module).values():
+            result.setdefault(kd.key, kd)
 
     # ── CUDA JIT cubins saved by the hook ────────────────────────────────────
-    # cuda_hook.c saves cubins as /tmp/hprofiler_cubin_<pid>_<n>.bin.
-    # Filter by the profiled process's PID so we never read stale cubin files
-    # left over from previous runs (which would show the wrong code).
+    # cuda_hook.c saves cubins as /tmp/hprofiler_cubin_<pid>_<n>.bin and names
+    # each in its module-load span (path=, the keys of module_ids): exactly
+    # this trace's cubins, whatever process saved them (a wrapper's child
+    # has another pid). Older hooks name none: filter by the profiled
+    # process's PID so we never read stale cubin files left over from
+    # previous runs (which would show the wrong code).
     if "cuda" in backends:
         import glob
-        pid_pat = str(profiled_pid) if profiled_pid else "*"
-        for cubin_path in glob.glob(f"/tmp/hprofiler_cubin_{pid_pat}_*.bin"):
+        cubin_paths = sorted(p for p in module_ids if "hprofiler_cubin_" in p and Path(p).exists())
+        if not cubin_paths:
+            pid_pat = str(profiled_pid) if profiled_pid else "*"
+            cubin_paths = glob.glob(f"/tmp/hprofiler_cubin_{pid_pat}_*.bin")
+        for cubin_path in cubin_paths:
             # Detect PTX content (ACPP JIT passes raw PTX text)
             try:
                 with open(cubin_path, "rb") as _cf:
@@ -945,8 +1168,10 @@ def collect_disasm(
                 # Fallback: PTX parse (or non-PTX cubin via cuobjdump/nvdisasm)
                 jit_kd = disasm_cuda_cubin(cubin_path)
 
-            for name, kd in jit_kd.items():
-                result.setdefault(name, kd)
+            mod = _file_module_id(cubin_path, module_ids)
+            for kd in jit_kd.values():
+                kd.module = mod
+                result.setdefault(kd.key, kd)
             try:
                 os.unlink(cubin_path)
             except OSError:
@@ -954,12 +1179,13 @@ def collect_disasm(
 
     # ── ROCm AoT + JIT binaries saved by the hook ────────────────────────────
     if "rocm" in backends:
-        if binary and Path(binary).exists():
-            rocm = disasm_rocm_binary(binary)
+        for exe in aot:
+            rocm = disasm_rocm_binary(exe)
             if not rocm:
                 # Main binary is a native HIP AoT binary with embedded fat bundle
-                rocm = _disasm_hip_aot_binary(binary)
-            result.update(rocm)
+                rocm = _disasm_hip_aot_binary(exe)
+            for key, kd in rocm.items():
+                result.setdefault(key, kd)
 
         # Collect paths from the jit_spans path= tag (set by hipModuleLoadData hook)
         rocm_jit_paths: set[str] = set()
@@ -987,8 +1213,10 @@ def collect_disasm(
                 jit_kd = _parse_ptx_text(text, rocm_path)
             else:
                 jit_kd = disasm_rocm_binary(rocm_path)
-            for name, kd in jit_kd.items():
-                result.setdefault(name, kd)
+            mod = _file_module_id(rocm_path, module_ids)
+            for kd in jit_kd.values():
+                kd.module = mod
+                result.setdefault(kd.key, kd)
             try:
                 os.unlink(rocm_path)
             except OSError:
@@ -1007,6 +1235,8 @@ def collect_disasm(
         so_path    = entry.get("so_path", "")
         short_name = entry.get("name", "")
         mangled    = entry.get("mangled", "")
+        if not so_path and entry.get("path"):     # ROCm entries: handled above
+            continue
 
         # Prefer the /tmp copy saved by the hook (original may be gone)
         if not Path(so_path).exists():
@@ -1020,27 +1250,64 @@ def collect_disasm(
         candidate = so_path or (list(tmp_jit.values())[0] if tmp_jit else "")
         if not candidate or not Path(candidate).exists():
             continue
+        mod = (entry.get("mod") if candidate == entry.get("so_path") else "") \
+            or _file_module_id(candidate, module_ids)
 
-        # Find the full mangled symbol.  Prefer an explicit mangled name;
-        # fall back to nm-search on the saved copy.
-        # If short_name looks like a filename (.so/.bin suffix), don't pass
-        # it as a symbol search hint — search for any function instead.
-        sym_to_extract = mangled or None
-        if not sym_to_extract:
+        # Which symbols: an explicit mangled name; else every kernel that was
+        # launched from this binary (mod= on its spans), named exactly as its
+        # spans are; else (older hooks, nothing launched) the symbol matching
+        # the span name, or the first function, named as before.
+        targets: list[tuple[str, str]] = []          # (symbol, entry name)
+        if mangled:
+            targets = [(mangled, "")]
+        elif launched_by_module.get(mod):
+            launched = launched_by_module[mod]
+            for sym in _nm_load(candidate):
+                hit = sym if sym in launched else _hook_kernel_name(sym)
+                if hit in launched:
+                    targets.append((sym, hit))
+        if not targets:
             search_hint = "" if short_name.endswith((".so", ".bin")) else short_name
-            sym_to_extract = _find_jit_symbol(candidate, search_hint)
+            sym = _find_jit_symbol(candidate, search_hint)
+            if sym:
+                targets = [(sym, "")]
 
-        # Derive a human-readable kernel name from the mangled symbol.
-        # This replaces filename basenames with the actual kernel name.
-        if sym_to_extract:
-            extracted = _acpp_kernel_short(sym_to_extract)
-            if not short_name or short_name.endswith((".so", ".bin")):
-                short_name = extracted
-
-        kd = disasm_elf(candidate, symbol=sym_to_extract, arch="x86-64")
-        if kd:
-            kd.name = short_name or kd.name
-            result[kd.name] = kd
+        made = False
+        try:
+            with open(candidate, "rb") as _f:
+                _head = _f.read(2)
+        except OSError:
+            _head = b""
+        if _head[:2] == b"//" or _head[:1] == b".":
+            # PTX text (NVIDIA OpenCL program binaries): every .entry, whose
+            # name is the kernel's own name, as its launches report it --
+            # like the symbols above, only the ones launched from this
+            # program when its launches carry mod=
+            text = Path(candidate).read_text(errors="replace").rstrip("\x00")
+            launched = launched_by_module.get(mod)
+            for kd in _parse_ptx_text(text, candidate).values():
+                if launched and kd.name not in launched:
+                    continue
+                kd.module = mod
+                result[kd.key] = kd
+                made = True
+            targets = []
+        for sym_to_extract, exact_name in sorted(targets):
+            # A readable name from the mangled symbol replaces a file basename.
+            name = exact_name
+            if not name:
+                name = short_name
+                if not name or name.endswith((".so", ".bin")):
+                    name = _acpp_kernel_short(sym_to_extract)
+            kd = disasm_elf(candidate, symbol=sym_to_extract, arch="x86-64")
+            if kd:
+                kd.name = name or kd.name
+                kd.module = mod
+                if sym_to_extract != kd.name:
+                    kd.mangled_name = kd.mangled_name or sym_to_extract
+                result[kd.key] = kd
+                made = True
+        if made:
             # Remove the used temp file from disk and from the dict so the
             # next jit_span entry doesn't reuse the same .so file.
             if candidate in tmp_jit.values():
@@ -1159,7 +1426,7 @@ def collect_disasm(
             if kd and kd.lines:
                 result[fn_name] = kd
 
-    return result
+    return dedupe_unlinked(result)
 
 
 # ── Post-run annotation: perf annotate (CPU) ──────────────────────────────────

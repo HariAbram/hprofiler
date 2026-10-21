@@ -40,6 +40,8 @@ ColumnLayout {
                 id: canvas
                 anchors.fill: parent
                 property real margin: 8
+                // colours painted from the theme: repaint on a light/dark toggle
+                Connections { target: AppTheme; function onThemeChanged() { canvas.requestPaint() } }
 
                 onPaint: {
                     var ctx = getContext("2d")
@@ -67,7 +69,7 @@ ColumnLayout {
                         var p = pts2[k]
                         var x = margin + p.x * pw
                         var y = margin + p.y * ph
-                        ctx.fillStyle = p.color
+                        ctx.fillStyle = AppTheme.boundColor(p.bound, AppTheme.dark)
                         ctx.beginPath()
                         ctx.arc(x, y, 4, 0, 2 * Math.PI)
                         ctx.fill()
@@ -117,11 +119,10 @@ ColumnLayout {
         Layout.fillWidth: true
         visible: Roofline.available
         spacing: AppTheme.spacingXl
-        // Uses the cpu/rocm category colors, which match the dark-theme
-        // values of the scatter points' colors -- those are fixed server-side
-        // (bridge.py's RooflineBridge._BOUND_COLOR), independent of AppTheme.
-        LegendSwatch { swatchColor: AppTheme.categoryColor("cpu"); label: "compute-bound" }
-        LegendSwatch { swatchColor: AppTheme.categoryColor("rocm"); label: "memory-bound" }
+        // The points' colours: theme.py's bound_color() is the cpu/rocm
+        // category pair, for either theme.
+        LegendSwatch { swatchColor: AppTheme.categoryColor("cpu", AppTheme.dark); label: "compute-bound" }
+        LegendSwatch { swatchColor: AppTheme.categoryColor("rocm", AppTheme.dark); label: "memory-bound" }
         Item { Layout.fillWidth: true }
     }
 }

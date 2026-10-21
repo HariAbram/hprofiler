@@ -58,6 +58,13 @@ class LIKWIDBackend(Backend):
     def is_available(self) -> bool:
         return shutil.which("likwid-perfctr") is not None
 
+    def usability(self) -> tuple[str, str]:
+        if not self.is_available():
+            return "missing", ""
+        from . import probes
+        ok, why = probes.likwid(self.group)
+        return ("usable" if ok else "installed"), why
+
     def availability_note(self) -> str:
         if not self.is_available():
             return "install likwid: apt install likwid  (or build from github.com/RRZE-HPC/likwid)"

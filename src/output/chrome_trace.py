@@ -168,6 +168,11 @@ def _metadata_json(trace: Trace) -> dict:
         "deviceActivity": meta.device_activity,
         # Transport / receiver / capture-state integrity (src/core/receiver.py).
         "captureHealth": meta.capture_health,
+        # The profiled command's exit status (null: unknown).
+        "exitStatus": meta.exit_status,
+        # Known holes in the MPI dependency graph (criticalpath.py).
+        "dependencyDiagnostics": meta.dependency_diagnostics,
+        "clock": meta.clock,
     }
 
 
@@ -187,7 +192,7 @@ def write(trace: Trace, out: Path | str | IO, pretty: bool = False,
 
 
 def _write_stream(trace: Trace, f: IO, pretty: bool, extra_args=None) -> None:
-    from ..core.trace_io import disasm_to_json
+    from ..core.trace_io import disasm_entries
     dumps = json.dumps
     f.write(JSON_LAYOUT_LINE + "\n")
     f.write('"metadata": ' + dumps(_metadata_json(trace), indent=2 if pretty else None) + ",\n")
@@ -198,9 +203,9 @@ def _write_stream(trace: Trace, f: IO, pretty: bool, extra_args=None) -> None:
         f.write(("\n" if first else ",\n") + dumps(ev))
         first = False
     f.write("\n]")
-    disasm = trace.disasm
+    disasm = disasm_entries(trace)
     if disasm:
-        f.write(',\n"disasm": ' + dumps({name: disasm_to_json(kd) for name, kd in disasm.items()}))
+        f.write(',\n"disasm": ' + dumps(disasm))
     f.write("\n}\n")
 
 
@@ -432,6 +437,9 @@ def _finish_load(trace: Trace, meta_raw: dict, disasm_raw: dict | None, collect_
     metadata.pid = meta_raw.get("pid", 0) or 0
     metadata.device_activity = dict(meta_raw.get("deviceActivity") or {})
     metadata.capture_health = dict(meta_raw.get("captureHealth") or {})
+    metadata.exit_status = meta_raw.get("exitStatus")
+    metadata.dependency_diagnostics = dict(meta_raw.get("dependencyDiagnostics") or {})
+    metadata.clock = dict(meta_raw.get("clock") or {})
 
     # Profiling window. Files written before startTimeNs/endTimeNs existed
     # fall back to the event extent -- never TraceMetadata's default

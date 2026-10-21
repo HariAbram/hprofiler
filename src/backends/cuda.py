@@ -75,5 +75,12 @@ class CUDABackend(Backend):
         except Exception:
             return False
 
+    def usability(self) -> tuple[str, str]:
+        if not self.is_available():
+            return "missing", ""
+        from . import probes
+        ok, why = probes.cuda()
+        return ("usable" if ok else "installed"), why
+
     def preload_libs(self) -> list[str]:
         return [str(_HOOK_LIB)] if _HOOK_LIB.exists() else []

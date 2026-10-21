@@ -13,15 +13,15 @@ Rectangle {
     implicitWidth: label.implicitWidth + AppTheme.spacingMd
     implicitHeight: label.implicitHeight + AppTheme.spacingXs
     radius: height / 2
-    color: Qt.alpha(AppTheme.changeColor(root.status), 0.18)
-    border.color: AppTheme.changeColor(root.status)
+    color: Qt.alpha(AppTheme.changeColor(root.status, AppTheme.dark), 0.18)
+    border.color: AppTheme.changeColor(root.status, AppTheme.dark)
     border.width: 1
 
     Text {
         id: label
         anchors.centerIn: parent
         text: root.text
-        color: AppTheme.changeColor(root.status)
+        color: AppTheme.changeColor(root.status, AppTheme.dark)
         font.bold: true
         font.pixelSize: AppTheme.typeCaption
     }

@@ -51,6 +51,44 @@ if command -v gcc >/dev/null 2>&1 && gcc -fsanitize=thread -E -x c /dev/null -o 
     fi
 fi
 
+# hooks/common/hp_module.h: module ids, the kernel table, in-memory ELF and
+# fat-binary image sizes (also driven, with ASan+UBSan, by
+# tests/test_disasm_modules.py).
+echo "=== hp_module_test ==="
+if gcc -O1 -Wall -Wextra -pthread -o "$HERE/hp_module_test" "$HERE/hp_module_test.c" \
+        && "$HERE/hp_module_test" | grep -q "RESULT fails=0"; then
+    echo "  OK   hp_module_test"
+else
+    echo "  FAIL hp_module_test"
+    FAIL=1
+fi
+rm -f "$HERE/hp_module_test"
+
+# hooks/cuda_hook/cupti_trace.c's record decoding and callback handling,
+# built against the real CUPTI headers (asserted in detail by
+# tests/integration/test_native_gpu_records.py); here: it builds, runs, and
+# a launch the hook did not intercept names its module (mod=).
+CUPTI_INC=""
+for d in "${HPROFILER_CUPTI_INCLUDE:-}" /usr/local/cuda/include /usr/local/cuda/extras/CUPTI/include /usr/include; do
+    if [ -n "$d" ] && [ -f "$d/cupti.h" ]; then CUPTI_INC="$d"; break; fi
+done
+if [ -n "$CUPTI_INC" ]; then
+    echo "=== cupti_records_test ==="
+    ROOT="$HERE/../.."
+    if gcc -O1 -Wall -Wextra -DHP_HAVE_CUPTI -DHP_CUPTI_UNIT_TEST -DHP_CUPTI_MEMCPY6 -DHP_CUPTI_SYNC2 \
+            -I"$CUPTI_INC" -I"$ROOT/hooks/cuda_hook" -o "$HERE/cupti_records_test" \
+            "$HERE/cupti_records_test.c" "$ROOT/hooks/cuda_hook/cupti_trace.c" -ldl -lpthread \
+            && "$HERE/cupti_records_test" | grep -q "cuLaunchKernelEx:.*src=cupti_cb,corr=760,.*mod=0123456789abcdef"; then
+        echo "  OK   cupti_records_test"
+    else
+        echo "  FAIL cupti_records_test"
+        FAIL=1
+    fi
+    rm -f "$HERE/cupti_records_test"
+else
+    echo "  SKIP cupti_records_test (no CUPTI headers)"
+fi
+
 if [ "$FAIL" = "0" ]; then
     echo "=== ALL OK ==="
 else

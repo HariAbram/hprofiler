@@ -177,7 +177,7 @@ Item {
                                         width: 8
                                         height: 8
                                         radius: 2
-                                        color: AppTheme.bucketColor(val.value)
+                                        color: AppTheme.bucketColor(val.value, AppTheme.dark)
                                     }
                                     CheckBox {
                                         objectName: "filterCheck_" + dimBlock.dim.key + "_" + val.value

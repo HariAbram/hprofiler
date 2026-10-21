@@ -6,8 +6,10 @@
  *                                         device span from the event's
  *                                         completion callback
  *   clEnqueueRead/WriteBuffer, SVMMemcpy  transfer spans (category "memory")
- *   clBuildProgram, clCompileProgram      JIT compile spans; built binaries
- *                                         are saved for disassembly
+ *   clBuildProgram, clCompileProgram,     JIT compile spans; built binaries
+ *   clLinkProgram                         are saved for disassembly, and the
+ *                                         kernel spans carry mod=, the id of
+ *                                         the binary they ran (hp_module.h)
  *   clFinish, clWaitForEvents             host waits ("sync")
  *   clCreateBuffer, clReleaseMemObject    opencl_memory_bytes counter
  *   dlopen, dlsym                         ACPP SSCP .jit.so CPU kernels, which
@@ -95,6 +97,9 @@ static uint64_t now_ns(void) {
 static FILE *g_dbg = NULL;  /* set when HPROFILER_DEBUG=1 */
 
 #include "../common/hp_transport.h"
+#include "../common/hp_ids.h"
+#include "../common/hp_module.h"
+#include "../common/hp_acpp.h"
 #include "../common/callstack.h"
 
 static pid_t gettid_compat(void) { return hp_tx_tid(); }
@@ -121,8 +126,15 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
 #endif
 
 /* Context for the event callback. `category` ("opencl" or "memory") comes
- * from the caller, which knows what it timed. */
-typedef struct { char name[128]; char extra[128]; char category[16]; } event_cb_data_t;
+ * from the caller, which knows what it timed. `name` is a heap copy of any
+ * length (kernel names from SYCL/JIT compilers run to hundreds of chars). */
+typedef struct { char *name; char extra[160]; char category[16]; } event_cb_data_t;
+
+static void event_cb_free(event_cb_data_t *d) {
+    if (!d) return;
+    free(d->name);
+    free(d);
+}
 
 typedef void (*event_cb_fn_t)(cl_event, cl_int, void *);
 typedef cl_int (*SetCB_t)(cl_event, cl_int, event_cb_fn_t, void *);
@@ -157,11 +169,33 @@ static void *find_real_ocl(const char *sym) {
     return s_ocl_h ? dlsym(s_ocl_h, sym) : NULL;
 }
 
+/* Completion callbacks still to run. clFinish() can return before the
+ * driver thread has run a finished command's callback, so a program whose
+ * last kernel completes just before it exits would lose that kernel's
+ * device span. At exit -- from an atexit handler registered here, after the
+ * driver's own initialisation, so it runs before the driver is torn down --
+ * the hook waits for them, at most HP_OCL_EXIT_WAIT_NS. */
+static int g_cb_inflight = 0;
+#define HP_OCL_EXIT_WAIT_NS 2000000000ULL
+
+static void wait_for_callbacks_at_exit(void) {
+    uint64_t t0 = now_ns();
+    while (__atomic_load_n(&g_cb_inflight, __ATOMIC_ACQUIRE) > 0 && now_ns() - t0 < HP_OCL_EXIT_WAIT_NS) {
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* A forked child runs none of its parent's callbacks: nothing to wait for. */
+static void reset_callbacks_in_child(void) { __atomic_store_n(&g_cb_inflight, 0, __ATOMIC_RELEASE); }
+
 static void _ecb_init_fns(void) {
     g_real_prof    = (GetEventProf_t)find_real_ocl("clGetEventProfilingInfo");
     g_real_release = (ReleaseEvent_t)find_real_ocl("clReleaseEvent");
     g_real_setcb   = (SetCB_t)find_real_ocl("clSetEventCallback");
     g_real_retain  = (RetainEvent_t)find_real_ocl("clRetainEvent");
+    atexit(wait_for_callbacks_at_exit);
+    pthread_atfork(NULL, NULL, reset_callbacks_in_child);
 }
 
 /* OpenCL event completion callback — fired on a driver thread when the
@@ -169,7 +203,11 @@ static void _ecb_init_fns(void) {
 static void CL_CALLBACK on_event_complete(cl_event ev,
                                            cl_int status, void *user_data) {
     event_cb_data_t *d = (event_cb_data_t *)user_data;
-    if (status != 0 /* CL_COMPLETE */) { free(d); return; }
+    if (status != 0 /* CL_COMPLETE */) {
+        event_cb_free(d);
+        __atomic_sub_fetch(&g_cb_inflight, 1, __ATOMIC_RELEASE);
+        return;
+    }
 
     pthread_once(&g_ecb_once, _ecb_init_fns);
 
@@ -185,7 +223,8 @@ static void CL_CALLBACK on_event_complete(cl_event ev,
         emit_span(d->category, gettid_compat(), wall_start, dur_ns, d->name, d->extra);
     }
     if (g_real_release) g_real_release(ev);
-    free(d);
+    event_cb_free(d);
+    __atomic_sub_fetch(&g_cb_inflight, 1, __ATOMIC_RELEASE);
 }
 
 /* Register the completion callback; returns immediately. parent_sid != 0
@@ -199,7 +238,8 @@ static void register_event_callback(cl_event ev,
 
     event_cb_data_t *d = (event_cb_data_t *)malloc(sizeof(*d));
     if (!d) return;
-    snprintf(d->name,  sizeof(d->name),  "%s", name  ? name  : "");
+    d->name = strdup(name ? name : "");
+    if (!d->name) { free(d); return; }
     snprintf(d->category, sizeof(d->category), "%s", category ? category : "opencl");
     if (parent_sid)
         snprintf(d->extra, sizeof(d->extra), "%s,psid=%llu",
@@ -208,22 +248,99 @@ static void register_event_callback(cl_event ev,
         snprintf(d->extra, sizeof(d->extra), "%s", extra ? extra : "");
 
     if (g_real_retain) g_real_retain(ev);
+    __atomic_add_fetch(&g_cb_inflight, 1, __ATOMIC_ACQ_REL);
     if (g_real_setcb(ev, 0 /* CL_COMPLETE */, on_event_complete, d) != CL_SUCCESS) {
         if (g_real_retain && g_real_release) g_real_release(ev);
-        free(d);
+        event_cb_free(d);
+        __atomic_sub_fetch(&g_cb_inflight, 1, __ATOMIC_RELEASE);
     }
 }
 
-/* Resolve kernel name. */
-static const char *get_kernel_name(cl_kernel kernel) {
+/* The kernel's full name as a heap string (free() it): the size is queried
+ * first, so names of any length come back whole, and a failed query gives
+ * "<unknown>" -- never a previous kernel's name. (A fixed 256-byte buffer
+ * made clGetKernelInfo fail with CL_INVALID_VALUE for longer names, leaving
+ * the last kernel's name in the buffer: BabelStream's SYCL reduction
+ * kernels were reported as "triad".) */
+static char *get_kernel_name(cl_kernel kernel) {
     typedef cl_int (*GetKernelInfo_t)(cl_kernel, cl_uint, size_t, void*, size_t*);
     static GetKernelInfo_t real = NULL;
-    static __thread char kname[256];
     if (!real) real = (GetKernelInfo_t)find_real_ocl("clGetKernelInfo");
-    if (!real || !kernel) return "<unknown>";
 #define CL_KERNEL_FUNCTION_NAME 0x1190
-    real(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(kname), kname, NULL);
-    return kname;
+    size_t sz = 0;
+    if (real && kernel &&
+        real(kernel, CL_KERNEL_FUNCTION_NAME, 0, NULL, &sz) == CL_SUCCESS && sz > 0) {
+        char *buf = (char *)malloc(sz + 1);
+        if (buf) {
+            if (real(kernel, CL_KERNEL_FUNCTION_NAME, sz, buf, NULL) == CL_SUCCESS) {
+                buf[sz] = '\0';
+                if (buf[0]) return buf;
+            }
+            free(buf);
+        }
+    }
+    return strdup("<unknown>");
+}
+
+/* ── Program binary -> module id ─────────────────────────────────────── */
+
+/* (program, device) -> module id of the binary built for that device, so a
+ * kernel launch can name the code it ran (cl_kernel -> CL_KERNEL_PROGRAM,
+ * queue -> CL_QUEUE_DEVICE). A rebuilt program, or a new one at a reused
+ * address, overwrites its entries. */
+typedef struct { cl_program prog; cl_device_id dev; uint64_t mod; } OclModEntry;
+static OclModEntry    *g_oclmods;
+static size_t          g_oclmod_n, g_oclmod_cap;
+static pthread_mutex_t g_oclmod_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void oclmod_set(cl_program prog, cl_device_id dev, uint64_t mod) {
+    pthread_mutex_lock(&g_oclmod_mutex);
+    for (size_t i = 0; i < g_oclmod_n; i++) {
+        if (g_oclmods[i].prog == prog && g_oclmods[i].dev == dev) {
+            g_oclmods[i].mod = mod;
+            pthread_mutex_unlock(&g_oclmod_mutex);
+            return;
+        }
+    }
+    if (g_oclmod_n == g_oclmod_cap) {
+        size_t cap = g_oclmod_cap ? g_oclmod_cap * 2 : 64;
+        OclModEntry *p = (OclModEntry *)realloc(g_oclmods, cap * sizeof(*p));
+        if (!p) { pthread_mutex_unlock(&g_oclmod_mutex); return; }
+        g_oclmods = p;
+        g_oclmod_cap = cap;
+    }
+    g_oclmods[g_oclmod_n++] = (OclModEntry){prog, dev, mod};
+    pthread_mutex_unlock(&g_oclmod_mutex);
+}
+
+/* Module id of the code a launch of `kernel` on `q` runs (0: unknown). With
+ * no entry for the queue's device, a program built for one device only
+ * still answers. */
+static uint64_t kernel_module_id(cl_kernel kernel, cl_command_queue q) {
+    typedef cl_int (*GetKI_t)(cl_kernel, cl_uint, size_t, void*, size_t*);
+    typedef cl_int (*GetQI_t)(cl_command_queue, cl_uint, size_t, void*, size_t*);
+    static GetKI_t gki = NULL;
+    static GetQI_t gqi = NULL;
+    if (!gki) gki = (GetKI_t)find_real_ocl("clGetKernelInfo");
+    if (!gqi) gqi = (GetQI_t)find_real_ocl("clGetCommandQueueInfo");
+#define CL_KERNEL_PROGRAM 0x1194
+#define CL_QUEUE_DEVICE   0x1091
+    cl_program prog = NULL;
+    cl_device_id dev = NULL;
+    if (!gki || !kernel || gki(kernel, CL_KERNEL_PROGRAM, sizeof(prog), &prog, NULL) != CL_SUCCESS || !prog)
+        return 0;
+    if (gqi && q) gqi(q, CL_QUEUE_DEVICE, sizeof(dev), &dev, NULL);
+    uint64_t mod = 0, only = 0;
+    int nprog = 0;
+    pthread_mutex_lock(&g_oclmod_mutex);
+    for (size_t i = 0; i < g_oclmod_n; i++) {
+        if (g_oclmods[i].prog != prog) continue;
+        if (dev && g_oclmods[i].dev == dev) { mod = g_oclmods[i].mod; break; }
+        only = g_oclmods[i].mod;
+        nprog++;
+    }
+    pthread_mutex_unlock(&g_oclmod_mutex);
+    return mod ? mod : (nprog == 1 ? only : 0);
 }
 
 /* ── clCreateCommandQueue ────────────────────────────────────────────── */
@@ -291,7 +408,8 @@ cl_int clEnqueueNDRangeKernel(
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clEnqueueNDRangeKernel");
 
-    const char *kname = get_kernel_name(kernel);
+    char *kname_heap = get_kernel_name(kernel);
+    const char *kname = kname_heap ? kname_heap : "<unknown>";
     if (g_dbg) { fprintf(g_dbg, "[opencl-hook] clEnqueueNDRangeKernel kernel=%s\n", kname); fflush(g_dbg); }
 
     /* If the caller doesn't want an event, create an internal one. */
@@ -307,14 +425,19 @@ cl_int clEnqueueNDRangeKernel(
     if (g_dbg) { fprintf(g_dbg, "[opencl-hook] enqueue ret=%d event=%p\n", ret, event ? *event : NULL); fflush(g_dbg); }
 
     if (ret == CL_SUCCESS && *event) {
-        /* CPU-side span: time from enqueue call to return (scheduling latency).
-           cpu_t0 doubles as a unique span ID for linking to the GPU execution span. */
-        char cpu_extra[64];
-        snprintf(cpu_extra, sizeof(cpu_extra), "type=kernel,side=cpu,sid=%llu",
-                 (unsigned long long)cpu_t0);
+        /* CPU-side span: time from enqueue call to return (scheduling latency),
+           with a span id (hp_ids.h) the GPU execution span links back to. */
+        static uint32_t ocl_seq = 0;
+        uint64_t sid = hp_span_id(HP_ID_OPENCL, (uint32_t)getpid(),
+                                  __atomic_add_fetch(&ocl_seq, 1, __ATOMIC_RELAXED));
+        char modtag[24], cpu_extra[96], gpu_extra[64];
+        hp_mod_tag(modtag, sizeof(modtag), kernel_module_id(kernel, q));
+        snprintf(cpu_extra, sizeof(cpu_extra), "type=kernel,side=cpu,sid=%llu%s",
+                 (unsigned long long)sid, modtag);
+        snprintf(gpu_extra, sizeof(gpu_extra), "type=kernel,side=gpu%s", modtag);
         emit_span("opencl", gettid_compat(), cpu_t0, cpu_dur, kname, cpu_extra);
         /* GPU-side span: async callback carries psid= linking back to the CPU span. */
-        register_event_callback(*event, kname, "type=kernel,side=gpu", cpu_t0, "opencl");
+        register_event_callback(*event, kname, gpu_extra, sid, "opencl");
         /* Release our internal event reference if the caller didn't want it. */
         if (our_event) {
             typedef cl_int (*ReleaseEvent_t)(cl_event);
@@ -323,6 +446,7 @@ cl_int clEnqueueNDRangeKernel(
             if (real_release) real_release(*event);
         }
     }
+    free(kname_heap);
     return ret;
 }
 
@@ -471,6 +595,7 @@ static void _extract_ocl_binary(cl_program program) {
     if (!gpi) return;
 
 #define _OCL_PROG_NUM_DEVICES   0x1162u
+#define _OCL_PROG_DEVICES       0x1163u
 #define _OCL_PROG_BINARY_SIZES  0x1165u
 #define _OCL_PROG_BINARIES      0x1166u
 
@@ -479,12 +604,15 @@ static void _extract_ocl_binary(cl_program program) {
     if (r1 || ndev == 0) return;
 
     size_t *bsizes = (size_t *)calloc(ndev, sizeof(size_t));
-    if (!bsizes) return;
+    cl_device_id *devs = (cl_device_id *)calloc(ndev, sizeof(cl_device_id));
+    if (!bsizes || !devs) { free(bsizes); free(devs); return; }
     cl_int r2 = gpi(program, _OCL_PROG_BINARY_SIZES, ndev * sizeof(size_t), bsizes, NULL);
-    if (r2) { free(bsizes); return; }
+    if (r2) { free(bsizes); free(devs); return; }
+    if (gpi(program, _OCL_PROG_DEVICES, ndev * sizeof(cl_device_id), devs, NULL) != CL_SUCCESS)
+        memset(devs, 0, ndev * sizeof(cl_device_id));
 
     unsigned char **bins = (unsigned char **)calloc(ndev, sizeof(unsigned char *));
-    if (!bins) { free(bsizes); return; }
+    if (!bins) { free(bsizes); free(devs); return; }
     for (cl_uint i = 0; i < ndev; i++) {
         if (bsizes[i] > 0) bins[i] = (unsigned char *)malloc(bsizes[i]);
     }
@@ -494,19 +622,31 @@ static void _extract_ocl_binary(cl_program program) {
         static int ocl_bin_n = 0;
         for (cl_uint i = 0; i < ndev; i++) {
             if (!bins[i] || bsizes[i] < 4) continue;
-            if (!(bins[i][0] == 0x7f && bins[i][1] == 'E' &&
-                  bins[i][2] == 'L'  && bins[i][3] == 'F'))
+            int is_elf = bins[i][0] == 0x7f && bins[i][1] == 'E' &&
+                         bins[i][2] == 'L'  && bins[i][3] == 'F';
+            /* NVIDIA's OpenCL returns PTX text: saved too (the extractor
+             * parses PTX) */
+            int is_ptx = (bins[i][0] == '/' && bins[i][1] == '/') || bins[i][0] == '.';
+            if (!is_elf && !is_ptx) {
+                /* other GPU ISA: not disassembled, but launches still name
+                 * the binary they ran. */
+                oclmod_set(program, devs[i], hp_fnv1a64(bins[i], bsizes[i]));
                 continue;
+            }
             /* Peel Intel CPU OCL outer wrapper (e_type=0xff04) to get the
              * standard x86-64 ELF relocatable stored in .ocl.obj. */
             const unsigned char *obj_data = bins[i];
             size_t obj_sz = bsizes[i];
             const unsigned char *inner = NULL;
             size_t inner_sz = 0;
-            if (_unwrap_intel_ocl(bins[i], bsizes[i], &inner, &inner_sz)) {
+            if (is_elf && _unwrap_intel_ocl(bins[i], bsizes[i], &inner, &inner_sz)) {
                 obj_data = inner;
                 obj_sz   = inner_sz;
             }
+            /* The module id hashes exactly the bytes saved below, so the
+             * disassembler can recompute it from the file. */
+            uint64_t mod = hp_fnv1a64(obj_data, obj_sz);
+            oclmod_set(program, devs[i], mod);
             int idx = __atomic_fetch_add(&ocl_bin_n, 1, __ATOMIC_RELAXED);
             char saved[512];
             snprintf(saved, sizeof(saved), "/tmp/hprofiler_ocl_%d_%d.bin",
@@ -515,8 +655,9 @@ static void _extract_ocl_binary(cl_program program) {
             if (fp) {
                 fwrite(obj_data, 1, obj_sz, fp);
                 fclose(fp);
-                char extra[640];
-                snprintf(extra, sizeof(extra), "type=jit_load,path=%s", saved);
+                char extra[640], modtag[24];
+                snprintf(extra, sizeof(extra), "type=jit_load,stage=load,path=%s%s", saved,
+                         hp_mod_tag(modtag, sizeof(modtag), mod));
                 emit_span("jit", gettid_compat(), now_ns(), 0, "ocl_kernel.bin", extra);
             }
         }
@@ -525,6 +666,22 @@ static void _extract_ocl_binary(cl_program program) {
     for (cl_uint i = 0; i < ndev; i++) free(bins[i]);
     free(bins);
     free(bsizes);
+    free(devs);
+}
+
+/* stage= of a build: "source" when the program was created from OpenCL C
+ * (the driver runs front and back end), "backend" for IL (SPIR-V, e.g.
+ * AdaptiveCpp SSCP, whose own IR generation happens before this call and
+ * outside every span) or binaries. */
+static const char *ocl_build_stage(cl_program program) {
+    typedef cl_int (*GetPI_t)(cl_program, cl_uint, size_t, void*, size_t*);
+    static GetPI_t gpi = NULL;
+    if (!gpi) gpi = (GetPI_t)find_real_ocl("clGetProgramInfo");
+#define _OCL_PROG_SOURCE 0x1164u
+    size_t n = 0;
+    if (gpi && gpi(program, _OCL_PROG_SOURCE, 0, NULL, &n) == CL_SUCCESS && n > 1)
+        return "source";
+    return "backend";
 }
 
 cl_int clBuildProgram(
@@ -536,10 +693,12 @@ cl_int clBuildProgram(
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clBuildProgram");
 
+    const char *stage = ocl_build_stage(program);
     uint64_t t0 = now_ns();
     cl_int ret = real(program, num_devices, device_list, options, pfn_notify, user_data);
-    emit_span("jit", gettid_compat(), t0, now_ns()-t0,
-              "clBuildProgram", ret == CL_SUCCESS ? "status=ok" : "status=err");
+    char extra[48];
+    snprintf(extra, sizeof(extra), "status=%s,stage=%s", ret == CL_SUCCESS ? "ok" : "err", stage);
+    emit_span("jit", gettid_compat(), t0, now_ns()-t0, "clBuildProgram", extra);
     if (ret == CL_SUCCESS) _extract_ocl_binary(program);
     return ret;
 }
@@ -556,13 +715,44 @@ cl_int clCompileProgram(
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clCompileProgram");
 
+    const char *stage = ocl_build_stage(program);
     uint64_t t0 = now_ns();
     cl_int ret = real(program, num_devices, device_list, options,
                       num_input_headers, input_headers, header_include_names,
                       pfn_notify, user_data);
-    emit_span("jit", gettid_compat(), t0, now_ns()-t0,
-              "clCompileProgram", "type=jit_compile");
+    char extra[48];
+    snprintf(extra, sizeof(extra), "type=jit_compile,stage=%s", stage);
+    emit_span("jit", gettid_compat(), t0, now_ns()-t0, "clCompileProgram", extra);
     return ret;
+}
+
+/* A linked program never goes through clBuildProgram: save its binaries
+ * here, so its kernels get disassembly and a module id too. */
+cl_program clLinkProgram(
+    cl_context ctx, cl_uint num_devices, const cl_device_id *device_list,
+    const char *options, cl_uint num_input_programs,
+    const cl_program *input_programs,
+    void (*pfn_notify)(cl_program, void*), void *user_data, cl_int *errcode_ret)
+{
+    typedef cl_program (*fn_t)(cl_context, cl_uint, const cl_device_id*,
+                                const char*, cl_uint, const cl_program*,
+                                void(*)(cl_program,void*), void*, cl_int*);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)find_real_ocl("clLinkProgram");
+    if (!real) { if (errcode_ret) *errcode_ret = -6; return NULL; }
+
+    cl_int err = CL_SUCCESS;
+    uint64_t t0 = now_ns();
+    cl_program prog = real(ctx, num_devices, device_list, options,
+                           num_input_programs, input_programs, pfn_notify, user_data, &err);
+    emit_span("jit", gettid_compat(), t0, now_ns()-t0,
+              "clLinkProgram", err == CL_SUCCESS ? "type=jit_compile,stage=backend,status=ok"
+                                                 : "type=jit_compile,stage=backend,status=err");
+    if (errcode_ret) *errcode_ret = err;
+    /* With a callback the link may still be running: its binary is not
+     * available yet (like an asynchronous clBuildProgram). */
+    if (prog && err == CL_SUCCESS && !pfn_notify) _extract_ocl_binary(prog);
+    return prog;
 }
 
 /* ── clFinish / clWaitForEvents sync spans ──────────────────────────── */
@@ -667,13 +857,16 @@ cl_int clReleaseMemObject(cl_mem memobj) {
 #define MAX_JIT_HANDLES 128
 static void     *g_jit_handles[MAX_JIT_HANDLES];
 static char      g_jit_names[MAX_JIT_HANDLES][64]; /* short basename */
+static uint64_t  g_jit_mods[MAX_JIT_HANDLES];      /* module id of the .jit.so (hp_module.h) */
 static int       g_jit_count = 0;
 static pthread_mutex_t g_jit_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int is_jit_handle(void *h) {
+/* 1 if h is a registered .jit.so handle; *mod gets its module id. */
+static int is_jit_handle(void *h, uint64_t *mod) {
     pthread_mutex_lock(&g_jit_mutex);
     for (int i = 0; i < g_jit_count; i++) {
         if (g_jit_handles[i] == h) {
+            if (mod) *mod = g_jit_mods[i];
             pthread_mutex_unlock(&g_jit_mutex);
             return 1;
         }
@@ -708,6 +901,7 @@ void *dlopen(const char *filename, int flags) {
        still exists for the disassembler even if ACPP unlinks it after load. */
     static int jit_copy_n = 0;
     char saved_jit_path[512] = {0};
+    uint64_t jit_mod = 0;    /* hash of exactly the bytes copied (hp_module.h) */
     if (filename && strstr(filename, ".jit.so")) {
         FILE *src = fopen(filename, "rb");
         if (src) {
@@ -719,11 +913,14 @@ void *dlopen(const char *filename, int flags) {
                 char buf[65536];
                 size_t n;
                 int copy_ok = 1;
+                uint64_t h = HP_FNV1A64_INIT;
                 while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
                     if (fwrite(buf, 1, n, dst) != n) { copy_ok = 0; break; }
+                    h = hp_fnv1a64_update(h, buf, n);
                 }
                 fclose(dst);
                 if (!copy_ok) { remove(saved_jit_path); saved_jit_path[0] = 0; }
+                else jit_mod = h;
             } else {
                 saved_jit_path[0] = 0;
             }
@@ -742,14 +939,16 @@ void *dlopen(const char *filename, int flags) {
 
         /* Emit path of the SAVED copy so Python can disassemble it later. */
         const char *disasm_path = saved_jit_path[0] ? saved_jit_path : filename;
-        char jit_extra[640];
-        snprintf(jit_extra, sizeof(jit_extra), "type=jit_load,path=%s", disasm_path);
+        char jit_extra[640], modtag[24];
+        snprintf(jit_extra, sizeof(jit_extra), "type=jit_load,stage=load,path=%s%s", disasm_path,
+                 hp_mod_tag(modtag, sizeof(modtag), jit_mod));
         emit_span("jit", gettid_compat(), t0, dur, base, jit_extra);
 
         /* Register this handle so dlsym calls on it are intercepted. */
         pthread_mutex_lock(&g_jit_mutex);
         if (g_jit_count < MAX_JIT_HANDLES) {
             g_jit_handles[g_jit_count] = h;
+            g_jit_mods[g_jit_count] = jit_mod;
             snprintf(g_jit_names[g_jit_count], sizeof(g_jit_names[0]),
                      "%s", base);
             g_jit_count++;
@@ -779,7 +978,8 @@ static void *(*g_real_dlsym)(void *, const char *) = NULL;
 
 typedef struct {
     void    (*real_fn)(void);   /* real kernel entry point (cast to fn ptr) */
-    char     name[128];         /* kernel name for span emission */
+    char    *name;              /* kernel name for span emission (heap) */
+    char     extra[48];         /* span tags: type=jit_kernel,side=cpu[,mod=] */
     int      used;
 } trampoline_slot_t;
 
@@ -838,27 +1038,28 @@ static void jit_dispatch(int slot, void *a0, void *a1, void *a2,
     ((kern_t)s->real_fn)(a0, a1, a2, a3, a4, a5);
 
     uint64_t dur = now_ns() - t0;
-    emit_span("opencl", gettid_compat(), t0, dur, s->name, "type=jit_kernel,side=cpu");
+    emit_span("opencl", gettid_compat(), t0, dur, s->name ? s->name : "<jit-kernel>",
+              s->extra[0] ? s->extra : "type=jit_kernel,side=cpu");
 }
 
-/* Extract a short human-readable name from ACPP SSCP's mangled kernel names.
-   ACPP SSCP encodes the user kernel as a local-in-function lambda:
+/* Span name for an ACPP SSCP kernel, as a heap string. ACPP SSCP encodes the
+   user kernel as a local-in-function lambda:
      _Z18__acpp_sscp_kernel<...ZZ<len><user_func_name>...>
-   We find the first "ZZ<digits><name>" occurrence and return "<name>".
-   Falls back to the raw (truncated) symbol if the pattern isn't found.    */
-static void extract_kernel_name(const char *mangled, char *out, size_t outsz) {
+   When the first "ZZ" is followed by <len><name>, that name is used.
+   Otherwise the whole symbol is: a nested lambda ("ZZZ8runbench...", as in
+   mixbench's templated kernels) gives no short name, and a cut-off prefix
+   would merge every kernel into one name (the first 64 characters used to
+   be kept, which reported mixbench's 100 SYCL kernels as 2). */
+static char *extract_kernel_name(const char *mangled) {
     const char *p = strstr(mangled, "ZZ");
     if (p) {
         p += 2;
         int len = 0;
-        while (*p >= '0' && *p <= '9') { len = len * 10 + (*p - '0'); p++; }
-        if (len > 0 && len < 128) {
-            snprintf(out, outsz, "%.*s", len, p);
-            return;
-        }
+        while (*p >= '0' && *p <= '9' && len < 100000) { len = len * 10 + (*p - '0'); p++; }
+        if (len > 0 && strnlen(p, (size_t)len) == (size_t)len)
+            return strndup(p, (size_t)len);
     }
-    /* Fallback: first 64 chars of mangled name. */
-    snprintf(out, outsz, "%.64s", mangled);
+    return strdup(mangled);
 }
 
 static void hprofiler_opencl_dlsym_init(void);
@@ -878,7 +1079,8 @@ void *dlsym(void *handle, const char *symbol) {
     void *real_sym = g_real_dlsym(handle, symbol);
 
     /* Only intercept lookups on registered JIT handles. */
-    if (!real_sym || !is_jit_handle(handle)) {
+    uint64_t mod = 0;
+    if (!real_sym || !is_jit_handle(handle, &mod)) {
         return real_sym;
     }
 
@@ -898,8 +1100,11 @@ void *dlsym(void *handle, const char *symbol) {
     pthread_mutex_unlock(&g_slot_mutex);
 
     trampoline_slot_t *s = &g_slots[idx];
-    s->real_fn = (void (*)(void))real_sym;
-    extract_kernel_name(symbol, s->name, sizeof(s->name));
+    s->name = extract_kernel_name(symbol);
+    char modtag[24];
+    snprintf(s->extra, sizeof(s->extra), "type=jit_kernel,side=cpu%s",
+             hp_mod_tag(modtag, sizeof(modtag), mod));
+    s->real_fn = (void (*)(void))real_sym;   /* last: jit_dispatch checks it */
     s->used = 1;
 
     return (void *)g_trampolines[idx];

@@ -184,6 +184,7 @@ class TestOpenclTrampolines(unittest.TestCase):
             p = subprocess.run([exe], capture_output=True, text=True, timeout=60, env=env)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("RESULT trampolines=256 wrong=0", p.stdout)
+            self.assertIn("RESULT names_wrong=0", p.stdout)
 
 
 if __name__ == "__main__":

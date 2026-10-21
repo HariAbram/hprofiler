@@ -3,14 +3,23 @@
  * hooks/mpi_hook/mpi_hook.c for cross-layer causal attribution:
  *   - wildcard MPI_Irecv (ANY_SOURCE/ANY_TAG) resolved via MPI_Waitany
  *     and MPI_Waitsome, including status resolution even when the
- *     original request array has already-completed (NULL) slots.
- *   - MPI_Test polling loop observing flag=0 then flag=1.
- *   - MPI_Cancel on a never-matched wildcard receive.
+ *     original request array has already-completed (NULL) slots: rank 0
+ *     posts 3 receives, completes one with MPI_Waitany and the others with
+ *     MPI_Waitsome over the same array, called until all three are done
+ *     (one call may return only some of them);
+ *   - MPI_Test polling loop observing flag=0 then flag=1 (started with no
+ *     other receive outstanding, so only the delayed tag-200 send can
+ *     match it);
+ *   - MPI_Cancel on a never-matched wildcard receive;
  *   - MPI_Comm_split into two disjoint sub-communicators, each doing an
  *     MPI_Allreduce, to check commid= agreement/uniqueness.
  *
- * Requires exactly 4 ranks (tests/integration/test_mpi_protocol.py runs
- * it via `mpirun -np 4`).
+ * Requires exactly 4 ranks. tests/integration/test_mpi_multirank.py
+ * (TestMPIProto) runs it with `mpirun -np 4`, unprofiled and under the
+ * hook, and checks the output and the trace against the ground truth
+ * below; tests/integration/test_mpi_protocol.py covers the same
+ * completion paths in one self-communicating process (mpi_proto_self.c).
+ * The stdout line formats are parsed by external checkers: keep them.
  */
 #include <mpi.h>
 #include <stdio.h>
@@ -39,12 +48,20 @@ int main(int argc, char **argv) {
         printf("phase_a waitany completed_index=%d source=%d tag=%d value=%d\n",
                idx, st.MPI_SOURCE, st.MPI_TAG, bufs[idx]);
 
-        int outcount, indices[3]; MPI_Status stats[3];
-        MPI_Waitsome(3, reqs, &outcount, indices, stats);
-        for (int k = 0; k < outcount; k++) {
-            int i = indices[k];
-            printf("phase_a waitsome index=%d source=%d tag=%d value=%d\n",
-                   i, stats[k].MPI_SOURCE, stats[k].MPI_TAG, bufs[i]);
+        /* The other two: MPI_Waitsome returns as soon as SOME are done --
+         * call it until all are. The array keeps its completed
+         * (MPI_REQUEST_NULL) slots. */
+        int done = 1;
+        while (done < 3) {
+            int outcount, indices[3]; MPI_Status stats[3];
+            MPI_Waitsome(3, reqs, &outcount, indices, stats);
+            if (outcount == MPI_UNDEFINED) break;          /* no active request left */
+            for (int k = 0; k < outcount; k++) {
+                int i = indices[k];
+                printf("phase_a waitsome index=%d source=%d tag=%d value=%d\n",
+                       i, stats[k].MPI_SOURCE, stats[k].MPI_TAG, bufs[i]);
+            }
+            done += outcount;
         }
 
         /* ── Phase B: Test-poll loop until a delayed send arrives ───── */

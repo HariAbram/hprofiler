@@ -81,5 +81,12 @@ class NCCLBackend(Backend):
             return "libnccl not found — install NCCL from developer.nvidia.com/nccl"
         return ""
 
+    def usability(self) -> tuple[str, str]:
+        if not self.is_available():
+            return "missing", ""
+        from . import probes
+        ok, why = probes.cuda()
+        return ("usable", why) if ok else ("installed", f"NCCL needs a usable CUDA GPU: {why}")
+
     def preload_libs(self) -> list[str]:
         return [str(_HOOK_LIB)] if _HOOK_LIB.exists() else []

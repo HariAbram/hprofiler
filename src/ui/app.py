@@ -2010,11 +2010,11 @@ class DisasmWidget(Widget):
         self.border_title = "Source"
         self._trace    = trace
         # Build the ordered kernel list: profiled kernels first (by total time),
-        # supplemented by kernels only present in disasm data.
+        # each followed by its name@module variants when several modules
+        # define that name, then kernels only present in disasm data.
         stats = trace.aggregated_stats()
         profiled_names = [r["name"] for r in stats]
-        disasm_only    = [n for n in trace.disasm if n not in profiled_names]
-        self._kernel_names: list[str] = profiled_names + disasm_only
+        self._kernel_names: list[str] = trace.disasm_listing(profiled_names)
         self._stats_by_name = {r["name"]: r for r in stats}
         # Cache pre-rendered Text objects per kernel so navigating back is instant.
         self._disasm_cache: dict[str, Any] = {}
@@ -2045,15 +2045,19 @@ class DisasmWidget(Widget):
         dt: DataTable = self.query_one("#disasm-kernels", DataTable)
         dt.clear(columns=True)
         dt.add_columns("Kernel", "Arch", "Total")
-        disasm = self._trace.disasm
 
         for name in self._kernel_names:
-            arch  = disasm[name].arch if name in disasm else "—"
+            kd, how = self._trace.disasm_for(name)
+            arch  = kd.arch if kd else "—"
             stat  = self._stats_by_name.get(name)
-            total = _fmt_ns(stat["total_ns"]) if stat else "—"
-            has_d = "✓" if name in disasm else " "
+            total = _fmt_ns(stat["total_ns"]) if stat else (
+                f"{kd.launches}×" if kd and kd.launches else "—")
+            # ✓ exact or own code, ~ matched by kernel name only
+            has_d = " " if kd is None else ("~" if how.startswith("name") else "✓")
             color = _cat_color(stat["category"]) if stat else "grey70"
             disp = _fmt_kernel_name(name)
+            if kd is not None and kd.module and name == kd.key:
+                disp = f"{_fmt_kernel_name(kd.name)} @{kd.module[:6]}"
             dt.add_row(
                 Text(f"{has_d} {disp[:22]}", style=f"bold {color}"),
                 Text(arch, style="dim"),
@@ -2070,14 +2074,12 @@ class DisasmWidget(Widget):
             return
         # If only annotations changed (version bumped but set of names didn't grow),
         # invalidate the render cache so heat/stall columns are re-drawn.
-        disasm = self._trace.disasm
         if cur_version != self._last_disasm_version:
             self._disasm_cache.clear()
         self._last_disasm_version = cur_version
         stats = self._trace.aggregated_stats()
         profiled_names = [r["name"] for r in stats]
-        disasm_only = [n for n in disasm if n not in profiled_names]
-        self._kernel_names = profiled_names + disasm_only
+        self._kernel_names = self._trace.disasm_listing(profiled_names)
         self._stats_by_name = {r["name"]: r for r in stats}
         self._rebuild_kernel_list()
         self._show_disasm()
@@ -2099,9 +2101,9 @@ class DisasmWidget(Widget):
 
         idx    = min(self._sel, len(self._kernel_names) - 1)
         name   = self._kernel_names[idx]
-        disasm = self._trace.disasm
+        kd, how = self._trace.disasm_for(name)
 
-        if name not in disasm:
+        if kd is None:
             msg = Text()
             msg.append(name, style="bold")
 
@@ -2146,7 +2148,9 @@ class DisasmWidget(Widget):
             elif tag_info[0] == "kernel":
                 msg.append(
                     "\n\nNo disassembly available for this GPU kernel.\n\n"
-                    "Tips:\n"
+                    + ("Its name could not be resolved at launch, so it cannot be "
+                       "matched to any captured code.\n\n" if name == "<jit-kernel>" else "")
+                    + "Tips:\n"
                     "  • For CUDA AoT: install cuobjdump (CUDA toolkit)\n"
                     "  • For ROCm: install llvm-objdump\n"
                     "  • JIT cubins are auto-captured when the CUDA hook is loaded",
@@ -2172,12 +2176,22 @@ class DisasmWidget(Widget):
                 log.write(obj)
             return
 
-        kd   = disasm[name]
         stat = self._stats_by_name.get(name)
 
         hdr = Text()
-        hdr.append(name, style="bold")
+        hdr.append(kd.name, style="bold")
         hdr.append(f"  arch: {kd.arch}   source: {kd.source}", style="dim")
+        if kd.module or kd.launches or kd.launch_basis == "unknown":
+            count = ("launch count unknown (several entries share this name)"
+                     if kd.launch_basis == "unknown" else
+                     f"{kd.launches} launches" + (" (counted by kernel name)"
+                                                  if kd.launch_basis == "name" else "")
+                     if kd.launches else "")
+            hdr.append("\n" + " · ".join(x for x in (f"module {kd.module}" if kd.module else "", count) if x),
+                       style="dim")
+        if how.startswith("name"):
+            # Name-only match: say so, the code may not be what ran.
+            hdr.append(f"\n⚠ {Trace.DISASM_FOUND_HOW[how]}", style="yellow")
         if stat:
             hdr.append(f"   {_fmt_ns(stat['total_ns'])}", style="yellow")
             hdr.append(f"  {stat['count']}×  {stat['pct']:.1f}%", style="dim")
@@ -2313,14 +2327,14 @@ class DisasmWidget(Widget):
 
         idx  = min(self._sel, len(self._kernel_names) - 1)
         name = self._kernel_names[idx]
-        disasm = self._trace.disasm
+        kd, _how = self._trace.disasm_for(name)
 
-        if name not in disasm or not disasm[name].lines:
+        if kd is None or not kd.lines:
             mix_bar.update("[dim]No instruction mix data[/dim]")
             return
 
-        pcts    = disasm[name].itype_pcts()
-        total   = disasm[name].total_insns()
+        pcts    = kd.itype_pcts()
+        total   = kd.total_insns()
         bar_w   = 10
         parts   = []
         order   = [InsnType.VEC_SP, InsnType.VEC_DP, InsnType.VEC_MEM, InsnType.VECTOR,
@@ -2353,15 +2367,15 @@ class DisasmWidget(Widget):
 
         idx  = min(self._sel, len(self._kernel_names) - 1)
         name = self._kernel_names[idx]
-        disasm = self._trace.disasm
+        kd, _how = self._trace.disasm_for(name)
 
-        if name not in disasm or not disasm[name].lines:
+        if kd is None or not kd.lines:
             hints_bar.update("")
             return
 
         try:
             from ..analysis.asm_advisor import advise, AsmAdvice
-            advices = advise(disasm[name])
+            advices = advise(kd)
         except Exception:
             hints_bar.update("")
             return

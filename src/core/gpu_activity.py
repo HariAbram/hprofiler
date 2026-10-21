@@ -77,9 +77,14 @@ _SUBMITTING_OPS = DEVICE_WORK_OPS
 # Clock-mapping slack between a host span (CLOCK_MONOTONIC) and a native
 # device timestamp mapped onto it. With CUPTI's timestamp callback both are
 # literally the same clock; with the offset method the error is the
-# calibration bracket (~1 us). 50 us is far above either and far below any
-# real launch latency, so it only absorbs mapping error, never real order.
+# calibration bracket (~1 us). A device record starting more than this
+# before its (unique) submission is counted as preceding it -- a clock
+# diagnostic; the link is kept (the correlation id decides, not time).
 CLOCK_TOLERANCE_NS = 50_000
+
+# Device-clock corrections (device_clock_corrections()) above this are
+# reported as a capture warning.
+CLOCK_CORRECTION_WARN_NS = 10_000
 
 
 # ── tag helpers ─────────────────────────────────────────────────────────────
@@ -238,7 +243,8 @@ class Correlation:
     confidence: dict[int, str] = field(default_factory=dict)    # device idx -> certain/high
     devices_of: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
     unmatched: list[int] = field(default_factory=list)          # had ids, no host span
-    precedes_submission: list[int] = field(default_factory=list)  # only host started after it
+    # linked, but starting more than CLOCK_TOLERANCE_NS before its host span
+    precedes_submission: list[int] = field(default_factory=list)
     ambiguous: int = 0                                          # resolved among >1 host by time
 
 
@@ -263,14 +269,17 @@ def correlate(spans) -> Correlation:
     produced it.
 
     lid is preferred (exact, hook-assigned). Otherwise the union of
-    candidates sharing corr/corr2. A correlation id can be reused (CUPTI's
+    candidates sharing corr/corr2. One candidate is always linked: the id
+    says which submission it was, whatever the timestamps say (a drifting
+    GPU->host clock mapping can put the device record before its own
+    submission; such records are counted in precedes_submission and fixed
+    by device_clock_corrections()). A correlation id can be reused (CUPTI's
     are 32-bit and wrap; the same id appears on several host spans after a
-    wrap), so among candidates the latest host span that started no later
-    than the device start wins -- a device operation cannot begin before it
-    was submitted, and the most recent submission with that id is the one
-    still outstanding. Only when every candidate starts after the device op
-    is CLOCK_TOLERANCE_NS allowed (host/device clock-mapping error), and
-    beyond it the record is reported as preceding its submission. Delivery
+    wrap, hours apart), so among several candidates time decides: the
+    latest host span that started no later than the device start (a device
+    operation cannot begin before it was submitted, and the most recent
+    submission with that id is the one still outstanding) -- unless a later
+    candidate is nearer, which only a mapping error can explain. Delivery
     order is irrelevant: this runs on the complete span list."""
     by_key: dict[tuple, list[int]] = defaultdict(list)
     for i, s in _items(spans):
@@ -307,16 +316,18 @@ def correlate(spans) -> Correlation:
             if lid or s.tags.get("corr"):
                 out.unmatched.append(i)
             continue
-        pick = None
-        for h in reversed(cands):              # latest submission before it
-            if spans[h].start_ns <= s.start_ns:
-                pick = h
-                break
-        if pick is None and spans[cands[0]].start_ns <= s.start_ns + CLOCK_TOLERANCE_NS:
-            pick = cands[0]                    # clock-mapping error only
-        if pick is None:
+        if len(cands) == 1:
+            pick = cands[0]
+        else:
+            j = bisect.bisect_right([spans[h].start_ns for h in cands], s.start_ns)
+            before = cands[j - 1] if j else None           # latest submission before it
+            after = cands[j] if j < len(cands) else None   # earliest one after it
+            pick = before
+            if after is not None and (before is None or
+                                      spans[after].start_ns - s.start_ns < s.start_ns - spans[before].start_ns):
+                pick = after
+        if spans[pick].start_ns > s.start_ns + CLOCK_TOLERANCE_NS:
             out.precedes_submission.append(i)
-            continue
         out.host_of[i] = pick
         if len(cands) == 1:
             out.confidence[i] = "certain"
@@ -325,6 +336,91 @@ def correlate(spans) -> Correlation:
             out.ambiguous += 1
         out.devices_of[pick].append(i)
     return out
+
+
+# ── device clock drift ─────────────────────────────────────────────────────
+
+def _device_clock_key(s: "SpanEvent") -> tuple:
+    return (s.pid, s.tags["rt"], s.tags.get("dev") or s.tags.get("ctx") or "")
+
+
+def device_clock_corrections(spans, corr: Correlation, exclude=()) -> dict[tuple, "ClockCorrection"]:
+    """Per (pid, runtime, device) with evidence of drift: the correction to
+    add to that device's measured timestamps (ClockCorrection.at).
+
+    The tracer maps GPU timestamps onto the host clock, and that mapping can
+    drift (seen: a laptop GPU after long GPU-idle phases, device records up
+    to 78 us before their own submission after 8 s of a run). A device
+    operation cannot be submitted before its API call entered, so each
+    linked pair bounds the error from below at the record's time t_i:
+    need_i = host start - the record's `submitted` (CUPTI's submission
+    timestamp, on the device clock; its start where absent). CUPTI's
+    `queued` is taken on the host during the call (measured: a steady
+    ~2 us after the call's start while `submitted` drifted 78 us), and
+    nothing is submitted before it is queued: when it lies within the call
+    it replaces the host start as the tighter bound. The correction
+    is the smallest one that meets every bound and changes by at most
+    CLOCK_DRIFT_RATE per unit of time: c(t) = max(0, max_i(need_i -
+    rate*|t - t_i|)). It is zero where no pair needs one (a correct trace
+    keeps its timestamps exactly), an outlier only moves its neighbourhood,
+    and t + c(t) is strictly increasing, so the device's operations keep
+    their order. Only the drift that makes a record precede its submission
+    is visible; a drift the other way looks like launch latency and is left
+    alone."""
+    need: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
+    for d, h in _items(corr.host_of):
+        dev = spans[d]
+        if d in exclude or timing_source(dev) != TIMING_DEVICE or op_of(dev) not in DEVICE_WORK_OPS:
+            continue
+        bound = spans[h].start_ns
+        queued = _int_tag(dev, "queued")
+        if queued and spans[h].start_ns <= queued <= spans[h].end_ns:
+            bound = queued                       # host clock, during the call: a tighter bound
+        n = bound - _clock_evidence_ns(dev)
+        if n > 0:
+            need[_device_clock_key(dev)].append((_clock_evidence_ns(dev), n))
+    return {key: ClockCorrection(sorted(pts)) for key, pts in need.items()}
+
+
+# How fast a device-clock correction may change: 100 ppm (the drift seen
+# was ~26 ppm). It only bounds how far a correction reaches beyond the
+# records that demand it; every record's own bound is met regardless.
+CLOCK_DRIFT_RATE = 1e-4
+
+
+def _clock_evidence_ns(dev: "SpanEvent") -> int:
+    """The device-clock time a record was submitted: CUPTI's `submitted`
+    (when consistent with the start), else its start."""
+    submitted = _int_tag(dev, "submitted")
+    return submitted if submitted and submitted <= dev.start_ns else dev.start_ns
+
+
+class ClockCorrection:
+    """max(0, max_i(need_i - rate*|t - t_i|)) over sorted (t_i, need_i > 0),
+    in O(log n) per query via prefix/suffix maxima."""
+
+    def __init__(self, points: list[tuple[int, int]], rate: float = CLOCK_DRIFT_RATE):
+        self.rate = rate
+        self.times = [t for t, _ in points]
+        self.max_need = max(n for _, n in points)
+        self._fwd, best = [], float("-inf")
+        for t, n in points:                      # max over t_i <= t of need_i + rate*t_i
+            best = max(best, n + rate * t)
+            self._fwd.append(best)
+        self._bwd, best = [0.0] * len(points), float("-inf")
+        for k in range(len(points) - 1, -1, -1):  # max over t_i >= t of need_i - rate*t_i
+            t, n = points[k]
+            best = max(best, n - rate * t)
+            self._bwd[k] = best
+
+    def at(self, t: int) -> int:
+        j = bisect.bisect_right(self.times, t)
+        c = 0.0
+        if j:
+            c = max(c, self._fwd[j - 1] - self.rate * t)
+        if j < len(self.times):
+            c = max(c, self._bwd[j] + self.rate * t)
+        return int(round(c))
 
 
 def submission_ns(spans: list["SpanEvent"], corr: Correlation, i: int) -> int:
@@ -338,6 +434,13 @@ def submission_ns(spans: list["SpanEvent"], corr: Correlation, i: int) -> int:
 
 def _summary_entry(summary: dict, pid: int, rt: str) -> dict:
     return summary.setdefault(f"{pid}/{rt}", {})
+
+
+# Summary fields assemble() derives (the rest of an entry is the hooks' status).
+_ASSEMBLY_FIELDS = ("device_spans", "proxy_spans", "sync_records", "correlated", "host_calls",
+                    "host_without_device", "unmatched_device", "precedes_submission",
+                    "duplicate_records", "deduplicated_proxy", "clock_corrected_spans",
+                    "clock_correction_max_ns", "timing")
 
 
 def assemble(trace: "Trace") -> dict:
@@ -384,6 +487,31 @@ def assemble(trace: "Trace") -> dict:
         if timing_source(spans[d]) in PROXY_TIMINGS and h in natively_seen_hosts:
             drop.add(d)
             deduped[(spans[d].pid, spans[d].tags["rt"])] += 1
+
+    # 2b. Device clock drift: shift each device's measured spans (start, end
+    #     and CUPTI's `submitted`, all on the device clock -- not `queued`,
+    #     which CUPTI takes on the host) so none precedes its submission;
+    #     before anything below derives launch/queue latencies from them.
+    corrections = device_clock_corrections(spans, corr, exclude=drop)
+    corrected: dict[tuple[int, str], list[int]] = defaultdict(lambda: [0, 0])   # spans, max ns
+    if corrections:
+        for i, s in enumerate(spans):
+            if i in drop or not is_device_span(s) or timing_source(s) != TIMING_DEVICE \
+                    or op_of(s) not in DEVICE_WORK_OPS:
+                continue
+            fix = corrections.get(_device_clock_key(s))
+            c = fix.at(_clock_evidence_ns(s)) if fix else 0
+            if c <= 0:
+                continue
+            submitted = _int_tag(s, "submitted")
+            s.start_ns += c
+            if submitted:
+                s.tags["submitted"] = str(submitted + c)
+            s.tags["clock_corr_ns"] = str(c)
+            changed.add(i)
+            entry = corrected[(s.pid, s.tags["rt"])]
+            entry[0] += 1
+            entry[1] = max(entry[1], c)
 
     # 3. Stream unification. Native records name streams by the vendor's
     #    own id (CUPTI streamId / HSA queue); the host spans -- and every
@@ -440,6 +568,11 @@ def assemble(trace: "Trace") -> dict:
         if host.span_id and not dev.parent_span_id:
             dev.parent_span_id = host.span_id
             changed.add(d)
+        # The module the launch ran (mod=, hooks/common/hp_module.h): only
+        # the host call knows it, and disassembly is keyed by it.
+        if host.tags.get("mod") and not dev.tags.get("mod") and op_of(dev) == "kernel":
+            dev.tags["mod"] = host.tags["mod"]
+            changed.add(d)
         if timing_source(dev) != TIMING_DEVICE or op_of(dev) == "sync":
             continue
         changed.add(d)
@@ -479,6 +612,9 @@ def assemble(trace: "Trace") -> dict:
         counts[(spans[i].pid, spans[i].tags["rt"])]["unmatched_device"] += 1
     for i in corr.precedes_submission:
         counts[(spans[i].pid, spans[i].tags["rt"])]["precedes_submission"] += 1
+    for key, (n, worst) in corrected.items():
+        counts[key]["clock_corrected_spans"] = n
+        counts[key]["clock_correction_max_ns"] = worst
     for key, n in duplicates.items():
         counts[key]["duplicate_records"] += n
     for key, n in deduped.items():
@@ -492,6 +628,8 @@ def assemble(trace: "Trace") -> dict:
         if no_device and c.get("device_spans"):
             c["host_without_device"] = no_device
         entry = _summary_entry(meta_da, pid, rt)
+        for k in _ASSEMBLY_FIELDS:             # a re-assembly replaces them all
+            entry.pop(k, None)
         for k, v in c.items():
             entry[k] = v
         if c.get("device_spans"):
@@ -578,6 +716,11 @@ def degraded_warnings(device_activity: dict) -> list[str]:
             out.append(f"{who}: {tracer} could not allocate {e['buffer_alloc_failed']} activity buffer(s)")
         if status == "active" and e.get("clock") == "unmapped":
             out.append(f"{who}: device timestamps could not be mapped onto the host clock")
+        if e.get("clock_correction_max_ns", 0) > CLOCK_CORRECTION_WARN_NS:
+            out.append(f"{who}: the device clock drifted behind the host clock by up to "
+                       f"{e['clock_correction_max_ns'] / 1000:.1f} us (device records before their own "
+                       f"submission); {e.get('clock_corrected_spans', 0)} device span(s) were shifted later "
+                       "to correct it (tag clock_corr_ns)")
         if missing_final_flush(e):
             out.append(f"{who}: the process ended without {tracer}'s final flush (crash, _exit or kill) "
                        "-- device records still buffered at that point are missing")

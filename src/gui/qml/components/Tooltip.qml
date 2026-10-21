@@ -8,9 +8,8 @@ import Hprofiler 1.0
 // one component covering both via `followCursor`. Always theme-token-
 // driven internally, which is itself the fix for the hardcoded-hex
 // version's real bug: it never repainted on the light/dark toggle.
-// (TimelineScreen's inline status-row hover text is a deliberately
-// different, simpler design for that data-dense screen and is NOT
-// folded into this component.)
+// TimelineScreen's hover detail uses it too: it used to be a status-row
+// label, which widened the row -- and so every lane -- on each hover.
 Rectangle {
     id: root
     // View-relative cursor position, used only when followCursor is true.

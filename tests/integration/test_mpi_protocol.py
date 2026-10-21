@@ -10,23 +10,22 @@ lines the hook emits over a real AF_UNIX socket -- then parses them with
 the production _parse_record (src/core/runner.py) and asserts on the
 resolved semantics, not just "did it crash".
 
-Why "_self": this development machine's MPICH/Hydra cannot form a real
-multi-rank MPI_COMM_WORLD -- `mpirun -np N` (N>1) has every rank
-independently observe MPI_Comm_size() == 1, reproducible with the
-mpi_mini.c fixture too and confirmed via UCX_LOG_LEVEL=info
-to be a PMI/KVS rank-discovery failure in this machine's MPICH/UCX/PMIx
-setup, unrelated to hprofiler. mpi_proto_self.c exercises the same
-PMPI_Isend/Irecv/Waitany/Waitsome/Test/Cancel completion semantics via
-self-communication instead, which still drives the real MPI completion
-machinery end-to-end. It CANNOT exercise genuine cross-process commid=
-agreement (that needs a real second rank) -- this test only checks
-commid= self-consistency across two collectives on the same
-communicator. tests/fixtures/mpi_proto.c is the real 4-rank design,
-kept compile-verified (tests/integration/run_matrix.sh does not build it
-either, for the same reason) for use on a working cluster.
+Why "_self": one process, so it runs with any MPI -- including Ubuntu's
+MPICH/Hydra, whose `mpirun -np N` starts N singletons (every rank sees
+MPI_Comm_size() == 1, a PMI/KVS rank-discovery failure of that package's
+setup, unrelated to hprofiler). mpi_proto_self.c exercises the
+PMPI_Isend/Irecv/Waitany/Waitsome/Test/Cancel completion semantics through
+self-communication, which still drives the real MPI completion machinery
+end to end, but it cannot exercise cross-process commid= agreement: this
+test only checks commid= self-consistency across two collectives on one
+communicator. The 4-rank version, tests/fixtures/mpi_proto.c, runs on
+real ranks in tests/integration/test_mpi_multirank.py (TestMPIProto, with
+Intel MPI, which forms 4 real ranks on the development machine): resolved
+wildcard matches, Test polling, cancellation, commid= agreement across
+processes and the dependency edges.
 
-Skips (does not fail) if mpicc or a working multi-process MPI environment
-is unavailable, consistent with the rest of tests/integration/.
+Skips (does not fail) if mpicc is unavailable, consistent with the rest of
+tests/integration/.
 """
 from __future__ import annotations
 import os

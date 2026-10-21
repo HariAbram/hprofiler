@@ -155,6 +155,75 @@ class TestTimelineModel(unittest.TestCase):
         self.assertNotEqual(c["predLane"], c["succLane"])
         self.assertTrue(c["color"].startswith("#"))
 
+    def test_connectors_of_one_span_on_a_disk_store(self):
+        # A disk store's event ids pass 2^31 ((shard << 38) | row), so the
+        # hovered span's id reaches QML as a double: connectorsOf() is the
+        # overlay's per-hover query (never the whole `connectors` list,
+        # which QML re-read from Python per element access -- minutes per
+        # repaint on a 44k-connector OSU trace), declared float like
+        # spanAt(). Called through Qt's meta-object, as QML calls it.
+        import tempfile
+        from PySide6.QtCore import QMetaObject, Qt, Q_ARG, Q_RETURN_ARG
+        from src.core import trace_io
+        send = _span(1, 101, Category.MPI, 1000, 50, "MPI_Send",
+                     tags={"type": "send", "rank": "0", "peer": "1", "tag": "7"})
+        recv = _span(2, 201, Category.MPI, 1100, 80, "MPI_Recv",
+                     tags={"type": "recv", "rank": "1", "peer": "0", "tag": "7"})
+        other = _span(2, 201, Category.MPI, 2000, 10, "MPI_Barrier", tags={"type": "barrier", "rank": "1"})
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.hpstore")
+            t = trace_io.create_disk_trace(path, TraceMetadata())
+            for s in (send, recv, other):
+                t.add(s)
+            t.finalize()
+            t.close()
+            tr = trace_io.open_trace(path)
+            try:
+                m = self._model(tr)
+                self.assertEqual(len(m.connectors), 1)
+                c = m.connectors[0]
+                self.assertGreater(c["succSpanIdx"], 2**31)      # the 2nd process: shard 1
+                for lane, idx in ((c["predLane"], c["predSpanIdx"]), (c["succLane"], c["succSpanIdx"])):
+                    got = QMetaObject.invokeMethod(m, "connectorsOf", Qt.DirectConnection,
+                                                   Q_RETURN_ARG("QVariantList"),
+                                                   Q_ARG(int, lane), Q_ARG(float, float(idx)))
+                    self.assertEqual(got, [c])
+                barrier = next(s for s in tr.iter_spans() if s.name == "MPI_Barrier")
+                self.assertEqual(m.connectorsOf(c["succLane"], float(barrier.eid)), [])
+                self.assertEqual(m.connectorsOf(c["predLane"], -1.0), [])
+            finally:
+                tr.close()
+
+    def test_theme_toggle_recolors_the_timeline(self):
+        # Lane, bucket, category and connector colours were computed once:
+        # after a toggle a "sync" lane kept the dark theme's near-white
+        # label on the light background. Recomputed and announced by
+        # colorsChanged -- never rowsChanged, which resets the lane list
+        # (and its scroll position).
+        from src.gui.theme import Theme, category_color, bucket_color, confidence_color
+        from src.gui.models import TimelineModel
+        send = _span(1, 101, Category.MPI, 1000, 50, "MPI_Send",
+                     tags={"type": "send", "rank": "0", "peer": "1", "tag": "7"})
+        recv = _span(1, 201, Category.MPI, 1100, 80, "MPI_Recv",
+                     tags={"type": "recv", "rank": "1", "peer": "0", "tag": "7"})
+        wait = _span(1, 201, Category.SYNC, 1300, 20, "cudaStreamSynchronize")
+        theme = Theme(dark=True)
+        m = TimelineModel(_mk_trace([send, recv, wait]), theme)
+        events = []
+        m.colorsChanged.connect(lambda: events.append("colors"))
+        m.rowsChanged.connect(lambda: events.append("rows"))
+        m.setColorMode("bucket")
+        events.clear()
+        theme.dark = False
+        self.assertEqual(events, ["colors"])
+        for lane, row in zip(m.lanes, [r for r in m.rows if r["kind"] == "lane"]):
+            self.assertEqual(lane["color"], category_color(lane["category"], False))
+            self.assertEqual(row["color"], lane["color"])
+        sync_lane = next(i for i, ln in enumerate(m.lanes) if ln["category"] == "sync")
+        self.assertEqual(m.visibleSpans(sync_lane, 0, 10_000, 10)[0]["color"],
+                         bucket_color("Synchronization", False))
+        self.assertEqual(m.connectors[0]["color"], confidence_color(m.connectors[0]["confidence"], False))
+
     def test_minimal_single_span_trace_does_not_crash(self):
         self._model(_mk_trace([_span(1, 1, Category.CPU, 0, 10, "main")]))
 

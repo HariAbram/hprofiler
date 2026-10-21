@@ -779,29 +779,33 @@ class _Builder:
         if not path:
             return
         report = cp.attribute_blame(graph.spans, path, max(1, self.hi - self.lo), confs, kinds)
-        credited = report.path_credited_ns
+        credited, gaps = report.path_credited_ns, report.path_gap_ns
         spans = graph.spans
-        prev = None
         for i, o in enumerate(path):
             s = spans[o]
-            gap = max(0, s.start_ns - prev.end_ns) if prev is not None else 0
-            own = credited[i] if len(credited) == len(path) else s.duration_ns
+            # the report's own split (attribute_blame): each instant once
+            own, gap = credited[i], gaps[i]
             self.path_credit[o] = own
             self.path_rows.append((o, own, gap, s.start_ns, s.end_ns,
                                    kinds[i - 1] if 0 < i <= len(kinds) else "",
                                    confs[i - 1] if 0 < i <= len(confs) else ""))
-            prev = s
 
     def finish_critical_path(self) -> tuple[list[CPSegment], int]:
-        """Segments with their nodes; idle time on the path is blamed on the
-        node of the span before it (what the path was waiting for)."""
+        """Segments with their nodes; idle time on the path before a hop that
+        waits on something else (a message, a rendezvous, device work, a
+        request) is blamed on the node of the span before it (what the path
+        was waiting for). Idle time between two consecutive calls on one
+        thread (a "sequential" hop) is that thread's own uninstrumented
+        work: it counts in the phase's critical time but is blamed on no
+        node -- else reordering independent calls would move blame from one
+        to the other."""
         segments: list[CPSegment] = []
         total = 0
         prev_node = -1
         for o, own, gap, start, end, kind, conf in self.path_rows:
             nid = int(self.node_of[o])
             ph = self.nodes[nid].phase if nid >= 0 else self.phase_at(start)
-            if gap and prev_node >= 0:
+            if gap and prev_node >= 0 and kind != "sequential":
                 self.nodes[prev_node].blame_ns += gap
             if nid >= 0:
                 self.nodes[nid].cp_count += 1

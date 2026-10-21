@@ -45,7 +45,7 @@ Column {
                 font.pixelSize: AppTheme.typeLabel
                 Layout.preferredWidth: 14
             }
-            Rectangle { width: 8; height: 8; radius: 4; color: root.node.color }
+            Rectangle { width: 8; height: 8; radius: 4; color: AppTheme.categoryColor(root.node.category, AppTheme.dark) }
             Text {
                 text: root.node.name
                 color: AppTheme.text

@@ -6,7 +6,9 @@
  * (timing=proxy_*). Also recorded: sync calls, event record / stream wait,
  * allocations (device and pinned_memory_bytes counters, unreleased memory
  * reported at exit), ROCTx ranges and marks, module loads (kernel names and
- * code objects saved for disassembly).
+ * code objects saved for disassembly; launches carry mod=, the id of the
+ * module they ran, see hp_module.h), HIPRTC compilation (front-end JIT,
+ * stage=frontend).
  */
 
 #define _GNU_SOURCE
@@ -67,6 +69,9 @@ static uint64_t now_ns(void) {
 }
 #include "../common/hp_transport.h"
 #include "../common/callstack.h"
+#include "../common/hp_module.h"
+#include "../common/hp_ids.h"
+#include "../common/hp_acpp.h"
 
 static pid_t gettid_compat(void) { return hp_tx_tid(); }
 
@@ -91,24 +96,16 @@ static void emit_ctr(const char *cat, const char *name,
                 (unsigned long long)now_ns(), name, (long long)value, unit);
 }
 
-/* ── Kernel name table (hipModuleGetFunction → name) ──────────────────────── */
-#define KNAME_MAP_CAP 512
-typedef struct { hipFunction_t fn; char name[2048]; } KNameEntry;
-static KNameEntry      g_knames[KNAME_MAP_CAP];
-static int             g_kname_n = 0;
-static pthread_mutex_t g_kname_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* ── Kernel names (hipModuleGetFunction / __hipRegisterFunction -> name +
+ *    module, hp_module.h) ──────────────────────────────────────────────── */
 
-static const char *resolve_name(const void *fn) {
+/* Full name of a launched kernel (any length) and its module id (0: none);
+ * the pointer is a per-thread copy valid until this thread's next call. */
+static const char *resolve_name(const void *fn, uint64_t *mod) {
+    if (mod) *mod = 0;
     if (!fn) return "<unknown>";
-    pthread_mutex_lock(&g_kname_mutex);
-    for (int i = 0; i < g_kname_n; i++) {
-        if (g_knames[i].fn == (hipFunction_t)fn) {
-            const char *p = g_knames[i].name;
-            pthread_mutex_unlock(&g_kname_mutex);
-            return p;
-        }
-    }
-    pthread_mutex_unlock(&g_kname_mutex);
+    const char *known = hp_function_lookup(fn, mod);
+    if (known) return known;
     Dl_info info;
     if (dladdr(fn, &info) && info.dli_sname) return info.dli_sname;
     return "<jit-kernel>";
@@ -285,8 +282,8 @@ typedef struct {
     hipEvent_t   ev_end;
     hipStream_t  stream;
     char         cat[32];
-    char         kname[2048];
-    char         extra[256];
+    char        *kname;      /* heap copy (names have no length limit) */
+    char         extra[320];
     uint64_t     cpu_start_ns;
     pid_t        tid;
 } PendingKernel;
@@ -300,7 +297,7 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
 
     typedef struct {
         hipEvent_t ev_s, ev_e;
-        char cat[32], kname[2048], extra[256];
+        char cat[32], *kname, extra[320];
         uint64_t t0;
         pid_t tid;
     } Local;
@@ -319,8 +316,8 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
             l->ev_s = pk->ev_start; l->ev_e = pk->ev_end;
             l->t0   = pk->cpu_start_ns; l->tid  = pk->tid;
             strncpy(l->cat,   pk->cat,   31);  l->cat[31]   = '\0';
-            strncpy(l->kname, pk->kname, 2047); l->kname[2047] = '\0';
-            strncpy(l->extra, pk->extra, 255); l->extra[255] = '\0';
+            l->kname = pk->kname;          /* ownership moves to todo[] */
+            strncpy(l->extra, pk->extra, sizeof(l->extra) - 1); l->extra[sizeof(l->extra) - 1] = '\0';
         }
     }
     g_pk_n = keep;
@@ -340,7 +337,7 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
         if (ok) {
             /* timing=proxy_event: GPU-measured duration (event pair),
              * start at the host submission time t0. */
-            char final_extra[340];
+            char final_extra[400];
             const char *sep = l->extra[0] ? "," : "";
             if (has_xs)
                 snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event,xs=%llu",
@@ -349,18 +346,20 @@ static void pk_flush(hipStream_t flush_stream, int all_streams) {
                 snprintf(final_extra, sizeof(final_extra), "%s%stiming=proxy_event",
                          l->extra, sep);
             emit_span(l->cat, l->tid, l->t0, (uint64_t)(ms * 1e6f),
-                      l->kname, final_extra);
+                      l->kname ? l->kname : "<unknown>", final_extra);
         } else {
             /* Sync/elapsed-time query failed: keep the kernel, timed from
              * launch to this flush -- an upper bound that can include later
              * queued kernels (timing=proxy_flush). */
-            char marked[300];
+            char marked[360];
             if (l->extra[0])
                 snprintf(marked, sizeof(marked), "%s,timing=proxy_flush", l->extra);
             else
                 snprintf(marked, sizeof(marked), "timing=proxy_flush");
-            emit_span(l->cat, l->tid, l->t0, now_ns() - l->t0, l->kname, marked);
+            emit_span(l->cat, l->tid, l->t0, now_ns() - l->t0,
+                      l->kname ? l->kname : "<unknown>", marked);
         }
+        free(l->kname);
     }
 }
 
@@ -391,7 +390,7 @@ static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
         pk->ev_start = ev_s; pk->ev_end = ev_e;
         pk->stream = stream; pk->cpu_start_ns = t0; pk->tid = tid;
         snprintf(pk->cat,   sizeof(pk->cat),   "%s", cat);
-        snprintf(pk->kname, sizeof(pk->kname), "%s", kname);
+        pk->kname = strdup(kname ? kname : "<unknown>");
         snprintf(pk->extra, sizeof(pk->extra), "%s", extra);
         pthread_mutex_unlock(&g_pk_mutex);
     } else {
@@ -399,7 +398,7 @@ static void pk_commit(hipEvent_t ev_s, hipEvent_t ev_e,
         f_evDestroy(ev_s); f_evDestroy(ev_e);
         /* Pending-kernel queue full -- fall back to CPU-side timing,
          * clearly marked so it isn't mistaken for a GPU-accurate one. */
-        char marked[300];
+        char marked[360];
         if (extra && *extra)
             snprintf(marked, sizeof(marked), "%s,timing=proxy_host", extra);
         else
@@ -460,14 +459,28 @@ typedef struct {
     uint64_t   lid, t0, t1;
     pid_t      tid;
     int        proxy, gpu_ok;
+    int        dev;         /* current device after the call (-1: none) -> hdev= */
     hipEvent_t ev_s, ev_e;
 } Sub;
+
+/* The calling thread's current device, as hdev= (see cuda_hook.c's
+ * current_device): read after the real call; -1 when unavailable. */
+static int current_device(void) {
+    typedef hipError_t (*fn_t)(int *);
+    static fn_t f = NULL;
+    static int tried = 0;
+    if (!tried) { f = (fn_t)_real_hip_sym("hipGetDevice"); tried = 1; }
+    int d = -1;
+    if (!f || f(&d) != 0) return -1;
+    return d;
+}
 
 static void sub_begin(Sub *u, hipStream_t stream, int device_work) {
     native_ensure();
     u->lid    = __atomic_add_fetch(&g_lid_counter, 1, __ATOMIC_RELAXED);
     u->tid    = gettid_compat();
     u->proxy  = device_work && want_proxy();
+    u->dev    = -1;
     u->gpu_ok = u->proxy ? pk_try_begin(stream, &u->ev_s, &u->ev_e) : 0;
     hp_roc_push(u->lid);       /* after pk_try_begin: its events aren't app work */
     u->t0 = now_ns();
@@ -476,6 +489,7 @@ static void sub_begin(Sub *u, hipStream_t stream, int device_work) {
 static void sub_end(Sub *u) {
     u->t1 = now_ns();
     hp_roc_pop();
+    u->dev = current_device();   /* after pop: not a call of the program's */
 }
 
 static void sub_host(const Sub *u, const char *cat, const char *api,
@@ -483,7 +497,10 @@ static void sub_host(const Sub *u, const char *cat, const char *api,
     char x[512];
     int n = snprintf(x, sizeof(x), "%s,side=cpu,rt=rocm,timing=host,lid=%llu,sid=%llu",
                      tags, (unsigned long long)u->lid,
-                     (unsigned long long)(((uint64_t)(uint32_t)getpid() << 32) | (u->lid & 0xffffffffULL)));
+                     (unsigned long long)hp_span_id(HP_ID_ROCM, (uint32_t)getpid(),
+                                                    (uint32_t)(u->lid & 0xffffffffULL)));
+    if (u->dev >= 0 && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",hdev=%d", u->dev);
     if (ret != 0 && n > 0 && n < (int)sizeof(x))
         snprintf(x + n, sizeof(x) - (size_t)n, ",err=%d", ret);
     emit_span(cat, u->tid, u->t0, u->t1 - u->t0, api, x);
@@ -492,12 +509,14 @@ static void sub_host(const Sub *u, const char *cat, const char *api,
 static void sub_proxy(Sub *u, hipStream_t stream, const char *cat,
                       const char *name, const char *tags) {
     if (!u->proxy) return;
-    char x[256];
-    snprintf(x, sizeof(x), "%s,side=gpu,rt=rocm,lid=%llu", tags, (unsigned long long)u->lid);
+    char x[320];
+    int n = snprintf(x, sizeof(x), "%s,side=gpu,rt=rocm,lid=%llu", tags, (unsigned long long)u->lid);
+    if (u->dev >= 0 && n > 0 && n < (int)sizeof(x))
+        snprintf(x + n, sizeof(x) - (size_t)n, ",hdev=%d", u->dev);
     if (u->gpu_ok) {
         pk_commit(u->ev_s, u->ev_e, stream, cat, name, x, u->t0, u->tid);
     } else {
-        char y[300];
+        char y[360];
         snprintf(y, sizeof(y), "%s,timing=proxy_host", x);
         emit_span(cat, u->tid, u->t0, u->t1 - u->t0, name, y);
     }
@@ -524,11 +543,13 @@ hipError_t hipLaunchKernel(const void *fn, dim3 grid, dim3 block,
     if (in_hook) return real(fn, grid, block, args, sharedMem, stream);
     in_hook = 1;
 
-    const char *kname = resolve_name(fn);
+    uint64_t mod;
+    const char *kname = resolve_name(fn, &mod);
     int sid = get_stream_id(stream);
-    char host[64], dev[160];
-    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
-    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%dx%dx%d,block=%dx%dx%d", sid, grid.x, grid.y, grid.z, block.x, block.y, block.z);
+    char host[96], dev[192], modtag[24];
+    hp_mod_tag(modtag, sizeof(modtag), mod);
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d%s", sid, modtag);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%dx%dx%d,block=%dx%dx%d%s", sid, grid.x, grid.y, grid.z, block.x, block.y, block.z, modtag);
 
     Sub u;
     sub_begin(&u, stream, 1);
@@ -553,11 +574,13 @@ hipError_t hipLaunchKernelGGL(hipFunction_t fn,
     if (in_hook) return real(fn, grid, block, sharedMem, stream, kernelParams);
     in_hook = 1;
 
-    const char *kname = resolve_name(fn);
+    uint64_t mod;
+    const char *kname = resolve_name(fn, &mod);
     int sid = get_stream_id(stream);
-    char host[64], dev[160];
-    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
-    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%dx%dx%d,block=%dx%dx%d", sid, grid.x, grid.y, grid.z, block.x, block.y, block.z);
+    char host[96], dev[192], modtag[24];
+    hp_mod_tag(modtag, sizeof(modtag), mod);
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d%s", sid, modtag);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%dx%dx%d,block=%dx%dx%d%s", sid, grid.x, grid.y, grid.z, block.x, block.y, block.z, modtag);
 
     Sub u;
     sub_begin(&u, stream, 1);
@@ -583,11 +606,13 @@ hipError_t hipModuleLaunchKernel(hipFunction_t f,
     if (in_hook) return real(f, gx,gy,gz, bx,by,bz, sharedMem, stream, kernelParams, extra_params);
     in_hook = 1;
 
-    const char *kname = resolve_name(f);
+    uint64_t mod;
+    const char *kname = resolve_name(f, &mod);
     int sid = get_stream_id(stream);
-    char host[64], dev[160];
-    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d", sid);
-    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u", sid, gx, gy, gz, bx, by, bz);
+    char host[96], dev[192], modtag[24];
+    hp_mod_tag(modtag, sizeof(modtag), mod);
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d%s", sid, modtag);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%ux%ux%u,block=%ux%ux%u%s", sid, gx, gy, gz, bx, by, bz, modtag);
 
     Sub u;
     sub_begin(&u, stream, 1);
@@ -1008,7 +1033,7 @@ hipError_t hipMemset(void *dst, int value, size_t size) {
 }
 
 /* ── Native HIP AoT kernel registration ─────────────────────────────────── */
-static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap);
+static uint64_t _save_rocm_bin(const void *image, char *out_path, size_t path_cap);
 
 /*
  * __hipRegisterFatBinary is called once per translation unit during static
@@ -1028,13 +1053,17 @@ void **__hipRegisterFatBinary(const void *data) {
     void **ret = real ? real(data) : NULL;
 
     char saved_path[512];
-    _save_rocm_bin(data, saved_path, sizeof(saved_path));
+    uint64_t mod = _save_rocm_bin(data, saved_path, sizeof(saved_path));
+    /* The returned handle is the `modules` argument of every
+     * __hipRegisterFunction for this binary: its kernels get this id. */
+    if (ret) hp_module_add(ret, mod);
     if (saved_path[0]) {
         /* Emit a jit_compile span so runner.py finds the saved path and
          * passes it to collect_disasm via rocm_jit_paths.  The span is also
          * useful for the glob fallback in case the socket isn't yet open. */
-        char extra[640];
-        snprintf(extra, sizeof(extra), "type=jit_compile,path=%s", saved_path);
+        char extra[640], modtag[24];
+        snprintf(extra, sizeof(extra), "type=jit_compile,stage=load,path=%s%s", saved_path,
+                 hp_mod_tag(modtag, sizeof(modtag), mod));
         emit_span("jit", gettid_compat(), now_ns(), 0,
                   "__hipRegisterFatBinary", extra);
     }
@@ -1069,56 +1098,27 @@ void __hipRegisterFunction(
 
     const char *kname = (deviceName && deviceName[0]) ? deviceName : deviceFunction;
     if (!hostFunction || !kname || !kname[0]) return;
-    pthread_mutex_lock(&g_kname_mutex);
-    int found = 0;
-    for (int i = 0; i < g_kname_n; i++) {
-        if (g_knames[i].fn == (hipFunction_t)(uintptr_t)hostFunction) {
-            found = 1; break;
-        }
-    }
-    if (!found && g_kname_n < KNAME_MAP_CAP) {
-        g_knames[g_kname_n].fn = (hipFunction_t)(uintptr_t)hostFunction;
-        strncpy(g_knames[g_kname_n].name, kname, 2047);
-        g_knames[g_kname_n].name[2047] = '\0';
-        g_kname_n++;
-    }
-    pthread_mutex_unlock(&g_kname_mutex);
+    hp_function_add(hostFunction, modules, kname);
 }
 
 /* ── JIT module load + kernel name table ─────────────────────────────────── */
 
 /* Save the AMDGCN ELF (or PTX text) passed to hipModuleLoad* so the Python
- * disassembler can find it after the process exits.  Returns the saved path
- * in out_path (capacity path_cap) or leaves it empty on failure. */
+ * disassembler can find it after the process exits.  Returns its module id
+ * (hp_module.h: FNV-1a of exactly the bytes saved) and the saved path in
+ * out_path (capacity path_cap), or 0 and "" on failure. */
 static int _rocm_bin_counter = 0;
-static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
+static uint64_t _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
     out_path[0] = '\0';
-    if (!image) return;
+    if (!image) return 0;
     const uint8_t *p = (const uint8_t *)image;
     size_t sz = 0;
 
     if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
         int is64 = (p[4] == 2);
         if (is64) {
-            /* 64-bit ELF: start with end of section header table, then scan
-             * each section header to include section data that may follow. */
-            uint64_t shoff; memcpy(&shoff, p + 40, 8);
-            uint16_t shesz; memcpy(&shesz, p + 58, 2);
-            uint16_t shnum; memcpy(&shnum, p + 60, 2);
-            size_t end = (size_t)(shoff + (uint64_t)shesz * shnum);
-            if (shoff > 0 && shesz >= 64 && shnum > 0 && shnum <= 32768
-                    && shoff < 256ULL*1024*1024) {
-                for (uint16_t i = 0; i < shnum; i++) {
-                    const uint8_t *shdr = p + shoff + (size_t)i * shesz;
-                    uint64_t sec_off, sec_sz;
-                    memcpy(&sec_off, shdr + 24, 8);   /* sh_offset */
-                    memcpy(&sec_sz,  shdr + 32, 8);   /* sh_size   */
-                    size_t sec_end = (size_t)(sec_off + sec_sz);
-                    if (sec_end > end && sec_end < 256ULL*1024*1024)
-                        end = sec_end;
-                }
-            }
-            if (end > 64 && end < 256ULL * 1024 * 1024) sz = end;
+            /* 64-bit ELF: the end of its headers and file data */
+            sz = hp_elf64_image_size(image, 256ULL*1024*1024);
         }
     } else if (memcmp(p, "__CLANG_OFFLOAD_BUNDLE__", 24) == 0) {
         /* Clang offload bundle: parse entry headers to find total data extent. */
@@ -1142,15 +1142,16 @@ static void _save_rocm_bin(const void *image, char *out_path, size_t path_cap) {
         sz = strnlen((const char *)image, 64 * 1024 * 1024);
         if (sz > 0 && sz < 64 * 1024 * 1024) sz++;
     }
-    if (sz == 0) return;
+    if (sz == 0) return 0;
 
     int idx = __atomic_fetch_add(&_rocm_bin_counter, 1, __ATOMIC_RELAXED);
     snprintf(out_path, path_cap, "/tmp/hprofiler_rocm_%d_%d.bin",
              (int)getpid(), idx);
     FILE *f = fopen(out_path, "wb");
-    if (f) {
-        fwrite(image, 1, sz, f); fclose(f);
-    } else { out_path[0] = '\0'; }
+    if (!f) { out_path[0] = '\0'; return 0; }
+    fwrite(image, 1, sz, f);
+    fclose(f);
+    return hp_fnv1a64(image, sz);
 }
 
 hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {
@@ -1159,15 +1160,17 @@ hipError_t hipModuleLoadData(hipModule_t *module, const void *image) {
     if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadData");
     if (!real) return -1;
     char saved_path[512];
-    _save_rocm_bin(image, saved_path, sizeof(saved_path));
+    uint64_t mod = _save_rocm_bin(image, saved_path, sizeof(saved_path));
     uint64_t t0 = now_ns();
     hipError_t ret = real(module, image);
-    char extra[640];
+    char extra[640], modtag[24];
     if (saved_path[0])
-        snprintf(extra, sizeof(extra), "type=jit_compile,path=%s", saved_path);
+        snprintf(extra, sizeof(extra), "type=jit_compile,stage=backend,path=%s%s", saved_path,
+                 hp_mod_tag(modtag, sizeof(modtag), mod));
     else
-        snprintf(extra, sizeof(extra), "type=jit_compile");
+        snprintf(extra, sizeof(extra), "type=jit_compile,stage=backend");
     emit_span("jit", gettid_compat(), t0, now_ns()-t0, "hipModuleLoadData", extra);
+    if (ret == 0 && module) hp_module_add(*module, mod);
     return ret;
 }
 
@@ -1179,15 +1182,34 @@ hipError_t hipModuleLoadDataEx(hipModule_t *module, const void *image,
     if (!real) real = (fn_t)_real_hip_sym("hipModuleLoadDataEx");
     if (!real) return -1;
     char saved_path[512];
-    _save_rocm_bin(image, saved_path, sizeof(saved_path));
+    uint64_t mod = _save_rocm_bin(image, saved_path, sizeof(saved_path));
     uint64_t t0 = now_ns();
     hipError_t ret = real(module, image, numOptions, options, optionValues);
-    char extra[640];
+    char extra[640], modtag[24];
     if (saved_path[0])
-        snprintf(extra, sizeof(extra), "type=jit_compile,path=%s", saved_path);
+        snprintf(extra, sizeof(extra), "type=jit_compile,stage=backend,path=%s%s", saved_path,
+                 hp_mod_tag(modtag, sizeof(modtag), mod));
     else
-        snprintf(extra, sizeof(extra), "type=jit_compile");
+        snprintf(extra, sizeof(extra), "type=jit_compile,stage=backend");
     emit_span("jit", gettid_compat(), t0, now_ns()-t0, "hipModuleLoadDataEx", extra);
+    if (ret == 0 && module) hp_module_add(*module, mod);
+    return ret;
+}
+
+/* HIPRTC front-end compilation (HIP C++ -> code object). Only calls bound
+ * to libhiprtc's exported symbol are seen (see nvrtcCompileProgram in
+ * cuda_hook.c). */
+typedef void *hiprtcProgram_t;
+int hiprtcCompileProgram(hiprtcProgram_t prog, int numOptions, const char **options) {
+    typedef int (*fn_t)(hiprtcProgram_t, int, const char **);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)dlsym(RTLD_NEXT, "hiprtcCompileProgram");
+    if (!real) return 11;  /* HIPRTC_ERROR_INTERNAL_ERROR */
+    uint64_t t0 = now_ns();
+    int ret = real(prog, numOptions, options);
+    emit_span("jit", gettid_compat(), t0, now_ns() - t0, "hiprtcCompileProgram",
+              ret == 0 ? "type=jit_compile,stage=frontend,status=ok"
+                       : "type=jit_compile,stage=frontend,status=err");
     return ret;
 }
 
@@ -1198,16 +1220,8 @@ hipError_t hipModuleGetFunction(hipFunction_t *hfunc, hipModule_t hmod,
     if (!real) real = (fn_t)_real_hip_sym("hipModuleGetFunction");
     if (!real) return -1;
     hipError_t ret = real(hfunc, hmod, name);
-    if (ret == 0 && hfunc && *hfunc && name) {
-        pthread_mutex_lock(&g_kname_mutex);
-        if (g_kname_n < KNAME_MAP_CAP) {
-            g_knames[g_kname_n].fn = *hfunc;
-            strncpy(g_knames[g_kname_n].name, name, 2047);
-            g_knames[g_kname_n].name[2047] = '\0';
-            g_kname_n++;
-        }
-        pthread_mutex_unlock(&g_kname_mutex);
-    }
+    if (ret == 0 && hfunc && *hfunc && name)
+        hp_function_add(*hfunc, hmod, name);
     return ret;
 }
 
@@ -1218,14 +1232,9 @@ hipError_t hipModuleUnload(hipModule_t hmod) {
     if (!real) return -1;
     hipError_t ret = real(hmod);
     /* The runtime may reuse a freed hipFunction_t address for another kernel
-     * (JIT-heavy use, e.g. ACPP), and g_knames does not record modules, so
-     * clear the whole table; entries come back with the next
-     * hipModuleGetFunction. */
-    if (ret == 0) {
-        pthread_mutex_lock(&g_kname_mutex);
-        g_kname_n = 0;
-        pthread_mutex_unlock(&g_kname_mutex);
-    }
+     * (JIT-heavy use, e.g. ACPP): drop this module's functions (they come
+     * back with the next hipModuleGetFunction). */
+    if (ret == 0) hp_module_remove(hmod);
     return ret;
 }
 

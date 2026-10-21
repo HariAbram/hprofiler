@@ -25,9 +25,9 @@ Item {
     }
     readonly property var cpPalette: ["openmp", "cuda", "mpi", "sync", "memory", "nvtx", "jit", "rocm", "opencl"]
 
-    function causeChipColor(cause) { return AppTheme.causeColor(cause || "") }
+    function causeChipColor(cause) { return AppTheme.causeColor(cause || "", AppTheme.dark) }
     function cpColor(identity) {
-        return identity < 0 ? AppTheme.textMuted : AppTheme.categoryColor(cpPalette[identity % cpPalette.length])
+        return identity < 0 ? AppTheme.textMuted : AppTheme.categoryColor(cpPalette[identity % cpPalette.length], AppTheme.dark)
     }
     function showInTimeline(d) {
         if (!d || !d.hasTimeline) return
@@ -208,9 +208,9 @@ Item {
                                     width: 14
                                     height: 18
                                     radius: AppTheme.radiusSmall
-                                    color: modelData.status === "inserted" ? AppTheme.changeColor("new")
-                                         : modelData.status === "removed" ? AppTheme.changeColor("removed")
-                                         : AppTheme.changeColor(modelData.deltaStatus)
+                                    color: modelData.status === "inserted" ? AppTheme.changeColor("new", AppTheme.dark)
+                                         : modelData.status === "removed" ? AppTheme.changeColor("removed", AppTheme.dark)
+                                         : AppTheme.changeColor(modelData.deltaStatus, AppTheme.dark)
                                     opacity: modelData.status === "matched" && modelData.deltaStatus === "unchanged" ? 0.35 : 0.9
                                     border.width: Compare.selectedPhase === modelData.index ? 2 : 0
                                     border.color: AppTheme.text
@@ -322,7 +322,7 @@ Item {
                                             }
                                             Text {
                                                 text: Format.signedNs(modelData.impactNs)
-                                                color: AppTheme.changeColor("regressed")
+                                                color: AppTheme.changeColor("regressed", AppTheme.dark)
                                                 font.pixelSize: AppTheme.typeBody
                                             }
                                         }
@@ -649,7 +649,7 @@ Item {
                                         Text {
                                             text: Format.signedNs(Math.abs(modelData.ownDeltaNs) >= Math.abs(modelData.criticalDeltaNs)
                                                                   ? modelData.ownDeltaNs : modelData.criticalDeltaNs)
-                                            color: AppTheme.changeColor(modelData.ownDeltaNs + modelData.criticalDeltaNs >= 0 ? "regressed" : "improved")
+                                            color: AppTheme.changeColor(modelData.ownDeltaNs + modelData.criticalDeltaNs >= 0 ? "regressed" : "improved", AppTheme.dark)
                                             font.pixelSize: AppTheme.typeCaption
                                         }
                                     }
@@ -760,7 +760,7 @@ Item {
                                 model: Compare.bucketDeltas
                                 delegate: RowLayout {
                                     Layout.fillWidth: true
-                                    Rectangle { width: 8; height: 8; radius: 4; color: AppTheme.bucketColor(modelData.bucket) }
+                                    Rectangle { width: 8; height: 8; radius: 4; color: AppTheme.bucketColor(modelData.bucket, AppTheme.dark) }
                                     Text {
                                         text: modelData.bucket
                                         color: AppTheme.text
@@ -841,7 +841,7 @@ Item {
                                     }
                                     Text {
                                         text: Format.signedNs(modelData.deltaNs)
-                                        color: AppTheme.changeColor("regressed")
+                                        color: AppTheme.changeColor("regressed", AppTheme.dark)
                                         font.pixelSize: AppTheme.typeCaption
                                     }
                                 }
@@ -868,7 +868,7 @@ Item {
                                     }
                                     Text {
                                         text: Format.signedNs(modelData.deltaNs)
-                                        color: AppTheme.changeColor("improved")
+                                        color: AppTheme.changeColor("improved", AppTheme.dark)
                                         font.pixelSize: AppTheme.typeCaption
                                     }
                                 }

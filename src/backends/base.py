@@ -14,7 +14,15 @@ class Backend(ABC):
 
     @abstractmethod
     def is_available(self) -> bool:
-        """Return True if this backend can be used on the current system."""
+        """True if this backend is installed: its hook or tool and the
+        library it needs are present (see usability() for whether it can
+        actually work here)."""
+
+    def usability(self) -> tuple[str, str]:
+        """("usable" | "installed" | "missing", reason): installed but not
+        usable when a probe (src/backends/probes.py) shows the hardware or
+        access it needs is absent. Auto-detection picks usable backends only."""
+        return ("usable", "") if self.is_available() else ("missing", "")
 
     def env_vars(self) -> dict[str, str]:
         """Additional environment variables to inject into the profiled process."""

@@ -47,7 +47,7 @@ RowLayout {
         delegate: LegendSwatch {
             visible: !Workspace.legendCollapsed
             circular: false
-            swatchColor: AppTheme.bucketColor(modelData)
+            swatchColor: AppTheme.bucketColor(modelData, AppTheme.dark)
             label: modelData
         }
     }
