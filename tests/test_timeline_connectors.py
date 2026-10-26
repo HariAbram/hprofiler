@@ -90,13 +90,21 @@ class TestConnectorComputation(unittest.TestCase):
         self.assertEqual(len(w._connectors), 0)
 
     def test_commid_scoped_rendezvous_produces_high_confidence_connector(self):
+        # two ranks (processes): one call each on communicator 1, grouped by
+        # call order. (Two threads of one process are no rendezvous: MPI
+        # allows one call per process per collective instance.)
         a1 = _span(1, 101, Category.MPI, 1000, 100, "MPI_Allreduce",
-                  tags={"type": "allreduce", "commid": "1"})
-        a2 = _span(1, 201, Category.MPI, 1010, 80, "MPI_Allreduce",
-                  tags={"type": "allreduce", "commid": "1"})
+                  tags={"type": "allreduce", "commid": "1", "rank": "0"})
+        a2 = _span(2, 201, Category.MPI, 1010, 80, "MPI_Allreduce",
+                  tags={"type": "allreduce", "commid": "1", "rank": "1"})
         w = TimelineWidget(_mk_trace([a1, a2]))
         self.assertEqual(len(w._connectors), 1)
         self.assertEqual(w._connectors[0][4], "high")
+        same_process = [_span(1, 101, Category.MPI, 1000, 100, "MPI_Allreduce",
+                              tags={"type": "allreduce", "commid": "1", "rank": "0"}),
+                        _span(1, 201, Category.MPI, 1010, 80, "MPI_Allreduce",
+                              tags={"type": "allreduce", "commid": "1", "rank": "0"})]
+        self.assertEqual(TimelineWidget(_mk_trace(same_process))._connectors, [])
 
     def test_empty_trace_produces_no_connectors_and_no_crash(self):
         w = TimelineWidget(_mk_trace([]))

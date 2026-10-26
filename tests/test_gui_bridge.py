@@ -178,6 +178,8 @@ class TestGuiBridge(unittest.TestCase):
         self.assertEqual(theme.categoryColor("memory"), "#7c3aed")
         self.assertEqual(theme.categoryColor("jit"), "#581c87")
         self.assertEqual(theme.categoryColor("nvtx"), "#9a3412")
+        # sycl (host-run SYCL kernels): lime, chosen the same way
+        self.assertEqual((theme.categoryColor("sycl"), theme.categoryColor("sycl", True)), ("#4d7c0f", "#a3e635"))
 
     def test_bucket_color_covers_every_bucket_and_varies_with_theme(self):
         from src.analysis.activity_buckets import BUCKETS

@@ -292,13 +292,16 @@ class TestDerivedResults(_Pair):
         pd = [span_key(rd.spans[i]) for i in rd.path_span_indices]
         self.assertEqual(pm, pd)
         for attr in ("path_span_indices", "path_edge_confidence", "path_edge_kinds", "total_path_ns",
-                     "wall_ns", "time_on_path_by_category", "wait_caused_by_category", "notes"):
+                     "wall_ns", "time_on_path_by_category", "wait_caused_by_category", "notes",
+                     "path_credited_ns", "path_gap_ns", "path_time_by_tier", "modeled_path_ns",
+                     "modeled_unrecorded_idle_ns", "modeled_direct_only_ns"):
             self.assertEqual(getattr(rm, attr), getattr(rd, attr), attr)
+        self.assertEqual(rm.model.sensitivity, rd.model.sensitivity)
         spans, preds = cp.build_dependency_graph(self.mem)
-        self.assertEqual(cp._compute_path_full(spans, preds),
-                         (rm.path_span_indices, rm.path_edge_confidence, rm.path_edge_kinds))
         graph = cp.load_or_build_graph(self.disk)
         self.assertEqual(graph.preds_dict(), {k: v for k, v in preds.items() if v})
+        # the span-level (legacy) DP: dict pipeline == array pipeline
+        self.assertEqual(cp._compute_path_full(spans, preds), graph.critical_path())
 
     def test_streaming_edge_builders_equal_dict_builders_on_mpi_corner_cases(self):
         # Wildcard receives resolved by Wait (rpeer/rtag) or Waitall
@@ -345,15 +348,16 @@ class TestDerivedResults(_Pair):
                 else:
                     ev.append(SpanEvent(rng.choice(["omp_barrier", "omp_taskwait"]), Category.SYNC,
                                         st, d, pid, tid, {"type": "barrier"}))
+            paths = []
             for store in (MemoryTraceStore(), DiskTraceStore(os.path.join(self.tmp, f"mpi{seed}.hpstore"))):
                 t = build(store, ev)
                 spans, preds = cp.build_dependency_graph(t)
                 self.assertEqual(cp.load_or_build_graph(t).preds_dict(), {k: v for k, v in preds.items() if v})
-                r = cp.analyze(t)
-                self.assertEqual(cp._compute_path_full(spans, preds),
-                                 (r.path_span_indices, r.path_edge_confidence, r.path_edge_kinds))
+                self.assertEqual(cp._compute_path_full(spans, preds), cp.load_or_build_graph(t).critical_path())
+                paths.append(cp.analyze(t).path_span_indices)
                 self.assertEqual(mn.validate_causality(t), mn.validate_causality(build(MemoryTraceStore(), ev)))
                 t.close()
+            self.assertEqual(paths[0], paths[1])
 
     def test_call_tree_identical(self):
         from src.analysis.call_tree import build_call_tree, _ct_build

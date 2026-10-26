@@ -114,7 +114,7 @@ class TestViewStatePersistence(unittest.TestCase):
         p.save()
         other = self.model()
         ViewStatePersister(self.settings(), self.trace_path + ".other", other, {})
-        self.assertEqual(other.grouping, "none")
+        self.assertEqual(other.grouping, "hierarchy")             # the default, not process
         self.assertEqual(other.restoredView, {})
 
     def test_nothing_sensitive_written(self):
@@ -162,7 +162,7 @@ class TestViewStatePersistence(unittest.TestCase):
         qs.sync()
         m = self.model()
         ViewStatePersister(self.settings(), self.trace_path, m, {})
-        self.assertEqual(m.grouping, "none")
+        self.assertEqual(m.grouping, "hierarchy")                 # the default
 
     def test_restoring_does_not_trigger_a_save(self):
         from src.gui.settings import ViewStatePersister

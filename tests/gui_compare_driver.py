@@ -40,9 +40,11 @@ def mpi_trace(slow: bool) -> Trace:
                         {"type": "work", "file": str(SRC), "line": "12"}))
         t.add(SpanEvent("MPI_Send", Category.MPI, c + w0, MS // 10, 100, 100,
                         {"type": "send", "rank": "0", "peer": "1", "tag": "7"}))
-        t.add(SpanEvent("compute", Category.OPENMP, c, 10 * MS, 200, 200, {"type": "work"}))
+        # rank 1 posts its receive 1 ms before rank 0's baseline send (posted
+        # at the same instant, both ranks would be equally critical: a tie)
+        t.add(SpanEvent("compute", Category.OPENMP, c, 9 * MS, 200, 200, {"type": "work"}))
         end = c + w0 + 150_000
-        t.add(SpanEvent("MPI_Recv", Category.MPI, c + 10 * MS, end - (c + 10 * MS), 200, 200,
+        t.add(SpanEvent("MPI_Recv", Category.MPI, c + 9 * MS, end - (c + 9 * MS), 200, 200,
                         {"type": "recv", "rank": "1", "peer": "0", "tag": "7"}))
         c = end + 200_000
     return t
@@ -140,6 +142,67 @@ def main() -> None:
     out["afterPhaseTab"] = nav.currentTab
     out["phaseFocus"] = dict(nav.focusRange)
     out["phaseRange"] = dict(cmpb.phaseRange(2))
+
+    # ── side-by-side timelines: match, alignment, sync, delta strip ─────
+    from PySide6.QtCore import QMetaObject, Q_ARG
+    cmpb.selectPhase(-1)
+    nav.navigateTo(9)
+    QTest.qWait(300)
+
+    def walk(item):
+        yield item
+        for ch in item.childItems():
+            yield from walk(ch)
+    panel = root.findChild(QObject, "compareTimelinesPanel")
+    out["ctPanelVisible"] = bool(panel is not None and panel.property("visible"))
+    ct = next((i for i in walk(win.contentItem()) if i.objectName() == "compareTimelines"), None)
+    out["ctFound"] = ct is not None
+    cand_m, base_m = cmpb.candidateTimeline, cmpb.baselineTimeline
+    key = lambda s: s.start_ns
+    cand_c = sorted((s for s in candidate.iter_spans() if s.name == "compute" and s.pid == 100), key=key)
+    base_c = sorted((s for s in baseline.iter_spans() if s.name == "compute" and s.pid == 100), key=key)
+    s2 = cand_c[2]
+    QMetaObject.invokeMethod(ct, "selectIn", Q_ARG("QVariant", "candidate"),
+                             Q_ARG("QVariant", cand_m._lane_of_span(s2)), Q_ARG("QVariant", float(s2.eid)))
+    QTest.qWait(150)
+    m = ct.property("match")
+    m = m.toVariant() if hasattr(m, "toVariant") else m
+    out["ctMatchStatus"] = m.get("status")
+    out["ctCounterpart"] = (m.get("counterpart") or {}).get("eid")
+    out["ctExpectedCounterpart"] = float(base_c[2].eid)
+    out["ctBaseSelected"] = base_m.selectedEvent["spanIdx"]
+    out["ctBasis"] = m.get("basis", "")
+    dur = root.findChild(QObject, "compareMatchDurations")
+    dur = dur or next((i for i in walk(win.contentItem()) if i.objectName() == "compareMatchDurations"), None)
+    out["ctDurationsText"] = dur.property("text") if dur is not None else ""
+    ct.setProperty("alignMode", "event")
+    QMetaObject.invokeMethod(ct, "applyAlignment")
+    QTest.qWait(50)
+    combo = next((i for i in walk(win.contentItem()) if i.objectName() == "compareTimelinesAlign"), None)
+    out["ctComboIndex"] = combo.property("currentIndex") if combo is not None else -1
+    out["ctOffset"] = ct.property("offsetNs")
+    out["ctExpectedOffset"] = float(s2.start_ns - base_c[2].start_ns)
+    QMetaObject.invokeMethod(ct, "setCand", Q_ARG("QVariant", float(s2.start_ns)), Q_ARG("QVariant", 1e6))
+    QTest.qWait(50)
+    out["ctBaseStart"] = ct.property("baseStart")
+    out["ctBaseVisible"] = ct.property("baseVisible")
+    out["ctSetCandStart"] = float(s2.start_ns)
+    out["ctDeltaStrip"] = len(cmpb.deltaStrip)
+    out["ctPhases"] = len(cmpb.phasePairs)
+    recv = next(s for s in candidate.iter_spans() if s.name == "MPI_Recv")
+    QMetaObject.invokeMethod(ct, "selectIn", Q_ARG("QVariant", "candidate"),
+                             Q_ARG("QVariant", cand_m._lane_of_span(recv)), Q_ARG("QVariant", float(recv.eid)))
+    QTest.qWait(150)
+    m = ct.property("match")
+    m = m.toVariant() if hasattr(m, "toVariant") else m
+    out["ctSteps"] = [(st["label"], st["kind"]) for st in m.get("steps", [])]
+    shot = os.environ.get("HPROFILER_COMPARE_SHOT")
+    if shot:
+        flick = root.findChild(QObject, "compareFlick")
+        if flick is not None and panel is not None:
+            flick.setProperty("contentY", max(0.0, panel.mapToItem(flick.property("contentItem"), 0, 0).y() - 10))
+            QTest.qWait(200)
+        win.grabWindow().save(shot)
 
     nav.navigateTo(9)
     QTest.qWait(200)

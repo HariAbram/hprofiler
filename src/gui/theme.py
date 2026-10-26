@@ -48,6 +48,11 @@ _CATEGORY_COLORS: dict[str, tuple[str, str]] = {
     "jit":     ("#8b5cf6", "#581c87"),   # was ("#c084fc", "#7e22ce")
     "nvtx":    ("#ea580c", "#9a3412"),   # was ("#fb923c", "#c2410c")
     "other":   ("#9ca3af", "#6b7280"),
+    # SYCL kernels run on the host (events.SYCL). Lime: of the Tailwind
+    # hues left, the farthest from every category above (CIE76, Machado
+    # protan/deutan/tritan simulations): >= 7.7 dark / 6.3 light, and
+    # apart from openmp's green it is drawn next to.
+    "sycl":    ("#a3e635", "#4d7c0f"),
 }
 
 # severity family (from analysis/dashboard.py's diagnose()/top_findings())
@@ -111,14 +116,79 @@ def text_muted_color(dark: bool) -> str:
 _BUCKET_TO_CATEGORY = {
     "Computation": "cpu", "Communication": "mpi",
     "Synchronization": "sync", "Memory transfer": "memory",
-    "Runtime overhead": "jit", "Annotation": "nvtx",
+    "Annotation": "nvtx",
 }
+
+# Runtime overhead had JIT's violet; the Timeline separates the two
+# (activity class "overhead" vs "jit"), so it gets its own hue.
+_OVERHEAD_COLOR = ("#fb923c", "#c2410c")
 
 
 def bucket_color(bucket: str, dark: bool) -> str:
     if bucket in ("Idle", "Other"):
         return text_muted_color(dark)
+    if bucket == "Runtime overhead":
+        return _OVERHEAD_COLOR[0] if dark else _OVERHEAD_COLOR[1]
     return category_color(_BUCKET_TO_CATEGORY.get(bucket, "other"), dark)
+
+
+# ── Timeline visual vocabulary (src/gui/timeline_paint.py) ──────────────
+# Activity classes (timeline_lod.ACTIVITY): the fill in the "Activity"
+# colour mode. Waiting and idle are neutral and ALWAYS hatched (the pattern,
+# not the colour, says "not working"), annotations are outlines only.
+_ACTIVITY_TO_BUCKET = {
+    "work": "Computation", "communication": "Communication", "memory": "Memory transfer",
+    "overhead": "Runtime overhead", "wait": "Synchronization", "annotation": "Annotation",
+}
+_IDLE_COLOR = ("#6e7681", "#8c959f")
+
+
+def activity_color(activity: str, dark: bool) -> str:
+    if activity == "jit":
+        return category_color("jit", dark)
+    if activity == "wait":
+        return text_muted_color(dark)
+    if activity == "idle":
+        return _IDLE_COLOR[0] if dark else _IDLE_COLOR[1]
+    if activity in _ACTIVITY_TO_BUCKET:
+        return bucket_color(_ACTIVITY_TO_BUCKET[activity], dark)
+    return category_color("other", dark)
+
+
+# Dependency-overlay families (timeline_analysis.FAMILIES): Okabe-Ito hues
+# (Okabe & Ito, Color Universal Design), distinguishable under the common
+# colour-vision deficiencies. The evidence TIER is never a colour: it is
+# the line width, opacity and dash (timeline_paint.tier_pen), and the
+# family also has its own source-marker shape.
+_FAMILY_COLORS: dict[str, tuple[str, str]] = {
+    "critical":       ("#fde047", "#a16207"),
+    "mpi_p2p":        ("#56b4e9", "#0072b2"),
+    "mpi_collective": ("#0072b2", "#00507d"),
+    "openmp":         ("#009e73", "#00704f"),
+    "submission":     ("#e69f00", "#a66f00"),
+    "gpu_sync":       ("#cc79a7", "#9c4c7c"),
+    "nccl":           ("#d55e00", "#a04600"),
+    "other":          ("#9ca3af", "#6b7280"),
+}
+
+
+def family_color(family: str, dark: bool) -> str:
+    pair = _FAMILY_COLORS.get(family, _FAMILY_COLORS["other"])
+    return pair[0] if dark else pair[1]
+
+
+# Critical path overlay (a band on the lanes + its hops): the same yellow
+# as the "critical" family; productive path time solid, waiting hatched.
+def critical_color(dark: bool) -> str:
+    return family_color("critical", dark)
+
+
+# Graph-score overlap (the span-level search counting an interval twice).
+_OVERLAP_COLOR = ("#f87171", "#b91c1c")
+
+
+def overlap_color(dark: bool) -> str:
+    return _OVERLAP_COLOR[0] if dark else _OVERLAP_COLOR[1]
 
 
 _CHANGE_TO_SEVERITY_FAMILY = {
@@ -358,6 +428,24 @@ class Theme(QObject):
     @Slot(str, bool, result=str)
     def changeColor(self, status: str, dark: bool | None = None) -> str:
         return change_color(status, self._dark if dark is None else dark)
+
+    @Slot(str, result=str)
+    @Slot(str, bool, result=str)
+    def activityColor(self, activity: str, dark: bool | None = None) -> str:
+        return activity_color(activity, self._dark if dark is None else dark)
+
+    @Slot(str, result=str)
+    @Slot(str, bool, result=str)
+    def familyColor(self, family: str, dark: bool | None = None) -> str:
+        return family_color(family, self._dark if dark is None else dark)
+
+    @Property(str, notify=themeChanged)
+    def criticalColor(self) -> str:
+        return critical_color(self._dark)
+
+    @Property(str, notify=themeChanged)
+    def overlapColor(self) -> str:
+        return overlap_color(self._dark)
 
     @Slot(str, result=str)
     @Slot(str, bool, result=str)

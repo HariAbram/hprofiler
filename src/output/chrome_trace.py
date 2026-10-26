@@ -29,6 +29,7 @@ def _category_color(cat: str) -> str:
         "sync": "white",
         "jit": "purple",
         "nvtx": "thread_state_usermode",
+        "sycl": "cq_build_passed",
     }
     return colors.get(cat, "generic_work")
 

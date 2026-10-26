@@ -11,11 +11,12 @@ ranges), on synthetic two-rank traces:
     p2p, launch and device_wait hops; no path time is on `nvtx`; both
     builders agree; edges persisted by the previous builder version are
     rebuilt; the ranges stay available as display (path_time_by_annotation);
-  * the path's length is the time it covers: walked with a frontier (the
-    latest end so far), so a start-gated hop whose successor started before
-    its predecessor -- or an earlier path span on another rank -- ended
-    counts that wall time once. total <= extent <= wall, credited + gaps =
-    total, in an arrival hop, a p2p hop into a completion that started
+  * the path's length is the time it covers: on the event-point model
+    (cp_model.py) every step covers [source event, destination event], so a
+    start-gated hop whose successor started before its predecessor -- or an
+    earlier path span on another rank -- ended counts that wall time once.
+    total <= extent <= wall, credited + gaps = total, the composition sums
+    to total, in an arrival hop, a p2p hop into a completion that started
     before the send, and a ping-pong zig-zag.
 """
 import sys
@@ -117,15 +118,13 @@ class TestAnnotationsAreNoNodes(unittest.TestCase):
         self.assertFalse([1 for d, s_ in zip(edges["dst"], edges["src"]) if int(d) in nv or int(s_) in nv])
 
     def test_full_and_streaming_builders_agree(self):
+        # same edges, and the same span-level (legacy) DP result over them
         t = comb_cycle()
         spans, preds = cp.build_dependency_graph(t)
+        graph = cp.load_or_build_graph(t)
+        self.assertEqual(graph.preds_dict(), {k: v for k, v in preds.items() if v})
         full = cp._compute_path_full(spans, preds)
-        r = cp.analyze(t)
-        self.assertEqual((list(full[0]), list(full[1]), list(full[2])),
-                         (r.path_span_indices, r.path_edge_confidence, r.path_edge_kinds))
-        report_full = cp.attribute_blame(spans, full[0], r.wall_ns, full[1], full[2])
-        self.assertEqual(report_full.total_path_ns, r.total_path_ns)
-        self.assertEqual(report_full.time_on_path_by_category, r.time_on_path_by_category)
+        self.assertEqual(tuple(map(list, full)), tuple(map(list, graph.critical_path())))
 
     def test_an_annotation_never_ends_the_path(self):
         # a range longer than any chain of work, with no edges at all
@@ -216,11 +215,13 @@ class TestPathCoversEachInstantOnce(unittest.TestCase):
         self.assertEqual(sum(r.path_credited_ns) + sum(r.path_gap_ns), r.total_path_ns)
         self.assertEqual(sum(r.time_on_path_by_category.values()) + sum(r.wait_caused_by_category.values()),
                          r.total_path_ns)
-        self.assertGreaterEqual(r.dp_accounted_ns, r.total_path_ns)
+        self.assertEqual(sum(r.path_work_by_category.values()) + sum(r.path_in_call_by_category.values())
+                         + r.path_unrecorded_ns + r.path_device_idle_ns
+                         + sum(r.path_dependency_by_kind.values()), r.total_path_ns)
+        self.assertEqual(r.dp_accounted_ns, r.total_path_ns)
+        self.assertLessEqual(r.modeled_path_ns, r.wall_ns)
         if expect_total is not None:
             self.assertEqual(r.total_path_ns, expect_total)
-        full = cp._compute_path_full(*cp.build_dependency_graph(t))
-        self.assertEqual(list(full[0]), r.path_span_indices)
         return r
 
     def test_arrival_hop_whose_successor_started_before_its_predecessor_ended(self):
@@ -232,8 +233,12 @@ class TestPathCoversEachInstantOnce(unittest.TestCase):
                     _work("A1", 2, 0, 690), _mpi("MPI_Reduce", 2, 690, 710, type="reduce", rank=1, commid=0)])
         r = self._check(t, "arrival", expect_total=800)
         self.assertEqual([r.spans[i].name for i in r.path_span_indices], ["A1", "MPI_Reduce", "MPI_Reduce", "B0"])
-        self.assertEqual(r.dp_accounted_ns, 1210)
-        self.assertTrue(any("longest-path search" in n for n in r.notes))
+        # A1's work, rank 1's arrival releasing rank 0's reduce 10 ns later
+        # (dependency latency), B0's work; the span-level DP valued this
+        # path at 1210
+        self.assertEqual(r.path_work_by_category, {"openmp": 690 + 100})
+        self.assertEqual(r.path_dependency_by_kind, {"arrival": 10})
+        self.assertEqual(r.modeled_path_ns, 790)
 
     def test_p2p_hop_into_a_completion_that_started_before_the_send(self):
         # rank 0 waits from 100; rank 1 sends at 600 after computing
@@ -241,7 +246,12 @@ class TestPathCoversEachInstantOnce(unittest.TestCase):
                     _work("after", 1, 650, 700)])
         r = self._check(t, "p2p", expect_total=700)
         self.assertEqual([r.spans[i].name for i in r.path_span_indices], ["compute", "MPI_Isend", "MPI_Wait", "after"])
-        self.assertEqual(r.path_credited_ns, [600, 10, 40, 50])
+        # the Wait returned 50 ns after the send began: dependency latency
+        # (the trace cannot split it into the Isend call, the transfer and
+        # the Wait's own processing) -- not 10 + 40 credited to the calls
+        self.assertEqual(r.path_credited_ns, [600, 0, 0, 50])
+        self.assertEqual(r.path_gap_ns, [0, 0, 50, 0])
+        self.assertEqual(r.path_dependency_by_kind, {"p2p": 50})
 
     def test_ping_pong_zig_zag(self):
         # each rank waits for the other's reply with its receive posted (and
@@ -254,14 +264,20 @@ class TestPathCoversEachInstantOnce(unittest.TestCase):
         self.assertLessEqual(r.total_path_ns, 500)
         self.assertGreaterEqual(r.path_edge_kinds.count("p2p"), 2)
 
-    def test_launch_and_device_wait_overlap_still_credited_by_tail(self):
-        # the host/device overlap rule is the frontier rule's special case
+    def test_a_sync_calls_tail_after_the_work_is_device_wait_latency(self):
+        # the sync call overlaps the work it waited for: only its tail after
+        # the work ended is on the path, as the device_wait step
         t = comb_cycle(nvtx=False)
         r = cp.analyze(t)
+        hops = 0
         for i, k in enumerate(r.path_edge_kinds):
             if k == "device_wait":
+                hops += 1
                 sync, work = r.spans[r.path_span_indices[i + 1]], r.spans[r.path_span_indices[i]]
-                self.assertEqual(r.path_credited_ns[i + 1], max(0, sync.end_ns - work.end_ns))
+                # the sync call's tail after the work ended: device_wait latency
+                self.assertEqual(r.path_gap_ns[i + 1], max(0, sync.end_ns - work.end_ns))
+                self.assertEqual(r.path_credited_ns[i + 1], 0)
+        self.assertTrue(hops)
         self.assertLessEqual(r.total_path_ns, r.wall_ns)
 
 

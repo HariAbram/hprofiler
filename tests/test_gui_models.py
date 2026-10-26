@@ -41,10 +41,17 @@ class TestTimelineModel(unittest.TestCase):
     def setUpClass(cls):
         cls._app = QGuiApplication.instance() or QGuiApplication([])
 
-    def _model(self, trace):
+    def _model(self, trace, grouping: str | None = "none"):
+        """Flat rows ("none") unless asked otherwise: these tests are about
+        filter / hide / isolate / reorder semantics, which hold under any
+        grouping; the default is the hierarchy (tested below and in
+        tests/test_timeline_render.py)."""
         from src.gui.theme import Theme
         from src.gui.models import TimelineModel
-        return TimelineModel(trace, Theme(dark=True))
+        m = TimelineModel(trace, Theme(dark=True))
+        if grouping is not None:
+            m.setGrouping(grouping)
+        return m
 
     def test_lanes_labeled_by_mpi_rank_not_generic_thread_number(self):
         a = _span(100, 101, Category.MPI, 0, 10, "MPI_Send", tags={"rank": "5"})
@@ -265,9 +272,13 @@ class TestTimelineModel(unittest.TestCase):
 
     # ── rows (the visual row list TimelineScreen.qml's ListView iterates) ──
 
-    def test_rows_is_1_to_1_with_lanes_before_any_filter_or_grouping(self):
+    def test_rows_default_to_the_hierarchy_and_flat_mode_is_1_to_1_with_lanes(self):
         spans = [_span(1, i, Category.CPU, 0, 100, f"fn{i}") for i in range(1, 5)]
-        m = self._model(_mk_trace(spans))
+        m = self._model(_mk_trace(spans), grouping=None)
+        self.assertEqual(m.grouping, "hierarchy")
+        self.assertEqual(sorted(r["laneIndex"] for r in m.rows if r["kind"] == "lane"), list(range(len(m.lanes))))
+        self.assertEqual(m.rows[0]["kind"], "group")            # the system header
+        m.setGrouping("none")
         self.assertEqual(len(m.rows), len(m.lanes))
         for i, (row, lane) in enumerate(zip(m.rows, m.lanes)):
             self.assertEqual(row["kind"], "lane")

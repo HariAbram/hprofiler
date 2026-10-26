@@ -30,10 +30,12 @@ def _span(pid, tid, cat, start_ns, dur_ns, name="s", tags=None, span_id="", pare
 
 class TestProgramOrderEdges(unittest.TestCase):
     def test_three_sequential_spans_no_gaps(self):
+        # (not "cpu": that category holds perf samples, estimated weights
+        # that are no graph nodes)
         spans = [
-            _span(1, 1, Category.CPU, 0, 100, name="a"),
-            _span(1, 1, Category.CPU, 100, 100, name="b"),
-            _span(1, 1, Category.CPU, 200, 100, name="c"),
+            _span(1, 1, Category.OPENMP, 0, 100, name="a"),
+            _span(1, 1, Category.OPENMP, 100, 100, name="b"),
+            _span(1, 1, Category.OPENMP, 200, 100, name="c"),
         ]
         trace = _mk_trace(spans)
         report = cp.analyze(trace)
@@ -42,14 +44,18 @@ class TestProgramOrderEdges(unittest.TestCase):
         self.assertEqual(report.total_path_ns, 300)  # no idle gaps
         self.assertEqual(report.wait_caused_by_category, {})
 
-    def test_gap_between_spans_attributed_to_earlier_spans_category(self):
+    def test_gap_between_spans_is_unrecorded_time_not_the_earlier_spans_category(self):
+        # the trace cannot tell untraced work from idle time between two calls
+        # of one thread: it was blamed on the earlier call's category (mpi)
         spans = [
             _span(1, 1, Category.MPI, 0, 100, name="a", tags={"type": "barrier"}),
-            _span(1, 1, Category.CPU, 300, 100, name="b"),  # 200ns idle gap after a
+            _span(1, 1, Category.OPENMP, 300, 100, name="b"),  # 200ns gap after a
         ]
         trace = _mk_trace(spans)
         report = cp.analyze(trace)
-        self.assertEqual(report.wait_caused_by_category.get("mpi"), 200)
+        self.assertEqual(report.wait_caused_by_category, {"(unrecorded)": 200})
+        self.assertEqual(report.path_unrecorded_ns, 200)
+        self.assertEqual(report.total_path_ns, 400)
 
 
 class TestStreamOrderAndDeviceSync(unittest.TestCase):
@@ -192,7 +198,7 @@ class TestCausalityEnforcement(unittest.TestCase):
         backward walk chain through arrival edges repeatedly within one
         cluster (on a real OpenMP trace: 8.2s of category time inside a 9ms
         run). With edges restricted to "every member -> the single last
-        arriver" (_add_last_arriver_edges) plus the current-node-relative
+        arriver" (_add_group_arrival_edges) plus the current-node-relative
         causality check in compute_critical_path, a 5-thread rendezvous
         cluster must stay bounded -- and if the span-level (not
         event-level) approximation still overshoots wall time at all, it
@@ -228,10 +234,11 @@ class TestOMPBarrier(unittest.TestCase):
         spans_list, preds = cp.build_dependency_graph(trace)
         self.assertTrue(any(kind == "arrival" for _, kind, _conf in preds.get(0, [])))
         self.assertFalse(any(kind == "arrival" for _, kind, _conf in preds.get(1, [])))
-        # OpenMP barrier rendezvous is hardware/runtime-enforced -- "certain",
-        # not "medium" the way MPI/NCCL rendezvous can be without a commid=.
+        # The barrier itself is runtime-enforced, but which calls form one
+        # barrier instance is inferred: without a team id (team= / psid=)
+        # they are grouped by overlapping intervals -- "medium" (cp-5).
         self.assertEqual(
-            [conf for _, kind, conf in preds.get(0, []) if kind == "arrival"], ["certain"]
+            [conf for _, kind, conf in preds.get(0, []) if kind == "arrival"], ["medium"]
         )
 
 

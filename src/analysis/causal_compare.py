@@ -514,10 +514,18 @@ def collapse(proj: TraceProjection) -> TraceProjection:
                       sg.start_ns, sg.end_ns, sg.edge_kind, sg.confidence) for sg in proj.critical_path]
     whole.driver_tokens = frozenset().union(*(p.driver_tokens for p in proj.phases)) if proj.phases else frozenset()
     whole.node_paths = frozenset(n.key.path for n in nodes)
+    span_node = None
+    if proj.span_node is not None:
+        import numpy as np
+        lut = np.full(len(proj.nodes) + 1, -1, dtype=np.int32)
+        for old, new in remap.items():
+            lut[old] = new
+        sn = np.asarray(proj.span_node, dtype=np.int64)
+        span_node = np.where(sn >= 0, lut[np.clip(sn, 0, len(proj.nodes))], -1).astype(np.int32)
     return TraceProjection(proj.command, proj.start_ns, proj.end_ns, [whole], "whole", proj.anchor,
                            proj.driver, nodes, [(s, d, k, c, cf) for (s, d, k), (c, cf) in edges.items()],
                            segs, proj.critical_total_ns, proj.span_count, dict(proj.availability),
-                           list(proj.notes))
+                           list(proj.notes), span_node=span_node, span_seqs=proj.span_seqs)
 
 
 # ── analysis of one identity ─────────────────────────────────────────────────
@@ -712,7 +720,12 @@ def compare_traces(trace_a, trace_b, *, noise_pct: float = cmp.NOISE_FLOOR_PCT,
 
 def compare_projections(pa: TraceProjection, pb: TraceProjection, *, trace_a=None, trace_b=None,
                         noise_pct: float = cmp.NOISE_FLOOR_PCT, noise_ns: float = cmp.NOISE_FLOOR_NS,
-                        min_confidence: float = DEFAULT_MIN_CONFIDENCE, top_n: int = 25) -> dict[str, Any]:
+                        min_confidence: float = DEFAULT_MIN_CONFIDENCE, top_n: int = 25,
+                        detail: dict | None = None) -> dict[str, Any]:
+    """`detail` (optional, a dict): filled with the projections actually
+    compared (after a whole-run collapse), the identity matching and the
+    method -- for the GUI's event-level counterpart lookup; the report
+    itself is the same either way."""
     notes: list[str] = []
     pairs, phase_conf = align_phases(pa.phases, pb.phases)
     comp = _Comparison(pa, pb, pairs, noise_pct, noise_ns)
@@ -770,13 +783,21 @@ def compare_projections(pa: TraceProjection, pb: TraceProjection, *, trace_a=Non
             "differs too much for node-level explanations; showing the (category, name) aggregate "
             "comparison instead")
         report["alignment"]["pairs"] = [_pair_dict(p, pa, pb) for p in pairs]
+        if detail is not None:
+            detail.update({"pa": pa, "pb": pb, "comp": None, "method": method, "pairs": pairs,
+                           "confidence": confidence})
         return report
+    if detail is not None:
+        detail.update({"pa": pa, "pb": pb, "comp": comp, "method": method, "pairs": pairs,
+                       "confidence": confidence})
     _describe_alignment(report["alignment"], pairs, pa, pb)
     ex = _Explainer(comp)
     for ident in comp.identities:
         ex.classify(ident)
     rows = {ident.id: _ident_row(ident, comp, ex, confidence) for ident in comp.identities}
     _attribute_to_origins(rows, comp, noise_pct, noise_ns)
+    if detail is not None:
+        detail["rows"] = rows
     contributors, off_path, improvements, new_work, removed, propagated = [], [], [], [], [], []
     for ident in comp.identities:
         r = rows[ident.id]
@@ -854,6 +875,11 @@ def _attribute_to_origins(rows: dict[int, dict], comp: _Comparison, noise_pct: f
                 groups[o].append(r)
         for o, symptoms in groups.items():
             ro = rows[o]
+            if sign * ro["ownDeltaNs"] < 0:
+                # an origin whose own time moved the other way is no origin
+                # of this direction's change (and must keep the impact the
+                # other pass gave it): its symptoms keep their own change
+                continue
             base = max(sign * ro["criticalDeltaNs"], 0)
             total = sum(sign * r["criticalDeltaNs"] for r in symptoms)
             give = max(0, min(total, max(base, sign * ro["ownDeltaNs"]) - base))

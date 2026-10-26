@@ -187,6 +187,21 @@ Item {
                     }
                 }
 
+                // ── Side-by-side timelines (events matched by identity) ──
+                Panel {
+                    objectName: "compareTimelinesPanel"
+                    title: "Timelines — baseline above candidate; events matched by comparison identity, not by time"
+                    visible: Compare.available && Compare.baselineTimeline !== null
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: compareTimelinesLoader.implicitHeight + AppTheme.spacingMd * 2 + 24
+                    Loader {
+                        id: compareTimelinesLoader
+                        anchors.fill: parent
+                        active: Compare.available && Compare.baselineTimeline !== null
+                        sourceComponent: CompareTimelines {}
+                    }
+                }
+
                 // ── Phase navigation ──────────────────────────────────
                 Panel {
                     objectName: "comparePhases"

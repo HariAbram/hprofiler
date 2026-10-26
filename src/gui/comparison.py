@@ -122,6 +122,12 @@ class ComparisonBridge(QObject):
         self._removed_count = 0
         self._projections = None
         self._cwd = {"baseline": "", "candidate": ""}
+        # side-by-side timelines (compare_timeline.py): both traces, the
+        # matcher over the comparison's identities, the baseline's own model
+        self._traces = {"baseline": compare_trace, "candidate": trace}
+        self._detail: dict[str, Any] = {}
+        self._matcher = None
+        self._timelines: dict[str, Any] = {"baseline": None, "candidate": None}
 
         reason = ("no comparison trace loaded -- run "
                   "`hprofiler gui AFTER.json --compare BEFORE.json`")
@@ -172,7 +178,12 @@ class ComparisonBridge(QObject):
         if self._projections is None:
             return
         pa, pb = self._projections
-        self._report = cc.compare_projections(pa, pb, noise_pct=self._noise_pct, noise_ns=self._noise_ns)
+        self._detail = {}
+        self._report = cc.compare_projections(pa, pb, noise_pct=self._noise_pct, noise_ns=self._noise_ns,
+                                              detail=self._detail)
+        from .compare_timeline import EventMatcher
+        self._matcher = EventMatcher(self._detail, self._traces["baseline"], self._traces["candidate"]) \
+            if self._detail.get("pa") is not None and pa.span_node is not None else None
         self._rows_by_id = {}
         for key in ("contributors", "propagated", "offCriticalPath", "improvements", "newWork", "removedWork"):
             for r in self._report.get(key, []):
@@ -530,6 +541,151 @@ class ComparisonBridge(QObject):
             return True
         except OSError:
             return False
+
+    # ── side-by-side timelines ───────────────────────────────────────
+    timelinesChanged = Signal()
+
+    def attach_candidate_timeline(self, model) -> None:
+        """The opened trace's TimelineModel (the candidate); the baseline
+        gets its own. Both learn to colour events by their comparison
+        status and to show their counterpart in the event details."""
+        if not self._available:
+            return
+        from .models import TimelineModel
+        self._timelines["candidate"] = model
+        if self._timelines["baseline"] is None:
+            self._timelines["baseline"] = TimelineModel(self._traces["baseline"], self._theme)
+        for side, m in self._timelines.items():
+            m._comparison_hook = (lambda lane, eid, side=side: self._detail_fields(side, eid))
+            m._status_of = (lambda span, side=side: self._matcher.status_of(side, span)
+                            if self._matcher is not None else "unmatched")
+        self.timelinesChanged.emit()
+
+    @Property(QObject, notify=timelinesChanged)
+    def baselineTimeline(self):
+        return self._timelines["baseline"]
+
+    @Property(QObject, notify=timelinesChanged)
+    def candidateTimeline(self):
+        return self._timelines["candidate"]
+
+    @Property(bool, notify=causalChanged)
+    def eventMatching(self) -> bool:
+        return self._matcher is not None and self._matcher.ok
+
+    def _detail_fields(self, side: str, eid: int) -> list[dict[str, Any]]:
+        m = self.matchEvent(side, float(eid))
+        f = dash.fmt_ns
+        if m.get("status") == "unavailable":
+            return [{"label": "Counterpart", "value": "", "kind": "unavailable", "reason": m.get("basis", "")}]
+        out = [{"label": "Comparison status", "value": m.get("status", ""), "kind": "measured", "reason": ""}]
+        cp = m.get("counterpart")
+        other = "baseline" if side == "candidate" else "candidate"
+        if cp:
+            out.append({"label": f"In the {other}", "value": f"{cp['name']}  dur {f(cp['durNs'])}", "kind": "derived",
+                        "reason": "matched by comparison identity, aligned phase and occurrence index"})
+            a, b = m["durationNs"]
+            rel = f" ({m['relDelta'] * 100:+.1f}%)" if m.get("relDelta") is not None else ""
+            out.append({"label": "Duration baseline → candidate", "value": f"{f(a)} → {f(b)}  Δ {dash.fmt_signed_ns(b - a)}{rel}",
+                        "kind": "measured", "reason": ""})
+        else:
+            out.append({"label": f"In the {other}", "value": "", "kind": "unavailable", "reason": m.get("basis", "")})
+        if m.get("confidence") is not None:
+            out.append({"label": "Match confidence", "value": f"{m['confidence']:.2f}", "kind": "estimated",
+                        "reason": "identity match score × phase alignment confidence (a heuristic)"})
+        out.append({"label": "Basis", "value": m.get("basis", ""), "kind": "derived", "reason": ""})
+        if m.get("explanation"):
+            out.append({"label": "Why it changed", "value": m["explanation"], "kind": "derived",
+                        "reason": "causal_compare: measured deltas + graph-derived dependencies"})
+        return out
+
+    @Slot(str, float, result='QVariantMap')
+    def matchEvent(self, side: str, span_idx: float) -> dict[str, Any]:
+        """The counterpart of an event of `side` ("baseline" / "candidate")
+        in the other run, with durations, deltas, the match basis and its
+        confidence, and the identity's causal explanation and chain."""
+        if self._matcher is None:
+            return {"status": "unavailable",
+                    "basis": "no node-level comparison: " + (self._report.get("alignment", {}).get("fallbackReason")
+                                                             or "comparison not loaded")}
+        out = self._matcher.match(side, int(span_idx))
+        cp = out.get("counterpart")
+        other = "baseline" if side == "candidate" else "candidate"
+        om = self._timelines.get(other)
+        if cp and om is not None:
+            span = self._traces[other].store.event_by_id(int(cp["eid"]))
+            lane = om._lane_of_span(span) if span is not None else None
+            cp["laneIndex"] = -1 if lane is None else int(lane)
+        from .compare_timeline import regression_chain
+        row = self._detail.get("rows", {}).get(out.get("identity"))
+        out["steps"] = regression_chain(row) if row else []
+        for k in ("measured", "derived"):
+            out.pop(k, None)
+        return out
+
+    @Property('QVariantMap', notify=timelinesChanged)
+    def timelineStarts(self) -> dict[str, float]:
+        out = {}
+        for side, m in self._timelines.items():
+            if m is not None:
+                out[side] = float(m.viewStartNs)
+                out[side + "Duration"] = float(m.traceDurationNs)
+        return out
+
+    @Slot(str, int, int, float, float, result='QVariantMap')
+    def alignmentOffset(self, mode: str, phase: int, identity: int, base_ns: float, cand_ns: float) -> dict[str, Any]:
+        from .compare_timeline import alignment_offset
+        st = self.timelineStarts
+        row = self._detail.get("rows", {}).get(identity) if identity >= 0 else None
+        return alignment_offset(mode, self._report or {}, phase=phase, identity_row=row,
+                                event_pair=(base_ns, cand_ns) if base_ns > 0 and cand_ns > 0 else None,
+                                starts=(st.get("baseline", 0.0), st.get("candidate", 0.0)))
+
+    @Property('QVariantList', notify=causalChanged)
+    def deltaStrip(self) -> list[dict[str, Any]]:
+        from .compare_timeline import delta_strip
+        return delta_strip(self._report or {})
+
+    @Property('QVariantList', notify=timelinesChanged)
+    def structureDiff(self) -> list[dict[str, Any]]:
+        from .compare_timeline import structure_diff
+        a, b = self._timelines["baseline"], self._timelines["candidate"]
+        if a is None or b is None:
+            return []
+        return structure_diff(a._lane_extra, b._lane_extra)
+
+    @Slot(int, result='QVariantList')
+    def regressionSteps(self, identity: int) -> list[dict[str, Any]]:
+        from .compare_timeline import regression_chain
+        row = self._detail.get("rows", {}).get(identity)
+        return regression_chain(row) if row else []
+
+    @Slot(int, result='QVariantMap')
+    def identitySpans(self, identity: int) -> dict[str, Any]:
+        """What to highlight for an identity on each timeline: its raw name
+        (both runs) -- the highlight is by name, the identity's own roles
+        are in the label."""
+        row = self._detail.get("rows", {}).get(identity)
+        if not row:
+            return {}
+        return {"names": [row["rawName"]], "label": f"{row['label']} ({row['roles']})"}
+
+    @Property('QVariantMap', notify=timelinesChanged)
+    def evidenceChange(self) -> dict[str, Any]:
+        """Critical-path time by evidence tier in each run (needs both
+        runs' analyses; TimelineModel.startAnalysis on each)."""
+        out = {}
+        for side, m in self._timelines.items():
+            if m is None:
+                continue
+            sm = m.criticalSummary
+            out[side] = sm.get("tiers", {}) if sm else {}
+            out[side + "State"] = m.analysisState
+        return out
+
+    @Slot()
+    def refreshTimelines(self) -> None:
+        self.timelinesChanged.emit()
 
 
 def _signed(ns: float) -> str:

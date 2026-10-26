@@ -14,14 +14,14 @@ Item {
     implicitWidth: rowLayout.implicitWidth
     implicitHeight: AppTheme.buttonHeight
 
-    readonly property var groupOptions: ["none", "rank", "process", "runtime", "stream", "thread", "device"]
+    readonly property var groupOptions: ["hierarchy", "none", "rank", "process", "runtime", "stream", "thread", "device"]
     readonly property var groupLabels: ({
-        "none": "None", "rank": "Rank", "process": "Process", "runtime": "Runtime",
+        "hierarchy": "Hierarchy", "none": "None", "rank": "Rank", "process": "Process", "runtime": "Runtime",
         "stream": "Stream", "thread": "Thread", "device": "Device"
     })
 
     function dimAvailable(key) {
-        if (key === "none") return true
+        if (key === "none" || key === "hierarchy") return true
         var dims = TimelineModel.filterDimensions
         for (var i = 0; i < dims.length; i++)
             if (dims[i].key === key) return dims[i].available
@@ -39,7 +39,7 @@ Item {
             text: "Group: " + root.groupLabels[TimelineModel.grouping]
             onClicked: groupPopup.visible ? groupPopup.close() : groupPopup.open()
             ToolTip.visible: hovered
-            ToolTip.text: "Group Timeline rows by rank, process, runtime, stream, or thread"
+            ToolTip.text: "Organize rows: node / process / thread / device / stream hierarchy, or flat groups by one dimension"
         }
 
         ToolButton {
@@ -66,15 +66,17 @@ Item {
         }
         ToolButton {
             objectName: "timelineColorModeButton"
-            readonly property var modes: ["function", "bucket", "category"]
-            readonly property var modeLabels: ({"function": "Function", "bucket": "Activity", "category": "Category"})
+            readonly property var modes: TimelineModel.hasComparison ? ["function", "bucket", "category", "comparison"]
+                                                                      : ["function", "bucket", "category"]
+            readonly property var modeLabels: ({"function": "Function", "bucket": "Activity", "category": "Category",
+                                                "comparison": "Change vs baseline"})
             text: "Color: " + modeLabels[TimelineModel.colorMode]
             onClicked: {
                 var idx = modes.indexOf(TimelineModel.colorMode)
                 TimelineModel.setColorMode(modes[(idx + 1) % modes.length])
             }
             ToolTip.visible: hovered
-            ToolTip.text: "Cycle span coloring: by function, activity bucket, or runtime category"
+            ToolTip.text: "Cycle span coloring: by function, activity, runtime category" + (TimelineModel.hasComparison ? ", or change vs the baseline run" : "")
         }
     }
 

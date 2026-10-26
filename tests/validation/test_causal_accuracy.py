@@ -181,8 +181,9 @@ def scenario_omp_barrier() -> Scenario:
     spans = [b1, b2]
     # bar_t2 starts later (20 > 0) -- it's the last arriver, so it's the
     # PREDECESSOR of bar_t1 (bar_t1 depends on/waits for it), not the other
-    # way around -- see _add_last_arriver_edges.
-    expected = {("bar_t2", "bar_t1", "arrival", "certain")}
+    # way around -- see _add_group_arrival_edges. No team id (team= / psid=)
+    # on these spans: grouped by overlapping intervals, "medium" (cp-5).
+    expected = {("bar_t2", "bar_t1", "arrival", "medium")}
     return Scenario("omp_barrier", spans, expected)
 
 

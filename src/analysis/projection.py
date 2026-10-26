@@ -25,8 +25,9 @@ runs:
 Each node carries measured counts and durations (inclusive, exclusive
 "self", queue delay from native device timing, time overlapped with
 concurrent work on other threads/streams) and graph-derived values from
-the critical path (time credited on the path, idle time on the path
-blamed on it). Node-level dependency edges aggregate the span-level edges
+the critical path on the event-point model of src/analysis/cp_model.py
+(the node's exclusive time on the path, dependency latency on the path
+blamed on it as the source). Node-level dependency edges aggregate the span-level edges
 of src/analysis/criticalpath.py with their best confidence.
 
 **Phases** (heuristic): the driver thread (main thread of rank 0, or of the
@@ -198,10 +199,11 @@ class Phase:
 class CPSegment:
     node: int                     # node id (-1: span with no node)
     credited_ns: int
-    gap_before_ns: int            # idle time on the path before it (blamed on the previous node)
-    start_ns: int
+    gap_before_ns: int            # other path time: dependency latency (blamed on its source's node),
+                                  # unrecorded thread time, device idle time
+    start_ns: int                 # the run of path steps this segment covers
     end_ns: int
-    edge_kind: str                # kind of the edge into it ("" for the first)
+    edge_kind: str                # cp_model.KINDS: thread / device_work for time in a call
     confidence: str
 
 
@@ -221,6 +223,11 @@ class TraceProjection:
     span_count: int
     availability: dict[str, bool]
     notes: list[str] = field(default_factory=list)
+    # Per span (ordinal = index into span_seqs): its node id (-1 none). Kept
+    # for the GUI's event-level counterpart lookup (an event -> its node ->
+    # its comparison identity); never serialized.
+    span_node: Any = field(default=None, repr=False, compare=False)
+    span_seqs: Any = field(default=None, repr=False, compare=False)
 
     @property
     def wall_ns(self) -> int:
@@ -284,19 +291,13 @@ class _Rec:
 
 
 class _Frame:
-    __slots__ = ("end", "path", "node", "dur", "child", "ratio")
+    __slots__ = ("end", "path", "node", "dur", "child")
 
-    def __init__(self, end: int, path: int, node: ProjectedNode, dur: int, ratio: float) -> None:
+    def __init__(self, end: int, path: int, node: ProjectedNode, dur: int) -> None:
         self.end, self.path, self.node, self.dur, self.child = end, path, node, dur, 0
-        # share of this span's time credited on the critical path: its own
-        # credit when it is a path span, else its enclosing span's share
-        self.ratio = ratio
 
     def close(self) -> None:
-        own = max(0, self.dur - self.child)
-        self.node.self_ns += own
-        if self.ratio:
-            self.node.cp_ns += int(round(own * self.ratio))
+        self.node.self_ns += max(0, self.dur - self.child)
 
 
 def source_key(source: str) -> str:
@@ -430,6 +431,7 @@ class _Builder:
         phases = self.finish_phases()
         self.node_index = {}
         self.path_index = {}
+        span_node, span_seqs = self.node_of, self.seqs
         self.node_of = self.path_of = self.phase_of = None
         self.edges = None
         has_queue = any(n.queued for n in self.nodes)
@@ -446,7 +448,7 @@ class _Builder:
             command=trace.metadata.command, start_ns=self.lo, end_ns=self.hi, phases=phases,
             phase_method=self.phase_method, anchor=self.anchor, driver=self.driver_label,
             nodes=self.nodes, edges=edges, critical_path=segments, critical_total_ns=cp_total,
-            span_count=n_spans, availability=avail, notes=notes)
+            span_count=n_spans, availability=avail, notes=notes, span_node=span_node, span_seqs=span_seqs)
 
     def ordinal(self, seq: int) -> int:
         return int(np.searchsorted(self.seqs, seq))
@@ -662,8 +664,9 @@ class _Builder:
                 if parent is not None:
                     parent.child += dur
                 credit = self.path_credit.get(o)
-                ratio = min(1.0, credit / dur) if credit is not None else (parent.ratio if parent else 0.0)
-                stack.append(_Frame(s.end_ns, path, n, dur, ratio))
+                if credit:
+                    n.cp_ns += credit           # exclusive: nested calls own their own path time
+                stack.append(_Frame(s.end_ns, path, n, dur))
             for f in stack:
                 f.close()
 
@@ -768,51 +771,47 @@ class _Builder:
 
     # ── critical path ────────────────────────────────────────────────────
     def prepare_critical_path(self, graph) -> None:
-        """The path (ordinals, time credited to each span, idle gap before
-        it), computed before the passes so that a path span's credit can be
-        spread over its own and its descendants' exclusive time: a path
-        through an enclosing call (an NVTX range, a parallel region) is a
-        path through what ran inside it."""
-        self.path_credit: dict[int, int] = {}
-        self.path_rows: list[tuple] = []
-        path, confs, kinds = graph.critical_path()
-        if not path:
+        """The observed critical path on the event-point model
+        (cp_model.py), computed before the passes: each span's exclusive
+        time on the path (path_credit), and its runs of steps (path_rows)."""
+        from . import cp_model
+        self.path_credit: dict[int, int] = defaultdict(int)
+        self.path_rows: list[cp_model.PathRow] = []
+        g, w = cp_model.observed_path(self.trace, graph)
+        if not w.steps:
             return
-        report = cp.attribute_blame(graph.spans, path, max(1, self.hi - self.lo), confs, kinds)
-        credited, gaps = report.path_credited_ns, report.path_gap_ns
-        spans = graph.spans
-        for i, o in enumerate(path):
-            s = spans[o]
-            # the report's own split (attribute_blame): each instant once
-            own, gap = credited[i], gaps[i]
-            self.path_credit[o] = own
-            self.path_rows.append((o, own, gap, s.start_ns, s.end_ns,
-                                   kinds[i - 1] if 0 < i <= len(kinds) else "",
-                                   confs[i - 1] if 0 < i <= len(confs) else ""))
+        self.path_rows = cp_model.path_rows(g, w)
+        for row in self.path_rows:
+            if row.own_ns:
+                self.path_credit[row.span] += row.own_ns
 
     def finish_critical_path(self) -> tuple[list[CPSegment], int]:
-        """Segments with their nodes; idle time on the path before a hop that
-        waits on something else (a message, a rendezvous, device work, a
-        request) is blamed on the node of the span before it (what the path
-        was waiting for). Idle time between two consecutive calls on one
-        thread (a "sequential" hop) is that thread's own uninstrumented
-        work: it counts in the phase's critical time but is blamed on no
-        node -- else reordering independent calls would move blame from one
-        to the other."""
+        """Segments with their nodes. Time in a call (busy, or in a gated
+        call) is the call's node's; dependency latency on the path is blamed
+        on the node of the span whose event released it (what the path was
+        waiting for). Unrecorded time on a thread and device idle time
+        between two operations of a stream count in the phase's critical
+        time but are blamed on no node -- else reordering independent calls
+        would move blame from one to the other."""
         segments: list[CPSegment] = []
         total = 0
-        prev_node = -1
-        for o, own, gap, start, end, kind, conf in self.path_rows:
+        seen: set[int] = set()
+        for row in self.path_rows:
+            o = row.span
             nid = int(self.node_of[o])
-            ph = self.nodes[nid].phase if nid >= 0 else self.phase_at(start)
-            if gap and prev_node >= 0 and kind != "sequential":
-                self.nodes[prev_node].blame_ns += gap
-            if nid >= 0:
+            ph = self.nodes[nid].phase if nid >= 0 else self.phase_at(row.start_ns)
+            if row.other_ns and row.source >= 0:
+                src = int(self.node_of[row.source])
+                if src >= 0:
+                    self.nodes[src].blame_ns += row.other_ns
+            if nid >= 0 and o not in seen:
                 self.nodes[nid].cp_count += 1
-            self.phases[ph].critical_ns += own + gap
-            total += own + gap
-            segments.append(CPSegment(nid, own, gap, start, end, kind, conf))
-            prev_node = nid
+            seen.add(o)
+            ns = row.own_ns + row.other_ns
+            self.phases[ph].critical_ns += ns
+            total += ns
+            segments.append(CPSegment(nid, row.own_ns, row.other_ns, row.start_ns, row.end_ns, row.kind,
+                                      row.conf))
         self.path_rows = []
         return segments, total
 

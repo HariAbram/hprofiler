@@ -45,6 +45,11 @@ int main(void) {
                   + !check_name("_Z18__acpp_sscp_kernelIZZ17runbench_warmup_0vENKUlvE_clEvEUlvE_",
                                 "runbench_warmup_0")
                   + !check_name("plain_kernel", "plain_kernel");
+    /* kernel calls are SYCL work, never shown as OpenCL */
+    if (strcmp(HP_JIT_KERNEL_CATEGORY, "sycl") != 0) {
+        fprintf(stderr, "JIT-kernel spans use category %s, want sycl\n", HP_JIT_KERNEL_CATEGORY);
+        names_bad++;
+    }
     for (int i = 0; i < TRAMPOLINE_N; i++) {
         memset(g_slots, 0, sizeof(g_slots));
         g_slots[i].real_fn = (void (*)(void))recorder;

@@ -88,6 +88,7 @@ _CAT_RICH: dict[str, str] = {
     "rocm":    "magenta",
     "opencl":  "yellow",
     "openmp":  "green",
+    "sycl":    "chartreuse3",
     "mpi":     "dodger_blue2",
     "nccl":    "deep_pink3",
     "memory":  "blue",
@@ -815,7 +816,7 @@ class TimelineWidget(Widget):
     _CAT_ABBREV: dict[str, str] = {
         "openmp": "omp",  "opencl": "ocl", "memory": "mem",
         "cuda":   "cuda", "rocm":   "rocm","cpu":    "cpu",
-        "sync":   "sync", "jit":    "jit", "nvtx":   "nvtx", "other":  "?",
+        "sync":   "sync", "jit":    "jit", "nvtx":   "nvtx", "sycl":   "sycl", "other":  "?",
     }
 
     def __init__(self, trace: Trace, **kwargs: Any) -> None:

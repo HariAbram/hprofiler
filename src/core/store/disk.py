@@ -181,6 +181,47 @@ class DiskTraceStore(TraceStore):
         self._finalized = self._info_int("finalized", 0) == 1 and \
             self._info_int("derived_version", 0) == DERIVED_VERSION
         self._content_version = self._info_int("content_version", 0)
+        if exists:
+            self._recategorize_host_jit_kernels()
+
+    # ── one-time event relabels (store_info.category_revision) ────────────
+    def _recategorize_host_jit_kernels(self) -> None:
+        """Category revision 1: AdaptiveCpp host JIT-kernel calls (type=
+        jit_kernel) stored under "opencl" become "sycl" -- SYCL kernels run
+        on the host, which the OpenCL hook only timed (events.SYCL). Once
+        per store, in place: seq, event ids and every other column are kept,
+        and the content-version bump rebuilds the derived tables and the
+        persisted edges. A store that cannot be written is shown as
+        recorded (and tried again on the next open)."""
+        if self._info_int("category_revision", 0) >= 1:
+            return
+        conn = None
+        try:
+            with self._lock:
+                old = self._cat_code.get("opencl")
+                moved = 0
+                for sh in (self.shards() if old is not None else ()):
+                    conn = self._conn(sh)
+                    keys = [lk for (lk,) in conn.execute(
+                        "SELECT DISTINCT lane_key FROM spans WHERE cat=? AND type='jit_kernel'", (old,))]
+                    if not keys:
+                        continue
+                    new = self._category_code("sycl")
+                    remap = {lk: self._lane_key(("sycl", *self._lane_key_by_id[lk][1:])) for lk in keys}
+                    if self._pending_lane_keys:
+                        self._flush_dictionaries()
+                    conn.execute("BEGIN")
+                    for lk, new_lk in remap.items():
+                        moved += conn.execute(
+                            "UPDATE spans SET cat=?, lane_key=? WHERE cat=? AND type='jit_kernel' "
+                            "AND lane_key=?", (new, new_lk, old, lk)).rowcount
+                    conn.execute("COMMIT")
+                if moved:
+                    self._mark_dirty()
+                self._set_info("category_revision", 1)
+        except sqlite3.OperationalError:          # read-only store or file system
+            if conn is not None and conn.in_transaction:
+                conn.execute("ROLLBACK")
 
     # ── connections / schema ─────────────────────────────────────────────
     @staticmethod
@@ -202,6 +243,7 @@ class DiskTraceStore(TraceStore):
         c.executemany("INSERT INTO store_info VALUES (?, ?)", [
             ("format", FORMAT_NAME), ("schema_version", str(SCHEMA_VERSION)),
             ("finalized", "0"), ("derived_version", "0"), ("next_seq", "0"), ("next_batch", "0"),
+            ("category_revision", "1"),       # written by Trace.add: already "sycl"
         ])
         c.executemany("INSERT INTO categories VALUES (?, ?)", [(i, v) for i, v in enumerate(CATEGORY_BY_CODE)])
         c.executemany("INSERT INTO buckets VALUES (?, ?)", [(i, v) for i, v in enumerate(BUCKET_NAMES)])

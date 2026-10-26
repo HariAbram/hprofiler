@@ -1172,7 +1172,7 @@ def _collect_disasm(
             gpu_pids.add(span.pid)
         if span.category == Category.JIT and mod and span.tags.get("path"):
             module_ids[span.tags["path"]] = mod
-        elif span.category.value in ("cuda", "rocm", "opencl") and (
+        elif span.category.value in ("cuda", "rocm", "opencl", "sycl") and (
                 span.tags.get("side") == "gpu" or span.tags.get("type") == "jit_kernel"):
             launches[(span.name, mod)] += 1
         # OpenCL/ACPP SSCP JIT .so files

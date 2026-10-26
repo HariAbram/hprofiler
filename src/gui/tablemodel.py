@@ -498,5 +498,10 @@ class FormatBridge(QObject):
         return dash.fmt_signed_ns(value)
 
     @Slot(float, result=str)
+    def duration(self, value: float) -> str:
+        """One time format for every Timeline view (dashboard.fmt_ns)."""
+        return dash.fmt_ns(value)
+
+    @Slot(float, result=str)
     def signedPct(self, value: float) -> str:
         return dash.fmt_signed_pct(value)

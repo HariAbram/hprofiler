@@ -479,7 +479,7 @@ def analyze_trace(trace: "Trace") -> list[tuple[DevicePeak, KernelMetrics]]:
         dev = next(
             (d for d in devices
              if d.backend == cat
-             or (cat in ("openmp", "cpu", "opencl") and d.backend == "cpu")),
+             or (cat in ("openmp", "cpu", "opencl", "sycl") and d.backend == "cpu")),
             devices[0],
         )
 

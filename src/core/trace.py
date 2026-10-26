@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
-from .events import SpanEvent, InstantEvent, CounterEvent, Category, AnyEvent
+from .events import SpanEvent, InstantEvent, CounterEvent, Category, AnyEvent, is_legacy_host_jit_kernel
 
 if TYPE_CHECKING:
     from .store import LaneInfo, TraceStore
@@ -190,6 +190,11 @@ class Trace:
 
     # ── writing ──────────────────────────────────────────────────────────
     def add(self, event: AnyEvent) -> None:
+        # Host JIT-kernel calls from an older OpenCL hook, or an older JSON
+        # export, arrive as "opencl": they are SYCL kernels (events.SYCL).
+        if isinstance(event, SpanEvent) and is_legacy_host_jit_kernel(event.category.value,
+                                                                       event.tags.get("type")):
+            event.category = Category.SYCL
         self.store.append(event)
         if isinstance(event, SpanEvent):
             if event.stack_frames:

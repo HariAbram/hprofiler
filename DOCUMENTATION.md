@@ -5,7 +5,7 @@ across CUDA, ROCm/HIP, OpenCL, OpenMP (LLVM libomp and GNU libgomp), NCCL and
 MPI through injected hook libraries, samples the CPU with Linux `perf`, and
 records everything one run produces into a single indexed trace. On that
 trace it builds one cross-runtime dependency graph — every edge graded by
-how directly the data proves it — and derives a formal critical path,
+how directly the data proves it — and derives its critical path,
 POP-style efficiency metrics and structure-aware comparisons of two runs.
 Traces are explored in a terminal UI, an optional Qt/QML GUI, text reports
 or Perfetto.
@@ -900,7 +900,7 @@ buffer-transfer timestamps via event callbacks, and emits `jit` spans for
 | `clEnqueueReadBuffer` / `clEnqueueWriteBuffer` / `clEnqueueSVMMemcpy` | `memory` | Buffer/SVM transfer timing (GPU-accurate when non-blocking; see below) |
 | `clBuildProgram` / `clCompileProgram` / `clLinkProgram` | `jit` | JIT compile time, `stage=source` (from OpenCL C) or `backend` (IL/binary); `clBuildProgram` and `clLinkProgram` also extract the compiled binary for disassembly |
 | `clCreateBuffer` / `clReleaseMemObject` | `memory` | Allocation spans and the `opencl_memory_bytes` counter (live buffer bytes) |
-| `dlopen` / `dlsym` | `jit`, `opencl` | ACPP SSCP `.jit.so` CPU kernels, which never go through an enqueue call: a `jit` span per loaded module and an `opencl` span (`type=jit_kernel,side=cpu`) per kernel call via a trampoline (up to 256 kernels) |
+| `dlopen` / `dlsym` | `jit`, `sycl` | ACPP SSCP `.jit.so` CPU kernels, which never go through an enqueue call: a `jit` span per loaded module and a `sycl` span (`type=jit_kernel,side=cpu`) per kernel call via a trampoline (up to 256 kernels). This is SYCL work run on the host -- no OpenCL is involved, this hook only times it; older hooks wrote `opencl`, which hprofiler relabels (on ingestion, and once when opening an older store) |
 | `clFinish` / `clWaitForEvents` | `sync` | Host-side synchronisation barriers |
 
 **Kernel launches emit two spans, memory transfers emit one:** each
@@ -1195,7 +1195,7 @@ and every other one-sided call (`MPI_Rput`, `MPI_Get_accumulate`,
 call of that MPI version is wrapped or recorded as a marker (MPI 3.x), 0 on
 an MPI-4 runtime (its large-count, partitioned and `MPI_Isendrecv` calls
 are not wrapped). The opt-in exact
-matching rule ([Edge confidence](#edge-confidence-how-directly-each-dependency-is-proven)) relies on it.
+matching rule ([Edge evidence](#edge-evidence-tiers-provenance-direct-or-inferred)) relies on it.
 
 Every span is in category `mpi` and carries `type=<call>`, `bytes=N`
 (count × datatype size; the `v` collectives sum their counts),
@@ -1501,8 +1501,9 @@ ACPP_VISIBILITY_MASK=omp hprofiler run --backend openmp -- ./acpp_omp_program
 
 Kernels run through the `.jit.so` files ACPP SSCP generates: the OpenCL
 hook copies each one at `dlopen` (module id = hash of the copy) and wraps
-the kernel symbols looked up with `dlsym`, so every call is an `opencl`
-span (`type=jit_kernel,side=cpu,mod=`) named by its kernel — the short name
+the kernel symbols looked up with `dlsym`, so every call is a `sycl`
+span (`type=jit_kernel,side=cpu,mod=`, on the OpenMP backend one per
+work-group per thread, inside its `omp_loop` span) named by its kernel — the short name
 for `ZZ<len><name>` symbols, otherwise the whole symbol (templated kernels
 in one function share every prefix). ACPP maps SYCL kernels to `#pragma omp
 parallel for` in its runtime library.
@@ -2172,7 +2173,7 @@ convention throughout.
 | # | Tab | Notes vs. the TUI equivalent |
 |---|-----|-------------------------------|
 | 1 | Overview | Same stat cards / top findings / hot kernels / source correlation as [Terminal UI](#terminal-ui)'s Overview Tab, plus the largest comparison changes when a `--compare` trace is loaded (see Comparison mode below) |
-| 2 | Timeline | Real vector Gantt view, not character cells — see Timeline exploration below for filtering/grouping/search/bookmarks, all GUI-only |
+| 2 | Timeline | Real vector Gantt view, not character cells: a node / process / thread / device / stream hierarchy, honest level of detail, critical path and dependencies in place, linked summaries — see Timeline exploration below |
 | 3 | Kernels | Same aggregated stats as a sortable/filterable/exportable table — see Tables below |
 | 4 | Call Tree | Same stack-frame tree, proportional-width tree rows instead of ASCII indentation, plus a text filter (keeps ancestors of a match, not a flat hide) and per-level sort |
 | 5 | Flame Graph | Same tree as Call Tree (same `_ct_build` call, via `analysis/flamegraph_tree.py`), rendered as a Canvas-drawn proportional icicle chart instead of character-cell blocks — same interaction model as the TUI's Flame Graph tab. The total reaches QML as a number (`FlameGraph.totalNs`): as a Qt int it overflowed past 2.1 s and the header and empty state broke |
@@ -2191,10 +2192,13 @@ paired with a same-thread `sync` lane (`<category>/thread-N` with
 the neutral Idle colour with a thin stripe in the wait's own colour (the
 same hue as on the sync lane, so the rows still correlate); work that ran
 *inside* a wait (e.g. a task executed during a barrier) is painted on top
-again. Zoomed out (occupancy bins), each column's busy share is the lane's
-occupancy minus the wait occupancy (`tests/test_gui_timeline_waits.py`
-checks the rendered pixels). A
-legend ("waiting (barrier / lock), not working") appears in the second
+again. Waits are cut out only where they fall inside the lane's *own*
+spans; a wait while the lane has no span of its own is drawn on the sync
+lane only (it used to be painted on every lane of the thread, which made a
+lane look active where it had no event). Zoomed out (occupancy bins), each
+column's busy share is the lane's occupancy minus the wait occupancy
+(`tests/test_gui_timeline_waits.py` checks the rendered pixels). A
+legend ("hatched = waiting, not working") appears in the second
 toolbar row (with the bookmarks) when at least one lane has this pairing. The TUI does the same ([Terminal UI](#terminal-ui)).
 
 **Source tab, GUI-specific addition:** a third panel (kernel list |
@@ -2209,46 +2213,128 @@ the TUI (`~`, `name @<module id>` rows, a warning line above the code).
 
 #### Timeline exploration
 
-**Only the visible range is ever requested.** Each lane's Canvas asks
-`TimelineModel.laneView(lane, start, end, pixelWidth, maxSpans)` for its
-current view. When the window holds at most `maxSpans` (2,000) spans, the
-answer is those exact spans (an indexed window query against the trace
-store, [Trace store](#trace-store)). Otherwise it is one occupancy value per pixel column from the
-multiresolution activity index built at finalization (union busy time per
-bin, so overlapping spans never read as more than 100%), painted as bars —
-zoomed-out views never create one object per event. A column is resampled
-from the index's finest level that still has at most one bin per column:
-busy time is assumed uniform inside a source bin, so a bin straddling a
-column edge leaks into the next column, and the coarsest level (the old
-choice, bins up to a column wide) showed idle columns as busy until zooming
-in switched the lane to exact spans. Zooming in until the
-window holds few enough spans switches the lane back to exact, hoverable
-spans. With event-level filters active (name, duration, bucket, range),
-occupancy is binned from the filtered window instead, since the
-precomputed index covers all spans. On a 300k-span disk store the fully
-zoomed-out view paints in bins and a zoomed window returns its 11 spans in
-0.2 ms. MPI/NCCL connectors are built from persisted dependency edges
-(p2p/arrival kinds only); above 500,000 spans they are drawn only once
-`hprofiler critical-path` has persisted the edges, rather than building
-the dependency graph just to open the view.
+The design rationale, a literature review, the mapping of every value to
+its visual, and performance figures are in
+[docs/VISUALIZATION_DESIGN.md](docs/VISUALIZATION_DESIGN.md).
+
+**Rows.** Grouping defaults to *Hierarchy*: System → Node (only for a
+merged multi-node trace with `node` tags) → process (labelled with its
+MPI rank when known) → thread (`T1 · tid 100`) → one row per runtime
+(`mpi`, `cuda`, `sync`, `nvtx`, …), and under the process its devices →
+streams → runtime rows. A thread or stream with a single runtime is one
+row. Lane labels show their event count (filtered/total when a filter is
+active); headers show their lane count and can be collapsed. A header row
+is a summary: a thread or stream row shows the busiest of its runtime rows
+with explicit waits taken out; a process, device, node or System row the
+mean busy share of its threads (streams), with the critical-path coverage
+as a band when the path is shown. NVTX annotations are not counted as
+work.
+
+**Level of detail — what a pixel means.** Only the visible window is ever
+read from the store ([Trace store](#trace-store)), and everything is
+painted by Python `QPainter` code (`src/gui/timeline_paint.py`), the same
+code that exports figures and that the pixel tests use:
+
+- An event at least one pixel wide is a rectangle at its exact, clipped
+  position.
+- An event narrower than a pixel adds its *duration* to its column's
+  busy fraction (bar height = fraction of the column's time; time an exact
+  rectangle already shows is not counted again) and a count to a small
+  presence tick. Hovering such a column says "aggregated: N event(s) < 1 px,
+  busy X%". Sparse short events read as a sliver, never as a solid bar, and
+  the busy share of an interval is the same at every zoom
+  (`tests/test_timeline_render.py`). The old renderer stretched each of them
+  to a full-height pixel and gave every non-empty bin at least 25% opacity,
+  which made idle threads look busy when zoomed out.
+- More than 6,000 events of one lane in view: the column fractions come
+  from the multiresolution activity index built at finalization (union busy
+  time per bin, never above 100%); the hover says when a column is narrower
+  than 8 index bins (approximate). With event-level filters active the
+  fractions are binned from the filtered window instead.
+- Waiting (explicit synchronization) is hatched in a neutral colour; empty
+  time inside a thread's observed extent stays empty (a real gap); time
+  before its first or after its last event is cross-hatched "no data".
+- Zooming goes down to a 200 ns window. Panning reuses a prefetched window
+  of spans three views wide.
+
+**Navigation.** The wheel zooms at the cursor; Shift+wheel scrolls rows
+(time stays put); a horizontal wheel or a drag pans; Shift+drag selects a
+range; double-click zooms to the span under the cursor or, on empty space,
+to the whole run. The minimap above the ruler shows the whole run with the
+current window (click or drag to move, double-click for the whole run).
+◀ / ▶ (Alt+← / Alt+→) step through the view history; the jump field
+(Ctrl+G) takes a time (`12.5ms`), a range (`3ms-4ms`), `rank 1`, `T2`,
+`tid 1234`, `stream 7`, or an event name; ⤢ (Z) zooms to the selected event or
+range. The hint line in the toolbar repeats the mouse bindings.
+
+**Details.** Clicking an event selects it and opens the details panel:
+event (name, category, runtime, activity class), time, place (process,
+rank, thread, lane), source / stack / kernel where recorded, its
+critical-path role (on the observed path, its time there, on every or some
+longest path, slack, a counterfactual, inferred waiting), MPI matching
+(matched sender / receiver with provenance), the comparison match when a
+`--compare` trace is loaded, other tags, and its dependencies. Every value
+carries its kind (measured, derived, model, estimated). Clicking a
+dependency jumps to the partner event. Esc clears the selection.
+
+**Critical path and dependencies** (toolbar, second row). They are
+computed in the background from the same analysis as `hprofiler
+critical-path` ([Critical path](#critical-path)) — automatically up to
+300,000 spans, on request above that — and only read by the GUI:
+
+- *Critical path* (C): a band above each lane where the observed path runs
+  (solid = busy, hatched = waiting), its hops between lanes, and a ▼ where
+  it switches rank, thread, runtime, device or stream (N / Shift+N step
+  through the switches). Options: focus (only the lanes the path touches),
+  inferred waiting (a dotted veil from a blocking call's start to its last
+  dependency's source event), and the span-level score track (where the
+  span-level search counts time twice).
+- *Dependencies*: the hovered or selected event's edges are always drawn;
+  tick a family (MPI point-to-point, MPI collectives, OpenMP barriers /
+  fork-join, CPU → GPU submission, GPU synchronization / stream order,
+  NCCL, other explicit ids) to draw all of its edges in view, filtered by
+  evidence tier and class. Colour = family (colour-blind-safe), marker shape
+  = family, width and opacity = tier, solid = direct, dashed = inferred,
+  dotted = low tier, arrowhead = the gated event. Clicking an edge shows its
+  endpoints, latency, tier, provenance and reason. At most 4,000 edges are
+  drawn at once (critical-path and strongest first), with a notice.
+
+**Bottom panel** (collapsible): *Summary* (host and device time by
+activity, per process, explicit waiting by runtime, busiest lanes, top
+waits with their upstream cause), *Critical path* (wall time, observed
+path, modeled longest path and span-level search value side by side and as
+bars on one scale, composition by runtime, evidence on the path,
+dependency and MPI coverage, switches), and *Heatmap* (busy share per
+process / device over time). Clicking a value highlights its events on the
+timeline (a removable chip shows the highlight).
+
+**Export** writes the current view as PNG (2× resolution) or SVG with a
+legend.
+
+**Store and connectors.** Before the analysis is ready, hovering an MPI or
+NCCL call still shows its partners from the persisted communication edges
+(p2p/arrival kinds only); above 500,000 spans these are drawn only once
+`hprofiler critical-path` has persisted the edges, rather than building the
+dependency graph just to open the view.
 
 Beyond smooth wheel-zoom and drag-to-pan (custom horizontal scrollbar
 thumb bound to the same pan state, plus a vertical `ScrollBar` for traces
 with more lanes than fit the window), the Timeline tab supports:
 
 - **Filters** (`TimelineFilterBar.qml`, the "Filters" button): rank,
-  process, thread, runtime, stream, activity bucket, event name
+  process, thread, runtime, device, stream, activity bucket, event name
   (substring or regex), minimum duration, and time range. Each control
   only appears when the trace actually has that dimension's data — e.g.
   "MPI rank" and "Stream" both honestly report "not available, no
   <rank/stream> tags in this trace" rather than showing an empty,
   confusing control. Filtering narrows both which *rows* stay visible
-  (lane-level dimensions: rank/process/thread/runtime/stream) and which
+  (lane-level dimensions: rank/process/thread/runtime/device/stream) and which
   *events* paint within a visible row (event-level: name/duration/
   bucket/time-range) — "Show only active rows" hides a lane entirely
   once its event-level filters leave it with zero matches.
-- **Grouping** (`TimelineViewControls.qml`, the "Group" button): by rank,
-  process, runtime, stream, or thread — one collapsible group header per
+- **Grouping** (`TimelineViewControls.qml`, the "Group" button): the
+  hierarchy (default, see Rows above), or flat by rank, process, runtime,
+  stream, device, or thread — one collapsible group header per
   distinct value, "(unavailable)" honestly grouping together lanes with
   no data for that dimension rather than fabricating one. A collapsed
   group shows a coverage strip standing in for its member lanes'
@@ -2268,7 +2354,8 @@ with more lanes than fit the window), the Timeline tab supports:
   its full width from x = 0: an `MPI_Barrier` ending 7% into a Comb window
   filled the whole lane, and the busy region grew or shrank as zoom and pan
   moved the span's start on or off screen.
-- **Hover**: the span under the cursor -- name, start, duration -- in a
+- **Hover**: the span under the cursor -- name, start, duration -- or, on
+  an aggregated column, its event count and busy share, in a
   tooltip beside the cursor (`Tooltip.qml`, as in the Flame Graph tab). It
   floats over the lanes, and the two toolbar rows shrink to the screen
   (their texts elide), so neither hovering nor the window width changes
@@ -2287,8 +2374,11 @@ with more lanes than fit the window), the Timeline tab supports:
   on an OSU multi-pair bandwidth trace with 44k connectors).
 - **Color mode** (the "Color" button in `TimelineViewControls.qml`):
   cycles function-name coloring (the default, stable per-function hash)
-  with activity-bucket coloring (`BucketLegend.qml` appears alongside)
-  and runtime-category coloring.
+  with activity coloring (`BucketLegend.qml` appears alongside; runtime
+  overhead and JIT compilation have their own colours) and
+  runtime-category coloring, plus coloring by comparison status
+  (regressed / improved / unchanged / new / removed) when a `--compare`
+  trace is loaded.
 - **Time ruler, bookmarks, named ranges** (`TimeRuler.qml`, above the
   lanes): "nice" round-number tick labels (the classic 1/2/5-times-a-
   power-of-ten interval selection), plus "+ Bookmark" (marks the current
@@ -2364,6 +2454,20 @@ top to bottom:
   splits between the ranked contributors and work that left the path, and
   — when confidence is too low — the reason the tab fell back to the
   aggregate view.
+- **Timelines**: the baseline above the candidate, each with the
+  Timeline's rows and painters, zoom and pan synchronized (or not), aligned
+  by application start, the selected event, the selected phase or a
+  matched region (the selected identity's first occurrence), with the
+  offset printed. A difference strip shows each aligned phase pair's
+  status. Selecting an event in either pane selects its counterpart in the
+  other: same comparison identity, same aligned phase pair, same
+  occurrence by start — never the event at the same timestamp. Below the
+  panes: both durations and the delta (measured), the basis of the match
+  and its confidence, why it changed, the trace-back of the change (the
+  observed change first, inferred links labelled), evidence changes and
+  structural differences (lanes, streams, ordering). "Colour by change"
+  colours both panes by comparison status; "Critical path (both)" shows
+  each run's path.
 - **Phases**: one chip per aligned phase pair (iterations, prologue,
   epilogue or top-level segments), colored by status: regressed, improved,
   unchanged, inserted (only in the candidate) or removed (only in the
@@ -2435,8 +2539,16 @@ key bindings read, so the two can't disagree):
 | + / − | Timeline | Zoom in / out around the view centre |
 | Home / End | Timeline | Jump to the start / end of the trace |
 | 0 | Timeline | Reset zoom and pan to the whole trace |
-| Shift + drag | Timeline | Select a time range |
-| Double-click a span | Timeline | Zoom to that span |
+| Alt+← / Alt+→ | Timeline | Previous / next view (zoom and pan history) |
+| Z | Timeline | Zoom to the selected event or time range |
+| N / Shift+N | Timeline | Next / previous critical-path switch |
+| C | Timeline | Toggle the critical-path highlight |
+| Ctrl+G | Timeline | Jump to a time, range, rank, thread, stream or event |
+| Esc | Timeline | Clear the selected event and the summary highlight |
+| Wheel / Shift+wheel / horizontal wheel | Timeline | Zoom at the cursor / scroll lanes / pan |
+| Drag / Shift + drag | Timeline | Pan / select a time range |
+| Click | Timeline | Select an event or dependency arrow (empty space clears) |
+| Double-click | Timeline | Zoom to the span (empty space: whole run) |
 
 **Guidance and accessibility.** The first visit to the Timeline shows a
 small, dismissible tip (zoom, pan, filter, select, reset) that stays
@@ -2734,7 +2846,9 @@ hprofiler run --backend cuda --call-tree -- ./sim --steps 10
 
 ### Critical path
 
-Computes the N-way cross-runtime critical path of a saved trace.
+Builds one dependency graph over the spans of a saved trace -- CUDA, ROCm,
+OpenCL, OpenMP, MPI and NCCL together, since every hook of a run reports to
+the same collector -- and reports its critical path.
 
 ```
 hprofiler critical-path [OPTIONS] TRACE_FILE
@@ -2742,178 +2856,343 @@ hprofiler critical-path [OPTIONS] TRACE_FILE
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--top`, `-n` | `15` | Number of top categories to show in each breakdown |
-| `--export FILE` | none | Write the trace back out as Chrome Trace JSON with critical-path spans tagged `on_critical_path=1`, for highlighting in Perfetto |
+| `--top`, `-n` | `15` | Rows shown in each breakdown |
+| `--sensitivity N` | `5`; none above 4M event nodes | Counterfactual candidates to evaluate ([Modeled longest path, criticality and sensitivity](#modeled-longest-path-criticality-and-sensitivity)); each is one pass over the graph; `0` disables |
+| `--export FILE` | none | Write the trace back out as Chrome Trace JSON with critical-path tags ([`--export`](#--export-highlighting-the-critical-path-in-perfetto)) |
+| `--exact-p2p-high` | off | Grade exact MPI matches `high` where the channel's capture is provably complete ([Edge evidence](#edge-evidence-tiers-provenance-direct-or-inferred)) |
 
 ```bash
 hprofiler critical-path trace.json
 hprofiler critical-path trace.json --export trace.critpath.json
 ```
 
-`hprofiler critical-path` builds a dependency graph over **every** captured
-span — CUDA, ROCm, OpenCL, OpenMP, MPI, NCCL together in one graph, since
-every hook in a run already reports to the same collector — finds the real
-observed critical path via a formal DAG longest-path computation (see
-"Formal critical path" below), and attributes idle time on that path to
-whichever span was being waited on. This generalizes two established but
-narrower techniques: CASITA's critical-path analysis (MPI+CUDA only) and
-HPCToolkit's blame-shifting (CPU+GPU pairs only) to an arbitrary N-way
-combination of hprofiler's backends.
+The report keeps these apart:
+
+| Quantity | What it is | Kind of value |
+|---|---|---|
+| Measured wall time | First to last recorded event | measured |
+| Observed critical path | The chain of last-releasing dependencies back from the end of the run, each instant counted once, split into time in calls, time in gated calls, dependency latency, unrecorded thread time and device idle time | derived from the timestamps and the recorded edges |
+| Modeled longest path | The longest chain of *required* work (waiting, dependency latency and time in gated calls count zero), computed under each assumption the trace cannot decide | a graph model |
+| Evidence | For each dependency step: kind, runtime, tier, provenance, direct or inferred, and the reason | -- |
+| Alternatives | The observed path under each assumption the trace cannot decide, and which spans are on it under every one | -- |
+| Sensitivity | How much shorter the modeled path gets when the work of one span, or of every span of one name, is removed | graph counterfactual, not a measured speedup |
 
 #### Scope: structural synchronization, not data-flow
 
-An edge in the graph means *"the destination provably cannot proceed until
-the source reaches the marked point"* — never *"the destination reads data
-the source wrote"*. Edges come only from each programming model's known
-synchronization semantics:
+An edge means *"the destination cannot proceed until the source reaches
+the marked point"* — never *"the destination reads data the source
+wrote"*. Edges come only from each programming model's synchronization
+semantics, built per span first (persisted, see
+[Large traces](#large-traces-streamed-edge-building-persisted-edges)) and
+then mapped onto start and end events
+([The event-point graph](#the-event-point-graph)):
 
 | Edge kind | Meaning | Source |
 |---|---|---|
-| Program order | Sequential spans on the same OS thread (annotation ranges excluded, see below) | Timestamps only |
-| Stream order | Sequential CUDA/ROCm spans on the same `stream=N` | `stream=` tag |
-| Device sync | `cudaDeviceSynchronize`/`hipDeviceSynchronize` depends on every GPU span since the last device sync on that process | Category/name matching |
-| Point-to-point | The Nth send-side event pairs with the Nth matching receive-side event for a given `(rank, peer, tag)` key, in each side's own post/arrival order — **not** "whichever send had already started" (MPI guarantees FIFO delivery per ordered pair+tag, so this holds regardless of which span starts first; a recv is commonly posted well before its matching send, to overlap communication setup with compute). Covers both blocking `MPI_Send`/`MPI_Recv` and non-blocking `MPI_Isend`/`MPI_Irecv` — for the latter, the edge lands on whichever call actually observes completion (`MPI_Wait`/`Waitall`/`Waitany`/`Waitsome`), not the `Irecv` itself, which returns almost instantly and isn't what blocks. A receive posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG` is matched using the *resolved* real peer/tag mpi_hook.c reports ([`mpi` backend](#mpi-backend)), not a sentinel. Gated by the send's **start**, evaluated against the completing event's **end**. `Isend`/`Irecv` → their own `Wait`/`Waitall`/`Waitany`/`Waitsome` additionally get a same-rank `explicit_span_id` edge via `sid=`/`psid=` ([Wire protocol](#wire-protocol)), including through a `;`-separated multi-request `psid=` on `Waitall`/`Waitsome` | `rank=`/`peer=`/`tag=`/`wildcard=`/`rpeer=`/`rtag=` tags, `span_id`/`parent_span_id` |
-| Collective / barrier rendezvous | Every participant depends on the single **last-arriving** participant (by `start_ns`) — not a full mutual clique between all participants, which would let the walk keep chaining through arrival edges after the last arriver is already found. Gated the same way as point-to-point: by the last arriver's **start**, against the waiting participant's **end**. MPI collectives cluster per `(type, commid)` when a real communicator id is available ([`mpi` backend](#mpi-backend)), not just per `(type)` — so two *unrelated* communicators doing the same collective type at overlapping times are never merged into one rendezvous group | Overlapping-interval clustering per `(type, commid)` for MPI (falls back to `(type)` only when `commid` is unavailable), per `(type)` for NCCL (no communicator-identity mechanism yet), per `(pid, barrier name)` for OpenMP |
+| Program order | Consecutive calls of one OS thread | Timestamps only |
+| Stream order | Consecutive CUDA/ROCm operations of one stream ([CUDA/ROCm edges](#cudarocm-host-to-device-stream-and-wait-edges)) | `stream=`, device |
+| Launch, device wait, device sync | Host call → its device work; device work → the sync call that waited for it | correlation ids, sync kind |
+| Point-to-point | The k-th send of a (sender, receiver, tag, communicator) channel pairs with the k-th receive completion, in each side's posting order. Non-blocking receives: the edge lands on the call that observed completion (`MPI_Wait`/`Waitall`/`Waitany`/`Waitsome`). A wildcard receive is matched with the source and tag the hook read from `MPI_Status` ([`mpi` backend](#mpi-backend)) | `rank=`/`peer=`/`wpeer=`/`tag=`/`commid=`/`rpeer=`/`rtag=`/`rmatches=` |
+| Collective / barrier rendezvous | Every member depends on the single last-arriving member (by start); members are grouped by call order where every member made the same calls, else by overlapping intervals ([Collective/barrier pairing](#collectivebarrier-pairing)) | `type=`, `commid=`, NCCL `seq=`, OpenMP team (`psid=`/`team=`) |
+| Explicit ids | A request and its completion (`MPI_Isend` → `MPI_Wait`), an OpenMP parallel region and the tasks of its team | `span_id`/`parent_span_id` ([Wire protocol](#wire-protocol)) |
 
-This does **not** attempt arbitrary data-flow analysis (e.g. "this kernel
-depends on that MPI recv because it reads the buffer it filled") — only
-these structural cases. The same scoping choice CASITA and Score-P make.
+Not modeled: data flow (a kernel reading a buffer an `MPI_Recv` filled),
+locks and critical sections (`omp_critical_wait`, `omp_taskwait`,
+`omp_taskgroup`, `omp_reduction` are not rendezvous), and a non-blocking
+receive completed only through `MPI_Test*` polls (instant events, no edge).
 
-**Annotation ranges are not nodes.** NVTX/ROCTX ranges and marks
-(`type=nvtx_range|nvtx_mark|roctx_range|roctx_mark`, category `nvtx`) are
-the program's own labels, not work, and contribute nothing to any time
-breakdown: no builder links them (program order skips them, and the calls
-whose `psid=` names an enclosing range get no edge to it), and neither DP
-uses one as a node or path end. Before (`cp-2` edges), a closed top-level
-range became the program-order predecessor of everything after it, and
-the chain of enclosing ranges -- each as long as all its children -- was
-the longest path: on LLNL Comb (MPI + OpenMP + CUDA with NVTX phase
-ranges) 86 of 91 path spans were ranges, with no p2p, launch or
-device_wait hop; now the path is the one of the same trace with its NVTX
-events removed. Which ranges the path ran through is still reported, for
-display only: `path_time_by_annotation` (and "Path time inside annotation
-ranges" in the terminal output) gives, per range name, the path time of
-the steps that started on a thread inside that range (a device span: on
-its launching thread); nested ranges each count it.
+**Not nodes.** Annotation ranges and marks (NVTX/ROCTX: category `nvtx`,
+`type=nvtx_range|nvtx_mark|roctx_range|roctx_mark`) are the program's own
+labels, not work; perf samples (category `cpu`) are an estimated weight,
+not an interval; scheduler intervals (category `sched`) are thread states,
+not calls. No edge touches them. Before `cp-3` edges, a closed top-level
+NVTX range became the program-order predecessor of everything after it: on
+LLNL Comb 86 of 91 path spans were ranges. Which ranges the path ran
+through is still reported, for display only: `path_time_by_annotation`
+("Path time inside annotation ranges") gives, per range name, the path
+time of the path spans that started on a thread inside that range (a
+device span: on its launching thread); nested ranges each count it.
 
-One stated gap: `MPI_Test`/`MPI_Testany`/`MPI_Testsome`/`MPI_Testall`/
-`MPI_Cancel` are emitted as instant events, not spans (they're meant to be
-non-blocking polls, not durations — [`mpi` backend](#mpi-backend)), and this graph is built only
-over spans. A non-blocking receive completed *exclusively* via a `Test*`
-poll loop (never `Wait`/`Waitall`/`Waitany`/`Waitsome`) gets no cross-rank
-edge (a documented scope boundary).
+#### The event-point graph
 
-#### Edge confidence: how directly each dependency is proven
+`analyze()` (`src/analysis/cp_model.py`) gives every span a start event
+S and an end event E at its timestamps (device work: its execution
+interval, `xs=` where calibrated). Time lives on the edges: an edge u → v
+has an observed duration d = t(v) − t(u) ≥ 0 and a required part
+0 ≤ w ≤ d.
 
-Every edge also records how strong the evidence behind it is, so a
-hardware-enforced ordering can be told apart from a best-effort match:
+**Lanes.** A host thread's events are put in time order — an enclosing
+call's start before the start of a call nested in it, a nested call's end
+before the enclosing end — and consecutive events are linked. Each
+interval belongs to the innermost call open during it:
+
+| Lane interval | When | w |
+|---|---|---|
+| busy | inside a recorded call | d |
+| wait | inside a call whose end a dependency from another lane gates (a receive completion, a collective, a barrier, a sync call, a parallel region's join): the trace cannot split it into waiting and processing | 0 |
+| gap | no recorded call open: untraced work or idle time | d or 0 ([Bounds and alternatives](#bounds-and-alternatives)) |
+
+A device operation is one busy edge S → E (wait, if a dependency gates
+its end: an NCCL collective). So a nested call owns its own time and the
+enclosing call only the rest; a span that ends inside another without
+nesting is counted (`improper_nesting`) and its time goes to the innermost
+call still open.
+
+**Dependencies** connect events of different lanes with w = 0 — the source
+event must have happened; how long the dependency took to take effect is
+not required time:
+
+| Kind | Edge | Span-level edge it comes from |
+|---|---|---|
+| `p2p` | S(send) → E(receive completion) | `p2p` |
+| `arrival` | S(last arriver) → E(every other member) | `arrival` |
+| `launch` | S(host call) → S(device work) | `launch` |
+| `device_wait` | E(device work) → E(sync call) | `device_wait` |
+| `device_sync` | E(GPU span) → E(sync call) (traces before the host/device split) | `device_sync`, `sequential` |
+| `stream_order` | E(device op) → S(next op on the stream); the interval is device idle time, w = 0 | `sequential` |
+| `event_wait` | E(producer) → S(consumer), across streams | `sequential` |
+| `fork` / `join` | S(OpenMP region) → S(task on another thread inside it) / E(task) → E(region) | `explicit_span_id` |
+| `explicit_span_id` | other cross-thread ids: E(parent) → S(child); S(parent) → S/E(child) when the child does not start after the parent ended | `explicit_span_id` |
+| `sequential` | a pre-split GPU span and its launching thread | `sequential` |
+
+Same-thread links of the span-level graph (program order, a request and
+its `Wait` on one thread) are the thread's own event order and add nothing.
+An edge whose source event lies after its destination contradicts the
+timestamps: it is dropped and counted (`dropped_contradicting_time`, and a
+note), not bent — except host/device edges within the 50 µs clock
+tolerance ([CUDA/ROCm edges](#cudarocm-host-to-device-stream-and-wait-edges)),
+which are kept with d = 0. Every edge points forward in time, or joins
+events of one instant; edges among simultaneous events that would close a
+cycle are dropped and counted.
+
+#### Observed critical path
+
+Followed backwards from the last event of the trace (several at the same
+instant: one is taken and a tie counted): at each event, the incoming
+edge with the latest release time t(source) + w released it. A busy edge
+always wins — its release time is the event's own time. A gap edge
+releases at its source (the thread was free from then on), so a
+dependency that arrived during untraced time binds. Among equal release
+times the walk stays on the lane, then takes the stronger tier; each such
+point is counted (`ties`, a note) — another choice is equally consistent
+with the timestamps.
+
+Every step covers [t(source), t(destination)], so the path length
+(`total_path_ns`) is the time it covers, each instant once, and at most
+the wall time (a running frontier trims the overlap a kept clock-tolerance
+edge can cause). Each step is one of:
+
+| Composition | Report field |
+|---|---|
+| busy in a recorded call, by category | `path_work_by_category` |
+| in a gated call after its last dependency (waiting or processing), by category | `path_in_call_by_category` |
+| dependency latency: from the source event to the event it released, by kind | `path_dependency_by_kind` |
+| unrecorded thread time | `path_unrecorded_ns` |
+| device idle between two operations of one stream | `path_device_idle_ns` |
+
+They sum to `total_path_ns`, as do `path_time_by_tier`,
+`path_time_by_class` and the span view below. Example: rank 0 posts a
+receive at 0 that returns at 1000; rank 1 computes until 900 and sends.
+The path is rank 1's compute (900, busy), then the message (100,
+dependency latency: the send call, the transfer and the receive's own
+processing together — the trace cannot split them), then whatever follows
+on rank 0. The receive's first 900 ns are on no path.
+
+The span-level fields keep their invariants for existing readers:
+`path_span_indices` are the spans the path passes, in first-appearance
+order; `path_credited_ns[i]` the time span i owns on it (busy or gated),
+`path_gap_ns[i]` the other time that reached it (dependency latency,
+unrecorded time, device idle) — credited + gaps = total;
+`time_on_path_by_category` is time in calls (busy + gated) and
+`wait_caused_by_category` the rest by what it waited for (the source
+event's category; unrecorded thread time as `(unrecorded)`), together the
+total; `path_edge_kinds`/`path_edge_confidence[i]` are the kind (mapped
+back to the span-level names) and tier of the step that first reached
+span i+1; `dp_accounted_ns` equals `total_path_ns`.
+
+**What changed from the span-level path (`cp-4` and before).** The
+previous `analyze()` picked the path with a longest-path DP over spans,
+`accounted[v] = max(dur(v), accounted[u] + gap + dur(v))`, and counted its
+time with a frontier afterwards. The score counted a blocking call's
+waiting as its own time and the predecessor's overlapping work again, so
+it could exceed the wall time (1210 ns on an 800 ns run in
+`test_criticalpath_comb.py`) and the path it picked could be the wrong one;
+correcting the displayed total did not change the choice. Now the path is
+chosen on event times and nothing overlapping is ever scored. Further
+changes: a gated call's waiting before its last dependency is on no path;
+untraced time on a thread is reported as unrecorded, not blamed on the
+previous call's category; a launch's latency is measured from the call's
+start; OpenMP region → task links, which the span-level gate always
+rejected, are fork and join edges; nested calls own their own time. The
+span-level DP is kept, unchanged, as `Graph.critical_path()` /
+`compute_critical_path()` (and `attribute_blame()`), with its tests.
+
+#### Modeled longest path, criticality and sensitivity
+
+The longest path by required time w — forward and backward longest-path
+values in topological order, O(V + E): the longest chain of recorded work
+under the recorded dependencies, with waiting, dependency latency and time
+in gated calls set to zero. A model, not a measurement; it never exceeds
+the wall time and can be shorter or longer than the observed path (it may
+start on another lane). From it:
+
+- **Slack** of a span: how much one of its busy segments could grow before
+  the modeled path gets longer.
+- **On every / some / no longest path**, exactly: an edge is *tight* when
+  F[u] + w + B[v] = L; a tight edge lies on some longest path, and on every
+  one iff it is the only tight edge crossing some cut of the topological
+  order (paths may start and end anywhere). Reported as busy time on every
+  and on some longest path; the difference is work that equal-length
+  alternatives share.
+- **Sensitivity** (`--sensitivity N`): the modeled path recomputed with the
+  busy time of one span, or of every span of one (category, name), set to
+  zero — candidates are the N names and N spans with the most busy time on
+  longest paths, spans on every longest path first. The result accounts for
+  alternative paths: removing one of two equal tasks gives 0, since the
+  other takes over. It is a graph counterfactual under the model's
+  assumptions — the other timings unchanged, no contention, no
+  dependencies beyond the recorded ones — not a predicted or measured
+  speedup.
+
+#### Bounds and alternatives
+
+Where the trace does not decide, both choices are computed — no
+enumeration of paths, a few walks and linear passes:
+
+| Undecided | Modeled path | Observed path |
+|---|---|---|
+| Untraced time on a thread: work or idle | `modeled_path_ns` (as work) and `modeled_unrecorded_idle_ns` (as idle) | variant `unrecorded_as_work`: gap edges release at their end, so a dependency arriving during the gap no longer binds |
+| Inferred dependency edges (below) | `modeled_direct_only_ns`: direct-evidence edges only | variant `direct_evidence_only` |
+
+Spans on the observed path under every variant vs. only some
+(`stable_spans`, `variant_only_spans`, and `variant_only_ns`: the default
+path's in-call time owned by the latter) show how much of the path rests
+on these choices; a note says so when any span depends on them.
+
+#### Edge evidence: tiers, provenance, direct or inferred
+
+Every dependency edge carries a tier — an evidence class, not a
+probability: nothing calibrates it against ground truth:
 
 | Tier | Meaning |
 |---|---|
-| `certain` | Enforced by the runtime/hardware itself (same-thread program order; CUDA/HIP stream & event semantics), or an explicit id the hook itself assigned and later referenced (`sid=`/`psid=`) |
-| `high` | MPI point-to-point matched using *resolved* `MPI_ANY_SOURCE`/`ANY_TAG` status data, or collective/barrier rendezvous scoped by a real communicator id (`commid=`) |
-| `medium` | The same kind of matching without that extra evidence: exact (non-wildcard) tag matching by call order only, or rendezvous clustering with no `commid=` available; a device-wide sync or stream id whose device is ambiguous |
-| `low` | Order-based pairing in a process that lost events of the hook that produced it ([Event loss and order-based matching](#event-loss-and-order-based-matching)) |
+| `certain` | Enforced by the runtime or hardware on one clock (program order, CUDA/HIP stream and event semantics, a correlation id), or an explicit id the hook assigned and later referenced (`sid=`/`psid=`) |
+| `high` | Point-to-point matched with source and tag from `MPI_Status` (wildcards); a collective or barrier grouped by call order on a known communicator or team (every member made the same calls); an NCCL collective by (`commid`, `seq`) |
+| `medium` | The same kind of matching without that evidence: exact (non-wildcard) point-to-point by posting order only; rendezvous grouped by overlapping intervals; a device-wide sync or stream id whose device is ambiguous |
+| `low` | Order-based pairing in a process that lost events of the hook that produced it ([Event loss](#event-loss-and-order-based-matching)) |
 
-**Opt-in: exact matches as `high`** (`hprofiler critical-path
---exact-p2p-high`, or `HPROFILER_EXACT_P2P_HIGH=1` for every analysis).
-MPI's non-overtaking rule makes the k-th send / k-th receive pairing of a
-(sender, receiver, tag, communicator) channel exact when the capture of
-that channel is complete. Under the flag an exact (non-wildcard) match is
-graded `high` instead of `medium` only if all of these hold: the trace is
-keyed by world ranks and communicator ids; neither process lost MPI events
-(those edges are `low` regardless); both processes' hooks declare a
-complete point-to-point capture (counter `mpi_p2p_capture_complete` = 1 —
-traces of older hooks never qualify); the channel has as many sends as receives; and
-the communicator is registered (`commid` ≠ -1) and had no cancelled send,
+…and a provenance, which says what established it, with its class:
+
+| Provenance | Class | What established the edge |
+|---|---|---|
+| `thread_timeline` | direct | consecutive events of one thread |
+| `device_interval` | direct | the device work's measured interval |
+| `stream_fifo` | direct | one stream runs its work in submission order |
+| `event_record` | direct | a stream wait waits for the latest record of its event |
+| `sync_target` | direct | a sync call returns after the last work submitted to what it synchronizes |
+| `correlation_id` | direct | the runtime's correlation id |
+| `explicit_id` | direct | `sid=`/`psid=` recorded by the hook |
+| `fork_join` | direct | an OpenMP parallel-region id |
+| `nccl_seq` | direct | NCCL communicator id and sequence number |
+| `posting_order` | inferred | k-th send with k-th receive of a channel |
+| `status_resolved` | inferred | `MPI_Status` source and tag, then posting order |
+| `call_order` | inferred | k-th collective / barrier call of every member |
+| `time_overlap` | inferred | calls grouped because their intervals overlap |
+
+An edge of a direct provenance with a `medium` or `low` tier is
+*inferred* too (the builder chose among candidates, or the process lost
+events). Each dependency step of the path is reported with its kind,
+runtime, tier, provenance, class and a reason in words
+(`cp_model.edge_reason`); the terminal output groups them under
+"Evidence". A note flags a path with over 30% of its time on inferred
+dependency steps.
+
+**Opt-in: exact matches as `high`** (`--exact-p2p-high`, or
+`HPROFILER_EXACT_P2P_HIGH=1` for every analysis). MPI's non-overtaking rule
+makes the k-th send / k-th receive pairing of a (sender, receiver, tag,
+communicator) channel exact when the capture of that channel is complete.
+Under the flag an exact (non-wildcard) match is graded `high` instead of
+`medium` only if all of these hold: the trace is keyed by world ranks and
+communicator ids; neither process lost MPI events (those edges are `low`
+regardless); both processes' hooks declare a complete point-to-point
+capture (counter `mpi_p2p_capture_complete` = 1 — traces of older hooks
+never qualify); the channel has as many sends as receives; and the
+communicator is registered (`commid` ≠ -1) and had no cancelled send,
 matched probe (`MPI_Mprobe`/`MPI_Improbe`) or persistent request in either
 process. The count of upgraded edges is in the MPI dependency diagnostics
 (`exact_high`). Off by default; persisted edges built with it are kept
-apart (`<version>+exact`).
+apart (`<version>+exact`). Its provenance stays `posting_order`
+(inferred).
 
-`hprofiler critical-path`'s terminal output shows a "Path evidence
-strength" breakdown (ns and % of the reported path at each tier); `--export`
-tags each on-path span `path_confidence=<tier>` in addition to
-`on_critical_path=1`, so it's visible per-span in Perfetto too. If over 30%
-of the path's time rests on `medium`-or-below evidence, a note says so
-explicitly rather than leaving a single number silently mixing strong and
-weak evidence.
+#### What the trace cannot support
 
-#### Formal critical path: DAG longest-path DP, not a greedy walk
+Stated, not hidden; each is either a bound, an alternative or a note:
 
-A backward greedy walk — start at the last-ending span and repeatedly pick
-the valid predecessor with the single *tightest* gate time — makes a local
-choice that is not guaranteed to reach the same answer as the path that actually
-accounts for the most wall-clock time when two predecessors compete — a
-predecessor with a tighter gate but a short chain behind it can lose to one
-with a looser gate but a much longer chain, and greedy has no way to see
-that behind the immediate choice.
-
-`compute_critical_path` instead solves a dynamic program over
-the dependency DAG: `accounted[v] = max` over every causally-valid `(u, v)`
-edge of `accounted[u] + gap + duration(v)`, computed in topological order,
-with the reported path reconstructed by tracing the arg-max choices back
-from whichever node achieves the global maximum. This is the textbook
-"longest path in a DAG" algorithm — solvable exactly in O(V+E) time
-(longest path in a *general* graph is NP-hard; the DAG's acyclic structure,
-guaranteed here because every edge builder only ever points from an
-earlier-enabling event to a later-gated one, is what makes it tractable).
-`tests/test_criticalpath.py`'s `TestFormalDPBeatsGreedy` is a hand-verified
-worked example where the two algorithms diverge: the DP finds a path
-accounting for 650ns where greedy would have stopped at 60ns, on the exact
-same graph. The DAG-ness is verified via topological sort rather than
-assumed — if a cycle is ever detected (would indicate a bug in an edge
-builder, since none is expected to produce one), it falls back to the
-greedy walk, which stays correct in the presence of a cycle by
-construction (its `visited` set prevents infinite loops), with the caller
-free to notice the discrepancy rather than the tool silently hanging.
+- **Waiting vs. processing inside a blocking call.** Not separable: the
+  time in a gated call after its last dependency is reported as such, and
+  none of a gated call's time is required work in the model (a receive
+  that copies a large message is under-weighted there).
+- **Untraced time on a thread** may be work or idle: both bounds.
+- **Message and launch latency** is one interval from the source event to
+  the released event: the send call, the transfer and the receiver's
+  processing are not separated.
+- **Which calls form one rendezvous.** No instance id is recorded for MPI
+  collectives or OpenMP barriers: call order (`high`) or overlap
+  (`medium`), both inferred. **Rooted collectives** (bcast, reduce,
+  gather, scatter, scan) are modeled like all-to-all rendezvous (every
+  member gated by the last arriver), counted in a note; their real data
+  flow may need only the root.
+- **Point-to-point pairing** is by posting order, exact only for a
+  complete capture; lost events shift it (`low`).
+- **Clocks.** One host clock per node; device timestamps mapped onto it
+  (50 µs tolerance); across nodes, the merge's offsets
+  ([Across nodes](#across-nodes)).
+- **Unrecorded dependencies**: data flow, locks, `Test*`-only completions;
+  OpenCL has no launch or sync edges, so its sync calls count as busy host
+  time; fork/join needs `psid=` from tasks to their region (the OMPT tool
+  records it).
+- **Ties**: one path is reported, the count of equally consistent
+  alternatives is not expanded.
+- **The model** ignores contention and resource limits; counterfactuals
+  keep every other timing as recorded.
 
 #### Large traces: streamed edge building, persisted edges
 
-`analyze()` never needs the trace in memory. Nodes are numbered by arrival
-order (the same numbering the reference `build_dependency_graph()` uses).
-Program-order edges are built one thread at a time from start-ordered
-store iterators, holding only that thread's still-open spans. Stream,
-device-sync, CUDA/ROCm host/device and OpenMP-barrier edges never cross
-processes, so they are built one process at a time. Explicit-id, MPI
-point-to-point/collective and NCCL edges are built from one streaming pass
-that keeps small tuples (ordinal, times, a few tag values), not span
-objects. Edges go into compact typed arrays and the DP runs over per-node
-arrays. Every builder reproduces its reference version's iteration order,
-so each node receives the same predecessors in the same order and every
-tie-break is preserved. `tests/test_trace_store_parity.py` checks edges
-and paths against the dict-based pipeline, including MPI wildcard /
-`rmatches` / multi-request cases, and real CUDA traces were checked the
-same way.
+`analyze()` never needs the trace in memory. Span-level nodes are numbered
+by arrival order (the numbering of the reference
+`build_dependency_graph()`). Program-order edges are built one thread at a
+time from start-ordered store iterators; stream, device-sync, CUDA/ROCm
+host/device and OpenMP-barrier edges one process at a time; explicit-id,
+MPI and NCCL edges from one streaming pass of small tuples. Every builder
+reproduces its reference version's iteration order;
+`tests/test_trace_store_parity.py` checks edges and the span-level DP
+against the dict-based pipeline, and `analyze()` between memory and disk
+stores.
 
-The edges are persisted in the trace store (table `edges`, tagged with the
-builder version -- `cp-4` since a span id shared by two hooks' spans
-resolves by hook family ([Span ids](#span-ids)), `cp-3` when annotation
-ranges stopped being nodes --
-and the store's content version; edges of another version are rebuilt),
-so a second
-`critical-path`, `efficiency` (which uses the critical path by default) or the timelines' MPI
-connectors reuse them; any change to the events (e.g. disassembly added
-later) invalidates them. On a 1M-span disk store: 16 s and +171 MB peak
-the first time, 7 s with persisted edges.
+The span-level edges are persisted in the trace store (table `edges`,
+tagged with the builder version and the store's content version; edges of
+another version are rebuilt): `cp-5` since collectives and barriers are
+grouped by call order, `cp-4` since a span id shared by two hooks' spans
+resolves by hook family ([Span ids](#span-ids)), `cp-3` since annotation
+ranges stopped being nodes. A second `critical-path`, `efficiency` or the
+timelines' MPI connectors reuse them; any change to the events invalidates
+them. The event-point graph is built from them on each analysis, in typed
+arrays (32-bit node ids). On a synthetic 1M-span disk store on the
+development machine, with persisted edges: 20 s and +420 MB peak
+(graph construction ~9 s, each longest-path pass ~0.6 s; the span-level DP
+alone took 5 s); building the edges the first time adds ~9 s.
 
-#### GPU exec-start calibration feeds the DP directly
+#### GPU exec-start calibration feeds the event times
 
-The DP's gate/gap computation (`_edge_gap_and_gate`) uses each span's
-*effective* start/end rather than raw `start_ns`/`duration_ns` directly —
-for a GPU kernel/memcpy span carrying `xs=` ([`cuda` backend](#cuda-backend)'s exec-start calibration), that's the real GPU-timeline execution-start time instead of
-the CPU-side launch-call time. This matters specifically for idle-time
-attribution: under stream queue backlog, a kernel's CPU launch call can
-happen microseconds after the one before it while the GPU itself doesn't
-reach it until much later, and computing a gap from the misleadingly-early
-`start_ns` would understate (or entirely miss) how long a downstream span
-actually waited on it. `xs=` does **not** change which edges exist or what
-order spans are chained in (a stream's FIFO submission order and FIFO
-execution order are the same order, so plain `start_ns` sorting stays
-correct for that); it only changes the *numeric* causal reasoning the DP
-does once those edges already exist. Falls back to `start_ns` for any span
-without an `xs=` tag — everything non-GPU, and any GPU span calibration
-wasn't available for — so this is purely additive.
+A GPU kernel/memcpy span carrying `xs=` ([`cuda` backend](#cuda-backend)'s
+exec-start calibration) gets its start event at the calibrated
+GPU-timeline start instead of the CPU-side launch-call time; its end is
+that start plus the GPU-measured duration. Under stream queue backlog the
+launch calls of several kernels happen microseconds apart while the GPU
+reaches them much later; the calibrated start places the queueing delay
+in the launch step instead of the kernel. `xs=` does not change which
+edges exist (a stream's submission order is its execution order). Spans
+without it use `start_ns`.
 
 #### CUDA/ROCm: host-to-device, stream, and wait edges
 
@@ -2922,10 +3201,10 @@ from the same correlation `src/core/gpu_activity.py` uses everywhere:
 
 | Edge | From → to | Semantics | Confidence |
 |---|---|---|---|
-| `launch` | host submission → its device work (by `lid` / `corr` / `corr2`) | The work cannot start before the call started; it **may** start before the call returns. Gate: call start ≤ work start. | `certain` for a unique id; `high` when a reused id was resolved by time |
-| `sequential` | device op → next device op on the same program stream **of the same device**, in submission (= FIFO) order; the kernels of one graph launch are not chained to each other (the graph may run them concurrently, and its internal edges are not recorded): the stream orders them after the previous work, and the next work after the graph's last kernel to finish | Stream order | `certain` |
-| `device_wait` | device work → the sync call that waited for it | Stream sync: the last work submitted to that stream before the call. Device/context sync: the last work on each stream of the calling thread's device. Event sync: the last work submitted to the event's stream before the matching `cudaEventRecord`/`hipEventRecord`. The call starts before the work ends -- that is the wait -- so the gate is work end ≤ call end. | `certain`; `medium` for an event sync whose record call was never seen (falls back to the device-wide rule), for a device sync whose device is unknown in a process that used several, and for a stream id seen on several devices without the call's device; `low` for event-record lookups in a process that lost CUDA/ROCm events (an older record would be found) |
-| `sequential` | last work before an event record → first work submitted to the waiting stream after `cudaStreamWaitEvent`/`hipStreamWaitEvent` | Cross-stream dependency | `certain`; `low` after lost CUDA/ROCm events |
+| `launch` | host submission → its device work (by `lid` / `corr` / `corr2`) | The work cannot start before the call started; it **may** start before the call returns. Event model: S(call) → S(work). | `certain` for a unique id; `high` when a reused id was resolved by time |
+| `sequential` (→ `stream_order`) | device op → next device op on the same program stream **of the same device**, in submission (= FIFO) order; the kernels of one graph launch are not chained to each other (the graph may run them concurrently, and its internal edges are not recorded): the stream orders them after the previous work, and the next work after the graph's last kernel to finish | Stream order. Event model: E(op) → S(next op) | `certain` |
+| `device_wait` | device work → the sync call that waited for it | Stream sync: the last work submitted to that stream before the call. Device/context sync: the last work on each stream of the calling thread's device. Event sync: the last work submitted to the event's stream before the matching `cudaEventRecord`/`hipEventRecord`. Event model: E(work) → E(call); the call is gated, its tail after the work is `device_wait` latency | `certain`; `medium` for an event sync whose record call was never seen (falls back to the device-wide rule), for a device sync whose device is unknown in a process that used several, and for a stream id seen on several devices without the call's device; `low` for event-record lookups in a process that lost CUDA/ROCm events (an older record would be found) |
+| `sequential` (→ `event_wait`) | last work before an event record → first work submitted to the waiting stream after `cudaStreamWaitEvent`/`hipStreamWaitEvent` | Cross-stream dependency. Event model: E(producer) → S(consumer) | `certain`; `low` after lost CUDA/ROCm events |
 
 **Streams are per device.** A stream is keyed (process, runtime, device,
 `stream=`): the default (NULL) stream exists once per GPU, so two GPUs'
@@ -2938,18 +3217,13 @@ proxy spans from such hooks carry no device and stay keyed by stream only.
 Device spans are left out of their launching thread's program order (they
 did not run on it), and a sync call made from a CUPTI callback without a
 `stream=` tag takes its stream from the correlated CUPTI synchronization
-record. `launch` and `device_wait` hops add only the part of the successor
-that lies beyond its predecessor's end (the queueing delay plus the work,
-or the sync call's tail after the work finished) -- the general rule of
-[How much time the path covers](#how-much-time-the-path-covers). These edges make many chains
-between the same two points account exactly the same time (a sync's full
-duration via program order equals the work it waited for plus its tail);
-among such ties the DP picks the predecessor that finished last -- the
-one that actually gated the successor. On the real two-stream fixture this
-is what routes the path through the producer kernel on the other stream
-rather than an earlier, unrelated kernel on the consumer's own stream.
-Traces captured before the host/device split use the stream-order and
-device-sync rules with their own tie handling.
+record. A sync call overlapping the work it waited for contributes only
+its tail after that work ended (as `device_wait` latency); a kernel
+launched while the previous one still runs is released by whichever of
+its launch and its stream predecessor came last. Host/device edges within
+the 50 µs clock tolerance of contradicting the timestamps are kept with no
+time. Traces captured before the host/device split use the stream-order
+and device-sync rules.
 
 #### Across nodes
 
@@ -2957,29 +3231,39 @@ A single capture is single-node (the collector is an `AF_UNIX` socket).
 Traces from several nodes are merged first
 ([Multi-node traces](#multi-node-traces)); MPI matching works across the
 merge because it uses `rank=`/`peer=`/`commid=` tags rather than pids, but
-cross-node gaps are only as accurate as the clock offsets used.
+cross-node dependency latencies are only as accurate as the clock offsets
+used.
 
-#### Collective/barrier pairing assumes SPMD ordering
+#### Collective/barrier pairing
 
-Ranks are assumed to call the Nth collective of a given type in the same
-relative order, and one round finishes before the next starts on most ranks
-— true for typical GROMACS-style loop structure, not guaranteed in general.
-MPI collectives are grouped per (type, `commid=`) by overlapping time
-("high"; per type only, "medium", without a communicator id). NCCL
-collectives carry a cross-rank communicator id and a per-communicator
-sequence number (`commid=`, `seq=`): NCCL requires every rank to issue them
-in the same order, so the same (`commid`, `seq`) is one call and is grouped
-exactly, overlapping or not ("high"). NCCL traces from the older hook have
-neither and fall back to per-type overlap grouping ("medium"), in which two
-concurrent communicators' collectives of one type can be merged.
+No instance id is recorded for an MPI collective or an OpenMP barrier, so
+which calls form one rendezvous is inferred:
 
-OpenMP: only barriers (`omp_barrier*`) are rendezvous — `omp_critical_wait`,
-`omp_taskwait`, `omp_taskgroup` and `omp_reduction` are not (a thread waits
-there for a lock holder or for its own child tasks). Barriers are grouped
-per team: the parallel region id (`psid=` from the OMPT tool, `team=` from
-the GNU libgomp hook), so the barriers of concurrent teams (nested
-parallelism) stay apart. Traces without either keep the former grouping by
-name per process.
+- **MPI** with a communicator id (`commid=`): when every member made the
+  same number and types of collective calls on the communicator, the k-th
+  call of each member is one group, overlapping or not ("high", provenance
+  `call_order`: MPI requires every member to call collectives on a
+  communicator in the same order); otherwise grouped per (type, `commid`)
+  by overlapping intervals ("medium", `time_overlap`). Without a
+  communicator id: per type, by overlap ("medium").
+- **NCCL** collectives carry a cross-rank communicator id and a sequence
+  number (`commid=`, `seq=`): NCCL requires every rank to issue them in the
+  same order, so the same (`commid`, `seq`) is one call ("high",
+  `nccl_seq`). NCCL traces from the older hook fall back to per-type
+  overlap grouping ("medium"), in which two concurrent communicators'
+  collectives of one type can be merged.
+- **OpenMP**: only barriers (`omp_barrier*`) are rendezvous —
+  `omp_critical_wait`, `omp_taskwait`, `omp_taskgroup` and `omp_reduction`
+  are not (a thread waits there for a lock holder or its own child tasks).
+  Barriers are grouped per team (the parallel region id: `psid=` from the
+  OMPT tool, `team=` from the GNU libgomp hook) by call order when every
+  thread of the team made the same barrier calls ("high"), else by overlap
+  ("medium"); traces without a team id by name per process, by overlap
+  ("medium"). Before `cp-5` barriers were "certain".
+
+Grouping by call order can pair calls whose intervals do not overlap; an
+arrival edge from a last arriver that starts after a member ended
+contradicts the timestamps and is dropped and counted.
 
 #### Event loss and order-based matching
 
@@ -2999,65 +3283,73 @@ trace), in every process. The count is in the MPI dependency diagnostics
 #### Reading the output
 
 ```
-Time ON the critical path, by category (productive work):
-    cuda               812.4ms
-    mpi                 45.2ms
+  Measured wall time          : 20.00ms  (first to last recorded event)
+  Observed critical path      : 17.96ms  (each instant once; 18 spans)
+  Modeled longest path        : 17.70ms  (required work only; a model, not a measurement)
+    unrecorded time as idle   : 12.53ms
+    direct-evidence edges only: 15.72ms
 
-Path evidence strength (how directly each hop is proven, not guessed):
-    certain            790.1ms  ( 92.2%)
-    high                45.2ms  (  5.3%)
-    medium              21.8ms  (  2.5%)
+  Observed path composition (sums to the observed path):
+    busy in recorded calls, by category:
+      cuda                        12.50ms  ( 69.6%)
+    dependency latency (source event to the event it released), by kind:
+      p2p                          80.0us  (  0.4%)
+    unrecorded thread time (untraced work or idle)          5.17ms  ( 28.8%)
 
-Idle time on the critical path, blamed by category (what it was waiting on):
-    mpi                203.7ms
-    openmp              12.1ms
+  Evidence (path time by the step covering it; tiers are evidence classes, not probabilities):
+    direct 17.88ms ( 99.6%)   inferred 80.0us (  0.4%)
+      kind           runtime  provenance       class     tier     steps        time
+      p2p            mpi      posting_order    inferred  medium       1      80.0us
+
+  Modeled criticality (on the modeled longest path, unrecorded time as work):
+    busy time on every longest path : 12.53ms
+
+  Sensitivity (graph counterfactuals under the model, not measured speedups):
+    all 4 cuda:_Z4packv                                       9.76ms       6.79ms ( 38.4%)
+
+  Alternatives (where the trace cannot decide):
+    direct_evidence_only   observed     17.96ms, 18 spans (different spans)
 ```
 
-The first table is "what the critical path is actually doing" (where the
-unavoidable time goes); the third is "what it's idle *waiting on*" — the
-category of whichever span gated the next step. A large `mpi` entry in the
-blame table means MPI communication is the thing most worth optimizing
-*on the critical path specifically* (as opposed to MPI's total time in the
-`hprofiler summary` breakdown, which includes MPI activity off the critical
-path too). The middle "Path evidence strength" table is
-`CriticalPathReport.confidence_breakdown_ns()` (see "Edge confidence"
-above) — high `certain`/`high` percentages mean the reported path rests on
-hardware/runtime-enforced ordering or resolved MPI status/communicator
-data; a large `medium` share means more of it depends on call-order
-matching without that stronger evidence, worth keeping in mind before
-treating the exact reported chain as precise.
+(A synthetic two-rank Comb-like trace.) The observed path says where the
+run's time went along the chain that ended it; its composition separates
+work in calls from waiting and untraced time. The modeled path says how
+long the recorded work chain is when waiting is free; with sensitivity it
+says which work the model finds worth shortening, and by how much at most
+under the model. A large share of unrecorded time means the path runs
+through code no hook traced (use perf sampling or more hooks); a large
+`inferred` share, or spans that change between alternatives, means the
+exact chain rests on matching heuristics. MPI dependency coverage and the
+notes list holes in the graph.
 
-#### How much time the path covers
+#### Compatibility
 
-`Time accounted for` (`total_path_ns`) is the wall-clock time the path
-covers, each instant once, so it never exceeds the path's extent (first
-start to last end) nor the wall time. The path is walked keeping a
-frontier, the latest end reached so far: a span adds only its part beyond
-the frontier (`path_credited_ns`), and an idle gap only from the frontier
-to the span's start (`path_gap_ns`, blamed on the predecessor's category);
-credited + gaps = total, and the category tables add up to it. This
-matters for start-gated hops (collectives and barriers, point-to-point
-messages): their successor may start before its predecessor -- or an
-earlier path span on another rank -- ended, e.g. a wait posted early, or
-the other rank's `MPI_Reduce` that started 1.3 µs before the last arriver.
-Measuring each hop from its immediate predecessor counted the wall time a
-zig-zag between two ranks covers twice: on Comb's CPU runs the reported
-path was 7.90 ms in a 7.65 ms run (path extent 7.56 ms, the new total).
-
-The DP itself maximizes `accounted[]` (gap + full duration per hop, with
-no gap on start-gated hops), which counts such overlap on both sides of a
-hop: it is the search objective, not a duration. The report keeps the
-DP's value for the chosen path as `dp_accounted_ns` ("Longest-path value"
-in the terminal output, and a note when it exceeds the covered time by
-more than 1%); totals and breakdowns use the covered time.
+- **Stored traces** need no migration: span records are unchanged, and
+  persisted edges of an older builder version (`cp-4` and before) are
+  rebuilt on the first analysis and stored as `cp-5`.
+- **The report** (`CriticalPathReport`) keeps every field with the
+  invariants above; their values follow the event-point model (what
+  changed is listed in [Observed critical path](#observed-critical-path)).
+  New fields: the composition, `path_time_by_tier`/`_class`, the modeled
+  path and its bounds, and `model` (`cp_model.ModelResult`: criticality,
+  slack, sensitivity, alternatives, per-step evidence).
+  `confidence_breakdown_ns()` now covers the whole path (lane steps count
+  as `certain`).
+- **The command line** is unchanged apart from the new `--sensitivity`
+  and the reorganized output; `efficiency` runs the analysis without
+  counterfactuals.
+- **Run comparison** ([Comparing runs](#comparing-runs)) credits each
+  node with its exclusive time on the event-point path and blames
+  dependency latency on the source's node.
 
 #### `--export`: highlighting the critical path in Perfetto
 
-`--export FILE` writes the trace back out as Chrome Trace JSON with every
-critical-path span tagged `on_critical_path=1` and (for every span but the
-first — see "Edge confidence" above) `path_confidence=<tier>`, which you
-can filter/color on in [Perfetto](https://ui.perfetto.dev) or
-`chrome://tracing`.
+`--export FILE` writes the trace back out as Chrome Trace JSON. Spans on
+the observed path get `on_critical_path=1`, `path_ns` (their time on it)
+and, except the first, `path_confidence=<tier>` of the step that reached
+them; spans with busy time on a modeled longest path get
+`longest_path=every|some` and `slack_ns`. Filter or color on them in
+[Perfetto](https://ui.perfetto.dev) or `chrome://tracing`.
 
 ### POP-style efficiency
 
@@ -3168,7 +3460,7 @@ compatibility view. No language model is involved anywhere.
 | Kind | Meaning | Examples | Trust it as |
 |------|---------|----------|-------------|
 | **measured** | Computed directly from both runs' timestamps and counts | wall time, calls, self time, queue delay (native device timing only), time overlapped with other work | Exact for the two runs recorded; single runs carry no variance information |
-| **graph-derived** | Follows from the dependency graph and critical path of [Critical path](#critical-path) | critical-path time and its change, idle time on the path blamed on a node, added / removed dependency edges, moving onto or off the path, the upstream chain a wait is traced along | As good as the edges: each edge's confidence tier ([Critical path](#critical-path)) applies, and the critical path inherits [Critical path](#critical-path)'s semantics, including its known over-counting of overlapping rendezvous waits |
+| **graph-derived** | Follows from the dependency graph and critical path of [Critical path](#critical-path) | critical-path time and its change, idle time on the path blamed on a node, added / removed dependency edges, moving onto or off the path, the upstream chain a wait is traced along | As good as the edges: each edge's tier and provenance ([Edge evidence](#edge-evidence-tiers-provenance-direct-or-inferred)) applies, and the path inherits [Critical path](#critical-path)'s semantics, including what [the trace cannot support](#what-the-trace-cannot-support) |
 | **heuristic** | A judgment call with a stated confidence | phase detection, phase alignment, node matching, alignment confidence, which of identical iterations was the inserted one, phase-relative offsets used to pick the upstream chain | Read the confidence; low confidence falls back to the aggregate comparison |
 | **unavailable** | Could not be concluded, with the reason | queueing without CUPTI / ROCprofiler-SDK timing, source locations without `file=`/`sym=` tags or stacks, rank roles without `rank=` tags, statistical significance (always) | Not a zero: the data needed to conclude it is missing |
 
@@ -3204,18 +3496,16 @@ context, role):
   delay (from native device timing), and the time it overlapped work on
   another stream (device) or thread (top-level host calls), found by a sweep
   over each process.
-- **Graph-derived values per node**: the critical-path time credited to it
-  (the report's covered-time split, [How much time the path covers](#how-much-time-the-path-covers)),
-  and idle time on the path blamed on it -- the gap before a hop that waits
-  on something else (a message, a rendezvous, device work, a request);
-  the gap between two consecutive calls on one thread is that thread's own
-  uninstrumented work, counted in its phase's critical time but blamed on
-  no node, so reordering independent calls moves no blame. When the path
-  runs through an enclosing call (a parallel region; annotation ranges are
-  never on it), its credit is spread over the self time of that call and
-  everything inside it, so the enclosing call is not blamed for its
-  children; a node's calling context still names its enclosing NVTX
-  ranges.
+- **Graph-derived values per node**: its exclusive time on the observed
+  critical path ([Observed critical path](#observed-critical-path): busy
+  or in a gated call; a nested call owns its own time, so an enclosing
+  call is not credited for its children), and the dependency latency on
+  the path blamed on it -- the time from its event to the event it
+  released (a message, a rendezvous, device work, a request). Unrecorded
+  time between two calls on one thread and device idle time count in
+  their phase's critical time but are blamed on no node, so reordering
+  independent calls moves no blame. A node's calling context still names
+  its enclosing NVTX ranges (annotation ranges are never on the path).
 - **Node-level dependency edges**: the span-level edges of [Critical path](#critical-path) aggregated
   per node pair and kind, with their best confidence.
 
@@ -3314,13 +3604,14 @@ identity:
   way, mirrored: along the *baseline's* dependencies, following the source
   whose end moved earliest, to an origin whose own time improved — a wait
   that shrank because its sender got faster is credited to the sender.
-- **Critical-path impact** = Δ(critical-path time credited + idle time
-  blamed). The critical path can credit a blocking wait's time to the
-  wait, e.g. an `MPI_Recv` waiting for a late sender when the path reaches
-  it on its own thread (reached from the sender, only its tail after the
-  send is new path time). So a wait's
-  impact is moved to its origin, capped at the origin's own measured
-  change; anything beyond the cap stays with the wait. The same transfer
+- **Critical-path impact** = Δ(critical-path time credited + dependency
+  latency blamed). A wait's own time is on the path only after its last
+  dependency arrived (an `MPI_Recv` reached from a late sender contributes
+  the message latency, not its wait), but a wait whose path time or own
+  duration changed is still traced to its origin. So a wait's impact is
+  moved to its origin, capped at the origin's own measured change;
+  anything beyond the cap stays with the wait. An origin whose own time
+  moved the other way is not used for a change of the opposite sign. The same transfer
   applies per phase, and to improvements with the sign reversed, so
   swapping baseline and candidate negates every identity's impact instead
   of changing the attribution.
@@ -3384,10 +3675,12 @@ top-level keys:
   Programs whose ranks run different code paths (MPMD), or whose iterations
   differ structurally from one to the next, may get segments or a single
   phase; the comparison then works on whole runs.
-- Critical-path semantics come from [Critical path](#critical-path): blocking waits are credited
-  their full duration, and start-gated rendezvous edges can make the path
-  longer than the wall time. The origin transfer corrects the ranking, but
-  the critical-path change can still exceed the wall-time change.
+- Critical-path semantics come from [Critical path](#critical-path): the
+  path covers each instant once and never exceeds the wall time, but when
+  two chains are equally long (a tie) a small change can move the path
+  from one rank or thread to the other, which moves critical-path time
+  between their nodes; the critical-path change can then exceed the
+  wall-time change for individual nodes.
 - Upstream chains use phase-relative offsets averaged over phases, so a
   chain can stop early or pick a plausible but wrong predecessor when work
   moves between phases. The chain's evidence is labeled heuristic for this
@@ -4270,6 +4563,12 @@ Data is newline-terminated ASCII, one record per line.
 span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 ```
 
+`<cat>` is one of `cpu`, `cuda`, `rocm`, `opencl`, `openmp`, `mpi`, `nccl`,
+`memory`, `sync`, `jit`, `nvtx`, `sched`, `sycl` (`src/core/events.py`;
+a value an older hprofiler does not know is read as `other`). `sycl` is
+SYCL kernels run on the host (AdaptiveCpp's OpenMP backend), timed by the
+OpenCL hook.
+
 **Common tags:**
 
 | Backend | Tag | Meaning |
@@ -4284,7 +4583,7 @@ span:<cat>:<pid>:<tid>:<start_ns>:<dur_ns>:<name>[:<key=val,...>]
 | CUDA/ROCm device spans (added by the Runner) | `clock_corr_ns=N` | Shifted N ns later to correct a drifting device-clock mapping ([Correlation, de-duplication and streams](#correlation-de-duplication-and-streams-srccoregpu_activitypy)) |
 | CUDA/ROCm sync / event spans | `sync=device\|stream\|event`, `event=` | Which wait; event handle hash (same scheme as `stream=`) |
 | CUDA/ROCm host & proxy device spans | `hdev=N` | The calling thread's current device after the call; streams and device-wide syncs are per device |
-| `cuda`, `rocm`, `opencl` kernel spans | `mod=<16 hex>` | Module id of the code the launch ran ([Module identity](#module-identity-which-code-a-launch-ran)) |
+| `cuda`, `rocm`, `opencl`, `sycl` kernel spans | `mod=<16 hex>` | Module id of the code the launch ran ([Module identity](#module-identity-which-code-a-launch-ran)) |
 | `memory` | `type=memcpy,bytes=N` | Transfer size |
 | `memory` | `type=alloc,bytes=N` | Device allocation |
 | `openmp` | `sym=<mangled>` | Symbol resolved via `dladdr()` |
@@ -4788,13 +5087,14 @@ edges; reopening it then rebuilds the derived tables.
 
 #### Versioning and migrations
 
-Four independent version numbers decide what an older or newer hprofiler
+Five independent version numbers decide what an older or newer hprofiler
 does with a store:
 
 | Version | Where | Changes when | On mismatch |
 |---------|-------|--------------|-------------|
 | `SCHEMA_VERSION` (now 1) | `store_info.schema_version` | The meaning or columns of an existing table, the event-id encoding or the tag encoding change | Newer than supported: refused with "upgrade hprofiler". Older: `disk.migrate()` upgrades in place, one step per version |
 | `DERIVED_VERSION` (now 1) | `store_info.derived_version` | A derived table (lanes, activity, aggregates, exclusive, extents) changes meaning | Derived tables are rebuilt on open; events are untouched |
+| `category_revision` (1) | `store_info.category_revision` | Events of an existing category are moved to a new one: 1 = host JIT-kernel calls (`type=jit_kernel`) `opencl` → `sycl` | Applied once in place on open (category and lane key only; seq and event ids kept); derived tables and edges rebuild. New stores start at the current revision |
 | `EDGES_VERSION` (`cp-4`) | `edges.version` | A critical-path edge builder changes what it emits | Edges are rebuilt on next use |
 | `hprofilerJsonLayout` (1) | First line of exported JSON | The streamed JSON layout changes | Unknown layouts fall back to the whole-file parser |
 
@@ -5236,9 +5536,10 @@ LULESH, mixbench) checks traces against each benchmark's own ground truth.
 | `perf` CPU sampling | ⚠️ Parser tested only | `test_perf_script_parsing.py` with synthetic `perf script` text | Real `perf record` (blocked by `perf_event_paranoid=4`) |
 | LIKWID, hardware-counter roofline (ncu, rocprof, perf stat) | ❌ Not run on the development machine | Output parsers | PMU access denied; `ncu` and `rocprof` not installed |
 | Backend probes (`hprofiler backends`, `--backend auto`) | ✅ Unit tested; run on the development machine | `test_backend_probes.py` (driver mismatch, no device, no `/dev/kfd`, no PMU access, auto-detection skipping installed-but-unusable backends, explicit use with a warning; probes mocked); here: cuda/opencl/openmp/mpi usable, cpu and likwid installed but not usable (`perf_event_paranoid=4`), rocm installed without `/dev/kfd` | The probes on a real ROCm or NCCL system |
-| Critical-path DAG (confidence tiers, longest-path DP) | ✅ Verified | Hand-computed unit tests (`test_criticalpath.py`), including a case where the DP finds 650 ns vs. a greedy walk's 60 ns; precision/recall suite | — |
+| Span-level critical-path DP (`Graph.critical_path()`, `compute_critical_path()`; `analyze()` before `cp-5`) | ✅ Verified | Hand-computed unit tests (`test_criticalpath.py`), including a case where the DP finds 650 ns vs. a greedy walk's 60 ns; precision/recall suite (edge tiers) | — |
+| Event-point critical-path model (`analyze()` since `cp-5`: observed path, modeled path and bounds, every/some-path sets, slack, counterfactuals, alternatives, per-edge evidence) | ⚠️ Unit tested on synthetic traces only | `test_cp_model.py`: on 25 random multi-rank traces (nesting, partial overlap, point-to-point, synchronized collectives) every edge's time ≥ 0 and required ≤ observed, each thread's lane covers its extent once, the observed path is contiguous and ≤ wall, every composition sums to it, and the modeled length, both bounds, the every/some-path sets, slack and every counterfactual equal a brute force over all paths; hand-computed cases for nesting, partial overlap, a sync call over its kernel, a clock-tolerance overlap, an early-posted receive, a rendezvous, OpenMP fork/join, inferred edges and the direct-evidence alternative, a contradicting edge, rooted collectives, call-order vs. overlap grouping, equal-length paths (ties, every vs. some, absorbed counterfactuals), provenance; existing critical-path, comparison and parity suites updated to its semantics. Synthetic 1M-span store: 20 s, +420 MB | Any application trace (not run on saved harness or Comb traces); comparison with other tools; whether the tiers' ordering matches real error rates |
 | Critical-path edge rules for devices, graphs, OpenMP teams, event loss, NCCL communicators | ✅ Unit tested (synthetic); OpenMP teams also with the real GNU libgomp hook | `test_criticalpath_predictions.py` (both edge builders), `test_gomp_teams.py` (two concurrent nested teams) | `hdev=` and graph kernels on real multi-GPU / CUDA-graph runs |
-| Critical path with annotation ranges and overlapping hops | ✅ Unit tested; checked on saved LLNL Comb traces | `test_criticalpath_comb.py`: two ranks with nested NVTX phase ranges around pack kernel / stream sync / `MPI_Isend` / `MPI_Waitall` -- no annotation on the path, p2p + launch + device_wait hops, no `nvtx` time, the same path as without the ranges, both builders equal, old-version edges rebuilt; covered time in an arrival hop, a p2p hop into an earlier completion and a ping-pong (total ≤ extent ≤ wall, credited + gaps = total). Comb (MPI + OpenMP + CUDA, 2 ranks; read-only copies): CUDA runs 0 ms on NVTX (were 23.6–136.1 ms), path through launch/device_wait/p2p, identical to the NVTX-stripped control, within wall (383.6/384.9, 353.6/353.8, 46.8/48.6 ms); CPU runs 7.56/7.65, 10.26/11.07, 6.81/7.33 ms (were 7.90, 11.61, 7.60); 408 p2p edges, all receives matched, every row of the harness checker OK | Comb at scale / more ranks; enclosing *work* spans (Known limitations) |
+| Critical path with annotation ranges and overlapping hops | ✅ Unit tested; checked on saved LLNL Comb traces with the span-level path (`cp-4`; the event-point model was not run on them) | `test_criticalpath_comb.py`: two ranks with nested NVTX phase ranges around pack kernel / stream sync / `MPI_Isend` / `MPI_Waitall` -- no annotation on the path, p2p + launch + device_wait hops, no `nvtx` time, the same path as without the ranges, both builders equal, old-version edges rebuilt; covered time in an arrival hop, a p2p hop into an earlier completion and a ping-pong (total ≤ extent ≤ wall, credited + gaps = total). Comb (MPI + OpenMP + CUDA, 2 ranks; read-only copies): CUDA runs 0 ms on NVTX (were 23.6–136.1 ms), path through launch/device_wait/p2p, identical to the NVTX-stripped control, within wall (383.6/384.9, 353.6/353.8, 46.8/48.6 ms); CPU runs 7.56/7.65, 10.26/11.07, 6.81/7.33 ms (were 7.90, 11.61, 7.60); 408 p2p edges, all receives matched, every row of the harness checker OK | Comb at scale / more ranks |
 | Span ids shared by two hooks (older traces) and per-hook id spaces | ✅ Unit tested; checked on a saved LLNL Comb trace and real CUDA / MPI runs | `test_span_links.py`: resolution by family / enclosing range / time, no guess across families; a thread whose CUDA launch, device kernel, `MPI_Irecv` and `MPI_Wait` share one id gives a forest with the right links in both call-tree builders and the flame graph (1500 such iterations: was a RecursionError); MPI completion → MPI request, not the later CUDA call, in both edge builders; `hp_ids.h` ids of the six hooks differ. Comb CUDA trace copy (816 shared ids): call tree 0.2 s, depth 9, all three GUI loader steps OK (was the error); the harness's GUI self-test on the 8 clean-test traces that failed (OSU CUDA ibcast / iallreduce / bw / mbw_mr, Comb CUDA ×2, LULESH LLVM c1 / c8 -- recursion error or killed at a 6 GB cap) passes under a 3 GB cap, peaks 93–831 MB, 1–17 s (the old call tree on OSU iallreduce: ~90 MB/s until killed); all 816 explicit MPI links MPI → MPI (281 went to a CUDA call); path unchanged, 383.6/384.9 ms. New hooks: CUDA and MPI fixture runs carry hook tags 1 and 3; CUDA / MPI / OpenMP / OpenCL integration tests pass | ROCm id space compile-checked only (no AMD GPU here) |
 | Run comparison | ✅ Verified on constructed scenarios | `test_causal_compare.py` scenarios with known single differences; GUI interaction test | Real program pairs beyond the scenarios |
 | Multi-node merge and clock offsets | ✅ Verified on one host (true offset 0); ⚠️ multi-host pending | `test_multinode.py`: known offsets, asymmetric latency, 50 ppm drift, three coupled nodes, no clock data, older counters, same `boot_id`, CLI; harness per-rank OSU latency/allreduce and LULESH gnu-c1 with `HPROFILER_CLOCK_SYNC=1`: offsets 0, 0 violations (were 326 and 711); the forced estimate path (`HPROFILER_CLOCK_SYNC_IGNORE_BOOT_ID=1`) within 41 ns of 0, 0 violations | A real multi-host run (Vera/Dardel): network latency asymmetry, real drift, different boot_ids |
@@ -5284,19 +5585,18 @@ LULESH, mixbench) checks traces against each benchmark's own ground truth.
 | **Device peak values** | Computed from driver attributes (DRAM: memory clock × bus width × data-rate factor ×2, ×4 for CDNA3/MI300), datasheet tables only as fallback; L2/L3 bandwidths are architecture estimates; CPU DRAM bandwidth falls back to 50 GB/s without readable `dmidecode` (root). Each value carries its provenance, shown in the System tab: `detected` (read from the driver/OS), `computed` (exact formula from detected values), `datasheet` (vendor peak for the model), `estimate` (architecture-level rule of thumb), `fallback` (generic default). Only the MX550 value was checked against real hardware. | Check provenance before treating ceilings as exact. |
 | **Record size** | Records up to 64 KiB are sent intact; larger ones are rejected and counted (`oversize`). Stacks over 16 KiB end in a `[truncated]` frame; frame names are capped at 1 KiB; call-site tags that do not fit become `codeptr=truncated`. | — |
 | **Critical path: `Test*`-only completion** | `MPI_Test*`/`MPI_Cancel` are instant events; a non-blocking receive completed only by `Test*` polling gets no cross-rank edge. Such requests are counted (`test_only_completions`) and warned about. | — |
-| **Critical path: SPMD assumption** | MPI collective and OpenMP barrier pairing assumes ranks/threads call the Nth collective of a type (per communicator / team) in the same order and that rounds hardly overlap. NCCL calls with `commid=`/`seq=` are paired exactly. | — |
+| **Critical path: rendezvous grouping** | No instance id is recorded for MPI collectives or OpenMP barriers: they are grouped by call order where every member made the same calls (per communicator / team), else by overlapping intervals, both inferred; rooted collectives (bcast, reduce, gather, scatter, scan) are modeled like all-to-all rendezvous. NCCL calls with `commid=`/`seq=` are paired exactly. | Read the evidence section and the `direct_evidence_only` alternative. |
 | **Critical path: holes in the MPI graph** | Calls that are not wrapped (see the [`mpi` backend](#mpi-backend)'s list), events lost in the capture, and requests posted before the hook was loaded leave receives without an edge. They are counted per communicator in `metadata.dependencyDiagnostics` and warned about, not hidden. Messages on unregistered communicators (`commid=-1`) between the same ranks with one tag can be confused with each other. | Check "MPI dependency coverage" in `hprofiler critical-path`. |
 | **Critical path: order-based pairing after event loss** | Point-to-point messages and event syncs are paired by order; after a lost event the pairing of that channel may be shifted. Such edges are only *marked* "low" in processes with recorded loss; they are not corrected (that would need per-channel sequence numbers in the hook). | Avoid drops (`HPROFILER_RING_KB`); read "low" edges with care. |
 | **Critical path: GPU devices and graphs** | A device-wide sync is tied to its device through `hdev=`, read with `cuCtxGetDevice`/`hipGetDevice` after the call — never run on real multi-GPU hardware. Proxy device spans from hooks without `hdev=` carry no device and share a stream key across GPUs. Kernels of one CUDA graph launch get no edges among themselves (the graph's internal dependencies are not recorded). | — |
 | **Critical path: OpenMP teams without an id** | Barriers are grouped per team via OMPT's parallel id or the GNU libgomp hook's `team=`; traces recorded without either group barriers of one name per process, so concurrent (nested) teams' barriers can be merged. | Re-record with the current hooks. |
-| **Critical path: overlapping rendezvous** | The path's reported time counts each instant once, but the longest-path search maximizes a value that counts the overlap on both sides of start-gated hops (rendezvous, point-to-point), so among paths of equal covered time it can prefer one zig-zagging between ranks; its value is kept as `dp_accounted_ns` (and noted when larger). | Read the covered time and the hop kinds, not `dp_accounted_ns`. |
-| **Critical path: enclosing work spans** | Program order links a call to the latest-completed span on its thread (ties: the outermost), so a long work span that encloses others -- e.g. a parallel region around MPI calls in a funneled program -- is the only program-order exit from what ran inside it: a cross-rank chain that reaches a wait inside the region cannot continue to the work after the region (the path then ends at the wait). Annotation ranges no longer do this; work spans still can (not observed in Comb, whose MPI calls run outside its regions). | — |
+| **Critical path: what the trace cannot decide** | Waiting vs. processing inside a blocking call, untraced time on a thread (work or idle), the parts of a message's latency, ties between equally consistent paths: reported as bounds, alternatives and notes ([What the trace cannot support](#what-the-trace-cannot-support)); the modeled path and its counterfactuals are a graph model, not measurements. | — |
 | **POP Transfer Efficiency** | Fitted from the trace's own messages (latency/bandwidth model), not a network replay. | Treat it as a proxy; see the report's notes. |
 | **Run comparison** | See [Comparing runs](#comparing-runs) → Limitations. | — |
 | **Per-rank capture** | One `hprofiler run` per rank starts one Python collector per rank, which compete with the ranks for cores: LULESH, 8 ranks on one node, application phase 1.9–2.4 s vs. 0.56–0.60 s with one node collector. Node-collector mode has been run on one node with Intel MPI's `mpirun` only (not under Slurm); it collects no disassembly and cannot use the `cpu`/`likwid` backends. | Use [node-collector mode](#node-collector-mode-hprofiler-collect--hprofiler-exec); run `hprofiler view --disasm` on its trace afterwards on the same node. |
 | **Saved code blobs** | The hooks save JIT/module code to `/tmp/hprofiler_{cubin,rocm,ocl,jit}_<pid>_<n>.*` for disassembly. A run that collects disassembly deletes its own; one that does not (`--no-disasm`, `hprofiler collect`, a killed run) leaves them for a later `view --disasm`. | Delete stale `/tmp/hprofiler_*` files when no trace needs them. |
 | **eBPF tracer** | Never loaded into a kernel. `hprofiler run` creates its collector socket in a private temporary directory; `hprofiler collect --socket` gives a collector a fixed address `os_tracer` could connect to, but that has never been tried. | — |
-| **What still scales with trace size** | Viewers read windows and aggregates from the store, but some whole-trace analyses hold a subset in memory: the call tree without stacks (one thread's light spans at a time), the stack-based call tree and flame graph (the stacked spans), the critical path (~170 bytes/span: +171 MB at 1M spans, plus each process's CUDA/ROCm host/device spans) and the OTLP exporter. 1M spans: overview ~2.5 s, call tree ~4.6 s, critical path ~16 s cold / ~7 s with persisted edges. | Capture with `--no-json` and open the `.hpstore`; run `hprofiler critical-path` once to persist edges. |
+| **What still scales with trace size** | Viewers read windows and aggregates from the store, but some whole-trace analyses hold a subset in memory: the call tree without stacks (one thread's light spans at a time), the stack-based call tree and flame graph (the stacked spans), the critical path (~420 bytes/span on a synthetic trace: +420 MB at 1M spans, plus each process's CUDA/ROCm host/device spans) and the OTLP exporter. 1M spans: overview ~2.5 s, call tree ~4.6 s, critical path ~29 s cold / ~20 s with persisted edges (synthetic). | Capture with `--no-json` and open the `.hpstore`; run `hprofiler critical-path` once to persist edges. |
 | **OTLP export** | Spans are exported flat (no parent links); the payload is built in memory. | — |
 
 ---

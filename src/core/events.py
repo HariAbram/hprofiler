@@ -29,6 +29,18 @@ class Category(str, Enum):
     NVTX = "nvtx"
     SCHED = "sched"  # OS-level scheduler events (hooks/os_tracer) -- off-CPU/wakeup/migrate
     OTHER = "other"
+    # SYCL kernels JIT-compiled for and run on the host (AdaptiveCpp SSCP
+    # .jit.so on its OpenMP backend): one span per kernel call, type=
+    # jit_kernel. Timed by the OpenCL hook, but no OpenCL runs. Last, so the
+    # codes of the categories above never change.
+    SYCL = "sycl"
+
+
+def is_legacy_host_jit_kernel(category: str, span_type: Any) -> bool:
+    """A host JIT-kernel call recorded under "opencl" (the OpenCL hook's own
+    category, before SYCL existed): Trace.add and opening an older store
+    move these to SYCL."""
+    return category == "opencl" and span_type == "jit_kernel"
 
 
 @dataclass

@@ -70,7 +70,10 @@ def iterations(n: int) -> Trace:
 def mpi_wait(slow_rank0: bool, iters: int = 5) -> Trace:
     """rank 0 computes then sends to rank 1, which computes then receives;
     the candidate's rank-0 compute is slower, so rank 1 waits longer in
-    MPI_Recv without doing any more work itself."""
+    MPI_Recv without doing any more work itself. Rank 1 posts its receive
+    1 ms before rank 0's baseline send: posted at the same instant, both
+    ranks would be equally critical (a tie the critical path breaks by
+    staying on the receiver's thread)."""
     t = Trace(TraceMetadata(command="mpirun -np 2 ./halo"))
     c = 1 * MS
     w0 = (20 if slow_rank0 else 10) * MS
@@ -78,9 +81,9 @@ def mpi_wait(slow_rank0: bool, iters: int = 5) -> Trace:
         _span(t, "compute", Category.OPENMP, c, w0, pid=100, tid=100, type="work")
         _span(t, "MPI_Send", Category.MPI, c + w0, 0.1 * MS, pid=100, tid=100,
               type="send", rank="0", peer="1", tag="7", bytes="4096")
-        _span(t, "compute", Category.OPENMP, c, 10 * MS, pid=200, tid=200, type="work")
+        _span(t, "compute", Category.OPENMP, c, 9 * MS, pid=200, tid=200, type="work")
         recv_end = c + w0 + 0.15 * MS
-        _span(t, "MPI_Recv", Category.MPI, c + 10 * MS, recv_end - (c + 10 * MS), pid=200, tid=200,
+        _span(t, "MPI_Recv", Category.MPI, c + 9 * MS, recv_end - (c + 9 * MS), pid=200, tid=200,
               type="recv", rank="1", peer="0", tag="7", bytes="4096")
         c = recv_end + 0.2 * MS
     return t

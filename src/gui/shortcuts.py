@@ -12,7 +12,7 @@ one-off label strings. Consumed by:
     ToolTip.text like "Toggle theme (see Help > Keyboard Shortcuts)").
 
 TimelineScreen.qml's own `Keys.onPressed` switch (Left/Right/Up/Down/
-Plus/Minus/Home/End/0) is NOT re-implemented as `Shortcut{}` items here
+Plus/Minus/Home/End/0, Alt+Left/Right, Z, N, C, Ctrl+G, Esc) is NOT re-implemented as `Shortcut{}` items here
 -- it already works, is scoped to that one Item's focus, and QML
 `Shortcut{}` (global, application-wide) would double-fire alongside it
 if added. This table documents those entries for the reference dialog
@@ -44,8 +44,19 @@ SHORTCUTS: list[ShortcutEntry] = [
     ShortcutEntry("+  /  -", "Zoom in / out (centered on the view)", "Timeline"),
     ShortcutEntry("Home  /  End", "Jump to the start / end of the trace", "Timeline"),
     ShortcutEntry("0", "Reset zoom and pan to the full trace", "Timeline"),
+    ShortcutEntry("Alt+←  /  Alt+→", "Previous / next view (zoom and pan history)", "Timeline"),
+    ShortcutEntry("Z", "Zoom to the selected event or time range", "Timeline"),
+    ShortcutEntry("N  /  Shift+N", "Next / previous critical-path transition", "Timeline"),
+    ShortcutEntry("C", "Toggle the critical-path highlight", "Timeline"),
+    ShortcutEntry("Ctrl+G", "Jump to a time, range, rank, thread, stream or event", "Timeline"),
+    ShortcutEntry("Esc", "Clear the selected event and summary highlight", "Timeline"),
+    ShortcutEntry("Wheel", "Zoom at the cursor", "Timeline"),
+    ShortcutEntry("Shift + wheel", "Scroll lanes (the time axis stays put)", "Timeline"),
+    ShortcutEntry("Horizontal wheel", "Pan in time", "Timeline"),
+    ShortcutEntry("Drag", "Pan in time", "Timeline"),
     ShortcutEntry("Shift + drag", "Select a time range", "Timeline"),
-    ShortcutEntry("Double-click a span", "Zoom to that span", "Timeline"),
+    ShortcutEntry("Click", "Select an event or dependency arrow (empty space clears)", "Timeline"),
+    ShortcutEntry("Double-click a span", "Zoom to that span (empty space: whole run)", "Timeline"),
 ]
 
 

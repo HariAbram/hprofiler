@@ -169,6 +169,7 @@ def main() -> int:
     comparison = ComparisonBridge(trace, trace_b, theme, precomputed=result.comparison_data)
     dashboard = DashboardBridge(trace, theme, comparison=comparison, precomputed=result.dashboard_data)
     timeline = TimelineModel(trace, theme)
+    comparison.attach_candidate_timeline(timeline)
     kernels = KernelsBridge(trace, theme)
     call_tree = CallTreeBridge(trace, theme, precomputed=result.call_tree_data)
     flame_graph = FlameGraphBridge(trace, theme, precomputed=result.flame_graph_data)

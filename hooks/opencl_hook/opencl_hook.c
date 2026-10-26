@@ -976,6 +976,12 @@ static void *(*g_real_dlsym)(void *, const char *) = NULL;
 /* ── trampoline pool ────────────────────────────────────────────────────── */
 #define TRAMPOLINE_N  256
 
+/* Category of a JIT-kernel call span: these are SYCL kernels compiled for
+   and run on the host (AdaptiveCpp SSCP .jit.so, e.g. its OpenMP backend);
+   this hook only times them -- no OpenCL is involved. Older builds wrote
+   "opencl"; hprofiler relabels those (events.is_legacy_host_jit_kernel). */
+#define HP_JIT_KERNEL_CATEGORY "sycl"
+
 typedef struct {
     void    (*real_fn)(void);   /* real kernel entry point (cast to fn ptr) */
     char    *name;              /* kernel name for span emission (heap) */
@@ -1038,7 +1044,7 @@ static void jit_dispatch(int slot, void *a0, void *a1, void *a2,
     ((kern_t)s->real_fn)(a0, a1, a2, a3, a4, a5);
 
     uint64_t dur = now_ns() - t0;
-    emit_span("opencl", gettid_compat(), t0, dur, s->name ? s->name : "<jit-kernel>",
+    emit_span(HP_JIT_KERNEL_CATEGORY, gettid_compat(), t0, dur, s->name ? s->name : "<jit-kernel>",
               s->extra[0] ? s->extra : "type=jit_kernel,side=cpu");
 }
 

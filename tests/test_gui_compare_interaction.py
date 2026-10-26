@@ -8,6 +8,11 @@ Timeline" switches to the Timeline zoomed to the contributor's range,
 "Open in Source" selects it in the Source tab, phase selection filters the
 contributors and "Show phase in Timeline" focuses the phase, changing the
 thresholds recomputes the causal ranking, and nothing emits a QML warning.
+The side-by-side timelines: selecting a candidate event selects its matched
+baseline counterpart (by comparison identity + occurrence, never by
+timestamp) and states the basis, "align by selected event" offsets the
+baseline by exactly the pair's start difference, synchronized panning moves
+both panes, and an inferred trace-back step is labelled derived.
 """
 import json
 import os
@@ -73,6 +78,34 @@ class TestCompareTabInteraction(unittest.TestCase):
 
     def test_thresholds_recompute_the_causal_ranking(self):
         self.assertEqual(self.r["contributorsAtHugeFloor"], 0)
+
+    def test_side_by_side_timelines_present(self):
+        self.assertTrue(self.r["ctPanelVisible"] and self.r["ctFound"])
+        self.assertEqual(self.r["ctDeltaStrip"], self.r["ctPhases"])
+
+    def test_selecting_an_event_selects_its_identity_matched_counterpart(self):
+        # compute #2 on rank 0 (candidate) <-> compute #2 on rank 0 (baseline),
+        # even though the two start at different timestamps
+        self.assertEqual(self.r["ctCounterpart"], self.r["ctExpectedCounterpart"])
+        self.assertEqual(self.r["ctBaseSelected"], self.r["ctExpectedCounterpart"])
+        self.assertEqual(self.r["ctMatchStatus"], "regressed")
+        self.assertIn("identity", self.r["ctBasis"])
+        self.assertIn("aligned phase pair", self.r["ctBasis"])
+        self.assertIn("baseline 10.00ms", self.r["ctDurationsText"])
+        self.assertIn("candidate 20.00ms", self.r["ctDurationsText"])
+        self.assertIn("[measured]", self.r["ctDurationsText"])
+
+    def test_align_by_selected_event_and_synchronized_pan(self):
+        self.assertEqual(self.r["ctOffset"], self.r["ctExpectedOffset"])
+        self.assertEqual(self.r["ctComboIndex"], 1)                # the combo shows "selected event"
+        self.assertEqual(self.r["ctBaseStart"], self.r["ctSetCandStart"] - self.r["ctOffset"])
+        self.assertEqual(self.r["ctBaseVisible"], 1e6)
+
+    def test_trace_back_keeps_observed_and_inferred_separate(self):
+        steps = self.r["ctSteps"]
+        self.assertEqual(steps[0], ["MPI_Recv", "measured"])
+        self.assertTrue(all(k.startswith("derived") for _, k in steps[1:]))
+        self.assertEqual(steps[-1][0], "compute")
 
 
 if __name__ == "__main__":

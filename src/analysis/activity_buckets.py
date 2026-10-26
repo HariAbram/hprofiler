@@ -108,7 +108,7 @@ def is_annotation(span) -> bool:
 # type sub-tag by design).
 _CATEGORY_FALLBACK = {
     "cpu": "Computation", "cuda": "Computation", "rocm": "Computation",
-    "opencl": "Computation", "openmp": "Computation",
+    "opencl": "Computation", "openmp": "Computation", "sycl": "Computation",
     "mpi": "Communication", "nccl": "Communication",
     "sync": "Synchronization",
     "memory": "Memory transfer",

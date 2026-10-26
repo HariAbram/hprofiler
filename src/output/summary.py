@@ -154,7 +154,7 @@ def print_summary(trace: Trace, top_n: int = 20) -> None:
     timed  = [r for r in stats if r["total_ns"] > 0]
     samples = [r for r in stats if r["total_ns"] == 0 and r["category"] == "cpu"]
     if timed:
-        has_omp = any(r["category"] in ("openmp", "sync", "opencl") for r in timed)
+        has_omp = any(r["category"] in ("openmp", "sync", "opencl", "sycl") for r in timed)
         total_note = " (accumulated device/thread time, not wall time)" if has_omp else ""
         print(f"\n  Top {min(top_n, len(timed))} hotspots{total_note}:")
         hdr = (f"  {'Function':<40} {'Cat':<8} {'Count':>6}"

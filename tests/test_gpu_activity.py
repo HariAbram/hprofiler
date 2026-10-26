@@ -670,9 +670,12 @@ class TestCriticalPath(unittest.TestCase):
         # sync call over the kernel it waited for
         self.assertEqual(report.total_path_ns, 4300)
         self.assertEqual(report.wall_ns, 4300)
-        self.assertEqual(report.time_on_path_by_category["cuda"], 50 + 4000)
-        self.assertEqual(report.time_on_path_by_category["sync"], 100)
-        self.assertEqual(report.wait_caused_by_category["cuda"], 150)   # queueing delay
+        # the kernel's execution; the launch step from the call's start to
+        # the kernel's (the call itself, then queueing delay) and the sync
+        # call's tail after the kernel ended are dependency latency
+        self.assertEqual(report.time_on_path_by_category, {"cuda": 4000})
+        self.assertEqual(report.path_dependency_by_kind, {"launch": 50 + 150, "device_wait": 100})
+        self.assertEqual(report.wait_caused_by_category, {"cuda": 50 + 150 + 100})
 
     def test_launch_edge_tolerates_work_starting_before_the_call_returns(self):
         t = build([
@@ -725,7 +728,12 @@ class TestCriticalPath(unittest.TestCase):
         ])
         names, kinds, *_ = path_of(t)
         self.assertEqual(names[-2:], ["_Z8producerv", "_Z8consumerv"])
-        self.assertEqual(cp.analyze(t).wait_caused_by_category.get("cuda"), 50 + 90)
+        r = cp.analyze(t)
+        self.assertEqual([r.spans[i].name for i in r.path_span_indices][-2:], ["_Z8producerv", "_Z8consumerv"])
+        # launch latency of the producer (its call's start to the kernel's),
+        # then the consumer released by the producer across streams
+        self.assertEqual(r.path_dependency_by_kind, {"launch": 100, "event_wait": 50})
+        self.assertEqual(r.time_on_path_by_category, {"cuda": 7900 + 450})
 
     def test_stream_sync_ignores_other_streams(self):
         t = build(concurrent_streams()[:4] + [

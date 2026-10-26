@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QUrl, QObject, QPoint, QPointF, QRectF, Property, Qt, QSettings
+    from PySide6.QtCore import QMetaObject, Q_ARG, QUrl, QObject, QPoint, QPointF, QRectF, Property, Qt, QSettings
     from PySide6.QtGui import QGuiApplication, QWheelEvent, QColor
     from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterSingletonInstance
     from PySide6.QtQuick import QQuickWindow, QQuickItem
@@ -68,6 +68,10 @@ if _PYSIDE6_AVAILABLE:
         @Property(str, constant=True)
         def tracePath(self) -> str:
             return "test"
+
+        @Property(str, constant=True)
+        def comparePath(self) -> str:
+            return "baseline-test"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MAIN_QML = _REPO_ROOT / "src" / "gui" / "qml" / "Main.qml"
@@ -152,6 +156,7 @@ class TestTimelineHover(unittest.TestCase):
         # separately by tests/test_gui_compare_launch.py, which spawns a
         # genuine subprocess instead.
         cls._comparison = ComparisonBridge(cls._trace, None, cls._theme)
+        cls._comparison.attach_candidate_timeline(cls._timeline_model)     # as app.py does
         # Backed by a throwaway temp-file QSettings, never the real user
         # config -- matches test_gui_settings.py's own convention. Main.qml
         # reads Workspace.hasSavedGeometry/windowX/etc unconditionally at
@@ -681,9 +686,11 @@ class TestTimelineHover(unittest.TestCase):
         visible_ns_before = self._timeline_root.property("visibleNs")
         # y=200: the lanes area sits below the bookmarks/legend row and
         # TimeRuler.
-        cursor = QPointF(300, 200)
-        canvas_w = self._window.width() - 130 - 13
-        ns_under_cursor_before = view_start_before + (cursor.x() - 130) / canvas_w * visible_ns_before
+        pan = self._root.findChild(QObject, "timelinePanMouseArea")
+        x0 = pan.mapToScene(QPointF(0, 0)).x()
+        canvas_w = pan.width()
+        cursor = QPointF(x0 + 0.25 * canvas_w, pan.mapToScene(QPointF(0, pan.height() / 2)).y())
+        ns_under_cursor_before = view_start_before + (cursor.x() - x0) / canvas_w * visible_ns_before
 
         ev = QWheelEvent(cursor, cursor, QPoint(0, 0), QPoint(0, 120),
                           Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
@@ -696,7 +703,7 @@ class TestTimelineHover(unittest.TestCase):
 
         view_start_after = self._timeline_root.property("viewStartNs")
         visible_ns_after = self._timeline_root.property("visibleNs")
-        ns_under_cursor_after = view_start_after + (cursor.x() - 130) / canvas_w * visible_ns_after
+        ns_under_cursor_after = view_start_after + (cursor.x() - x0) / canvas_w * visible_ns_after
         # The timestamp under the cursor before the zoom should still be
         # (approximately) under the cursor after it -- the whole point of
         # zoom-to-cursor, as opposed to center-anchored zoom.
@@ -2093,6 +2100,251 @@ class TestTimelineHover(unittest.TestCase):
                 if field["kind"] == "unavailable":
                     self.assertTrue(field["reason"], f"{section}.{field['label']} unavailable with no reason given")
 
+
+    # ── Redesigned Timeline: one time axis, selection, history, jumps,
+    #    honest sub-pixel rendering, overlays, linked summaries ─────────
+    def _lane_of(self, name):
+        span = next(s for s in self._trace.iter_spans() if s.name == name)
+        return self._timeline_model._lane_of_span(span), span
+
+    def _visible_canvas(self, lane):
+        return next(c for c in self._find_items(self._flick, f"laneCanvas_{lane}") if c.isVisible() and c.width() > 0)
+
+    def test_time_axis_strips_span_exactly_the_lanes(self):
+        # opening the details panel narrowed the lanes but not the ruler and
+        # minimap: an instant was at two different x positions
+        lane, span = self._lane_of("target_event")
+        ruler = self._root.findChild(QObject, "timelineRuler")
+        mini = self._root.findChild(QObject, "timelineMinimap")
+        try:
+            for selected in (False, True):
+                if selected:
+                    self._timeline_model.selectEvent(lane, span.eid)
+                QTest.qWait(120)
+                canvas = self._visible_canvas(lane)
+                cx, cw = canvas.mapToScene(QPointF(0, 0)).x(), canvas.width()
+                for strip in (ruler, mini):
+                    self.assertAlmostEqual(strip.mapToScene(QPointF(0, 0)).x(), cx, delta=0.51, msg=selected)
+                    self.assertAlmostEqual(strip.width(), cw, delta=0.51, msg=selected)
+                panel = self._root.findChild(QObject, "timelineDetailsPanel")
+                self.assertEqual(panel.isVisible(), selected)
+        finally:
+            self._timeline_model.clearEventSelection()
+            QTest.qWait(60)
+        self.assertEqual(self._warnings, [])
+
+    def test_clicking_an_event_shows_its_details_and_escape_clears(self):
+        lane, span = self._lane_of("target_event")
+        self._timeline_root.setProperty("zoom", 10.0)
+        self._timeline_root.setProperty("viewStartNs", self._timeline_model.viewStartNs + 450_000)
+        QTest.qWait(120)
+        point = self._find_target_event_point()
+        self.assertIsNotNone(point)
+        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, point)
+        QTest.qWait(120)
+        try:
+            sel = self._timeline_model.selectedEvent
+            self.assertEqual((sel["laneIndex"], int(sel["spanIdx"])), (lane, span.eid))
+            title = self._root.findChild(QObject, "timelineDetailsTitle")
+            self.assertEqual(title.property("text"), "target_event")
+            self.assertTrue(self._root.findChild(QObject, "timelineDetailsPanel").isVisible())
+            self._timeline_root.forceActiveFocus()
+            QTest.keyClick(self._window, Qt.Key_Escape)
+            QTest.qWait(80)
+            self.assertLess(self._timeline_model.selectedEvent["spanIdx"], 0)
+            self.assertFalse(self._root.findChild(QObject, "timelineDetailsPanel").isVisible())
+        finally:
+            self._timeline_model.clearEventSelection()
+            self._timeline_root.setProperty("zoom", 1.0)
+            self._timeline_root.setProperty("viewStartNs", self._timeline_model.viewStartNs)
+        self.assertEqual(self._warnings, [])
+
+    def test_back_and_forward_restore_views(self):
+        tl = self._timeline_root
+        lane, span = self._lane_of("target_event")
+        QMetaObject_invoke = lambda name, *args: QMetaObject.invokeMethod(tl, name, *args)
+        QMetaObject_invoke("resetView")
+        QMetaObject_invoke("zoomToSpan", Q_ARG("QVariant", lane), Q_ARG("QVariant", float(span.eid)))
+        QTest.qWait(50)
+        zoomed = tl.property("zoom")
+        self.assertGreater(zoomed, 1.0)
+        back = self._root.findChild(QObject, "timelineBackButton")
+        fwd = self._root.findChild(QObject, "timelineForwardButton")
+        self.assertTrue(back.property("enabled"))
+        QMetaObject.invokeMethod(back, "clicked")
+        QTest.qWait(50)
+        self.assertEqual(tl.property("zoom"), 1.0)
+        self.assertTrue(fwd.property("enabled"))
+        QMetaObject.invokeMethod(fwd, "clicked")
+        QTest.qWait(50)
+        self.assertAlmostEqual(tl.property("zoom"), zoomed)
+        QMetaObject_invoke("resetView")
+        self.assertEqual(self._warnings, [])
+
+    def test_jump_field_goes_to_events_and_times(self):
+        tl = self._timeline_root
+        field = self._root.findChild(QObject, "timelineJumpField")
+        try:
+            QMetaObject.invokeMethod(tl, "runJump", Q_ARG("QVariant", "target_event"))
+            QTest.qWait(50)
+            lane, span = self._lane_of("target_event")
+            self.assertEqual(int(self._timeline_model.selectedEvent["spanIdx"]), span.eid)
+            self.assertGreater(tl.property("zoom"), 1.0)
+            QMetaObject.invokeMethod(tl, "runJump", Q_ARG("QVariant", "0.25ms"))
+            QTest.qWait(50)
+            center = tl.property("viewStartNs") + tl.property("visibleNs") / 2
+            self.assertAlmostEqual(center, self._timeline_model.viewStartNs + 250_000, delta=tl.property("visibleNs") * 0.01)
+            QMetaObject.invokeMethod(tl, "runJump", Q_ARG("QVariant", "nothing-like-this"))
+            self.assertIn("nothing matches", field.property("status"))
+        finally:
+            self._timeline_model.clearEventSelection()
+            QMetaObject.invokeMethod(tl, "resetView")
+        self.assertEqual(self._warnings, [])
+
+    def test_sub_pixel_events_do_not_paint_a_busy_bar_in_the_live_view(self):
+        # extra_fn_* lanes: one 1000 ns event at the very start of a 1 ms
+        # run -- under one pixel at the full view. The old renderer gave it a
+        # full-height pixel column and a "busy" look; now: an aggregated
+        # column (busy share) and an empty rest of the lane, at every zoom.
+        lane, span = self._lane_of("extra_fn_100")
+        tl = self._timeline_root
+        try:
+            for zoom in (1.0, 4.0):
+                tl.setProperty("zoom", zoom)
+                tl.setProperty("viewStartNs", self._timeline_model.viewStartNs)
+                QTest.qWait(80)
+                pos = self._timeline_model.rowIndexForLane(lane)
+                self._flick.setProperty("contentY", max(0.0, pos * tl.property("rowHeight") - 40))
+                QTest.qWait(80)
+                canvas = self._visible_canvas(lane)
+                w = canvas.width()
+                hit = self._timeline_model.hitTest(lane, 0.2, tl.property("viewStartNs"),
+                                                   tl.property("viewStartNs") + tl.property("visibleNs"), w)
+                event_px = span.duration_ns * w / tl.property("visibleNs")
+                if event_px < 1:
+                    # narrower than a pixel: an aggregated column, never a bar
+                    self.assertEqual(hit.get("kind"), "column", zoom)
+                    self.assertEqual(hit["count"], 1)
+                else:
+                    self.assertEqual(hit.get("kind"), "span", zoom)
+                img = self._window.grabWindow()
+                p0 = canvas.mapToScene(QPointF(0, 0))
+                # no busy (coloured) pixel anywhere past the event's column --
+                # the rest of the lane is empty or the neutral "no data"
+                # hatch (this thread has no event after it)
+                busy = 0
+                for x in range(int(p0.x() + max(4, event_px + 2)), int(p0.x() + w - 4), 3):
+                    for y in range(int(p0.y() + 3), int(p0.y() + canvas.height() - 3), 2):
+                        c = img.pixelColor(x, y)
+                        if max(c.red(), c.green(), c.blue()) - min(c.red(), c.green(), c.blue()) > 40:
+                            busy += 1
+                self.assertEqual(busy, 0, zoom)
+        finally:
+            self._flick.setProperty("contentY", 0)
+            tl.setProperty("zoom", 1.0)
+            tl.setProperty("viewStartNs", self._timeline_model.viewStartNs)
+        self.assertEqual(self._warnings, [])
+
+    def test_hovering_an_aggregated_column_says_so(self):
+        lane, _span = self._lane_of("extra_fn_101")
+        tl = self._timeline_root
+        pos = self._timeline_model.rowIndexForLane(lane)
+        self._flick.setProperty("contentY", max(0.0, pos * tl.property("rowHeight") - 40))
+        QTest.qWait(100)
+        try:
+            canvas = self._visible_canvas(lane)
+            p = canvas.mapToScene(QPointF(0.3, canvas.height() / 2)).toPoint()
+            for dx in (1, 0):
+                self._move_to(p + QPoint(dx + 3, 0))
+                self._move_to(p + QPoint(dx, 0))
+            self.assertTrue(tl.property("hoverText").startswith("aggregated: 1 event"), tl.property("hoverText"))
+        finally:
+            self._move_to(QPoint(5, 5))
+            self._flick.setProperty("contentY", 0)
+        self.assertEqual(self._warnings, [])
+
+    def test_shift_wheel_scrolls_rows_and_leaves_time_alone(self):
+        tl = self._timeline_root
+        pan = self._root.findChild(QObject, "timelinePanMouseArea")
+        at = pan.mapToScene(QPointF(pan.width() / 3, pan.height() / 2))
+        z0, v0, y0 = tl.property("zoom"), tl.property("viewStartNs"), self._flick.property("contentY")
+        ev = QWheelEvent(at, at, QPoint(0, 0), QPoint(0, -120), Qt.NoButton, Qt.ShiftModifier,
+                         Qt.NoScrollPhase, False)
+        QGuiApplication.sendEvent(self._window, ev)
+        QTest.qWait(30)
+        try:
+            self.assertGreater(self._flick.property("contentY"), y0)
+            self.assertEqual((tl.property("zoom"), tl.property("viewStartNs")), (z0, v0))
+        finally:
+            self._flick.setProperty("contentY", 0)
+        self.assertEqual(self._warnings, [])
+
+    def test_minimap_click_centres_the_view_there(self):
+        tl = self._timeline_root
+        tl.setProperty("zoom", 4.0)
+        QTest.qWait(30)
+        mini = self._root.findChild(QObject, "timelineMinimap")
+        p = mini.mapToScene(QPointF(mini.width() * 0.75, mini.height() / 2)).toPoint()
+        QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, p)
+        QTest.qWait(30)
+        try:
+            center = tl.property("viewStartNs") + tl.property("visibleNs") / 2
+            want = self._timeline_model.viewStartNs + 0.75 * self._timeline_model.traceDurationNs
+            self.assertAlmostEqual(center, want, delta=self._timeline_model.traceDurationNs * 0.01)
+        finally:
+            tl.setProperty("zoom", 1.0)
+            tl.setProperty("viewStartNs", self._timeline_model.viewStartNs)
+        self.assertEqual(self._warnings, [])
+
+    def test_summary_highlight_shows_a_removable_chip(self):
+        chip = self._root.findChild(QObject, "timelineHighlightChip")
+        self.assertFalse(chip.isVisible())
+        self._timeline_model.setHighlight({"activities": ["work"], "label": "Productive computation"})
+        QTest.qWait(60)
+        try:
+            self.assertTrue(chip.isVisible())
+            self.assertEqual(self._timeline_model.highlight["activities"], ["work"])
+            p = chip.mapToScene(QPointF(chip.width() / 2, chip.height() / 2)).toPoint()
+            QTest.mouseClick(self._window, Qt.LeftButton, Qt.NoModifier, p)
+            QTest.qWait(60)
+            self.assertEqual(self._timeline_model.highlight, {})
+            self.assertFalse(chip.isVisible())
+        finally:
+            self._timeline_model.clearHighlight()
+        self.assertEqual(self._warnings, [])
+
+    def test_bottom_panel_tabs_load_without_warnings(self):
+        bp = self._root.findChild(QObject, "timelineBottomPanel")
+        try:
+            for tab in (0, 1, 2):
+                bp.setProperty("tab", tab)
+                bp.setProperty("expanded", True)
+                QTest.qWait(80)
+                self.assertTrue(bp.property("expanded"))
+            self.assertIsNotNone(self._root.findChild(QObject, "timelineHeatmap"))
+        finally:
+            bp.setProperty("expanded", False)
+            QTest.qWait(30)
+        self.assertEqual(self._warnings, [])
+
+    def test_overlay_controls_switch_the_model_overlays(self):
+        m = self._timeline_model
+        try:
+            m.setOverlay({"criticalPath": True, "families": ["mpi_p2p"], "tiers": ["certain"]})
+            QTest.qWait(60)
+            ov = m.overlay
+            self.assertTrue(ov["criticalPath"])
+            self.assertEqual((ov["families"], ov["tiers"]), (["mpi_p2p"], ["certain"]))
+            btn = self._root.findChild(QObject, "timelineCriticalPathButton")
+            self.assertTrue(btn.property("text").endswith("●"))
+            self._timeline_root.forceActiveFocus()
+            QTest.keyClick(self._window, Qt.Key_N)       # no switches here: must not move or fail
+            QTest.keyClick(self._window, Qt.Key_C)
+            QTest.qWait(30)
+            self.assertFalse(m.overlay["criticalPath"])
+        finally:
+            m.setOverlay({"criticalPath": False, "families": [], "tiers": ["certain", "high", "medium", "low"]})
+        self.assertEqual(self._warnings, [])
 
 if __name__ == "__main__":
     unittest.main()

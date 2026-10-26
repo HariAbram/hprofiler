@@ -222,9 +222,10 @@ class TestSendVariantsAndSendrecv(unittest.TestCase):
                 _mpi("MPI_Sendrecv", pid, start, dur, type="recv", op="sendrecv", rank=rank,
                      peer=peer, wpeer=peer, tag=0, commid=0),
             ]
-        # rank 1 computes for 60 before its Sendrecv; rank 0 enters at 0 and waits
+        # rank 1 computes for 60 before its Sendrecv; rank 0 enters at 0 and
+        # waits, and finishes last (both ending at one instant is a tie)
         ev = [_mpi("compute", 1, 0, 60, type="work")] + sr(0, 0, 100, 0, 1) + sr(1, 60, 40, 1, 0) + \
-            [_mpi("after", 0, 110, 10, type="work"), _mpi("after", 1, 110, 10, type="work")]
+            [_mpi("after", 0, 110, 15, type="work"), _mpi("after", 1, 110, 10, type="work")]
         trace = _trace(ev)
         edges = p2p_edges(trace)
         self.assertEqual(sorted((s.name, s.pid, d.name, d.pid) for s, d, _c in edges),

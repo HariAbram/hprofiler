@@ -180,6 +180,91 @@ class TimelineModel(QObject):
                 "count": self._infos[lane_name].count,
             })
 
+        # ── Hierarchy: node / process (rank) / thread or device / stream ──
+        # Per-lane identity for the hierarchical rows (timeline_hierarchy.py)
+        # and for path-switch classification: the device of a stream lane is
+        # the hook's hdev= (else the native dev=) of its first span; the node
+        # of a merged multi-node trace is the `node` tag merge-nodes adds.
+        from . import timeline_hierarchy as th
+        merged = bool((trace.metadata.clock or {}).get("merge"))
+        node_of_pid: dict[int, str | None] = {}
+        self._lane_extra: list[dict[str, Any]] = []
+        metas: list[Any] = []
+        for i, lane_name in enumerate(self._lane_names):
+            cat, kind, ident, pid_suffix = parsed[lane_name]
+            info = self._infos[lane_name]
+            pid = info.pid
+            device = None
+            if kind in ("stream", "device") or (merged and pid not in node_of_pid):
+                first = next(iter(self._store.iter_spans(lane=lane_name)), None)
+                if first is not None:
+                    if kind in ("stream", "device"):
+                        dv = first.tags.get("hdev", first.tags.get("dev"))
+                        device = None if dv is None else str(dv)
+                    if merged and pid not in node_of_pid:
+                        node_of_pid[pid] = first.tags.get("node")
+            tid = self._lane_tid.get(lane_name)
+            k = _thread_key(lane_name)
+            extra = {"pid": pid, "tid": tid, "rank": pid_rank.get(pid), "node": node_of_pid.get(pid),
+                     "device": device, "kind": kind, "ident": ident, "category": cat,
+                     "threadLabel": f"T{tid_seq.get(k, '?')} · tid {tid}" if k is not None else ""}
+            self._lane_extra.append(extra)
+            metas.append(th.LaneMeta(i, lane_name, cat, kind, ident, pid, info.count, tid=tid,
+                                     rank=extra["rank"], node=extra["node"], device=device,
+                                     thread_label=extra["threadLabel"]))
+        host = trace.metadata.hostname
+        self._tree = th.build_tree(metas, system_label=f"System · {host}" if host else "System")
+        self._tree_nodes: dict[str, Any] = {}
+
+        def _index(n) -> None:
+            self._tree_nodes[n.id] = n
+            for c in n.children:
+                _index(c)
+        _index(self._tree)
+        # Each non-sync thread lane's explicit waits come from the sync lane
+        # of the same (pid, tid): they are cut out of its spans (a parallel
+        # region covers the barrier waits inside it).
+        sync_of: dict[tuple[int, int], int] = {}
+        for i, ex in enumerate(self._lane_extra):
+            if ex["kind"] == "thread" and ex["category"] == "sync" and ex["tid"] is not None:
+                sync_of[(ex["pid"], ex["tid"])] = i
+        self._sync_pair: dict[int, int] = {}
+        for i, ex in enumerate(self._lane_extra):
+            if ex["kind"] == "thread" and ex["category"] != "sync" and ex["tid"] is not None:
+                j = sync_of.get((ex["pid"], ex["tid"]))
+                if j is not None:
+                    self._sync_pair[i] = j
+
+        # Rendering, selection, highlight (linked views), overlays, analysis,
+        # view history -- see the sections near the end of this class.
+        self._render_cache: dict[tuple, Any] = {}
+        self._group_cache: dict[tuple, Any] = {}
+        self._group_approx: dict[tuple, bool] = {}
+        self._paint_rev = 0
+        self._paint_errors = 0
+        self._selected: tuple[int, int] = (-1, -1)          # (lane, eid)
+        self._selected_edge = -1
+        self._highlight: dict[str, Any] = {}
+        self._overlay: dict[str, Any] = {"criticalPath": False, "focusPath": False, "families": [],
+                                         "tiers": ["certain", "high", "medium", "low"],
+                                         "classes": ["direct", "inferred"], "selectedOnly": True,
+                                         "inferredWaits": False, "scoreTrack": False}
+        self._analysis = None
+        self._analysis_state = "idle"
+        self._analysis_message = ""
+        self._analysis_thread = None
+        self._overlay_geometry: list[Any] = []
+        self._history: list[tuple[float, float]] = []
+        self._history_pos = -1
+        self._minimap_cache: dict[tuple, Any] = {}
+        self._row_pos: dict[int, int] = {}
+        self._anchor_pos: dict[int, int] = {}
+        self._visible_lanes: set[int] = set()
+        self._comparison_hook = None
+        self._status_of = None              # set by ComparisonBridge: span -> comparison status
+        from .timeline_items import register_types
+        register_types()
+
         # Filter state (applyFilters()/clearFilters()) -- empty dict means
         # "no active filter"; every lane's filteredCount is then its full
         # count.
@@ -187,7 +272,8 @@ class TimelineModel(QObject):
         self._span_filt = None          # SpanFilter for the event-level filters
 
         # Grouping/hide/isolate/reorder state -- lane metadata only.
-        self._grouping: str = "none"
+        # "hierarchy" (node / process / thread / device / stream) by default.
+        self._grouping: str = "hierarchy"
         self._group_collapsed: dict[str, bool] = {}
         self._hidden_lanes: set[str] = set()
         # None = "not isolating" (every non-hidden lane shows); a set,
@@ -215,6 +301,7 @@ class TimelineModel(QObject):
         self._bucket_colors: dict[str, str] = {
             b: self._theme.bucketColor(b) for b in activity_buckets.BUCKETS
         }
+        self._jit_color = theme_mod.activity_color("jit", self._theme.dark)
         self._category_colors: dict[str, str] = {
             c: self._theme.categoryColor(c) for c in {r["category"] for r in stats}
         }
@@ -310,6 +397,7 @@ class TimelineModel(QObject):
         for m in self._lane_meta:
             m["color"] = theme_mod.category_color(m["category"], dark)
         self._bucket_colors = {b: theme_mod.bucket_color(b, dark) for b in self._bucket_colors}
+        self._jit_color = theme_mod.activity_color("jit", dark)
         self._category_colors = {c: theme_mod.category_color(c, dark) for c in self._category_colors}
         for c in self._connectors:
             c["color"] = theme_mod.confidence_color(c["confidence"], dark)
@@ -320,6 +408,7 @@ class TimelineModel(QObject):
             if r.get("kind") == "lane":
                 r["color"] = self._lane_meta[r["laneIndex"]]["color"]
         self.colorsChanged.emit()
+        self._repaint(data=True)
 
     def _lane_of_span(self, span) -> int | None:
         return self._lane_of_key.get((span.pid, self._lane_base(span)))
@@ -373,6 +462,9 @@ class TimelineModel(QObject):
             return False
         if f.get("streams") and self._lane_stream.get(lane_name) not in f["streams"]:
             return False
+        if f.get("devices") and self._lane_extra[self._lane_index[lane_name]]["device"] not in \
+                [str(d) for d in f["devices"]]:
+            return False
         return True
 
     def _effective_lane_order(self) -> list[str]:
@@ -412,10 +504,13 @@ class TimelineModel(QObject):
             "laneIndex": i,
             "name": lane,
             "label": m["label"],
+            "hierLabel": m["label"],
+            "level": 0,
             "category": m["category"],
             "color": m["color"],
             "count": m["count"],
             "filteredCount": filtered_count,
+            "syncLane": self._sync_pair.get(i, -1),
         }
 
     def _group_key_for_lane(self, lane_name: str, grouping: str) -> Any:
@@ -434,10 +529,10 @@ class TimelineModel(QObject):
             return self._lane_stream.get(lane_name)
         if grouping == "thread":
             return self._lane_tid.get(lane_name)
-        # "device": no per-span device field exists anywhere in this
-        # trace format (see filterDimensions' own docstring) -- every
-        # lane falls into the one "(unavailable)" group rather than a
-        # fabricated per-lane value.
+        if grouping == "device":
+            # device lanes / streams: the hook's hdev= (else the native
+            # dev=) of the lane's first span; host lanes have none
+            return self._lane_extra[self._lane_index[lane_name]]["device"]
         return None
 
     @staticmethod
@@ -461,14 +556,33 @@ class TimelineModel(QObject):
         lane_names = [ln for ln in self._effective_lane_order()
                       if self._lane_passes_static_filters(ln)]
 
+        if self._grouping == "hierarchy":
+            from . import timeline_hierarchy as th
+            lane_rows: dict[int, dict[str, Any]] = {}
+            for lane in lane_names:
+                r = self._lane_row(lane)
+                if r is not None:
+                    lane_rows[r["laneIndex"]] = r
+            focus = None
+            if self._overlay.get("focusPath") and self._analysis is not None and self._analysis.ok:
+                focus = self._analysis.path_lanes
+            rows = th.flatten(self._tree, self._group_collapsed,
+                              lane_row=lambda i: lane_rows.get(i) if focus is None or i in focus else None)
+            if self._row_order is not None:
+                # a custom order (moveRow/setRowOrder) is a flat concept:
+                # keep the hierarchy's headers, order lanes inside each
+                order = {n: k for k, n in enumerate(self._row_order)}
+                rows = self._reorder_within_groups(rows, order)
+            self._set_rows(rows)
+            return
+
         if self._grouping == "none":
             rows = []
             for lane in lane_names:
                 r = self._lane_row(lane)
                 if r is not None:
                     rows.append(r)
-            self._rows = rows
-            self.rowsChanged.emit()
+            self._set_rows(rows)
             return
 
         groups: dict[str, dict[str, Any]] = {}
@@ -493,6 +607,8 @@ class TimelineModel(QObject):
             rows.append({
                 "kind": "group",
                 "groupId": group_id,
+                "nodeKind": "group",
+                "level": 0,
                 "label": g["label"],
                 "laneIndexes": g["laneIndexes"],
                 "laneCount": len(g["laneRows"]),
@@ -501,9 +617,48 @@ class TimelineModel(QObject):
                 "collapsed": collapsed,
             })
             if not collapsed:
-                rows.extend(g["laneRows"])
+                rows.extend(dict(lr, level=1) for lr in g["laneRows"])
+        self._set_rows(rows)
+
+    @staticmethod
+    def _reorder_within_groups(rows: list[dict[str, Any]], order: dict[str, int]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        run: list[dict[str, Any]] = []
+        for r in rows + [None]:
+            if r is not None and r["kind"] == "lane" and (not run or r["level"] == run[0]["level"]):
+                run.append(r)
+                continue
+            out.extend(sorted(run, key=lambda x: order.get(x["name"], 1 << 30)))
+            run = []
+            if r is None:
+                break
+            if r["kind"] == "lane":
+                run.append(r)
+            else:
+                out.append(r)
+        return out
+
+    def _set_rows(self, rows: list[dict[str, Any]]) -> None:
+        """The visible rows, plus where each lane is: its own row, or the
+        collapsed header it is folded into (overlays anchor there)."""
         self._rows = rows
+        self._row_pos = {}
+        self._anchor_pos = {}
+        visible: set[int] = set()
+        for pos, r in enumerate(rows):
+            if r["kind"] == "lane":
+                self._row_pos[r["laneIndex"]] = pos
+                self._anchor_pos.setdefault(r["laneIndex"], pos)
+                visible.add(r["laneIndex"])
+            elif r.get("collapsed"):
+                for li in r["laneIndexes"]:
+                    self._anchor_pos.setdefault(li, pos)
+                    visible.add(li)
+        self._visible_lanes = visible
+        self._group_cache.clear()
         self.rowsChanged.emit()
+        self._paint_rev += 1
+        self.paintRevisionChanged.emit()
 
     @Property('QVariantList', notify=rowsChanged)
     def rows(self) -> list[dict[str, Any]]:
@@ -527,6 +682,7 @@ class TimelineModel(QObject):
         threads = sorted({t for t in self._lane_tid.values() if t is not None})
         runtimes = sorted({parse_lane_name(name)[0] for name in self._lane_names})
         streams = sorted({s for s in self._lane_stream.values() if s is not None})
+        devices = sorted({ex["device"] for ex in self._lane_extra if ex["device"] is not None})
 
         def _dim(key: str, label: str, values: list, supported: bool = True, reason: str = "") -> dict[str, Any]:
             is_available = supported and bool(values)
@@ -544,9 +700,8 @@ class TimelineModel(QObject):
             _dim("thread", "Thread", threads, reason="no per-thread lanes in this trace"),
             _dim("runtime", "Runtime", runtimes, reason="no runtime categories in this trace"),
             _dim("stream", "Stream", streams, reason="no GPU stream tags in this trace"),
-            _dim("device", "Device", [], supported=False,
-                 reason="no per-span device field exists in this trace format -- "
-                        "only per-run device capability data and per-stream lane naming"),
+            _dim("device", "Device", devices,
+                 reason="no hdev=/dev= tag on device work in this trace (older hooks, host-only runs)"),
             _dim("bucket", "Activity", list(activity_buckets.BUCKETS)),
         ]
 
@@ -600,6 +755,7 @@ class TimelineModel(QObject):
         self._recompute_event_mask()
         self._rebuild_rows()
         self.filtersChanged.emit()
+        self._repaint(data=True)
 
     @Slot()
     def clearFilters(self) -> None:
@@ -607,6 +763,7 @@ class TimelineModel(QObject):
         self._span_filt = None
         self._rebuild_rows()
         self.filtersChanged.emit()
+        self._repaint(data=True)
 
     # ── Grouping / collapse ──────────────────────────────────────────
     @Property(str, notify=groupingChanged)
@@ -622,7 +779,7 @@ class TimelineModel(QObject):
         lane can carry both Computation and Idle spans, so "group by
         activity bucket" isn't offered here the way it is as a filter."""
         self._grouping = key if key in (
-            "rank", "process", "runtime", "device", "stream", "thread") else "none"
+            "hierarchy", "rank", "process", "runtime", "device", "stream", "thread") else "none"
         self._rebuild_rows()
         self.groupingChanged.emit()
 
@@ -747,10 +904,7 @@ class TimelineModel(QObject):
         at pixel Y" calculation (e.g. the connector overlay) must use this
         rather than the raw laneIndex, since grouping/hide/isolate/reorder
         make a row's visual position differ from its lane's index."""
-        for pos, r in enumerate(self._rows):
-            if r["kind"] == "lane" and r["laneIndex"] == lane_index:
-                return pos
-        return -1
+        return self._row_pos.get(lane_index, -1)
 
     # ── On-demand span queries ──────────────────────────────────────────
     @Slot(int, float, float, int, result='QVariantList')
@@ -824,7 +978,13 @@ class TimelineModel(QObject):
         `_color_mode` -- bucket/category modes use dicts precomputed once
         in __init__ (see their construction there for why), so switching
         modes doesn't change visibleSpans()'s per-frame cost."""
+        if self._color_mode == "comparison" and self._status_of is not None:
+            return theme_mod.change_color(self._status_of(span), self._theme.dark)
         if self._color_mode == "bucket":
+            # the Activity mode: buckets, with JIT compilation apart from
+            # runtime overhead (timeline_lod.activity_of)
+            if span.category.value == "jit":
+                return self._jit_color
             return self._bucket_colors.get(activity_buckets.bucket_of_span(span), "#9ca3af")
         if self._color_mode == "category":
             return self._category_colors.get(span.category.value, "#9ca3af")
@@ -883,10 +1043,16 @@ class TimelineModel(QObject):
     def colorMode(self) -> str:
         return self._color_mode
 
+    @Property(bool, notify=colorModeChanged)
+    def hasComparison(self) -> bool:
+        return self._status_of is not None
+
     @Slot(str)
     def setColorMode(self, mode: str) -> None:
-        self._color_mode = mode if mode in ("function", "bucket", "category") else "function"
+        modes = ("function", "bucket", "category") + (("comparison",) if self._status_of is not None else ())
+        self._color_mode = mode if mode in modes else "function"
         self.colorModeChanged.emit()
+        self._repaint(data=True)
 
     # ── Search ───────────────────────────────────────────────────────
     @Property(int, notify=searchChanged)
@@ -939,6 +1105,7 @@ class TimelineModel(QObject):
         self._search_match_set = set(matches)
         self._search_cursor = 0 if matches else -1
         self.searchChanged.emit()
+        self._repaint()
         return len(matches)
 
     @Slot()
@@ -948,6 +1115,7 @@ class TimelineModel(QObject):
         self._search_match_set = set()
         self._search_cursor = -1
         self.searchChanged.emit()
+        self._repaint()
 
     def _match_result(self) -> dict[str, Any]:
         lane_idx, span_idx = self._search_matches[self._search_cursor]
@@ -1086,7 +1254,7 @@ class TimelineModel(QObject):
     # Presentation state only: what is filtered, grouped, hidden and where
     # the view is -- never span data. Restoring tolerates stale entries
     # (lanes that no longer exist are dropped, malformed values ignored).
-    _FILTER_LISTS = ("ranks", "processes", "threads", "runtimes", "streams", "buckets")
+    _FILTER_LISTS = ("ranks", "processes", "threads", "runtimes", "streams", "devices", "buckets")
 
     @Slot(float, float)
     def noteView(self, zoom: float, view_start_ns: float) -> None:
@@ -1148,7 +1316,8 @@ class TimelineModel(QObject):
             self._recompute_event_mask()
         if isinstance(state.get("grouping"), str):
             g = state["grouping"]
-            self._grouping = g if g in ("rank", "process", "runtime", "device", "stream", "thread") else "none"
+            self._grouping = g if g in ("hierarchy", "rank", "process", "runtime", "device", "stream",
+                                        "thread") else "none"
         if isinstance(state.get("groupCollapsed"), dict):
             self._group_collapsed = {str(k): bool(v) for k, v in state["groupCollapsed"].items()}
         if state.get("colorMode") in ("function", "category", "bucket"):
@@ -1187,3 +1356,878 @@ class TimelineModel(QObject):
         self.colorModeChanged.emit()
         self.bookmarksChanged.emit()
         self.namedRangesChanged.emit()
+        self._repaint(data=True)
+
+    # ══ Rendering (timeline_lod.py decides, timeline_paint.py draws) ══════
+    paintRevisionChanged = Signal()
+    eventSelectionChanged = Signal()
+    highlightChanged = Signal()
+    overlayChanged = Signal()
+    analysisChanged = Signal()
+    historyChanged = Signal()
+    _analysisDone = Signal(object)
+
+    @Property(int, notify=paintRevisionChanged)
+    def paintRevision(self) -> int:
+        """Bumped whenever something every painted item shows changed (data
+        filters, colours, selection, highlight, overlays): the lane items
+        bind their `revision` to it."""
+        return self._paint_rev
+
+    def _repaint(self, *, data: bool = False) -> None:
+        if data:
+            self._render_cache.clear()
+            self._group_cache.clear()
+            self._minimap_cache.clear()
+        self._paint_rev += 1
+        self.paintRevisionChanged.emit()
+
+    def note_paint_error(self, exc: Exception) -> None:
+        self._paint_errors += 1
+        if self._paint_errors <= 3:
+            import traceback
+            traceback.print_exception(exc)
+
+    def _style(self):
+        from .timeline_paint import Style
+        st = getattr(self, "_style_cache", None)
+        if st is None or st.dark != self._theme.dark:
+            st = self._style_cache = Style.for_theme(self._theme.dark)
+        return st
+
+    def _data_key(self) -> tuple:
+        return (self._color_mode, self._theme.dark, id(self._span_filt), self._search_active)
+
+    def render_lane(self, lane_index: int, a: float, b: float, px: int):
+        """The level-of-detail render of one lane for a viewport (cached)."""
+        key = (lane_index, float(a), float(b), int(px)) + self._data_key()
+        lr = self._render_cache.get(key)
+        if lr is None:
+            lr = self._compute_render(lane_index, float(a), float(b), max(1, min(int(px), 8192)))
+            if len(self._render_cache) > 600:
+                self._render_cache.clear()
+            self._render_cache[key] = lr
+        return lr
+
+    def _compute_render(self, lane_index: int, a: float, b: float, px: int):
+        from . import timeline_lod as lod
+        lane = self._lane_names[lane_index]
+        extent = self._observed_extent(lane_index)
+        A, B = int(math.floor(a)), int(math.ceil(b))
+        sync_idx = self._sync_pair.get(lane_index, -1)
+        sync_lane = self._lane_names[sync_idx] if sync_idx >= 0 else None
+        est = None
+        many = False
+        if self._span_filt is None:
+            est = self._store.estimate_starts(lane, a, b)
+            many = est is not None and est > 4 * lod.EXACT_LIMIT
+        if not many:
+            many = self._store.count_window(lane, A, B, filt=self._span_filt, cap=lod.EXACT_LIMIT) > lod.EXACT_LIMIT
+        if not many and sync_lane is not None:
+            many = self._store.count_window(sync_lane, A, B, cap=lod.EXACT_LIMIT) > lod.EXACT_LIMIT
+        lr = None
+        if not many:
+            waits = list(self._window_spans(sync_lane, A, B, None)[0]) if sync_lane is not None else None
+            spans, act = self._window_spans(lane, A, B, self._span_filt)
+            lr = lod.render_spans(
+                spans, a, b, px, color_of=self._span_color, waits=waits,
+                wait_color=theme_mod.category_color("sync", self._theme.dark), extent=extent, activity=act)
+        if lr is None:
+            occ = self._lane_occupancy(lane, a, b, px)
+            wait_occ = self._lane_occupancy(sync_lane, a, b, px) if sync_lane is not None else None
+            levels = self._store.activity(lane) if self._span_filt is None else None
+            starts = lod.starts_per_column(levels[0], a, b, px) if levels else None
+            bin_ns = 0.0
+            if levels:
+                usable = [lv["bin_ns"] for lv in levels if lv["bin_ns"] <= (b - a) / px]
+                bin_ns = min(usable) if usable else 0.0
+            lr = lod.render_occupancy(occ, starts, a, b, px, self._lane_meta[lane_index]["color"],
+                                      wait_occupancy=wait_occ, index_bin_ns=bin_ns, extent=extent,
+                                      events_in_view=int(est or 0))
+        return lr
+
+    _PREFETCH_LIMIT = 3          # x EXACT_LIMIT spans per prefetched lane window
+    _PREFETCH_TOTAL = 400_000    # spans held over all lanes
+
+    def _window_spans(self, lane: str, A: int, B: int, filt):
+        """The spans of `lane` the store returns for window [A, B] (start <=
+        B and end > A, start order), and a memoized activity_of for them.
+        A miss reads a window three views wide when it holds few enough
+        spans, so a pan or small zoom is served from memory instead of
+        reading and decoding the same rows again."""
+        import bisect
+        from . import timeline_lod as lod
+        cache = self.__dict__.setdefault("_span_window_cache", {})
+        ent = cache.get(lane)
+        if ent is None or ent["filt"] is not filt or not (ent["lo"] <= A and B <= ent["hi"]):
+            w = max(B - A, 1)
+            lo, hi = A - w, B + w
+            cap = self._PREFETCH_LIMIT * lod.EXACT_LIMIT
+            if self._store.count_window(lane, lo, hi, filt=filt, cap=cap) > cap:
+                lo, hi = A, B
+            spans = list(self._store.iter_spans(order="start", lane=lane, window=(lo, hi), filt=filt))
+            ent = {"filt": filt, "lo": lo, "hi": hi, "spans": spans,
+                   "starts": [s.start_ns for s in spans],
+                   "max_dur": max((max(s.duration_ns, 0) for s in spans), default=0), "act": {}}
+            cache.pop(lane, None)
+            cache[lane] = ent
+            total = sum(len(e["spans"]) for e in cache.values())
+            while total > self._PREFETCH_TOTAL and len(cache) > 1:
+                total -= len(cache.pop(next(iter(cache)))["spans"])
+        spans, starts = ent["spans"], ent["starts"]
+        i0 = bisect.bisect_left(starts, A - ent["max_dur"])
+        i1 = bisect.bisect_right(starts, B)
+        memo = ent["act"]
+
+        def act(s, memo=memo):
+            v = memo.get(id(s))
+            if v is None:
+                v = memo[id(s)] = lod.activity_of(s)
+            return v
+        return (s for s in spans[i0:i1] if s.start_ns + s.duration_ns > A), act
+
+    def _observed_extent(self, lane_index: int) -> tuple[int, int]:
+        """Where this lane's thread / stream has data: first to last event
+        over all of its runtime lanes -- outside it is "no data" (the trace
+        cannot say whether the thread existed); inside, a lane's empty time
+        is a real gap (the thread was observed doing something else)."""
+        c = getattr(self, "_extent_cache", None)
+        if c is None:
+            groups: dict[tuple, list[int]] = {}
+            for i, ex in enumerate(self._lane_extra):
+                if ex["kind"] == "thread" and ex["tid"] is not None:
+                    key = ("t", ex["pid"], ex["tid"])
+                elif ex["kind"] == "stream":
+                    key = ("s", ex["pid"], ex["device"], ex["ident"])
+                else:
+                    key = ("l", i)
+                groups.setdefault(key, []).append(i)
+            c = {}
+            for members in groups.values():
+                infos = [self._infos[self._lane_names[i]] for i in members]
+                ext = (min(x.min_start for x in infos), max(x.max_end for x in infos))
+                for i in members:
+                    c[i] = ext
+            self._extent_cache = c
+        return c[lane_index]
+
+    def paint_lane_item(self, painter, lane_index: int, a: float, b: float, w: float, h: float) -> None:
+        from .timeline_paint import paint_lane
+        if lane_index < 0 or lane_index >= len(self._lane_names):
+            return
+        lr = self.render_lane(lane_index, a, b, int(round(w)))
+        paint_lane(painter, lr, w, h, self._style(), self._lane_options(lane_index, lr))
+
+    def _lane_options(self, lane_index: int, lr):
+        from .timeline_paint import LaneOptions
+        from . import timeline_lod as lod
+        sel_lane, sel_eid = self._selected
+        opts = LaneOptions(selected_eid=sel_eid if sel_lane == lane_index else -1)
+        if self._search_active:
+            ms = self._search_match_set
+            opts.matched = lambda eid: (lane_index, eid) in ms
+        hl = self._highlight
+        if hl:
+            cat = self._lane_extra[lane_index]["category"]
+            lane_ok = (not hl.get("lanes") or lane_index in hl["lanes"]) and \
+                      (not hl.get("categories") or cat in hl["categories"])
+            acts = hl.get("activities")
+            eids = hl.get("eids")
+            names = hl.get("names")
+
+            def dim(r, lane_ok=lane_ok, acts=acts, eids=eids, names=names) -> bool:
+                if not lane_ok:
+                    return True
+                if acts and lod.ACTIVITY[r.activity] not in acts:
+                    return True
+                if eids and r.eid not in eids:
+                    return True
+                if names and r.name not in names:
+                    return True
+                return False
+            opts.dim = dim
+        an = self._analysis
+        if an is not None and an.ok:
+            if self._overlay.get("criticalPath"):
+                opts.cp_steps = self._cp_steps_px(lane_index, lr)
+            if self._overlay.get("inferredWaits"):
+                opts.inferred_waits = self._waits_px(lane_index, lr)
+        return opts
+
+    def _per_lane_times(self, cache_name: str, index: dict, items: list, t_of) -> dict:
+        c = getattr(self, cache_name, None)
+        if c is None:
+            c = {lane: np.asarray([t_of(items[k]) for k in ks], dtype=np.float64) for lane, ks in index.items()}
+            setattr(self, cache_name, c)
+        return c
+
+    def _cp_arrays(self) -> dict:
+        """The path steps as numpy columns (t0, t1, lane, mode code: 0 busy,
+        1 waiting, 2 dependency hop), built once per analysis -- the
+        per-frame step selection is then vectorized."""
+        c = getattr(self, "_cp_arr_cache", None)
+        if c is None:
+            steps = self._analysis.steps
+            c = {"t0": np.fromiter((s.t0 for s in steps), np.float64, len(steps)),
+                 "t1": np.fromiter((s.t1 for s in steps), np.float64, len(steps)),
+                 "lane": np.fromiter((s.lane for s in steps), np.int64, len(steps)),
+                 "mode": np.fromiter((0 if s.mode == "busy" else 2 if s.mode == "dependency" else 1
+                                      for s in steps), np.int8, len(steps)),
+                 "by_lane": {lane: np.asarray(ks, dtype=np.int64)
+                             for lane, ks in self._analysis.steps_of_lane.items()}}
+            self._cp_arr_cache = c
+        return c
+
+    _CP_DENSE_FACTOR = 2         # path steps per pixel above which the band is per column
+
+    @staticmethod
+    def _cp_columns(x0a: np.ndarray, x1a: np.ndarray, mode: np.ndarray, width: int) -> list:
+        """Zoomed out (many path steps per pixel): one band state per column
+        -- busy or waiting, whichever holds more of the column's path time
+        -- as runs of equal columns, instead of one rectangle per step."""
+        from .timeline_lod import _coverage
+        cov = []
+        for code in (0, 1):
+            sel = mode == code
+            lo = x0a[sel]
+            hi = np.maximum(x1a[sel], lo + 1e-6)          # a zero-length step still marks its column
+            order = np.argsort(lo, kind="stable")
+            cov.append(_coverage(lo[order], hi[order], width) if len(lo) else np.zeros(width))
+        col = np.where((cov[0] > 0) & (cov[0] >= cov[1]), 0, np.where(cov[1] > 0, 1, -1))
+        cut = np.flatnonzero(np.diff(col)) + 1
+        starts = np.concatenate(([0], cut)).tolist()
+        ends = np.concatenate((cut, [width])).tolist()
+        return [(float(c0), float(c1), "busy" if col[c0] == 0 else "wait", "")
+                for c0, c1 in zip(starts, ends) if col[c0] >= 0]
+
+    def _cp_steps_px(self, lane_index: int, lr) -> list:
+        an = self._analysis
+        ks = an.steps_of_lane.get(lane_index)
+        if not ks:
+            return []
+        t0s = self._per_lane_times("_cp_t0_cache", an.steps_of_lane, an.steps, lambda s: s.t0)[lane_index]
+        a, b = lr.view_start, lr.view_end
+        k = lr.scale
+        lo = max(0, int(np.searchsorted(t0s, a, side="left")) - 1)
+        hi = int(np.searchsorted(t0s, b, side="right"))
+        arr = self._cp_arrays()
+        idx = arr["by_lane"][lane_index][lo:hi]
+        t0, t1, mode = arr["t0"][idx], arr["t1"][idx], arr["mode"][idx]
+        keep = (t1 >= a) & (t0 <= b) & (mode != 2)
+        idx, t0, t1, mode = idx[keep], t0[keep], t1[keep], mode[keep]
+        x0a = np.maximum(0.0, (t0 - a) * k)
+        x1a = np.minimum(float(lr.width), (t1 - a) * k)
+        if len(idx) > self._CP_DENSE_FACTOR * lr.width:
+            return self._cp_columns(x0a, x1a, mode, int(lr.width))
+        x0s, x1s = x0a.tolist(), x1a.tolist()
+        steps = an.steps
+        out: list[list] = []
+        for i, x0, x1, md in zip(idx.tolist(), x0s, x1s, mode.tolist()):
+            m = "busy" if md == 0 else "wait"
+            if out and out[-1][2] == m and x0 - out[-1][1] < 0.5:
+                if x1 > out[-1][1]:
+                    out[-1][1] = x1
+            else:
+                out.append([x0, x1, m, steps[i].tier])
+        return [tuple(o) for o in out]
+
+    def _waits_px(self, lane_index: int, lr) -> list:
+        an = self._analysis
+        ks = an.waits_of_lane.get(lane_index)
+        if not ks:
+            return []
+        a, b, k = lr.view_start, lr.view_end, lr.scale
+        out = []
+        for idx in ks:
+            w = an.waits[idx]
+            if w.t1 <= a or w.t0 >= b:
+                continue
+            out.append((max(0.0, (w.t0 - a) * k), min(float(lr.width), (w.t1 - a) * k)))
+            if len(out) > 4000:
+                break
+        return out
+
+    # ── header rows: aggregate strips ────────────────────────────────────
+    def paint_group_item(self, painter, group_id: str, lane_indexes: list, a: float, b: float,
+                         w: float, h: float) -> None:
+        from .timeline_paint import paint_group
+        busy, wait, colors, cp = self.render_group(group_id, lane_indexes, a, b, int(round(w)))
+        paint_group(painter, busy, wait, colors, w, h, self._style(), cp_cols=cp)
+
+    def render_group(self, group_id: str, lane_indexes: list, a: float, b: float, px: int):
+        """(busy, wait, colour per column, critical-path coverage per column)
+        of a header row. Lanes of one thread or stream combine by MAX (they
+        nest: a barrier wait inside a parallel region), and a process,
+        device, node or the system by the MEAN of their members -- the
+        share of threads (streams) busy / waiting in that column. Busy
+        excludes the explicit waits of the thread's sync lane."""
+        px = max(1, min(int(px), 8192))
+        key = (group_id, tuple(lane_indexes), float(a), float(b), px) + self._data_key()
+        hit = self._group_cache.get(key)
+        if hit is not None:
+            return hit
+        palette: list[str] = []
+        pal_idx: dict[str, int] = {}
+
+        def code_of(color: str) -> int:
+            i = pal_idx.get(color)
+            if i is None:
+                i = pal_idx[color] = len(palette)
+                palette.append(color)
+            return i
+
+        visible = set(lane_indexes)
+
+        from .timeline_lod import column_fractions
+        approx = [False]
+
+        def lane_vals(li: int):
+            ex = self._lane_extra[li]
+            if ex["category"] in self._NOT_WORK_CATEGORIES:
+                return None          # annotation ranges are labels, not activity
+            # the lane's own (cached) render: the same activity classes the
+            # lane row shows -- an MPI_Wait is waiting here too
+            lr = self.render_lane(li, a, b, px)
+            busy, wait = column_fractions(lr)
+            if lr.source == "index":
+                approx[0] = True
+                if ex["category"] == "sync":
+                    busy, wait = np.zeros(px), np.clip(busy + wait, 0.0, 1.0)
+            code = np.full(px, code_of(self._lane_meta[li]["color"]), dtype=np.int32)
+            return busy, wait, code
+
+        def combine(kids, how: str):
+            kids = [k for k in kids if k is not None]
+            if not kids:
+                return np.zeros(px), np.zeros(px), np.zeros(px, dtype=np.int32)
+            B = np.stack([k[0] for k in kids])
+            W = np.stack([k[1] for k in kids])
+            C = np.stack([k[2] for k in kids])
+            arg = np.argmax(B, axis=0)
+            code = C[arg, np.arange(px)]
+            if how == "max":
+                wait = W.max(axis=0)
+                busy = np.clip(B.max(axis=0) - wait, 0.0, 1.0)
+            else:
+                busy, wait = B.mean(axis=0), W.mean(axis=0)
+            return busy, np.minimum(wait, 1.0 - busy), code
+
+        def agg(n):
+            if n.lane >= 0:
+                return lane_vals(n.lane) if n.lane in visible else None
+            kids = [(c, agg(c)) for c in n.children]
+            kids = [(c, v) for c, v in kids if v is not None]
+            if not kids:
+                return None
+            if n.kind in ("thread", "stream"):
+                return combine([v for _c, v in kids], "max")
+            if n.kind == "process":
+                host = [v for c, v in kids if c.kind == "thread" or (c.lane >= 0 and c.kind == "lane")]
+                return combine(host or [v for _c, v in kids], "mean")
+            return combine([v for _c, v in kids], "mean")
+
+        node = self._tree_nodes.get(group_id)
+        if node is None:            # a flat grouping (by rank, runtime, ...): mean of its lanes
+            vals = [lane_vals(li) for li in lane_indexes if 0 <= li < len(self._lane_names)]
+            res = combine(vals, "mean")
+        else:
+            res = agg(node) or (np.zeros(px), np.zeros(px), np.zeros(px, dtype=np.int32))
+        busy, wait, code = res
+        colors = [palette[c] if busy[i] > 0 and palette else None for i, c in enumerate(code.tolist())]
+        cp = None
+        an = self._analysis
+        if an is not None and an.ok and self._overlay.get("criticalPath"):
+            cp = self._cp_coverage(set(lane_indexes), a, b, px)
+        out = (busy, wait, colors, cp)
+        self._group_approx[key] = approx[0]
+        if len(self._group_cache) > 300:
+            self._group_cache.clear()
+        self._group_cache[key] = out
+        return out
+
+    def _cp_coverage(self, lanes: set | None, a: float, b: float, px: int) -> np.ndarray:
+        from .timeline_lod import _coverage
+        arr = self._cp_arrays()
+        k = px / max(b - a, 1e-9)
+        keep = (arr["mode"] != 2) & (arr["t1"] > a) & (arr["t0"] < b)
+        if lanes is not None:
+            keep &= np.isin(arr["lane"], np.fromiter(lanes, np.int64, len(lanes)))
+        if not keep.any():
+            return np.zeros(px)
+        lo = np.maximum(0.0, (arr["t0"][keep] - a) * k)
+        hi = np.minimum(float(px), (arr["t1"][keep] - a) * k)
+        order = np.argsort(lo, kind="stable")
+        return _coverage(lo[order], hi[order], px)
+
+    # ── hover / hit testing ──────────────────────────────────────────────
+    @Slot(int, float, float, float, float, result='QVariantMap')
+    def hitTest(self, lane_index: int, x: float, view_start_ns: float, view_end_ns: float,
+                width: float) -> dict[str, Any]:
+        """What is under pixel x of a lane: an exact span ({"kind": "span",
+        spanIdx, name, ...}) or an aggregated column ({"kind": "column",
+        count, busy, wait, ...: never an invented event}), else {}."""
+        if lane_index < 0 or lane_index >= len(self._lane_names):
+            return {}
+        lr = self.render_lane(lane_index, view_start_ns, view_end_ns, int(round(width)))
+        r = lr.hit(x)
+        if r is not None and r.eid >= 0:
+            return {"kind": "span", "spanIdx": float(r.eid), "name": r.name, "startNs": float(r.start_ns),
+                    "durNs": float(r.end_ns - r.start_ns), "activity": r.activity}
+        if r is not None:
+            return {"kind": "wait", "startNs": float(r.start_ns), "durNs": float(r.end_ns - r.start_ns),
+                    "name": "explicit wait (sync lane)"}
+        info = lr.column_info(x)
+        if info is not None:
+            info["kind"] = "column"
+            return info
+        return {}
+
+    # ── selection (one event) and its details ────────────────────────────
+    @Property('QVariantMap', notify=eventSelectionChanged)
+    def selectedEvent(self) -> dict[str, Any]:
+        lane, eid = self._selected
+        return {"laneIndex": lane, "spanIdx": float(eid), "edge": self._selected_edge}
+
+    @Slot(int, float)
+    def selectEvent(self, lane_index: int, span_idx: float) -> None:
+        sel = (int(lane_index), int(span_idx)) if span_idx is not None and span_idx >= 0 else (-1, -1)
+        if sel == self._selected and self._selected_edge < 0:
+            return
+        self._selected = sel
+        self._selected_edge = -1
+        self.eventSelectionChanged.emit()
+        self._repaint()
+
+    @Slot()
+    def clearEventSelection(self) -> None:
+        self._selected = (-1, -1)
+        self._selected_edge = -1
+        self.eventSelectionChanged.emit()
+        self._repaint()
+
+    @Slot(int, float, result='QVariantMap')
+    def eventDetails(self, lane_index: int, span_idx: float) -> dict[str, Any]:
+        from .timeline_details import event_details
+        return event_details(self, int(lane_index), int(span_idx))
+
+    @Slot(int, result='QVariantMap')
+    def edgeDetails(self, edge_id: int) -> dict[str, Any]:
+        from .timeline_details import edge_details
+        return edge_details(self, int(edge_id))
+
+    @Slot(float, float, result=int)
+    def edgeAt(self, x: float, y: float) -> int:
+        """The overlay edge within 5 px of (x, y) in the overlay's own
+        coordinates (as last painted), else -1."""
+        best, best_d = -1, 5.0
+        for e in self._overlay_geometry:
+            dx, dy = e.x1 - e.x0, e.y1 - e.y0
+            n2 = dx * dx + dy * dy
+            t = 0.0 if n2 <= 0 else max(0.0, min(1.0, ((x - e.x0) * dx + (y - e.y0) * dy) / n2))
+            px, py = e.x0 + t * dx, e.y0 + t * dy
+            d = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+            if d < best_d:
+                best, best_d = e.id, d
+        return best
+
+    @Slot(int)
+    def selectEdge(self, edge_id: int) -> None:
+        self._selected_edge = int(edge_id)
+        self.eventSelectionChanged.emit()
+        self._repaint()
+
+    # ── highlight (linked summary views) ─────────────────────────────────
+    @Property('QVariantMap', notify=highlightChanged)
+    def highlight(self) -> dict[str, Any]:
+        h = self._highlight
+        return {k: (sorted(v) if isinstance(v, (set, frozenset)) else v) for k, v in h.items()}
+
+    @Slot('QVariantMap')
+    def setHighlight(self, spec: dict) -> None:
+        """Dim everything except events matching ALL given keys: activities
+        (timeline_lod.ACTIVITY names), categories, lanes, eids, names; plus
+        an optional `label` shown in the screen's highlight chip."""
+        clean: dict[str, Any] = {}
+        for k in ("activities", "categories", "names"):
+            if spec.get(k):
+                clean[k] = frozenset(str(x) for x in spec[k])
+        for k in ("lanes", "eids"):
+            if spec.get(k):
+                clean[k] = frozenset(int(x) for x in spec[k])
+        if spec.get("label"):
+            clean["label"] = str(spec["label"])
+        self._highlight = clean
+        self.highlightChanged.emit()
+        self._repaint()
+
+    @Slot()
+    def clearHighlight(self) -> None:
+        self._highlight = {}
+        self.highlightChanged.emit()
+        self._repaint()
+
+    # ── overlays: dependencies, critical path ────────────────────────────
+    @Property('QVariantMap', notify=overlayChanged)
+    def overlay(self) -> dict[str, Any]:
+        return dict(self._overlay)
+
+    @Slot('QVariantMap')
+    def setOverlay(self, spec: dict) -> None:
+        before_focus = self._overlay.get("focusPath")
+        for k in ("criticalPath", "focusPath", "inferredWaits", "scoreTrack"):
+            if k in spec:
+                self._overlay[k] = bool(spec[k])
+        for k in ("families", "tiers", "classes"):
+            if k in spec and isinstance(spec[k], (list, tuple)):
+                self._overlay[k] = [str(x) for x in spec[k]]
+        if (self._overlay.get("criticalPath") or self._overlay.get("families")
+                or self._overlay.get("inferredWaits")) and self._analysis is None:
+            self.startAnalysis()
+        self.overlayChanged.emit()
+        if self._overlay.get("focusPath") != before_focus:
+            self._rebuild_rows()
+        self._repaint(data=True)
+
+    @Property('QVariantList', constant=True)
+    def edgeFamilies(self) -> list[dict[str, Any]]:
+        from .timeline_analysis import FAMILIES, FAMILY_LABELS
+        return [{"key": f, "label": FAMILY_LABELS[f]} for f in FAMILIES]
+
+    def _visible_edge_ids(self, a: float, b: float, hover_eid: int) -> list[int]:
+        an = self._analysis
+        ov = self._overlay
+        fams = set(ov.get("families") or ())
+        if ov.get("criticalPath"):
+            fams.add("critical")
+        tiers, classes = set(ov.get("tiers") or ()), set(ov.get("classes") or ())
+        focus = {e for e in (self._selected[1], int(hover_eid)) if e >= 0}
+        out = []
+        for k in an.edges_in(a, b):
+            e = an.edges[k]
+            if e.src_eid in focus or e.dst_eid in focus or k == self._selected_edge:
+                out.append(k)
+                continue
+            if not (e.family in fams or ("critical" in fams and e.on_path)):
+                continue
+            if e.on_path and "critical" in fams:
+                out.append(k)
+                continue
+            if e.tier in tiers and e.cls in classes:
+                out.append(k)
+        if len(out) > 4000:
+            out.sort(key=lambda k: (not an.edges[k].on_path, ("certain", "high", "medium", "low").index(an.edges[k].tier)))
+            out = out[:4000]
+        self._edges_capped = len(out) >= 4000
+        return out
+
+    def paint_overlay_item(self, painter, w: float, h: float, a: float, b: float, scroll_y: float,
+                           row_h: float, hover_lane: int, hover_eid: float) -> None:
+        from .timeline_paint import OverlayEdge, paint_edges, paint_transition_markers
+        k = w / max(b - a, 1e-9)
+        geo: list[OverlayEdge] = []
+
+        def y_of(lane: int):
+            pos = self._anchor_pos.get(lane)
+            if pos is None:
+                return None
+            return pos * row_h + row_h / 2 - scroll_y
+
+        an = self._analysis
+        if an is None or not an.ok:
+            # before the analysis: the hovered span's MPI/NCCL partners
+            # from the persisted communication edges (as before)
+            if hover_lane >= 0 and hover_eid is not None and hover_eid >= 0:
+                for c in self._connectors_of.get((hover_lane, int(hover_eid)), []):
+                    y0, y1 = y_of(c["predLane"]), y_of(c["succLane"])
+                    if y0 is None or y1 is None:
+                        continue
+                    tier = c["confidence"]
+                    geo.append(OverlayEdge(-1, (c["predMidNs"] - a) * k, y0, (c["succMidNs"] - a) * k, y1,
+                                           "mpi_p2p", tier, "inferred" if tier in ("medium", "low") else "direct",
+                                           False))
+        else:
+            for kk in self._visible_edge_ids(a, b, int(hover_eid if hover_eid is not None else -1)):
+                e = an.edges[kk]
+                y0, y1 = y_of(e.src_lane), y_of(e.dst_lane)
+                if y0 is None or y1 is None:
+                    continue
+                if (y0 < -row_h and y1 < -row_h) or (y0 > h + row_h and y1 > h + row_h):
+                    continue
+                geo.append(OverlayEdge(kk, (e.t_src - a) * k, y0, (e.t_dst - a) * k, y1, e.family, e.tier,
+                                       e.cls, e.on_path,
+                                       (e.src_lane in self._row_pos, e.dst_lane in self._row_pos)))
+        self._overlay_geometry = geo
+        paint_edges(painter, geo, self._style(), selected=self._selected_edge,
+                    path_mode=bool(self._overlay.get("criticalPath")))
+        if an is not None and an.ok and self._overlay.get("criticalPath"):
+            # one chevron per 4 px of a row (they are 10 px wide): N / Shift+N
+            # and the CP panel still step through every switch
+            import bisect
+            tc = getattr(self, "_transition_t", None)
+            if tc is None or len(tc[1]) != len(an.transitions):
+                srt = sorted(an.transitions, key=lambda t: t.t)
+                tc = self._transition_t = ([t.t for t in srt], srt)
+            ts, srt = tc
+            pts, seen = [], set()
+            for t in srt[bisect.bisect_left(ts, a):bisect.bisect_right(ts, b)]:
+                y = y_of(t.to_lane)
+                if y is None or not -row_h < y < h + row_h:
+                    continue
+                x = (t.t - a) * k
+                cell = (int(x // 4), y)
+                if cell not in seen:
+                    seen.add(cell)
+                    pts.append((x, y - row_h / 2 + 9))
+            paint_transition_markers(painter, pts, self._style())
+
+    @Property(bool, notify=paintRevisionChanged)
+    def edgesCapped(self) -> bool:
+        return bool(getattr(self, "_edges_capped", False))
+
+    # ── critical-path navigation and summary ─────────────────────────────
+    @Slot(float, int, result='QVariantMap')
+    def nextTransition(self, ns: float, direction: int) -> dict[str, Any]:
+        """The next (direction > 0) or previous path switch after / before
+        `ns`: where the path moves to another rank, thread, runtime,
+        device or stream."""
+        an = self._analysis
+        if an is None or not an.ok or not an.transitions:
+            return {}
+        ts = [t.t for t in an.transitions]
+        import bisect
+        if direction > 0:
+            i = bisect.bisect_right(ts, ns + 0.5)
+            if i >= len(ts):
+                return {}
+        else:
+            i = bisect.bisect_left(ts, ns - 0.5) - 1
+            if i < 0:
+                return {}
+        t = an.transitions[i]
+        return {"ns": float(t.t), "fromLane": t.from_lane, "toLane": t.to_lane,
+                "fromLabel": self._lane_display(t.from_lane), "toLabel": self._lane_display(t.to_lane),
+                "switch": " + ".join(t.switch), "kind": t.kind, "tier": t.tier, "index": i,
+                "count": len(ts)}
+
+    def _lane_display(self, lane: int) -> str:
+        if lane < 0 or lane >= len(self._lane_meta):
+            return "?"
+        ex = self._lane_extra[lane]
+        where = f"rank {ex['rank']}" if ex["rank"] is not None else f"pid {ex['pid']}"
+        if ex["kind"] == "thread":
+            where += f" {ex['threadLabel'].split(' · ')[0]}"
+        elif ex["kind"] == "stream":
+            where += f" stream {ex['ident']}" + (f" (device {ex['device']})" if ex["device"] else "")
+        return f"{ex['category']} · {where}"
+
+    @Property('QVariantMap', notify=analysisChanged)
+    def criticalSummary(self) -> dict[str, Any]:
+        an = self._analysis
+        if an is None or not an.ok:
+            return {}
+        return an.summary
+
+    @Property(str, notify=analysisChanged)
+    def analysisState(self) -> str:
+        return self._analysis_state
+
+    @Property(str, notify=analysisChanged)
+    def analysisMessage(self) -> str:
+        return self._analysis_message
+
+    # Lanes that are not activity: annotation ranges (NVTX / ROCTX).
+    _NOT_WORK_CATEGORIES = frozenset({"nvtx"})
+
+    # Above this many spans the analysis starts only when asked for.
+    AUTO_ANALYSIS_SPANS = 300_000
+
+    @Slot()
+    def maybeStartAnalysis(self) -> None:
+        if self._analysis is None and self._analysis_state == "idle" and \
+                self._store.span_count() <= self.AUTO_ANALYSIS_SPANS:
+            self.startAnalysis()
+
+    @Slot()
+    def startAnalysis(self) -> None:
+        """Builds the overlays (timeline_analysis.build) on a background
+        thread; the GUI stays interactive and repaints when they are in."""
+        if self._analysis_state == "running":
+            return
+        import threading
+        from . import timeline_analysis as ta
+        self._analysis_state = "running"
+        self._analysis_message = "computing dependencies and the critical path…"
+        self.analysisChanged.emit()
+        if not getattr(self, "_analysis_connected", False):
+            self._analysisDone.connect(self._on_analysis_done)
+            self._analysis_connected = True
+
+        def meta(lane: int) -> dict:
+            return self._lane_extra[lane] if 0 <= lane < len(self._lane_extra) else {}
+
+        def run() -> None:
+            try:
+                data = ta.build(self._trace, self._lane_of_span, meta,
+                                progress=lambda s: setattr(self, "_analysis_message", s + "…"))
+            except Exception as exc:          # reported in the GUI, never raised into Qt
+                data = ta.AnalysisData(ok=False, error=f"{type(exc).__name__}: {exc}")
+            self._analysisDone.emit(data)
+
+        self._analysis_thread = threading.Thread(target=run, name="hprofiler-timeline-analysis", daemon=True)
+        self._analysis_thread.start()
+
+    def _on_analysis_done(self, data) -> None:
+        self._analysis = data
+        for name in ("_cp_t0_cache", "_cp_arr_cache", "_transition_t"):
+            if hasattr(self, name):
+                delattr(self, name)
+        if data.ok:
+            self._analysis_state = "ready"
+            self._analysis_message = f"ready ({data.seconds:.1f} s)"
+        else:
+            self._analysis_state = "failed"
+            self._analysis_message = data.error or "analysis failed"
+        self.analysisChanged.emit()
+        if self._overlay.get("focusPath"):
+            self._rebuild_rows()
+        self._repaint(data=True)
+
+    def wait_for_analysis(self, timeout: float = 120.0) -> bool:
+        """Tests and export: block until the background analysis finished
+        (processing the queued completion)."""
+        import time as _t
+        from PySide6.QtCore import QCoreApplication
+        t_end = _t.time() + timeout
+        while self._analysis_state == "running" and _t.time() < t_end:
+            QCoreApplication.processEvents()
+            if self._analysis_thread is not None:
+                self._analysis_thread.join(0.02)
+        QCoreApplication.processEvents()
+        return self._analysis_state == "ready"
+
+    # ── minimap and score track ──────────────────────────────────────────
+    def minimap_columns(self, n: int):
+        key = (n,) + self._data_key() + (bool(self._analysis and self._analysis.ok),
+                                          bool(self._overlay.get("criticalPath")))
+        hit = self._minimap_cache.get(key)
+        if hit is not None:
+            return hit
+        t0, t1 = float(self._view_start), float(self._view_end)
+        busy_parts, wait_parts = [], []
+        for i, ln in enumerate(self._lane_names):
+            ex = self._lane_extra[i]
+            if ex["kind"] not in ("thread", "") or ex["category"] in self._NOT_WORK_CATEGORIES:
+                continue
+            occ = self._lane_occupancy(ln, t0, t1, n)
+            (wait_parts if ex["category"] == "sync" else busy_parts).append(occ)
+        busy = np.max(busy_parts, axis=0) if busy_parts else np.zeros(n)
+        wait = np.max(wait_parts, axis=0) if wait_parts else np.zeros(n)
+        busy = np.clip(busy - wait, 0.0, 1.0)
+        cp = None
+        an = self._analysis
+        if an is not None and an.ok and self._overlay.get("criticalPath"):
+            cp = self._cp_coverage(None, t0, t1, n)
+        out = (busy, np.minimum(wait, 1.0 - busy), cp)
+        self._minimap_cache[key] = out
+        return out
+
+    def paint_minimap_item(self, painter, w: float, h: float, a: float, b: float) -> None:
+        from .timeline_paint import paint_minimap
+        n = max(1, min(int(w), 4096))
+        busy, wait, cp = self.minimap_columns(n)
+        paint_minimap(painter, busy, wait, cp, float(self._view_start), float(self._view_end), a, b, w, h,
+                      self._style())
+
+    def paint_score_item(self, painter, w: float, h: float, a: float, b: float) -> None:
+        from .timeline_paint import paint_score_track
+        an = self._analysis
+        if an is None or not an.ok:
+            return
+        paint_score_track(painter, an.legacy, a, b, w, h, self._style())
+
+    @Slot(float, float, result='QVariantMap')
+    def scoreOverlapAt(self, ns: float, tolerance_ns: float) -> dict[str, Any]:
+        """Hover on the score track: the counted intervals at `ns` and how
+        many times the span-level search counts that instant."""
+        an = self._analysis
+        if an is None or not an.ok or not an.legacy.get("available"):
+            return {}
+        hits = [iv for iv in an.legacy["intervals"] if iv[0] - tolerance_ns <= ns <= iv[1] + tolerance_ns]
+        return {"count": len(hits), "names": [iv[2] for iv in hits[:6]],
+                "kinds": [iv[3] for iv in hits[:6]]}
+
+    # ── view history, jumps ──────────────────────────────────────────────
+    @Slot(float, float)
+    def pushView(self, start_ns: float, end_ns: float) -> None:
+        """Records a view (after a discrete navigation step) for Back /
+        Forward; consecutive near-identical views collapse into one."""
+        v = (float(start_ns), float(end_ns))
+        if self._history_pos >= 0:
+            cs, ce = self._history[self._history_pos]
+            if abs(cs - v[0]) <= 1e-6 * max(1.0, ce - cs) and abs(ce - v[1]) <= 1e-6 * max(1.0, ce - cs):
+                return
+        del self._history[self._history_pos + 1:]
+        self._history.append(v)
+        if len(self._history) > 200:
+            self._history.pop(0)
+        self._history_pos = len(self._history) - 1
+        self.historyChanged.emit()
+
+    @Property(bool, notify=historyChanged)
+    def canGoBack(self) -> bool:
+        return self._history_pos > 0
+
+    @Property(bool, notify=historyChanged)
+    def canGoForward(self) -> bool:
+        return 0 <= self._history_pos < len(self._history) - 1
+
+    @Slot(result='QVariantMap')
+    def historyBack(self) -> dict[str, float]:
+        if self._history_pos <= 0:
+            return {}
+        self._history_pos -= 1
+        self.historyChanged.emit()
+        s, e = self._history[self._history_pos]
+        return {"startNs": s, "endNs": e}
+
+    @Slot(result='QVariantMap')
+    def historyForward(self) -> dict[str, float]:
+        if self._history_pos >= len(self._history) - 1:
+            return {}
+        self._history_pos += 1
+        self.historyChanged.emit()
+        s, e = self._history[self._history_pos]
+        return {"startNs": s, "endNs": e}
+
+    @Slot(str, result='QVariantMap')
+    def resolveJump(self, text: str) -> dict[str, Any]:
+        from .timeline_details import resolve_jump
+        return resolve_jump(self, text)
+
+    @Slot(float, result=str)
+    def formatNs(self, ns: float) -> str:
+        return dash.fmt_ns(ns)
+
+    # ── coordinated summary views (timeline_details.py) ──────────────────
+    @Slot(result='QVariantMap')
+    def summaries(self) -> dict[str, Any]:
+        from .timeline_details import summaries
+        return summaries(self)
+
+    @Slot(int, result='QVariantMap')
+    def heatmap(self, n_bins: int) -> dict[str, Any]:
+        from .timeline_details import heatmap
+        return heatmap(self, n_bins)
+
+    # ── figure export ────────────────────────────────────────────────────
+    @Slot(str, float, float, int, result=str)
+    def exportFigure(self, path: str, view_start_ns: float, view_end_ns: float, width: int) -> str:
+        """Writes the visible rows of [start, end) as a PNG or SVG figure
+        (by extension) with time axis, row labels and a legend of the
+        encodings drawn. Returns "" on success, else the error."""
+        from .timeline_details import export_figure
+        try:
+            export_figure(self, path, view_start_ns, view_end_ns, int(width))
+            return ""
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"

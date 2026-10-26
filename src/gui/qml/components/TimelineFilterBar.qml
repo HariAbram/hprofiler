@@ -23,6 +23,7 @@ Item {
     property var threads: []
     property var runtimes: []
     property var streams: []
+    property var devices: []
     property var buckets: []
     property string nameQuery: ""
     property bool nameIsRegex: false
@@ -36,7 +37,7 @@ Item {
     // instead of one hand-written section per dimension.
     readonly property var _dimListKey: ({
         "rank": "ranks", "process": "processes", "thread": "threads",
-        "runtime": "runtimes", "stream": "streams", "bucket": "buckets"
+        "runtime": "runtimes", "stream": "streams", "device": "devices", "bucket": "buckets"
     })
 
     readonly property int activeCount: {
@@ -46,6 +47,7 @@ Item {
         if (threads.length) n++
         if (runtimes.length) n++
         if (streams.length) n++
+        if (devices.length) n++
         if (buckets.length) n++
         if (nameQuery.length) n++
         if (minDurationNs > 0) n++
@@ -78,7 +80,8 @@ Item {
         var range = Nav.selectedTimeRange
         TimelineModel.applyFilters({
             "ranks": root.ranks, "processes": root.processes, "threads": root.threads,
-            "runtimes": root.runtimes, "streams": root.streams, "buckets": root.buckets,
+            "runtimes": root.runtimes, "streams": root.streams, "devices": root.devices,
+            "buckets": root.buckets,
             "nameQuery": root.nameQuery, "nameIsRegex": root.nameIsRegex,
             "minDurationNs": root.minDurationNs, "activeOnly": root.activeOnly,
             "timeRangeOnly": root.timeRangeOnly,
@@ -89,7 +92,7 @@ Item {
 
     function clearAll() {
         ranks = []; processes = []; threads = []; runtimes = []; streams = []
-        buckets = []; nameQuery = ""; nameIsRegex = false; minDurationNs = 0
+        devices = []; buckets = []; nameQuery = ""; nameIsRegex = false; minDurationNs = 0
         activeOnly = false; timeRangeOnly = false
         TimelineModel.clearFilters()
     }

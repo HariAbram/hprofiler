@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from ..core.events import SpanEvent
     from .criticalpath import CriticalPathReport
 
-_USEFUL_CATS = frozenset({"cpu", "cuda", "rocm", "opencl", "openmp"})
+_USEFUL_CATS = frozenset({"cpu", "cuda", "rocm", "opencl", "openmp", "sycl"})
 _COMM_CATS = frozenset({"mpi", "nccl"})
 
 

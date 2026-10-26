@@ -138,7 +138,10 @@ class TestOpenMPRendezvous(unittest.TestCase):
     def test_barriers_still_rendezvous(self):
         spans = [_span("omp_barrier_implicit", "sync", 100, 500, tid=1, psid="7"),
                  _span("omp_barrier_implicit", "sync", 400, 200, tid=2, psid="7")]
-        self.assertEqual(self._arrivals(spans), {(2, 1, "certain")})
+        # grouped by call order within the team (the k-th barrier of each
+        # thread): "high" -- the hook records no barrier instance id, so the
+        # grouping is inferred, not "certain" (cp-5)
+        self.assertEqual(self._arrivals(spans), {(2, 1, "high")})
 
     def test_barriers_of_different_teams_are_separate(self):
         # two concurrent parallel regions (psid 7: threads 1-2, psid 8: 3-4)
@@ -146,20 +149,21 @@ class TestOpenMPRendezvous(unittest.TestCase):
                  _span("omp_barrier_implicit", "sync", 300, 300, tid=2, psid="7"),
                  _span("omp_barrier_implicit", "sync", 150, 600, tid=3, psid="8"),
                  _span("omp_barrier_implicit", "sync", 700, 50, tid=4, psid="8")]
-        self.assertEqual(self._arrivals(spans), {(2, 1, "certain"), (4, 3, "certain")})
+        self.assertEqual(self._arrivals(spans), {(2, 1, "high"), (4, 3, "high")})
 
     def test_gnu_libgomp_team_ids_separate_teams(self):
         spans = [_span("omp_barrier", "sync", 100, 500, tid=1, team=5),
                  _span("omp_barrier", "sync", 300, 300, tid=2, team=5),
                  _span("omp_barrier", "sync", 150, 600, tid=3, team=6),
                  _span("omp_barrier", "sync", 700, 50, tid=4, team=6)]
-        self.assertEqual(self._arrivals(spans), {(2, 1, "certain"), (4, 3, "certain")})
+        self.assertEqual(self._arrivals(spans), {(2, 1, "high"), (4, 3, "high")})
 
     def test_barriers_without_a_team_id_keep_the_per_process_grouping(self):
-        # traces from hooks before team= / psid=: one group per name, as before
+        # traces from hooks before team= / psid=: one group per name, as
+        # before, by overlapping intervals -- "medium"
         spans = [_span("omp_barrier", "sync", 100, 500, tid=1),
                  _span("omp_barrier", "sync", 400, 200, tid=2)]
-        self.assertEqual(self._arrivals(spans), {(2, 1, "certain")})
+        self.assertEqual(self._arrivals(spans), {(2, 1, "medium")})
 
 
 class TestEventLoss(unittest.TestCase):
