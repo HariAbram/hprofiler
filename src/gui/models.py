@@ -248,7 +248,12 @@ class TimelineModel(QObject):
         self._overlay: dict[str, Any] = {"criticalPath": False, "focusPath": False, "families": [],
                                          "tiers": ["certain", "high", "medium", "low"],
                                          "classes": ["direct", "inferred"], "selectedOnly": True,
-                                         "inferredWaits": False, "scoreTrack": False}
+                                         "inferredWaits": False, "scoreTrack": False,
+                                         "unknownBlocking": False, "disabledEdges": False,
+                                         "membership": "", "world": -1, "variant": ""}
+        self._alt_job: dict[str, Any] = {"running": False, "done": 0, "total": 0, "message": "", "error": ""}
+        self._alt_cancel = False
+        self._alt_thread = None
         self._analysis = None
         self._analysis_state = "idle"
         self._analysis_message = ""
@@ -1009,7 +1014,22 @@ class TimelineModel(QObject):
             # carries these as dataclass fields, not tags.
             "pid": s.pid,
             "tid": s.tid,
+            "analysisNote": self._analysis_note(int(span_idx)),
         }
+
+    def _analysis_note(self, eid: int) -> str:
+        """What the dependency graph says about a blocking call (hover): unknown
+        (nobody recorded releases it) or gated (and when it was released)."""
+        an = self._analysis
+        if an is None or not an.ok:
+            return ""
+        if eid in an.unknown_eids:
+            return "unknown blocking: no recorded dependency releases it (waiting or processing, not a gated wait)"
+        gt = an.gated_of_eid.get(eid)
+        if gt is not None:
+            return (f"gated: released at +{dash.fmt_ns(gt['releaseNs'] - self._view_start)}; "
+                    f"up to {dash.fmt_ns(gt['tailNs'])} after it may be processing")
+        return ""
 
     @Slot(str, str, int, result='QVariantList')
     def findByName(self, category: str, name: str, max_results: int = 50) -> list[dict[str, Any]]:
@@ -1552,7 +1572,78 @@ class TimelineModel(QObject):
                 opts.cp_steps = self._cp_steps_px(lane_index, lr)
             if self._overlay.get("inferredWaits"):
                 opts.inferred_waits = self._waits_px(lane_index, lr)
+            if self._overlay.get("unknownBlocking"):
+                opts.unknown_calls = self._unknown_px(lane_index, lr)
+            keep, partial = self._membership_sets()
+            if keep is not None:
+                opts.marks = self._marks_px(lane_index, lr, keep, partial)
+                if not hl:
+                    opts.dim = lambda r, keep=keep: r.eid >= 0 and r.eid not in keep
         return opts
+
+    def _membership_sets(self) -> tuple[set | None, set]:
+        """The spans the membership overlay marks: (all marked, the "some
+        only" part), or (None, set()) when off / not available. Alternative
+        worlds that were not evaluated mark nothing -- never "every world"."""
+        an = self._analysis
+        mode = self._overlay.get("membership") or ""
+        if an is None or not an.ok or not mode:
+            return None, set()
+        if mode == "worlds":
+            if not an.alternatives_evaluated:
+                return None, set()
+            return an.robust_some, an.robust_some - an.robust_every
+        if mode == "variants":
+            return an.stable_eids | an.variant_only_eids, an.variant_only_eids
+        if mode == "variant":
+            v = an.variant_eids.get(self._overlay.get("variant") or "")
+            return (set(v), set()) if v is not None else (None, set())
+        if mode == "near":
+            return an.near_eids, set()
+        if mode == "world":
+            k = int(self._overlay.get("world", -1))
+            if 0 <= k < len(an.worlds):
+                return an.worlds[k]["eids"], set()
+        return None, set()
+
+    def _eid_index(self):
+        """(eids sorted, their ordinals) for vectorized eid -> ordinal lookups."""
+        c = getattr(self, "_eid_index_cache", None)
+        if c is None:
+            an = self._analysis
+            order = np.argsort(an.eid_of_ord, kind="stable")
+            c = self._eid_index_cache = (an.eid_of_ord[order], order)
+        return c
+
+    def _marks_px(self, lane_index: int, lr, keep: set, partial: set) -> list:
+        an = self._analysis
+        if not keep:
+            return []
+        sorted_eids, order = self._eid_index()
+        eids = np.fromiter(keep, np.int64, len(keep))
+        pos = np.searchsorted(sorted_eids, eids)
+        ok = (pos < len(sorted_eids)) & (sorted_eids[np.minimum(pos, len(sorted_eids) - 1)] == eids)
+        ords = order[pos[ok]]
+        eids = eids[ok]
+        on_lane = an.lane_of_ord[ords] == lane_index
+        ords, eids = ords[on_lane], eids[on_lane]
+        a, b, k = lr.view_start, lr.view_end, lr.scale
+        t0, t1 = an.start_of_ord[ords].astype(np.float64), an.end_of_ord[ords].astype(np.float64)
+        vis = (t1 >= a) & (t0 <= b)
+        out = []
+        for x0, x1, eid in zip(np.maximum(0.0, (t0[vis] - a) * k).tolist(),
+                               np.minimum(float(lr.width), (t1[vis] - a) * k).tolist(), eids[vis].tolist()):
+            out.append((x0, max(x1, x0 + 1.0), "partial" if eid in partial else "robust"))
+        return out
+
+    def _unknown_px(self, lane_index: int, lr) -> list:
+        an = self._analysis
+        lst = an.unknown_of_lane.get(lane_index)
+        if not lst:
+            return []
+        a, b, k = lr.view_start, lr.view_end, lr.scale
+        return [(max(0.0, (t0 - a) * k), min(float(lr.width), (t1 - a) * k))
+                for t0, t1, _eid in lst if t1 >= a and t0 <= b]
 
     def _per_lane_times(self, cache_name: str, index: dict, items: list, t_of) -> dict:
         c = getattr(self, cache_name, None)
@@ -1563,16 +1654,17 @@ class TimelineModel(QObject):
 
     def _cp_arrays(self) -> dict:
         """The path steps as numpy columns (t0, t1, lane, mode code: 0 busy,
-        1 waiting, 2 dependency hop), built once per analysis -- the
-        per-frame step selection is then vectorized."""
+        1 waiting in a gated call / unrecorded / device idle, 2 dependency
+        hop, 3 in a blocking call nobody recorded releases -- unknown), built
+        once per analysis -- the per-frame step selection is then vectorized."""
         c = getattr(self, "_cp_arr_cache", None)
         if c is None:
             steps = self._analysis.steps
+            code = {"busy": 0, "dependency": 2, "unknown": 3}
             c = {"t0": np.fromiter((s.t0 for s in steps), np.float64, len(steps)),
                  "t1": np.fromiter((s.t1 for s in steps), np.float64, len(steps)),
                  "lane": np.fromiter((s.lane for s in steps), np.int64, len(steps)),
-                 "mode": np.fromiter((0 if s.mode == "busy" else 2 if s.mode == "dependency" else 1
-                                      for s in steps), np.int8, len(steps)),
+                 "mode": np.fromiter((code.get(s.mode, 1) for s in steps), np.int8, len(steps)),
                  "by_lane": {lane: np.asarray(ks, dtype=np.int64)
                              for lane, ks in self._analysis.steps_of_lane.items()}}
             self._cp_arr_cache = c
@@ -1587,17 +1679,20 @@ class TimelineModel(QObject):
         -- as runs of equal columns, instead of one rectangle per step."""
         from .timeline_lod import _coverage
         cov = []
-        for code in (0, 1):
+        for code in (0, 1, 3):
             sel = mode == code
             lo = x0a[sel]
             hi = np.maximum(x1a[sel], lo + 1e-6)          # a zero-length step still marks its column
             order = np.argsort(lo, kind="stable")
             cov.append(_coverage(lo[order], hi[order], width) if len(lo) else np.zeros(width))
-        col = np.where((cov[0] > 0) & (cov[0] >= cov[1]), 0, np.where(cov[1] > 0, 1, -1))
+        stack = np.vstack(cov)
+        best = np.argmax(stack, axis=0)                   # 0 busy, 1 waiting, 2 unknown (ties: busy first)
+        col = np.where(stack.max(axis=0) > 0, best, -1)
         cut = np.flatnonzero(np.diff(col)) + 1
         starts = np.concatenate(([0], cut)).tolist()
         ends = np.concatenate((cut, [width])).tolist()
-        return [(float(c0), float(c1), "busy" if col[c0] == 0 else "wait", "")
+        names = ("busy", "wait", "unknown")
+        return [(float(c0), float(c1), names[col[c0]], "")
                 for c0, c1 in zip(starts, ends) if col[c0] >= 0]
 
     def _cp_steps_px(self, lane_index: int, lr) -> list:
@@ -1623,7 +1718,7 @@ class TimelineModel(QObject):
         steps = an.steps
         out: list[list] = []
         for i, x0, x1, md in zip(idx.tolist(), x0s, x1s, mode.tolist()):
-            m = "busy" if md == 0 else "wait"
+            m = "busy" if md == 0 else "unknown" if md == 3 else "wait"
             if out and out[-1][2] == m and x0 - out[-1][1] < 0.5:
                 if x1 > out[-1][1]:
                     out[-1][1] = x1
@@ -1874,12 +1969,21 @@ class TimelineModel(QObject):
     @Slot('QVariantMap')
     def setOverlay(self, spec: dict) -> None:
         before_focus = self._overlay.get("focusPath")
-        for k in ("criticalPath", "focusPath", "inferredWaits", "scoreTrack"):
+        for k in ("criticalPath", "focusPath", "inferredWaits", "scoreTrack", "unknownBlocking", "disabledEdges"):
             if k in spec:
                 self._overlay[k] = bool(spec[k])
         for k in ("families", "tiers", "classes"):
             if k in spec and isinstance(spec[k], (list, tuple)):
                 self._overlay[k] = [str(x) for x in spec[k]]
+        if "membership" in spec:
+            # "" off, "worlds" every / some / no evaluated world, "variants"
+            # stable / variant-only, "near" near-critical, "world" one world's path
+            m = str(spec["membership"] or "")
+            self._overlay["membership"] = m if m in ("", "worlds", "variants", "variant", "near", "world") else ""
+        if "world" in spec:
+            self._overlay["world"] = int(spec["world"]) if spec["world"] is not None else -1
+        if "variant" in spec:
+            self._overlay["variant"] = str(spec["variant"] or "")
         if (self._overlay.get("criticalPath") or self._overlay.get("families")
                 or self._overlay.get("inferredWaits")) and self._analysis is None:
             self.startAnalysis()
@@ -1922,7 +2026,7 @@ class TimelineModel(QObject):
 
     def paint_overlay_item(self, painter, w: float, h: float, a: float, b: float, scroll_y: float,
                            row_h: float, hover_lane: int, hover_eid: float) -> None:
-        from .timeline_paint import OverlayEdge, paint_edges, paint_transition_markers
+        from .timeline_paint import OverlayEdge, paint_edges, paint_joint_markers, paint_transition_markers
         k = w / max(b - a, 1e-9)
         geo: list[OverlayEdge] = []
 
@@ -1955,7 +2059,15 @@ class TimelineModel(QObject):
                     continue
                 geo.append(OverlayEdge(kk, (e.t_src - a) * k, y0, (e.t_dst - a) * k, y1, e.family, e.tier,
                                        e.cls, e.on_path,
-                                       (e.src_lane in self._row_pos, e.dst_lane in self._row_pos)))
+                                       (e.src_lane in self._row_pos, e.dst_lane in self._row_pos), e.status))
+            for kk in self._visible_extra_ids(a, b):
+                x = an.extra_edges[kk - len(an.edges)]
+                y0, y1 = y_of(x.src_lane), y_of(x.dst_lane)
+                if y0 is None or y1 is None:
+                    continue
+                geo.append(OverlayEdge(kk, (x.t_src - a) * k, y0, (x.t_dst - a) * k, y1, x.family, x.tier,
+                                       "inferred", False, (True, True),
+                                       "contradicted" if x.role == "disabled" else "alternative"))
         self._overlay_geometry = geo
         paint_edges(painter, geo, self._style(), selected=self._selected_edge,
                     path_mode=bool(self._overlay.get("criticalPath")))
@@ -1979,6 +2091,33 @@ class TimelineModel(QObject):
                     seen.add(cell)
                     pts.append((x, y - row_h / 2 + 9))
             paint_transition_markers(painter, pts, self._style())
+            # joint releases: a wait several sources released at once (blame split)
+            pts = []
+            for w in an.blame_waits:
+                if not w["joint"] or not a <= w["releaseNs"] <= b:
+                    continue
+                y = y_of(w["laneIndex"])
+                if y is not None and -row_h < y < h + row_h:
+                    pts.append(((w["releaseNs"] - a) * k, y))
+            paint_joint_markers(painter, pts, self._style())
+
+    def _visible_extra_ids(self, a: float, b: float) -> list[int]:
+        """Edges that are not active dependencies, drawn on request only:
+        contradicted / dropped ones (overlay disabledEdges) and the selected
+        alternative world's edges (membership "world"); the selected one
+        always."""
+        an = self._analysis
+        base = len(an.edges)
+        world = int(self._overlay.get("world", -1)) if self._overlay.get("membership") == "world" else -1
+        alt = set(an.worlds[world]["altEdges"]) if 0 <= world < len(an.worlds) else set()
+        out = []
+        for i, x in enumerate(an.extra_edges):
+            kk = base + i
+            want = kk == self._selected_edge or (x.role == "disabled" and self._overlay.get("disabledEdges")) \
+                or kk in alt
+            if want and max(x.t_src, x.t_dst) >= a and min(x.t_src, x.t_dst) <= b:
+                out.append(kk)
+        return out
 
     @Property(bool, notify=paintRevisionChanged)
     def edgesCapped(self) -> bool:
@@ -2078,7 +2217,7 @@ class TimelineModel(QObject):
 
     def _on_analysis_done(self, data) -> None:
         self._analysis = data
-        for name in ("_cp_t0_cache", "_cp_arr_cache", "_transition_t"):
+        for name in ("_cp_t0_cache", "_cp_arr_cache", "_transition_t", "_eid_index_cache"):
             if hasattr(self, name):
                 delattr(self, name)
         if data.ok:
@@ -2091,6 +2230,91 @@ class TimelineModel(QObject):
         if self._overlay.get("focusPath"):
             self._rebuild_rows()
         self._repaint(data=True)
+
+    # ── alternative worlds on request (critical-path --alternatives N) ───
+    alternativesJobChanged = Signal()
+    _alternativesProgress = Signal(int, int)
+    _alternativesDone = Signal(object, str)
+
+    @Property('QVariantMap', notify=alternativesJobChanged)
+    def alternativesJob(self) -> dict[str, Any]:
+        """The on-request evaluation: running, worlds done / planned, a
+        message, the last error."""
+        return dict(self._alt_job)
+
+    @Slot(int)
+    def evaluateAlternatives(self, samples: int) -> None:
+        """Evaluate alternative worlds on a background thread: `samples`
+        sampled worlds plus up to 16 one-change worlds, each one more
+        assembly of the event graph (minutes on a large trace). The GUI stays
+        responsive; cancelAlternatives() stops after the current world."""
+        an = self._analysis
+        if an is None or not an.ok or self._alt_job["running"]:
+            return
+        import threading
+        from . import timeline_analysis as ta
+        self._alt_cancel = False
+        self._alt_job = {"running": True, "done": 0, "total": 0, "error": "",
+                         "message": "preparing the graph skeleton…"}
+        self.alternativesJobChanged.emit()
+        if not getattr(self, "_alt_connected", False):
+            self._alternativesProgress.connect(self._on_alternatives_progress)
+            self._alternativesDone.connect(self._on_alternatives_done)
+            self._alt_connected = True
+
+        def run() -> None:
+            try:
+                rep = ta.evaluate_alternatives(an, self._trace, int(samples),
+                                               progress=lambda d, t: self._alternativesProgress.emit(d, t),
+                                               cancel=lambda: self._alt_cancel)
+                self._alternativesDone.emit(rep, "")
+            except Exception as exc:          # reported in the GUI, never raised into Qt
+                self._alternativesDone.emit(None, f"{type(exc).__name__}: {exc}")
+
+        self._alt_thread = threading.Thread(target=run, name="hprofiler-alternatives", daemon=True)
+        self._alt_thread.start()
+
+    @Slot()
+    def cancelAlternatives(self) -> None:
+        if self._alt_job["running"]:
+            self._alt_cancel = True
+            self._alt_job = dict(self._alt_job, message="stopping after the current world…")
+            self.alternativesJobChanged.emit()
+
+    def _on_alternatives_progress(self, done: int, total: int) -> None:
+        if self._alt_job["running"]:
+            self._alt_job = dict(self._alt_job, done=int(done), total=int(total),
+                                 message=f"world {done} of {total} evaluated")
+            self.alternativesJobChanged.emit()
+
+    def _on_alternatives_done(self, rep, error: str) -> None:
+        from . import timeline_analysis as ta
+        an = self._analysis
+        if rep is not None and an is not None and an.ok:
+            ta.apply_alternatives(an, rep, n_nodes=2 * an.report.model.graph.n)
+            msg = f"{rep.worlds} world(s) evaluated" + (" (stopped early)" if rep.cancelled else "")
+            if self._selected_edge >= len(an.edges):       # extra-edge ids were renumbered
+                self._selected_edge = -1
+                self.eventSelectionChanged.emit()
+        else:
+            msg = "evaluation failed"
+        self._alt_job = {"running": False, "done": self._alt_job.get("done", 0),
+                         "total": self._alt_job.get("total", 0), "message": msg, "error": error}
+        self.alternativesJobChanged.emit()
+        self.analysisChanged.emit()
+        self._repaint(data=True)
+
+    def wait_for_alternatives(self, timeout: float = 120.0) -> bool:
+        """Tests: block until an on-request evaluation finished."""
+        import time as _t
+        from PySide6.QtCore import QCoreApplication
+        t_end = _t.time() + timeout
+        while self._alt_job["running"] and _t.time() < t_end:
+            QCoreApplication.processEvents()
+            if self._alt_thread is not None:
+                self._alt_thread.join(0.02)
+        QCoreApplication.processEvents()
+        return not self._alt_job["running"] and not self._alt_job["error"]
 
     def wait_for_analysis(self, timeout: float = 120.0) -> bool:
         """Tests and export: block until the background analysis finished

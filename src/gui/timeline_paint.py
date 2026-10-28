@@ -15,14 +15,25 @@ Encodings (see the design notes in docs/VISUALIZATION_DESIGN.md):
                         own colour (same wall time as a sync-lane span)
   inferred waiting      dotted veil over the part of a gated call before its
                         last dependency arrived (from the dependency graph)
+  unknown blocking      pink grid veil + border lines over a blocking call no
+                        recorded dependency releases: waiting for something
+                        unrecorded, or processing -- never the gated veil
   no data               cross-hatch: outside the lane's first..last event
   gap                   nothing drawn
   critical path         a band at the top of the lane: solid while the path
-                        is busy in the lane, hatched while it waits
+                        is busy in the lane, hatched while it waits in a
+                        gated call, pink dots while it is in an unknown
+                        blocking call
+  path membership       a strip at the bottom of the lane under the spans on
+                        the path in every variant / world (solid green) or in
+                        some only (hatched amber); others dimmed
   dependency edge       line + arrowhead at the gated event, a family-shaped
                         marker at the source; colour = family, width and
                         opacity = tier, solid = direct, dashed = inferred,
-                        dotted = low tier
+                        dotted = low tier; status: ambiguous adds an amber
+                        "?" ring at the middle, a contradicted (disabled) edge
+                        is rose, dash-dot with an "x" and a hollow head, an
+                        alternative world's edge violet, dotted, hollow head
 """
 from __future__ import annotations
 
@@ -56,14 +67,23 @@ class Style:
     critical: QColor
     overlap: QColor
     idle: QColor
+    unknown: QColor = None
+    contradicted: QColor = None
+    alternative: QColor = None
+    ambiguous: QColor = None
+    robust: QColor = None
+    partial: QColor = None
 
     @classmethod
     def for_theme(cls, dark: bool) -> "Style":
         pal = theme_mod._DARK if dark else theme_mod._LIGHT
+        ev = theme_mod.evidence_color
         return cls(dark, QColor(pal["background"]), QColor(pal["surface"]), QColor(pal["panelBorder"]),
                    QColor(pal["text"]), QColor(pal["textMuted"]), QColor(pal["accent"]),
                    QColor(theme_mod.critical_color(dark)), QColor(theme_mod.overlap_color(dark)),
-                   QColor(theme_mod.activity_color("idle", dark)))
+                   QColor(theme_mod.activity_color("idle", dark)),
+                   QColor(ev("unknown", dark)), QColor(ev("contradicted", dark)), QColor(ev("alternative", dark)),
+                   QColor(ev("ambiguous", dark)), QColor(ev("robust", dark)), QColor(ev("partial", dark)))
 
 
 _RGB_CACHE: dict[str, tuple[int, int, int]] = {}
@@ -180,6 +200,8 @@ class LaneOptions:
     dim: Callable[[lod.Rect], bool] | None = None           # highlight: True = not highlighted
     cp_steps: list[tuple[float, float, str, str]] = None    # (x0, x1, mode, tier)
     inferred_waits: list[tuple[float, float]] = None
+    unknown_calls: list[tuple[float, float]] = None         # blocking calls nobody releases
+    marks: list[tuple[float, float, str]] = None            # (x0, x1, "robust" | "partial")
     path_eids: set | None = None
     show_unobserved: bool = True
 
@@ -233,12 +255,36 @@ def paint_lane(p: QPainter, lr: lod.LaneRender, w: float, h: float, style: Style
     for x0, x1 in opts.inferred_waits or ():
         rect = QRectF(x0, top, max(1.0, x1 - x0), inner)
         p.fillRect(rect, _hatch_brush(_with_alpha(style.background, 0.75), Qt.BrushStyle.Dense6Pattern))
+    if opts.unknown_calls:
+        # veiled first (the span's own colour may be any hue, pink too), then
+        # the grid and border lines: readable over every span colour
+        veil = _with_alpha(style.background, 0.6)
+        fill = _with_alpha(style.unknown, 0.16)
+        grid = _hatch_brush(_with_alpha(style.unknown, 0.95), Qt.BrushStyle.CrossPattern)
+        for x0, x1 in opts.unknown_calls:
+            wpx = max(1.0, x1 - x0)
+            p.fillRect(QRectF(x0, top, wpx, inner), veil)
+            p.fillRect(QRectF(x0, top, wpx, inner), fill)
+            p.fillRect(QRectF(x0, top, wpx, inner), grid)
+            p.fillRect(QRectF(x0, top, wpx, 1), style.unknown)
+            p.fillRect(QRectF(x0, top + inner - 1, wpx, 1), style.unknown)
+    for x0, x1, key in opts.marks or ():
+        rect = QRectF(x0, h - MARGIN, max(1.0, x1 - x0), MARGIN)
+        if key == "robust":
+            p.fillRect(rect, style.robust)
+        else:
+            p.fillRect(rect, _with_alpha(style.partial, 0.35))
+            p.fillRect(rect, _hatch_brush(style.partial, Qt.BrushStyle.BDiagPattern))
     if opts.cp_steps:
         wait_fill, wait_hatch = _with_alpha(style.critical, 0.35), _hatch_brush(style.critical)
+        unk_fill, unk_dots = _with_alpha(style.unknown, 0.3), _hatch_brush(style.unknown, Qt.BrushStyle.Dense4Pattern)
         for x0, x1, mode, _tier in opts.cp_steps:
             rect = QRectF(x0, 0, max(1.0, x1 - x0), BAND)
             if mode == "busy":
                 p.fillRect(rect, style.critical)
+            elif mode == "unknown":
+                p.fillRect(rect, unk_fill)
+                p.fillRect(rect, unk_dots)
             elif mode in ("wait", "gap", "idle"):
                 p.fillRect(rect, wait_fill)
                 p.fillRect(rect, wait_hatch)
@@ -306,6 +352,37 @@ class OverlayEdge:
     cls: str
     on_path: bool
     anchored: tuple[bool, bool] = (True, True)     # endpoint on its own lane (False: on a collapsed header)
+    status: str = ""                               # evidence status; "contradicted" / "alternative": not active
+
+
+def _hollow_head(p: QPainter, a: QPointF, b: QPointF, color: QColor, size: float = 6.0) -> None:
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    n = (dx * dx + dy * dy) ** 0.5 or 1.0
+    ux, uy = dx / n, dy / n
+    left = QPointF(b.x() - size * ux + size * 0.5 * uy, b.y() - size * uy - size * 0.5 * ux)
+    right = QPointF(b.x() - size * ux - size * 0.5 * uy, b.y() - size * uy + size * 0.5 * ux)
+    p.setPen(QPen(color, 1.2))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPolygon(QPolygonF([b, left, right]))
+
+
+def _status_mark(p: QPainter, e: "OverlayEdge", style: Style) -> None:
+    """The status glyph at an edge's middle: "?" ring (ambiguous), "x"
+    (contradicted)."""
+    m = QPointF((e.x0 + e.x1) / 2, (e.y0 + e.y1) / 2)
+    if e.status == "ambiguous":
+        p.setPen(QPen(style.ambiguous, 1.4))
+        p.setBrush(style.background)
+        p.drawEllipse(m, 5.0, 5.0)
+        f = p.font()
+        f.setPixelSize(8)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(m.x() - 5, m.y() - 5, 10, 10), int(Qt.AlignmentFlag.AlignCenter), "?")
+    elif e.status == "contradicted":
+        p.setPen(QPen(style.contradicted, 1.6))
+        p.drawLine(QPointF(m.x() - 4, m.y() - 4), QPointF(m.x() + 4, m.y() + 4))
+        p.drawLine(QPointF(m.x() - 4, m.y() + 4), QPointF(m.x() + 4, m.y() - 4))
 
 
 def paint_edges(p: QPainter, edges: Iterable[OverlayEdge], style: Style, *, selected: int = -1,
@@ -314,17 +391,31 @@ def paint_edges(p: QPainter, edges: Iterable[OverlayEdge], style: Style, *, sele
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     for e in edges:
         a, b = QPointF(e.x0, e.y0), QPointF(e.x1, e.y1)
-        fam = "critical" if (path_mode and e.on_path) else e.family
-        color = QColor(theme_mod.family_color(fam, style.dark))
         if e.id == selected:
             halo = QPen(_with_alpha(style.accent, 0.45), TIER_WIDTH.get(e.tier, 1.2) + 5)
             p.setPen(halo)
             p.drawLine(a, b)
-        pen = tier_pen(color, e.tier, e.cls, scale=1.3 if (path_mode and e.on_path) else 1.0)
-        p.setPen(pen)
-        p.drawLine(a, b)
-        _marker(p, e.family, a, 3.2 if e.anchored[0] else 2.2, _with_alpha(color, TIER_ALPHA.get(e.tier, 0.6)))
-        _arrowhead(p, a, b, _with_alpha(color, TIER_ALPHA.get(e.tier, 0.6)))
+        if e.status in ("contradicted", "alternative"):
+            # not an active dependency: its own colour, never the family's
+            color = style.contradicted if e.status == "contradicted" else style.alternative
+            pen = QPen(_with_alpha(color, 0.9), 1.4)
+            pen.setStyle(Qt.PenStyle.DashDotLine if e.status == "contradicted" else Qt.PenStyle.DotLine)
+            p.setPen(pen)
+            p.drawLine(a, b)
+            p.setPen(QPen(color, 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(a, 2.6, 2.6)
+            _hollow_head(p, a, b, color)
+            _status_mark(p, e, style)
+        else:
+            fam = "critical" if (path_mode and e.on_path) else e.family
+            color = QColor(theme_mod.family_color(fam, style.dark))
+            pen = tier_pen(color, e.tier, e.cls, scale=1.3 if (path_mode and e.on_path) else 1.0)
+            p.setPen(pen)
+            p.drawLine(a, b)
+            _marker(p, e.family, a, 3.2 if e.anchored[0] else 2.2, _with_alpha(color, TIER_ALPHA.get(e.tier, 0.6)))
+            _arrowhead(p, a, b, _with_alpha(color, TIER_ALPHA.get(e.tier, 0.6)))
+            _status_mark(p, e, style)
         if e.id == selected:
             p.setPen(QPen(style.accent, 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -342,6 +433,18 @@ def paint_transition_markers(p: QPainter, points: Iterable[tuple[float, float]],
         p.setPen(QPen(style.background, 1))
         p.setBrush(style.critical)
         p.drawPolygon(QPolygonF([QPointF(x - 5, y - 8), QPointF(x + 5, y - 8), QPointF(x, y - 2)]))
+    p.restore()
+
+
+def paint_joint_markers(p: QPainter, points: Iterable[tuple[float, float]], style: Style) -> None:
+    """A joint release: a hollow amber diamond where several sources
+    released one wait at once (its blame is split between them)."""
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setPen(QPen(style.ambiguous, 1.6))
+    p.setBrush(style.background)
+    for x, y in points:
+        p.drawPolygon(QPolygonF([QPointF(x, y - 6), QPointF(x + 5, y), QPointF(x, y + 6), QPointF(x - 5, y)]))
     p.restore()
 
 
@@ -425,7 +528,8 @@ def paint_ruler(p: QPainter, ticks: list[dict], a: float, b: float, x: float, w:
 
 
 def legend_entries(dark: bool, *, color_mode: str, has_density: bool, has_unobserved: bool,
-                   families: Iterable[str] = (), critical: bool = False) -> list[dict[str, Any]]:
+                   families: Iterable[str] = (), critical: bool = False, contradicted: bool = False,
+                   alternative: bool = False, membership: str = "", strip_label: str = "") -> list[dict[str, Any]]:
     """What a figure (or the on-screen legend) explains: one entry per
     encoding actually drawn."""
     out: list[dict[str, Any]] = []
@@ -443,7 +547,12 @@ def legend_entries(dark: bool, *, color_mode: str, has_density: bool, has_unobse
                     "label": "No data (before the lane's first / after its last event)"})
     if critical:
         out.append({"kind": "critical", "color": theme_mod.critical_color(dark),
-                    "label": "Observed critical path (band: solid = busy, hatched = waiting)"})
+                    "label": "Observed critical path (band: solid = busy, hatched = waiting in a gated call)"})
+        out.append({"kind": "unknown", "color": theme_mod.evidence_color("unknown", dark),
+                    "label": "Unknown blocking time: a blocking call no recorded dependency releases "
+                             "(pink dots on the band; pink grid on the lane)"})
+        out.append({"kind": "joint", "color": theme_mod.evidence_color("ambiguous", dark),
+                    "label": "Hollow diamond: a joint release (several sources released one wait; blame split)"})
     from .timeline_analysis import FAMILY_LABELS
     for fam in families:
         out.append({"kind": "edge", "color": theme_mod.family_color(fam, dark),
@@ -452,4 +561,20 @@ def legend_entries(dark: bool, *, color_mode: str, has_density: bool, has_unobse
         out.append({"kind": "tiers", "color": theme_mod.text_muted_color(dark),
                     "label": "Edge width/opacity = evidence tier (certain > high > medium > low); "
                              "solid = direct, dashed = inferred, dotted = low"})
+        out.append({"kind": "status", "color": theme_mod.evidence_color("ambiguous", dark),
+                    "label": "Amber \"?\" ring: ambiguous (other candidates answer the same question)"})
+    if contradicted:
+        out.append({"kind": "contradicted", "color": theme_mod.evidence_color("contradicted", dark),
+                    "label": "Contradicted edge (clock bounds or timestamps): not an active dependency"})
+    if alternative:
+        out.append({"kind": "alternative", "color": theme_mod.evidence_color("alternative", dark),
+                    "label": "Alternative world's edge (not in the recorded graph)"})
+    if membership:
+        out.append({"kind": "robust", "color": theme_mod.evidence_color("robust", dark),
+                    "label": f"Strip: on the path in every {membership}"})
+        out.append({"kind": "partial", "color": theme_mod.evidence_color("partial", dark),
+                    "label": f"Hatched strip: on the path in some {membership} only; other spans dimmed"})
+    elif strip_label:
+        out.append({"kind": "robust", "color": theme_mod.evidence_color("robust", dark),
+                    "label": f"Strip: {strip_label}; other spans dimmed"})
     return out

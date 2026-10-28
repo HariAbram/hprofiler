@@ -198,6 +198,22 @@ Item {
         }
         TimelineModel.selectEvent(laneIndex, spanIdx)
     }
+    // A dependency edge (an undecidable step, a contradicted or alternative
+    // edge): both endpoints in view, both lanes revealed, the edge selected.
+    function focusEdge(edgeId, atNs) {
+        var d = TimelineModel.edgeDetails(edgeId)
+        if (!d || d.source === undefined) return
+        var a = Math.min(d.source.atNs, d.target.atNs), b = Math.max(d.source.atNs, d.target.atNs)
+        if (b - a < 1) { a = atNs - 500; b = atNs + 500 }
+        if (d.source.laneIndex >= 0) root.revealLane(d.source.laneIndex)
+        if (d.target.laneIndex >= 0) root.revealLane(d.target.laneIndex)
+        root.zoomToRange(a, b)
+        TimelineModel.selectEdge(edgeId)
+    }
+    function hoverLine(detail) {
+        return detail.name + "  @" + root.fmtNs(detail.startNs) + "  dur " + root.fmtNs(detail.durNs) +
+               (detail.analysisNote ? "  —  " + detail.analysisNote : "")
+    }
 
     // Search "next/previous match": pans (keeps the zoom) to centre the
     // match, scrolls its row into view and points the tooltip at it.
@@ -212,7 +228,7 @@ Item {
         if (detail.name) {
             root.hoverLane = match.laneIndex
             root.hoverSpanIdx = match.spanIdx
-            root.hoverText = detail.name + "  @" + root.fmtNs(detail.startNs) + "  dur " + root.fmtNs(detail.durNs)
+            root.hoverText = root.hoverLine(detail)
             var laneW = flick.width - root.labelWidth
             var row = rowPos >= 0 ? flick.itemAtIndex(rowPos) : null
             var p = row ? row.mapToItem(root, 0, row.height / 2) : flick.mapToItem(root, 0, flick.height / 2)
@@ -549,6 +565,66 @@ Item {
                     cursorShape: Qt.PointingHandCursor
                 }
             }
+            Rectangle {
+                // the path-membership marks (Critical path ▸ Variants / Alternative
+                // worlds): what the strip means, with a way out
+                objectName: "timelineMembershipChip"
+                readonly property string mode: TimelineModel.overlay.membership || ""
+                visible: mode.length > 0
+                // fill + min 0 + max its text: shrinks (eliding) before it can
+                // widen the row, and with it every lane
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                Layout.preferredWidth: Math.ceil(memText.implicitWidth) + 27
+                Layout.maximumWidth: Math.ceil(memText.implicitWidth) + 27
+                implicitHeight: 18
+                radius: 9
+                color: AppTheme.control
+                border.color: AppTheme.evidenceColor("robust", AppTheme.dark)
+                Text {
+                    id: memText
+                    objectName: "timelineMembershipChipText"
+                    x: 8
+                    width: Math.max(0, parent.width - 26)
+                    elide: Text.ElideRight
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: {
+                        var m = parent.mode
+                        if (m === "variants") return "strip: path in every variant · hatched: some only"
+                        if (m === "near") return "strip: near-critical (slack ≤ 1% of the modeled length)"
+                        if (m === "variant") {
+                            var vs = TimelineModel.criticalSummary.variantsTable || []
+                            for (var i = 0; i < vs.length; i++)
+                                if (vs[i].name === TimelineModel.overlay.variant) return "strip: observed path of the variant “" + vs[i].label + "”"
+                            return "strip: a variant's observed path"
+                        }
+                        if (m === "worlds") return (TimelineModel.criticalSummary.alternatives || {}).evaluated
+                                                   ? "strip: path in every evaluated world · hatched: some · dimmed: none"
+                                                   : "alternative worlds not evaluated: nothing marked"
+                        if (m === "world") {
+                            var rows = (TimelineModel.criticalSummary.alternatives || {}).worldRows || []
+                            var w = rows[TimelineModel.overlay.world]
+                            return "strip: path of " + (w ? w.label : "a world") + " · violet: its alternative edges"
+                        }
+                        return ""
+                    }
+                    color: AppTheme.text
+                    font.pixelSize: AppTheme.typeCaption
+                }
+                Text {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 6
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "✕"
+                    color: AppTheme.textMuted
+                    font.pixelSize: AppTheme.typeCaption
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: TimelineModel.setOverlay({"membership": "", "world": -1})
+                    cursorShape: Qt.PointingHandCursor
+                }
+            }
             Text {
                 id: transitionLabel
                 objectName: "timelineTransitionLabel"
@@ -878,7 +954,7 @@ Item {
                                     root.hoverLane = laneCanvas.laneIndex
                                     root.hoverSpanIdx = found
                                     var detail = TimelineModel.spanAt(laneCanvas.laneIndex, found)
-                                    root.hoverText = detail.name + "  @" + root.fmtNs(detail.startNs) + "  dur " + root.fmtNs(detail.durNs)
+                                    root.hoverText = root.hoverLine(detail)
                                 } else {
                                     root.hoverLane = -1
                                     root.hoverSpanIdx = -1
@@ -1107,6 +1183,7 @@ Item {
             }
             onRevealLanes: (laneIndexes) => { if (laneIndexes && laneIndexes.length) root.revealLane(laneIndexes[0]) }
             onTransitionRequested: (dir) => root.gotoTransition(dir)
+            onSelectEdge: (edgeId, atNs) => root.focusEdge(edgeId, atNs)
         }
     }
 

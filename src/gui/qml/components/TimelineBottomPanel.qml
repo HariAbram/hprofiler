@@ -9,8 +9,11 @@ import Hprofiler 1.0
 //   Summary       time by activity (host, device), per process, waiting by
 //                 runtime, busiest lanes, evidence, dependency coverage,
 //                 top waits and their upstream causes, path switches
-//   Critical path wall time vs. the observed path vs. the modeled path vs.
-//                 the span-level search score -- one scale, reconciled
+//   Critical path wall time vs. the observed path vs. the modeled path (and
+//                 its range over the variants) vs. the span-level search
+//                 score, then variants, alternative worlds, edge evidence,
+//                 clocks, blame, sensitivity and probabilities on demand
+//                 (TimelineCriticalPathTab.qml)
 //   Heatmap       busy share per process / device over the whole run
 Rectangle {
     id: panel
@@ -31,8 +34,10 @@ Rectangle {
     signal selectEvent(int laneIndex, real spanIdx, real startNs, real durNs)
     signal revealLanes(var laneIndexes)
     signal transitionRequested(int direction)
+    signal selectEdge(int edgeId, real atNs)
 
-    implicitHeight: expanded ? 250 : 26
+    // taller on the Critical path tab: its sections disclose on demand
+    implicitHeight: expanded ? (tab === 1 ? 320 : 250) : 26
 
     function refresh() {
         if (!expanded) return
@@ -389,9 +394,10 @@ Rectangle {
             }
         }
 
-        // ── Critical path ─────────────────────────────────────────────
+        // ── Critical path (TimelineCriticalPathTab.qml) ───────────────
         ScrollView {
             id: cpScroll
+            objectName: "timelineCpScroll"
             // a visible scrollbar when the content is taller than the panel,
             // so rows below the fold read as "scroll", not "cut off"
             ScrollBar.vertical.policy: contentHeight > availableHeight ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
@@ -401,222 +407,13 @@ Rectangle {
             clip: true
             contentWidth: availableWidth
 
-            ColumnLayout {
+            TimelineCriticalPathTab {
                 width: cpScroll.availableWidth
-                spacing: AppTheme.spacingXs
-
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    visible: !panel.ready
-                    text: TimelineModel.analysisState === "running" ? TimelineModel.analysisMessage
-                          : "Not computed. Critical path ▸ Compute (runs in the background)."
-                    color: AppTheme.textMuted
-                    font.pixelSize: AppTheme.typeLabel
-                }
-
-                Flow {
-                    id: cpRow
-                    visible: panel.ready
-                    Layout.fillWidth: true
-                    spacing: AppTheme.spacingLg
-
-                    // the numbers, each with what kind of value it is: one
-                    // grid cell per text, so columns size to their content
-                    GridLayout {
-                        id: cpNumbers
-                        objectName: "timelineCpNumbers"
-                        columns: 3
-                        rowSpacing: 0
-                        columnSpacing: AppTheme.spacingSm
-                        Repeater {
-                            model: {
-                                if (!panel.ready) return []
-                                var rows = [
-                                    ["Wall time", panel.fmt(panel.cps.wallNs), "measured"],
-                                    ["Observed path (unique time)", panel.fmt(panel.cps.observedNs), "each instant once"],
-                                    ["Path length", panel.cps.pathSpans + " spans", "derived"],
-                                    ["Modeled longest path", panel.fmt(panel.cps.modeledNs), "model: required work only"],
-                                    ["  unrecorded time as idle", panel.fmt(panel.cps.modeledIdleNs), "lower bound"],
-                                    ["  direct evidence only", panel.fmt(panel.cps.modeledDirectNs), "model"],
-                                    ["Span-level search value", panel.cps.legacyValueNs >= 0 ? panel.fmt(panel.cps.legacyValueNs) : "—",
-                                     "a search score, not elapsed time"],
-                                    ["Busy on every / some longest path", panel.fmt(panel.cps.workOnAllNs) + " / " + panel.fmt(panel.cps.workOnSomeNs), "model"],
-                                    ["Ties (equally consistent choices)", "" + panel.cps.ties, "derived"]
-                                ]
-                                var cells = []
-                                for (var i = 0; i < rows.length; i++)
-                                    cells.push(rows[i][0], rows[i][1], "[" + rows[i][2] + "]")
-                                return cells
-                            }
-                            delegate: Text {
-                                readonly property int col: index % 3
-                                text: modelData
-                                color: col === 0 ? AppTheme.textMuted : col === 1 ? AppTheme.text : AppTheme.accent
-                                font.pixelSize: AppTheme.typeCaption
-                                font.bold: col === 1
-                                elide: Text.ElideRight
-                                Layout.maximumWidth: col === 0 ? 240 : col === 1 ? 180 : 230
-                            }
-                        }
-                    }
-
-                    // time reconciliation: one scale for all four quantities
-                    Canvas {
-                        id: recon
-                        objectName: "timelineReconciliation"
-                        // beside the numbers when there is room, else under them
-                        readonly property real besideWidth: cpRow.width - cpNumbers.width - cpRow.spacing
-                        width: besideWidth >= 360 ? besideWidth : cpRow.width
-                        height: 120
-                        property var c: panel.cps
-                        onCChanged: requestPaint()
-                        onWidthChanged: requestPaint()
-                        Connections {
-                            target: AppTheme
-                            function onThemeChanged() { recon.requestPaint() }
-                        }
-                        onPaint: {
-                            var ctx = getContext("2d")
-                            ctx.reset()
-                            var c = panel.cps
-                            if (!c || c.wallNs === undefined) return
-                            ctx.font = AppTheme.typeCaption + "px sans-serif"
-                            // room for the widest label, so none is clipped at the right edge
-                            var labels = ["wall " + panel.fmt(c.wallNs), "observed " + panel.fmt(c.observedNs),
-                                          "modeled " + panel.fmt(c.modeledNs),
-                                          c.legacyValueNs > 0 ? "span-level score " + panel.fmt(c.legacyValueNs) : ""]
-                            var labelW = 0
-                            for (var li = 0; li < labels.length; li++)
-                                labelW = Math.max(labelW, ctx.measureText(labels[li]).width)
-                            var left = 4, w = Math.max(40, width - labelW - 20)
-                            var maxv = Math.max(c.wallNs, c.observedNs, c.modeledNs, c.legacyValueNs > 0 ? c.legacyValueNs : 0) * 1.04
-                            var k = w / Math.max(maxv, 1)
-                            var rowH = 18, y = 6
-                            function label(t, yy) { ctx.fillStyle = AppTheme.text; ctx.fillText(t, left + w + 8, yy + 12) }
-                            // wall
-                            ctx.strokeStyle = AppTheme.text
-                            ctx.lineWidth = 1
-                            ctx.strokeRect(left, y, c.wallNs * k, rowH - 4)
-                            label("wall " + panel.fmt(c.wallNs), y); y += rowH + 4
-                            // observed path: its composition
-                            var x = left
-                            var comp = c.composition || []
-                            for (var i = 0; i < comp.length; i++) {
-                                var part = comp[i], pw = part.ns * k
-                                if (part.group === "busy") ctx.fillStyle = AppTheme.categoryColor(part.key, AppTheme.dark)
-                                else if (part.group === "dependency latency") ctx.fillStyle = AppTheme.criticalColor
-                                else ctx.fillStyle = AppTheme.textMuted
-                                ctx.globalAlpha = part.group === "busy" ? 0.9 : 0.45
-                                ctx.fillRect(x, y, Math.max(0.5, pw), rowH - 4)
-                                x += pw
-                            }
-                            ctx.globalAlpha = 1
-                            label("observed " + panel.fmt(c.observedNs), y); y += rowH + 4
-                            // modeled path and its lower bound
-                            ctx.fillStyle = AppTheme.accent
-                            ctx.globalAlpha = 0.75
-                            ctx.fillRect(left, y, c.modeledNs * k, rowH - 4)
-                            ctx.globalAlpha = 1
-                            ctx.strokeStyle = AppTheme.text
-                            ctx.beginPath(); ctx.moveTo(left + c.modeledIdleNs * k, y - 2); ctx.lineTo(left + c.modeledIdleNs * k, y + rowH - 2); ctx.stroke()
-                            label("modeled " + panel.fmt(c.modeledNs), y); y += rowH + 4
-                            // span-level score: covered once + counted again
-                            if (c.legacyValueNs > 0) {
-                                var once = Math.min(c.legacyUnionNs, c.legacyValueNs)
-                                ctx.fillStyle = AppTheme.textMuted
-                                ctx.globalAlpha = 0.6
-                                ctx.fillRect(left, y, once * k, rowH - 4)
-                                ctx.globalAlpha = 1
-                                ctx.fillStyle = AppTheme.overlapColor
-                                ctx.fillRect(left + once * k, y, Math.max(0, (c.legacyValueNs - once) * k), rowH - 4)
-                                label("span-level score " + panel.fmt(c.legacyValueNs), y)
-                            }
-                            // the wall-time line across every bar
-                            ctx.strokeStyle = AppTheme.warningColor
-                            ctx.setLineDash([4, 3])
-                            ctx.beginPath(); ctx.moveTo(left + c.wallNs * k, 2); ctx.lineTo(left + c.wallNs * k, y + rowH); ctx.stroke()
-                        }
-                    }
-                }
-
-                Text {
-                    visible: panel.ready
-                    Layout.fillWidth: true
-                    text: "Observed path bar: busy time by runtime (solid), in gated calls / unrecorded / device idle (grey), "
-                          + "dependency latency (yellow). The span-level search adds each hop's full duration, so where a "
-                          + "start-gated hop's spans overlap it counts that wall time twice (red) and can exceed the wall line. "
-                          + "Turn on the score track to see where on the timeline."
-                    color: AppTheme.textMuted
-                    font.pixelSize: AppTheme.typeCaption
-                    wrapMode: Text.Wrap
-                }
-
-                RowLayout {
-                    visible: panel.ready
-                    Layout.fillWidth: true
-                    Button { text: "◀ previous switch"; onClicked: panel.transitionRequested(-1) }
-                    Button { text: "next switch ▶"; onClicked: panel.transitionRequested(1) }
-                    Text {
-                        Layout.fillWidth: true
-                        Layout.minimumWidth: 0
-                        text: (panel.cps.transitions || 0) + " switches (rank / thread / runtime / device / stream)"
-                        color: AppTheme.textMuted
-                        font.pixelSize: AppTheme.typeCaption
-                        elide: Text.ElideRight
-                    }
-                }
-
-                Text {
-                    visible: panel.ready
-                    text: "Composition of the observed path (click: highlight)"
-                    color: AppTheme.text
-                    font.bold: true
-                    font.pixelSize: AppTheme.typeCaption
-                }
-                Flow {
-                    visible: panel.ready
-                    Layout.fillWidth: true
-                    spacing: AppTheme.spacingSm
-                    Repeater {
-                        model: panel.ready ? (panel.cps.composition || []) : []
-                        delegate: Text {
-                            text: modelData.group + ": " + modelData.key + " " + panel.fmt(modelData.ns)
-                            color: modelData.group === "busy" ? AppTheme.categoryColor(modelData.key, AppTheme.dark) : AppTheme.textMuted
-                            font.pixelSize: AppTheme.typeCaption
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: {
-                                    if (modelData.group === "busy")
-                                        TimelineModel.setHighlight({"categories": [modelData.key], "activities": ["work", "communication", "memory", "overhead", "jit"], "label": "path: busy " + modelData.key})
-                                    else if (modelData.group === "in gated call")
-                                        TimelineModel.setHighlight({"categories": [modelData.key], "activities": ["wait"], "label": "path: waiting in " + modelData.key})
-                                }
-                            }
-                        }
-                    }
-                }
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    visible: panel.ready && (TimelineModel.criticalSummary.diagnostics || {}).receives !== undefined
-                    text: "MPI dependency coverage: " + ((TimelineModel.criticalSummary.diagnostics || {}).matched || 0)
-                          + " / " + ((TimelineModel.criticalSummary.diagnostics || {}).receives || 0)
-                          + " receive completions have a sender edge"
-                    color: AppTheme.text
-                    font.pixelSize: AppTheme.typeCaption
-                }
-                Repeater {
-                    model: panel.ready ? (panel.cps.notes || []) : []
-                    delegate: Text {
-                        Layout.fillWidth: true
-                        text: "• " + modelData
-                        color: AppTheme.textMuted
-                        font.pixelSize: AppTheme.typeCaption
-                        wrapMode: Text.Wrap
-                    }
-                }
+                cps: panel.cps
+                ready: panel.ready
+                onSelectEvent: (laneIndex, spanIdx, startNs, durNs) => panel.selectEvent(laneIndex, spanIdx, startNs, durNs)
+                onSelectEdge: (edgeId, atNs) => panel.selectEdge(edgeId, atNs)
+                onTransitionRequested: (dir) => panel.transitionRequested(dir)
             }
         }
 

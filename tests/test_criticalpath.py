@@ -292,6 +292,19 @@ class TestSerializationEfficiencyBridge(unittest.TestCase):
         # on-path comm ns = 150 (a+b), total comm ns = 150+500=650
         self.assertAlmostEqual(eff2, 150 / 650, places=6)
 
+    def test_a_call_partly_on_the_path_counts_that_part(self):
+        # rank 1's receive waits [0, 100] for rank 2's send at 60: the path
+        # takes rank 2's work until 60, then only [60, 100] of the receive
+        w = _span(2, 2, Category.OPENMP, 0, 60, name="w", tags={"type": "work"})
+        snd = _span(2, 2, Category.MPI, 60, 5, name="snd",
+                    tags={"type": "send", "rank": "1", "peer": "0", "wpeer": "0", "tag": "3", "commid": "0"})
+        rcv = _span(1, 1, Category.MPI, 0, 100, name="rcv",
+                    tags={"type": "recv", "rank": "0", "peer": "1", "wpeer": "1", "tag": "3", "commid": "0"})
+        trace = _mk_trace([w, snd, rcv])
+        report = cp.analyze(trace)
+        eff = cp.serialization_efficiency_from_path(report, [snd, rcv])
+        self.assertAlmostEqual(eff, 40 / 105, places=6)
+
     def test_works_across_separately_loaded_trace_instances(self):
         """Spans must be matched by value (_span_identity_key), not object
         identity (id()) -- `comm_spans` may come from a DIFFERENT Trace

@@ -30,7 +30,8 @@ from .trace import Trace, TraceMetadata
 from .store import TraceStore
 from . import gpu_activity
 
-HOOKS_DIR = Path(__file__).parent.parent.parent / "build" / "lib"
+from .hookdir import hooks_dir
+HOOKS_DIR = hooks_dir()
 
 # Wire records (DOCUMENTATION.md, "Wire protocol"): span:, inst:, ctr:,
 # stk:, gpuact:, pcsa:, xport:.

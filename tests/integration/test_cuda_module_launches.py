@@ -25,6 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
+from src.core.hookdir import hooks_dir  # noqa: E402  (HPROFILER_HOOKS_DIR, else build/lib)
 HP = [sys.executable, str(ROOT / "hprofiler")]
 CUDA_INC = next((d for d in (os.environ.get("CUDA_HOME", "") + "/include", "/usr/local/cuda/include",
                              "/usr/include") if os.path.exists(os.path.join(d, "cuda.h"))), None)
@@ -54,7 +55,7 @@ class TestModuleLaunches(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
-        if not (ROOT / "build/lib/libhprofiler_cuda.so").exists():
+        if not (hooks_dir() / "libhprofiler_cuda.so").exists():
             self.skipTest("CUDA hook not built")
 
     def _build(self, cmd, exe):

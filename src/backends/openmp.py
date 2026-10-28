@@ -34,11 +34,11 @@ doesn't try to guess and instead covers both.
 from __future__ import annotations
 import glob
 import os
-from pathlib import Path
 from .base import Backend
+from ..core.hookdir import hooks_dir
 
-_TOOL_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_ompt.so"
-_GOMP_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_gomp.so"
+_TOOL_LIB = hooks_dir() / "libhprofiler_ompt.so"
+_GOMP_LIB = hooks_dir() / "libhprofiler_gomp.so"
 
 
 def _libomp_paths() -> list[str]:

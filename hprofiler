@@ -890,12 +890,26 @@ def efficiency(trace_file, baseline, interconnect_bw, use_cp):
 @click.option("--export", default=None, type=click.Path(), metavar="FILE",
               help="Write the trace back out as Chrome Trace JSON with critical-path "
                    "spans tagged (on_critical_path=1, path_confidence=<tier>, path_ns, "
-                   "longest_path=every|some, slack_ns), for highlighting in Perfetto.")
+                   "path_robust=every|some across alternative worlds, longest_path=every|some, "
+                   "slack_ns, blame_ns), for highlighting in Perfetto.")
 @click.option("--exact-p2p-high", is_flag=True,
               help="Experimental: grade exact (non-wildcard) MPI matches 'high' where the capture "
                    "of their channel is provably complete (same as HPROFILER_EXACT_P2P_HIGH=1; see "
                    "DOCUMENTATION.md, Edge confidence).")
-def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
+@click.option("--alternatives", "n_alternatives", default=None, type=int, metavar="N",
+              help="Sampled alternative worlds where the trace does not decide a dependency (each is "
+                   "one more model build), besides one world per undecided choice on the path. "
+                   "Default: 2 (and up to 8 one-change worlds), skipped above 100k event nodes; "
+                   "0 disables.")
+@click.option("--calibration", default=None, type=click.Path(exists=True), metavar="FILE",
+              help="An edge calibration (edge_calibration.py's JSON, fitted on labelled traces) to "
+                   "turn the path's evidence into probabilities; same as HPROFILER_EDGE_CALIBRATION. "
+                   "Without one they are reported as unquantified.")
+@click.option("--json", "json_out", default=None, type=click.Path(), metavar="FILE",
+              help="Also write the whole analysis as JSON: composition, variants, clocks, evidence, "
+                   "alternative worlds, blame, probabilities, the path's dependency steps.")
+def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high, n_alternatives, calibration,
+                      json_out):
     """Compute and print the cross-runtime critical path of a saved trace.
 
     Builds a dependency graph over the captured spans (CUDA/ROCm/OpenCL/
@@ -931,7 +945,11 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
     from src.analysis import criticalpath as cpmod
 
     trace = open_trace(trace_file, collect_disasm=False)
-    report = cpmod.analyze(trace, sensitivity=sensitivity)
+    cal = None
+    if calibration:
+        from src.analysis.edge_calibration import Calibration
+        cal = Calibration.load(calibration)
+    report = cpmod.analyze(trace, sensitivity=sensitivity, alternatives=n_alternatives, calibration=cal)
     m = report.model
 
     def fmt_ns(ns):
@@ -967,6 +985,9 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
                f"a model, not a measurement)")
     click.echo(f"    unrecorded time as idle   : {fmt_ns(report.modeled_unrecorded_idle_ns)}")
     click.echo(f"    direct-evidence edges only: {fmt_ns(report.modeled_direct_only_ns)}")
+    click.echo(f"    gated tails as processing : {fmt_ns(report.modeled_gated_tail_ns)}")
+    lo, hi = report.modeled_range_ns
+    click.echo(f"    range over the variants   : {fmt_ns(lo)} .. {fmt_ns(hi)}")
 
     click.echo(f"\n  Observed path composition (sums to the observed path):")
     if report.path_work_by_category:
@@ -975,6 +996,9 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
     if report.path_in_call_by_category:
         click.echo(f"    in gated calls after their last dependency (waiting or processing), by category:")
         rows(report.path_in_call_by_category)
+    if report.path_unmatched_by_category:
+        click.echo(f"    in blocking calls no recorded dependency gates (waiting or processing), by category:")
+        rows(report.path_unmatched_by_category)
     if report.path_dependency_by_kind:
         click.echo(f"    dependency latency (source event to the event it released), by kind:")
         rows(report.path_dependency_by_kind)
@@ -997,6 +1021,15 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
         click.echo("    " + "   ".join(f"{t} {fmt_ns(report.path_time_by_tier[t])}"
                                        for t in ("certain", "high", "medium", "low")
                                        if t in report.path_time_by_tier))
+        ep = report.edge_probabilities or {}
+        if ep.get("status") == "calibrated":
+            allr = ep["p_all_quantified_right"]
+            click.echo(f"    probabilities (calibration fitted on {ep['dataset'] or 'an unnamed dataset'}): "
+                       f"{ep['quantified_steps']} step(s) quantified, {ep['unquantified_steps']} not; expected "
+                       f"wrong: {ep['expected_wrong_steps']:.2f}"
+                       + (f"; all quantified right: {allr:.3f}" if allr is not None else ""))
+        else:
+            click.echo(f"    probabilities: unquantified (no calibration; see --calibration)")
         deps = m.dependency_steps()
         if deps:
             by_prov = {}
@@ -1031,30 +1064,73 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
             L = report.modeled_path_ns
             t0 = (trace.store.span_extent(timed_only=True) or (0, 0))[0]
             click.echo(f"\n  Sensitivity (graph counterfactuals under the model, not measured speedups):")
-            click.echo(f"    {'busy time set to zero for':<52} {'on longest':>11} {'modeled cut':>12}")
+            click.echo(f"    {'busy time set to zero for':<46} {'on longest':>11} {'modeled cut':>12} "
+                       f"{'replayed':>10}")
             for r in m.sensitivity:
                 if r["scope"] == "name":
                     what = f"all {r['spans']} {r['category']}:{r['name']}"
                 else:
                     what = (f"one {r['category']}:{r['name']} @{fmt_ns(r['start_ns'] - t0)}"
                             + (" [every]" if r["on_every_longest_path"] else " [some]"))
-                click.echo(f"    {what[:52]:<52} {fmt_ns(r['work_on_longest_ns']):>11} "
-                           f"{fmt_ns(r['modeled_reduction_ns']):>12} {pct(r['modeled_reduction_ns'], L)}")
+                click.echo(f"    {what[:46]:<46} {fmt_ns(r['work_on_longest_ns']):>11} "
+                           f"{fmt_ns(r['modeled_reduction_ns']):>12} {fmt_ns(r.get('replay_reduction_ns', 0)):>10}")
             click.echo(f"    (\"modeled cut\": how much shorter the modeled longest path gets; less than the "
-                       f"time on it when another path takes over)")
+                       f"time on it when another path takes over. \"replayed\": how much earlier the run ends "
+                       f"when the trace is replayed with that work gone and every recorded residual kept)")
 
     if m is not None:
-        click.echo(f"\n  Alternatives (where the trace cannot decide):")
+        click.echo(f"\n  Variants (where the trace cannot decide how to count time):")
         for name, v in m.variants.items():
             same = "same spans" if v["same_spans_as_default"] else "different spans"
-            click.echo(f"    {name:<22} observed {fmt_ns(v['covered_ns']):>11}, {v['spans']} spans ({same})")
+            click.echo(f"    {name:<22} observed {fmt_ns(v['covered_ns']):>11}, modeled {fmt_ns(v['modeled_ns']):>11}, "
+                       f"{v['spans']} spans ({same})")
         click.echo(f"    spans on the path under every alternative: {m.stable_spans}; under some only: "
                    f"{m.variant_only_spans} ({fmt_ns(m.variant_only_ns)} of the default path's in-call time)")
         ev = m.graph_evidence
         click.echo(f"    graph: {sum(ev['by_kind'].values())} dependency edges "
                    f"({', '.join(f'{k} {v}' for k, v in sorted(ev['by_class'].items()))}); "
                    f"dropped: {sum(ev['dropped_contradicting_time'].values())} contradicting timestamps, "
-                   f"{ev['dropped_in_cycles']} in cycles; ties on the path: {m.walk.ties}")
+                   f"{ev['dropped_in_cycles']} in cycles, {ev.get('clock_contradicted', 0)} beyond the clocks' "
+                   f"bounds; ties on the path: {m.walk.ties}, undecidable by the clocks: {m.walk.undecidable}")
+        clocks = ev.get("clocks") or {}
+        doms = [d for d in clocks.get("domains", ()) if d["domain"] != "host/0"]
+        if doms:
+            click.echo(f"    clock domains (offset interval vs. node 0's host clock):")
+            for d in doms:
+                rng = ("unbounded" if d["lo_ns"] is None and d["hi_ns"] is None else
+                       f"{'-inf' if d['lo_ns'] is None else fmt_ns(d['lo_ns'])} .. "
+                       f"{'+inf' if d['hi_ns'] is None else fmt_ns(d['hi_ns'])}")
+                shift = f", shifted {fmt_ns(d['shift_ns'])}" if d.get("shift_ns") else ""
+                click.echo(f"      {d['domain']:<34} {rng}{shift}")
+
+    a = report.alternatives
+    if a is not None:
+        click.echo(f"\n  Alternative worlds (dependencies the trace does not decide):")
+        if a.skipped:
+            click.echo(f"    {a.skipped}")
+        elif not a.units:
+            click.echo(f"    none: every dependency on record is forced by its evidence")
+        else:
+            click.echo(f"    choices: {', '.join(f'{k} {v}' for k, v in sorted(a.units.items()))} "
+                       f"({a.alternatives} alternative edges)")
+            click.echo(f"    worlds evaluated: {a.worlds} (as recorded, {a.one_change_worlds} one-change, "
+                       f"{a.sampled_worlds} sampled)")
+            click.echo(f"    spans on the path in every world / some world: {len(a.every)} / {len(a.some)}; "
+                       f"near-critical in every world: {len(a.near)}")
+            click.echo(f"    observed length {fmt_ns(a.covered_range_ns[0])} .. {fmt_ns(a.covered_range_ns[1])}, "
+                       f"modeled {fmt_ns(a.modeled_range_ns[0])} .. {fmt_ns(a.modeled_range_ns[1])}")
+            click.echo(f"    verdict: {a.verdict}" + (f" -- {'; '.join(a.reasons)}" if a.reasons else ""))
+
+    if report.blame_by_category:
+        click.echo(f"\n  Blame (every gated call's waiting time, charged to the work that delayed its release; "
+                   f"joint releases shared):")
+        tot = sum(report.blame_by_category.values()) or 1
+        for k, ns in sorted(report.blame_by_category.items(), key=lambda kv: -kv[1])[:top]:
+            click.echo(f"      {k:<22} {fmt_ns(ns):>12}  ({100.0 * ns / tot:5.1f}%)")
+        t0 = (trace.store.span_extent(timed_only=True) or (0, 0))[0]
+        for r in report.blame_top[:min(top, 5)]:
+            click.echo(f"      {r['category']}:{r['name'][:40]:<40} @{fmt_ns(r['start_ns'] - t0):>10} "
+                       f"{fmt_ns(r['blame_ns']):>12}")
 
     if report.path_time_by_annotation:
         click.echo(f"\n  Path time inside annotation ranges (NVTX/ROCTX; display only, nested ranges "
@@ -1095,12 +1171,19 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
         # span (none for the first span on the path).
         crit = m.crit if m is not None else None
         extra: dict[int, dict] = {}
+        alts = report.alternatives
+        blame = m.blame.by_span if m is not None and m.blame is not None else {}
         for pos, idx in enumerate(report.path_span_indices):
             tags = {"on_critical_path": "1",
                     "path_ns": str(report.path_credited_ns[pos] + report.path_gap_ns[pos])}
             if pos > 0:
                 tags["path_confidence"] = report.path_edge_confidence[pos - 1]
+            if alts is not None and not alts.skipped:
+                tags["path_robust"] = "every" if idx in alts.every else "some"
             extra[report.spans[idx].eid] = tags
+        for j, ns in blame.items():
+            if ns >= 1:
+                extra.setdefault(report.spans[j].eid, {})["blame_ns"] = str(int(round(ns)))
         if crit is not None:
             for j in crit.on_some:
                 tags = extra.setdefault(report.spans[j].eid, {})
@@ -1108,6 +1191,12 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high):
                 tags["slack_ns"] = str(crit.slack.get(j, 0))
         chrome_trace.write(trace, export, pretty=True, extra_args=extra)
         click.echo(f"\n  Annotated trace written to: {export}")
+
+    if json_out:
+        import json as _json
+        with open(json_out, "w") as f:
+            _json.dump(cpmod.report_to_dict(report, top=max(top, 50)), f, indent=1, default=str)
+        click.echo(f"\n  Analysis written to: {json_out}")
 
     click.echo(f"{'='*72}\n")
 

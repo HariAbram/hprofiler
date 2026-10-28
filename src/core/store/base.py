@@ -456,6 +456,16 @@ class TraceStore(abc.ABC):
             edges = edges[np.isin(edges["kind"], list(kinds))]
         return edges
 
+    # ── derived blobs (dependency evidence) ──────────────────────────────
+    def save_blob(self, key: str, version: str, data: bytes) -> None:
+        """A derived result as bytes, valid until the events change."""
+        self._cache()[("blob", key)] = (version, data)
+
+    def load_blob(self, key: str, version: str) -> bytes | None:
+        """The bytes saved under `key` with this `version`, else None."""
+        hit = self._cache().get(("blob", key))
+        return hit[1] if hit is not None and hit[0] == version else None
+
     def close(self) -> None:
         pass
 

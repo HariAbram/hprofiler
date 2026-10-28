@@ -89,6 +89,30 @@ def mpi_wait(slow_rank0: bool, iters: int = 5) -> Trace:
     return t
 
 
+def mpi_waitall_two_senders(slow: bool, iters: int = 5) -> Trace:
+    """ranks 0 and 2 compute, then send to rank 1, which waits for both in
+    one MPI_Waitall; the candidate slows both senders' compute by the same
+    10 ms -- a joint release: the wait waited for both of them."""
+    t = Trace(TraceMetadata(command="mpirun -np 3 ./gather"))
+    c = 1 * MS
+    w = (20 if slow else 10) * MS
+    for i in range(iters):
+        for pid, rank in ((100, "0"), (300, "2")):
+            _span(t, "compute", Category.OPENMP, c, w, pid=pid, tid=pid, type="work")
+            _span(t, "MPI_Send", Category.MPI, c + w, 0.1 * MS, pid=pid, tid=pid,
+                  type="send", rank=rank, peer="1", wpeer="1", tag="7", commid="0", bytes="4096")
+        for k, src in enumerate(("0", "2")):
+            t.add(SpanEvent("MPI_Irecv", Category.MPI, int(c + k * 1000), 500, 200, 200,
+                            {"type": "irecv", "rank": "1", "peer": src, "wpeer": src, "tag": "7", "commid": "0"},
+                            span_id=f"r{i}_{src}"))
+        _span(t, "compute", Category.OPENMP, c + 0.01 * MS, 5 * MS, pid=200, tid=200, type="work")
+        end = c + w + 0.15 * MS
+        t.add(SpanEvent("MPI_Waitall", Category.MPI, int(c + 6 * MS), int(end - (c + 6 * MS)), 200, 200,
+                        {"type": "waitall", "rank": "1", "count": "2"}, parent_span_id=f"r{i}_0;r{i}_2"))
+        c = end + 0.2 * MS
+    return t
+
+
 def _gpu(lines) -> Trace:
     from tests.test_gpu_activity import build
     t = build(lines)

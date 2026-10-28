@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS extents (key TEXT PRIMARY KEY, lo INTEGER, hi INTEGER
 CREATE TABLE IF NOT EXISTS edges (version TEXT NOT NULL, ord INTEGER NOT NULL, dst INTEGER NOT NULL,
                                   src INTEGER NOT NULL, kind INTEGER NOT NULL, conf INTEGER NOT NULL,
                                   PRIMARY KEY (version, ord));
+CREATE TABLE IF NOT EXISTS blobs (key TEXT PRIMARY KEY, version TEXT NOT NULL, data BLOB NOT NULL);
 """
 
 SHARD_DDL = """
@@ -1248,6 +1249,20 @@ class DiskTraceStore(TraceStore):
         if not parts:
             return np.empty(0, dtype=EDGE_DTYPE)
         return np.concatenate(parts)
+
+    # ── derived blobs (dependency evidence) ──────────────────────────────
+    def save_blob(self, key: str, version: str, data: bytes) -> None:
+        """Persist one derived result; valid until the events change."""
+        with self._lock:
+            self._cat.execute("INSERT OR REPLACE INTO blobs VALUES (?, ?, ?)",
+                              (key, f"{version}@{self._content_version}", sqlite3.Binary(data)))
+
+    def load_blob(self, key: str, version: str) -> bytes | None:
+        with self._lock:
+            self._flush_locked()
+            r = self._cat.execute("SELECT data FROM blobs WHERE key=? AND version=?",
+                                  (key, f"{version}@{self._content_version}")).fetchone()
+        return bytes(r[0]) if r else None
 
     def close(self) -> None:
         with self._lock:

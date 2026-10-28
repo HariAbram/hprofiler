@@ -24,10 +24,10 @@ from __future__ import annotations
 import glob
 import os
 import subprocess
-from pathlib import Path
 from .base import Backend
+from ..core.hookdir import hooks_dir
 
-_HOOK_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_nccl.so"
+_HOOK_LIB = hooks_dir() / "libhprofiler_nccl.so"
 
 
 def _nccl_available() -> bool:

@@ -28,8 +28,9 @@ T = 4
 
 
 def _build_and_run(cc, hook, src=SRC):
-    if not shutil.which(cc) or not (ROOT / "build/lib" / hook).exists():
-        raise unittest.SkipTest(f"needs {cc} and build/lib/{hook}")
+    from src.core.hookdir import hooks_dir         # HPROFILER_HOOKS_DIR, else build/lib
+    if not shutil.which(cc) or not (hooks_dir() / hook).exists():
+        raise unittest.SkipTest(f"needs {cc} and {hooks_dir() / hook}")
     tmp = tempfile.mkdtemp()
     exe = os.path.join(tmp, "omp_sync")
     r = subprocess.run([cc, "-fopenmp", "-O1", str(src), "-o", exe], capture_output=True, text=True)
@@ -53,6 +54,14 @@ def _build_and_run(cc, hook, src=SRC):
     names = Counter(s.name for s in trace.iter_spans())
     names.update(i.name for i in trace.iter_instants())
     return base, prof, names, trace
+
+
+def _skip_unless_recorded(test, spans, tag, what):
+    """The hook library in use predates `tag` (build/ is rebuilt by hand):
+    nothing to check against it."""
+    if not any(tag in s.tags for s in spans):
+        test.skipTest(f"{what}: the hook library predates {tag}= -- rebuild build/ "
+                      f"or point HPROFILER_HOOKS_DIR at a fresh build")
 
 
 def _lines(text):
@@ -125,6 +134,41 @@ class TestLlvmLibompOmpt(unittest.TestCase):
         # explicit tasks only: no implicit-task fragment recorded as omp_task
         created, executed, _fragments, id0, not_complete = _task_counts(self.trace)
         self.assertEqual((created, executed, id0, not_complete), (27, 27, 0, 0))
+
+    def test_sync_region_kinds(self):
+        # named by ompt_sync_region_t, the kind itself in sk= (the hook used
+        # to name kinds 5-10 one slot late: taskwait came out as omp_sync,
+        # taskgroup as omp_taskwait, a loop's implicit barrier as omp_reduction)
+        sync = [s for s in self.trace.iter_spans() if s.category.value == "sync"
+                and s.tags.get("type") == "sync" and "mutex" not in s.tags]       # sync regions
+        _skip_unless_recorded(self, sync, "sk", "sync-region kinds")
+        self.assertEqual(self.n["omp_taskwait"], 2)
+        self.assertEqual(self.n["omp_taskgroup"], 1)
+        self.assertEqual(self.n["omp_sync"], 0)
+        self.assertEqual(self.n["omp_reduction"], 0)
+        self.assertTrue(all(s.tags.get("sk") for s in sync))
+        # taskwait / taskgroup: the task whose descendants they wait for;
+        # barriers: their team (the parallel region)
+        self.assertTrue(all(s.tags.get("task") for s in sync if s.name in ("omp_taskwait", "omp_taskgroup")))
+        self.assertTrue(all(s.parent_span_id for s in sync if s.name.startswith("omp_barrier")))
+
+    def test_task_parents(self):
+        creates = [s for s in self.trace.iter_spans() if s.name == "omp_task_create"]
+        _skip_unless_recorded(self, creates, "parent", "task parents")
+        self.assertTrue(all(s.tags.get("parent") for s in creates))
+        self.assertEqual(sum(1 for s in creates if s.tags.get("undeferred") == "1"), 1)
+
+    def test_task_graph(self):
+        # taskwait after 16 tasks, a taskgroup of 8, a final taskwait for all
+        # 27 children of the single thread's task; one recorded dependence
+        creates = [s for s in self.trace.iter_spans() if s.name == "omp_task_create"]
+        _skip_unless_recorded(self, creates, "parent", "task graph")
+        from collections import Counter as C
+        from src.analysis import criticalpath as cp
+        _spans, preds = cp.build_dependency_graph(self.trace)
+        kinds = C(k for pl in preds.values() for _u, k, _c in pl)
+        self.assertEqual(kinds["task_join"], 16 + 8 + 27)
+        self.assertEqual(kinds["task_dep"], 1)
 
     def test_task_dependences(self):
         self.assertEqual(self.n["omp_task_dependences"], 2)

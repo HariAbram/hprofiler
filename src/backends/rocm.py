@@ -16,8 +16,9 @@ import re
 import subprocess
 from pathlib import Path
 from .base import Backend
+from ..core.hookdir import hooks_dir
 
-_HOOK_LIB = Path(__file__).parent.parent.parent / "build" / "lib" / "libhprofiler_rocm.so"
+_HOOK_LIB = hooks_dir() / "libhprofiler_rocm.so"
 
 
 def _version_sort_key(path: str) -> tuple[int, ...]:

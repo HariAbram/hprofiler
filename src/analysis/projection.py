@@ -127,8 +127,12 @@ class NodeKey:
 class ProjectedNode:
     __slots__ = ("id", "phase", "key", "category", "raw_name", "bucket", "source",
                  "count", "total_ns", "self_ns", "min_ns", "max_ns", "first_start", "last_end",
-                 "queue_ns", "queued", "overlap_ns", "cp_ns", "cp_count", "blame_ns",
+                 "queue_ns", "queued", "overlap_ns", "cp_ns", "cp_count", "blame_ns", "wait_blame_ns",
                  "threads", "timing")
+    # cp_ns: witness -- its spans' own time on the observed path; blame_ns:
+    # dependency latency on the path its spans released; wait_blame_ns:
+    # every gated call's waiting time its spans' work delayed
+    # (cp_attribution.blame, joint releases shared)
     # timing: "host", or the device timing source of the node's spans
     # ("device", "proxy_event", ... -- "mixed" if they differ)
 
@@ -154,6 +158,7 @@ class ProjectedNode:
         self.cp_ns = 0
         self.cp_count = 0
         self.blame_ns = 0
+        self.wait_blame_ns = 0
         self.threads: set = set()
         self.timing = ""
 
@@ -168,6 +173,7 @@ class ProjectedNode:
             "source": self.source, "count": self.count, "totalNs": self.total_ns,
             "selfNs": self.self_ns, "queueNs": self.queue_ns if self.queued else None,
             "overlapNs": self.overlap_ns, "criticalNs": self.cp_ns, "blameNs": self.blame_ns,
+            "waitBlameNs": self.wait_blame_ns,
             "firstStartNs": self.first_start, "lastEndNs": self.last_end,
             "threads": len(self.threads),
         }
@@ -324,6 +330,10 @@ def _source_of(s) -> str:
 def _stream_order_key(value: str):
     v = value[1:] if value[:1] in ("n", "q") and value[1:].isdigit() else value
     return (0, int(v)) if v.lstrip("-").isdigit() else (1, value)
+
+
+# waiting blame (cp_attribution) up to this many event nodes
+BLAME_NODE_LIMIT = 4_000_000
 
 
 class _Builder:
@@ -666,6 +676,9 @@ class _Builder:
                 credit = self.path_credit.get(o)
                 if credit:
                     n.cp_ns += credit           # exclusive: nested calls own their own path time
+                wb = self.span_blame.get(o)
+                if wb:
+                    n.wait_blame_ns += wb
                 stack.append(_Frame(s.end_ns, path, n, dur))
             for f in stack:
                 f.close()
@@ -736,6 +749,9 @@ class _Builder:
                 credit = self.path_credit.get(o)
                 if credit is not None:
                     n.cp_ns += credit
+                wb = self.span_blame.get(o)
+                if wb:
+                    n.wait_blame_ns += wb
                 sw = sweeps.get(dev)
                 if sw is None:
                     sw = sweeps[dev] = _Sweep(self.nodes)
@@ -777,9 +793,13 @@ class _Builder:
         from . import cp_model
         self.path_credit: dict[int, int] = defaultdict(int)
         self.path_rows: list[cp_model.PathRow] = []
+        self.span_blame: dict[int, int] = {}
         g, w = cp_model.observed_path(self.trace, graph)
         if not w.steps:
             return
+        if 2 * g.n <= BLAME_NODE_LIMIT:
+            from .cp_attribution import blame
+            self.span_blame = {j: int(round(ns)) for j, ns in blame(g).by_span.items()}
         self.path_rows = cp_model.path_rows(g, w)
         for row in self.path_rows:
             if row.own_ns:

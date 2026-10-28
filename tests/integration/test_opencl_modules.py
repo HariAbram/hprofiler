@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
+from src.core.hookdir import hooks_dir  # noqa: E402  (HPROFILER_HOOKS_DIR, else build/lib)
 
 
 class TestOpenCLModules(unittest.TestCase):
@@ -24,7 +25,7 @@ class TestOpenCLModules(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
         cls.exe = os.path.join(cls.tmp, "ocl_variants")
-        if not shutil.which("gcc") or not (ROOT / "build/lib/libhprofiler_opencl.so").exists():
+        if not shutil.which("gcc") or not (hooks_dir() / "libhprofiler_opencl.so").exists():
             raise unittest.SkipTest("needs gcc and the built OpenCL hook")
         r = subprocess.run(["gcc", "-O1", str(ROOT / "tests/fixtures/ocl_variants.c"), "-o", cls.exe,
                             "-lOpenCL"], capture_output=True, text=True)

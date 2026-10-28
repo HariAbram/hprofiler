@@ -139,8 +139,12 @@ def bucket_of(category: str, span_type: str) -> str:
 def bucket_of_span(span: "SpanEvent") -> str:
     # OpenCL emits two spans per kernel: side=cpu is the host enqueue call
     # (API overhead), side=gpu the real device execution. Both carry
-    # type=kernel, so without this the enqueue call counted as compute.
-    if span.tags.get("side") == "cpu" and span.tags.get("type") == "kernel":
+    # type=kernel, so without this the enqueue call counted as compute. The
+    # hook's other side=cpu spans (marker / barrier enqueues) are calls too,
+    # and so are the NCCL hook's (a grouped or asynchronously timed
+    # operation's host call; its device span is the communication).
+    if span.tags.get("side") == "cpu" and (span.tags.get("type") == "kernel"
+                                           or span.category.value in ("opencl", "nccl")):
         return "Runtime overhead"
     return bucket_of(span.category.value, span.tags.get("type", ""))
 

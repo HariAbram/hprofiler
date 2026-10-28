@@ -35,6 +35,11 @@ Item {
         Nav.focusTimeRange(d.timelineStartNs, d.timelineEndNs)
         Nav.navigateTo(1)
     }
+    // any compared identity (a chain step, a joint origin, a released wait)
+    function showIdentity(id) {
+        var b = Compare.identityTimeline(id)
+        if (b && b.hasTimeline) root.showInTimeline(b)
+    }
     function openSource(d) {
         if (!d || !d.rawName) return
         Nav.selectFunction(d.category, d.rawName)
@@ -360,6 +365,8 @@ Item {
                                             }
                                             Text {
                                                 text: modelData.roles + (modelData.propagated ? "  ← " + modelData.origin : "")
+                                                      + (modelData.jointOrigins > 1 ? "  · joint release: " + modelData.jointOrigins + " origins" : "")
+                                                      + (modelData.jointWaits > 0 ? "  · released " + modelData.jointWaits + " wait(s)" : "")
                                                 color: AppTheme.textMuted
                                                 font.pixelSize: AppTheme.typeCaption
                                                 elide: Text.ElideRight
@@ -453,6 +460,120 @@ Item {
                                         font.pixelSize: AppTheme.typeCaption
                                     }
                                 }
+                                // three separate attributions (never summed into one number)
+                                GridLayout {
+                                    objectName: "compareAttribution"
+                                    columns: 3
+                                    rowSpacing: 0
+                                    columnSpacing: AppTheme.spacingSm
+                                    visible: !!root.detail.attribution
+                                    Repeater {
+                                        model: {
+                                            var a = root.detail.attribution || {}
+                                            return [
+                                                ["direct impact", Format.signedNs(a.directNs || 0), "its own critical-path time + latency blamed on it"],
+                                                ["jointly caused waiting", a.jointWaitNs === null || a.jointWaitNs === undefined ? "—"
+                                                    : Format.signedNs(a.jointWaitNs) + " (share of " + a.jointWaits + " wait(s))",
+                                                 "its equal share of the waits it released together with other origins"],
+                                                ["propagated wait blame", a.waitBlameDeltaNs === null || a.waitBlameDeltaNs === undefined ? "—"
+                                                    : Format.signedNs(a.waitBlameDeltaNs), "Δ of the waiting its work delayed (cp_attribution blame)"]
+                                            ].reduce(function(acc, r) { return acc.concat(r) }, [])
+                                        }
+                                        delegate: Text {
+                                            objectName: index % 3 === 1 ? "compareAttributionValue_" + Math.floor(index / 3) : ""
+                                            readonly property int col: index % 3
+                                            text: col === 2 ? "[derived] " + modelData : modelData
+                                            color: col === 0 ? AppTheme.textMuted : col === 1 ? AppTheme.text : AppTheme.textMuted
+                                            font.pixelSize: AppTheme.typeCaption
+                                            font.bold: col === 1
+                                            font.italic: col === 2
+                                            elide: Text.ElideRight
+                                            Layout.maximumWidth: col === 2 ? 360 : 200
+                                        }
+                                    }
+                                }
+                                ColumnLayout {
+                                    objectName: "compareJointOrigins"
+                                    visible: (root.detail.jointOrigins || []).length > 0
+                                    Layout.fillWidth: true
+                                    spacing: 1
+                                    Text {
+                                        text: "Joint release: the wait waited for all " + (root.detail.jointOrigins || []).length
+                                              + " origins — each shown with its own direct impact and its share of the wait  [graph-derived]"
+                                        color: AppTheme.text
+                                        font.bold: true
+                                        font.pixelSize: AppTheme.typeCaption
+                                        wrapMode: Text.WordWrap
+                                        Layout.fillWidth: true
+                                    }
+                                    Repeater {
+                                        objectName: "compareJointOriginRows"
+                                        model: root.detail.jointOrigins || []
+                                        delegate: RowLayout {
+                                            objectName: "compareJointOrigin_" + index
+                                            property string summary: modelData.label + " (" + modelData.roles + ")"
+                                            Layout.fillWidth: true
+                                            spacing: AppTheme.spacingSm
+                                            Text {
+                                                text: modelData.label + " (" + modelData.roles + ") · " + modelData.role
+                                                      + " · direct " + Format.signedNs(modelData.directNs || 0)
+                                                      + " · share " + (modelData.shareNs === null || modelData.shareNs === undefined ? "—" : Format.signedNs(modelData.shareNs))
+                                                      + " · wait blame " + (modelData.waitBlameDeltaNs === null || modelData.waitBlameDeltaNs === undefined ? "—" : Format.signedNs(modelData.waitBlameDeltaNs))
+                                                color: AppTheme.text
+                                                font.pixelSize: AppTheme.typeCaption
+                                                elide: Text.ElideRight
+                                                Layout.fillWidth: true
+                                                Layout.minimumWidth: 0
+                                            }
+                                            ToolButton {
+                                                objectName: "compareJointOriginSelect_" + index
+                                                text: "Select"
+                                                enabled: !!modelData.available
+                                                onClicked: root.selectedId = modelData.id
+                                            }
+                                            ToolButton {
+                                                objectName: "compareJointOriginTimeline_" + index
+                                                text: "Timeline"
+                                                enabled: !!modelData.hasTimeline
+                                                onClicked: root.showInTimeline(modelData)
+                                            }
+                                        }
+                                    }
+                                }
+                                ColumnLayout {
+                                    objectName: "compareJointWaits"
+                                    visible: (root.detail.jointWaits || []).length > 0
+                                    Layout.fillWidth: true
+                                    spacing: 1
+                                    Text {
+                                        text: "Waits it released (alone or with other origins)  [graph-derived]"
+                                        color: AppTheme.text
+                                        font.bold: true
+                                        font.pixelSize: AppTheme.typeCaption
+                                        Layout.fillWidth: true
+                                        elide: Text.ElideRight
+                                    }
+                                    Repeater {
+                                        model: root.detail.jointWaits || []
+                                        delegate: RowLayout {
+                                            Layout.fillWidth: true
+                                            spacing: AppTheme.spacingSm
+                                            Text {
+                                                text: modelData.label + " (" + modelData.roles + ") · wait Δ "
+                                                      + (modelData.waitDeltaNs === null || modelData.waitDeltaNs === undefined ? "—" : Format.signedNs(modelData.waitDeltaNs))
+                                                      + " · its share " + (modelData.shareNs === null || modelData.shareNs === undefined ? "—" : Format.signedNs(modelData.shareNs))
+                                                      + (modelData.coOrigins.length ? " · with " + modelData.coOrigins.join(", ") : "")
+                                                color: AppTheme.text
+                                                font.pixelSize: AppTheme.typeCaption
+                                                elide: Text.ElideRight
+                                                Layout.fillWidth: true
+                                                Layout.minimumWidth: 0
+                                            }
+                                            ToolButton { text: "Select"; enabled: !!modelData.available; onClicked: root.selectedId = modelData.id }
+                                            ToolButton { text: "Timeline"; enabled: !!modelData.hasTimeline; onClicked: root.showInTimeline(modelData) }
+                                        }
+                                    }
+                                }
                                 Text {
                                     objectName: "compareDetailExplanation"
                                     text: root.detail.explanation || ""
@@ -495,19 +616,29 @@ Item {
                                         Layout.fillWidth: true
                                     }
                                 }
-                                Text {
+                                Flow {
+                                    objectName: "compareChain"
                                     visible: (root.detail.chain || []).length > 0
-                                    text: {
-                                        var c = root.detail.chain || []
-                                        var parts = []
-                                        for (var i = 0; i < c.length; i++)
-                                            parts.push(c[i].label + " (" + c[i].roles + ", " + c[i].causeLabel + ")")
-                                        return "Waited for: " + parts.join(" ← ") + "  [graph-derived, heuristic phase offsets]"
-                                    }
-                                    color: AppTheme.text
-                                    font.pixelSize: AppTheme.typeCaption
-                                    wrapMode: Text.WordWrap
                                     Layout.fillWidth: true
+                                    spacing: AppTheme.spacingXs
+                                    Text { text: "Waited for:"; color: AppTheme.text; font.pixelSize: AppTheme.typeCaption }
+                                    Repeater {
+                                        model: root.detail.chain || []
+                                        delegate: Text {
+                                            text: (index > 0 ? "← " : "") + modelData.label + " (" + modelData.roles + ", " + modelData.causeLabel + ")"
+                                            color: modelData.selectable ? AppTheme.accent : AppTheme.text
+                                            font.pixelSize: AppTheme.typeCaption
+                                            font.underline: modelData.selectable
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                enabled: modelData.selectable
+                                                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                                onClicked: root.selectedId = modelData.identity
+                                                onDoubleClicked: root.showIdentity(modelData.identity)
+                                            }
+                                        }
+                                    }
+                                    Text { text: "[graph-derived, heuristic phase offsets; click: select · double-click: timeline]"; color: AppTheme.textMuted; font.pixelSize: AppTheme.typeCaption }
                                 }
                                 Text {
                                     visible: (root.detail.alsoCauses || []).length > 0
@@ -654,7 +785,9 @@ Item {
                                     delegate: RowLayout {
                                         Layout.fillWidth: true
                                         Text {
-                                            text: modelData.label + (modelData.propagated ? " ← " + modelData.origin : "")
+                                            text: modelData.label + " (" + modelData.roles + ")" + (modelData.propagated ? " ← " + modelData.origin : "")
+                                                  + (modelData.jointOrigins > 1 ? " · joint: " + modelData.jointOrigins + " origins" : "")
+                                                  + (modelData.jointWaits > 0 ? " · released " + modelData.jointWaits + " wait(s)" : "")
                                             color: AppTheme.text
                                             font.pixelSize: AppTheme.typeCaption
                                             elide: Text.ElideRight

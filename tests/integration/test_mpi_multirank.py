@@ -58,7 +58,8 @@ def _build_and_profile(cls, fixture: str, strict: bool = False) -> None:
     that starts 4 real ranks (the fixture says so itself: "requires exactly
     4 ranks"); with strict=True any other unprofiled failure is a failure,
     not a skip."""
-    if not (ROOT / "build/lib/libhprofiler_mpi.so").exists():
+    from src.core.hookdir import hooks_dir             # HPROFILER_HOOKS_DIR, else build/lib
+    if not (hooks_dir() / "libhprofiler_mpi.so").exists():
         raise unittest.SkipTest("MPI hook not built")
     cls.env = _mpi_env()
     mpicc = shutil.which("mpicc", path=cls.env.get("PATH"))

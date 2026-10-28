@@ -143,6 +143,46 @@ Item {
                 ToolTip.visible: hovered
                 ToolTip.text: "Dotted veil from a blocking call's start to its last dependency's source event (from the dependency graph)"
             }
+            WrapCheckBox {
+                objectName: "timelineUnknownBlocking"
+                text: "Unknown blocking time (no recorded dependency releases the call)"
+                checked: !!root.ov.unknownBlocking
+                onToggled: root.setKey("unknownBlocking", checked)
+                ToolTip.visible: hovered
+                ToolTip.text: "Pink grid over a blocking call (receive, wait, barrier, sync) nothing recorded releases: waiting for something unrecorded, or processing — not a gated wait"
+            }
+            // what the band and the veils mean
+            ColumnLayout {
+                objectName: "timelineCpLegend"
+                Layout.fillWidth: true
+                spacing: 1
+                Repeater {
+                    model: [{"c": AppTheme.criticalColor, "t": "path band, solid: busy"},
+                            {"c": AppTheme.criticalColor, "t": "path band, hatched: waiting in a gated call", "h": true},
+                            {"c": AppTheme.evidenceColor("unknown", AppTheme.dark), "t": "path band, pink dots / lane grid: unknown blocking time", "h": true},
+                            {"c": AppTheme.evidenceColor("ambiguous", AppTheme.dark), "t": "hollow diamond: a joint release (several sources released one wait)", "h": true}]
+                    delegate: RowLayout {
+                        Layout.fillWidth: true
+                        spacing: AppTheme.spacingXs
+                        Rectangle {
+                            Layout.preferredWidth: 18
+                            Layout.preferredHeight: 6
+                            color: modelData.h ? "transparent" : modelData.c
+                            border.width: modelData.h ? 1 : 0
+                            border.color: modelData.c
+                            opacity: modelData.h ? 0.8 : 1.0
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            text: modelData.t
+                            color: AppTheme.textMuted
+                            font.pixelSize: AppTheme.typeCaption
+                            wrapMode: Text.Wrap
+                        }
+                    }
+                }
+            }
             Flow {
                 Layout.fillWidth: true
                 enabled: root.ready
@@ -253,6 +293,20 @@ Item {
                     checked: (root.ov.classes || []).indexOf("inferred") >= 0
                     onToggled: root.toggleIn("classes", "inferred")
                 }
+            }
+            WrapCheckBox {
+                objectName: "timelineDisabledEdges"
+                text: "Contradicted / disabled edges (rose, dash-dot, ×): never active dependencies"
+                checked: !!root.ov.disabledEdges
+                onToggled: root.setKey("disabledEdges", checked)
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "Status: an amber “?” ring marks an ambiguous edge (other candidates remain); a selected "
+                      + "alternative world's own edges are violet and dotted (Critical path ▸ Alternative worlds)."
+                color: AppTheme.textMuted
+                font.pixelSize: AppTheme.typeCaption
+                wrapMode: Text.Wrap
             }
             Text {
                 Layout.fillWidth: true

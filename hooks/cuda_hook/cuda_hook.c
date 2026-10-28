@@ -11,6 +11,15 @@
  * cuLaunchKernel; JIT blobs saved for disassembly; launches carry mod=, the
  * id of the module they ran, see hp_module.h), NVRTC compilation (front-end
  * JIT, stage=frontend), optional CUPTI PC sampling.
+ *
+ * Also: whether a synchronous copy / memset blocks the host (blocking=, from
+ * CUDA's documented API synchronization behaviour), stream creation with
+ * its flags (nonblocking=1: no implicit synchronization with the legacy
+ * default stream), and host functions in stream order
+ * (cudaLaunchHostFunc, cudaStreamAddCallback, cuLaunchHostFunc): the
+ * enqueue call and, when the function runs, a stream-ordered span
+ * (side=gpu, exec=host, timing=host: measured on the host clock, on the
+ * runtime's callback thread) linked to it by lid=.
  */
 
 #define _GNU_SOURCE
@@ -709,6 +718,44 @@ static void sub_abort(Sub *u) {
     if (u->gpu_ok) { f_evDestroy(u->ev_s); f_evDestroy(u->ev_e); u->gpu_ok = 0; }
 }
 
+/* Memory behind a pointer: 'p' pageable host memory (or unknown), 'h'
+ * pinned host memory, 'd' device or managed memory. The driver API's
+ * cuPointerGetAttribute: unlike cudaPointerGetAttributes it never leaves an
+ * error behind for the program's cudaGetLastError(). Needs a current
+ * context: call it after the real call. */
+static char mem_kind(const void *p) {
+    typedef CUresult (*fn_t)(void *, int, CUdeviceptr);
+    static fn_t f = NULL;
+    static int tried = 0;
+    if (!tried) { f = (fn_t)find_cuda_sym("cuPointerGetAttribute"); tried = 1; }
+    unsigned int t = 0;
+    if (!f || !p || f(&t, 2 /* CU_POINTER_ATTRIBUTE_MEMORY_TYPE */, (CUdeviceptr)p) != 0) return 'p';
+    return t == 1 /* CU_MEMORYTYPE_HOST */ ? 'h' : 'd';
+}
+
+/* blocking= of a synchronous cudaMemcpy, per CUDA's "API synchronization
+ * behavior":
+ *   1       returns once the copy is done: to host memory, or from pinned
+ *           host memory to the device
+ *   staged  from pageable host memory to the device: returns once the data
+ *           is staged for DMA, which may still be running
+ *   0       device to device: no host synchronization */
+static const char *memcpy_blocking(cudaMemcpyKind kind, const void *dst, const void *src) {
+    int src_dev, dst_dev;
+    switch (kind) {
+    case 0: src_dev = 0; dst_dev = 0; break;    /* HtoH */
+    case 1: src_dev = 0; dst_dev = 1; break;    /* HtoD */
+    case 2: src_dev = 1; dst_dev = 0; break;    /* DtoH */
+    case 3: src_dev = 1; dst_dev = 1; break;    /* DtoD */
+    default:                                    /* Default: from the pointers (UVA) */
+        src_dev = mem_kind(src) == 'd';
+        dst_dev = mem_kind(dst) == 'd';
+    }
+    if (!dst_dev) return "1";
+    if (!src_dev) return mem_kind(src) == 'h' ? "1" : "staged";
+    return "0";
+}
+
 static const char *memcpy_dir(cudaMemcpyKind kind) {
     static const char *names[] = {"HtoH", "HtoD", "DtoH", "DtoD", "Default"};
     return kind <= 4 ? names[kind] : "Unknown";
@@ -764,12 +811,14 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count,
      * type=memcpy ("Memory transfer"), not a launch. "memory", not
      * "cuda", so its bytes count in the Memory tab. The device-side copy
      * comes from CUPTI when native tracing is active. */
-    char host[128];
-    snprintf(host, sizeof(host), "type=memcpy,op=memcpy,dir=%s,bytes=%zu", memcpy_dir(kind), count);
+    char host[160];
     Sub u;
     sub_begin(&u, NULL, 0);
     cudaError_t ret = real(dst, src, count, kind);
     sub_end(&u);
+    /* stream=0: a synchronous copy runs on the legacy default stream */
+    snprintf(host, sizeof(host), "type=memcpy,op=memcpy,dir=%s,bytes=%zu,blocking=%s,stream=0",
+             memcpy_dir(kind), count, memcpy_blocking(kind, dst, src));
     sub_host(&u, "memory", "cudaMemcpy", host, (int)ret);
 
     in_hook = 0;
@@ -1089,16 +1138,167 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned
     return ret;
 }
 
+/* ── Stream creation ────────────────────────────────────────────────── */
+/* type=stream_create,op=stream_create,stream=<id>[,nonblocking=1]
+ * [,priority=<p>]: a stream created with cudaStreamNonBlocking /
+ * CU_STREAM_NON_BLOCKING (0x1) does not synchronize with the legacy
+ * default stream; every other stream does. */
+static void stream_created(const Sub *u, const char *api, int ret, void *stream,
+                           unsigned flags, int prio, int has_prio) {
+    char tags[128];
+    int n = snprintf(tags, sizeof(tags), "type=stream_create,op=stream_create,stream=%d%s",
+                     ret == 0 ? get_stream_id(stream) : 0, (flags & 0x1) ? ",nonblocking=1" : "");
+    if (has_prio && n > 0 && (size_t)n < sizeof(tags))
+        snprintf(tags + n, sizeof(tags) - (size_t)n, ",priority=%d", prio);
+    sub_host(u, "cuda", api, tags, ret);
+}
+
+#define HP_STREAM_CREATE(RET, FNAME, PTYPE, CALL_ARGS, FLAGS, PRIO, HAS_PRIO, ...)  \
+RET FNAME(__VA_ARGS__) {                                                       \
+    typedef RET (*fn_t)(__VA_ARGS__);                                          \
+    static fn_t real = NULL;                                                   \
+    if (!real) real = (fn_t)find_cuda_sym(#FNAME);                             \
+    if (!real) return (RET)-1;                                                 \
+    if (in_hook) return real CALL_ARGS;                                        \
+    in_hook = 1;                                                               \
+    Sub u;                                                                     \
+    sub_begin(&u, NULL, 0);                                                    \
+    RET ret = real CALL_ARGS;                                                  \
+    sub_end(&u);                                                               \
+    stream_created(&u, #FNAME, (int)ret, (ret == 0 && pStream) ? (void *)*pStream : NULL, \
+                   (FLAGS), (PRIO), (HAS_PRIO));                               \
+    in_hook = 0;                                                               \
+    return ret;                                                                \
+}
+HP_STREAM_CREATE(cudaError_t, cudaStreamCreate, cudaStream_t, (pStream), 0, 0, 0,
+                 cudaStream_t *pStream)
+HP_STREAM_CREATE(cudaError_t, cudaStreamCreateWithFlags, cudaStream_t, (pStream, flags), flags, 0, 0,
+                 cudaStream_t *pStream, unsigned int flags)
+HP_STREAM_CREATE(cudaError_t, cudaStreamCreateWithPriority, cudaStream_t, (pStream, flags, priority),
+                 flags, priority, 1, cudaStream_t *pStream, unsigned int flags, int priority)
+HP_STREAM_CREATE(CUresult, cuStreamCreate, CUstream, (pStream, flags), flags, 0, 0,
+                 CUstream *pStream, unsigned int flags)
+HP_STREAM_CREATE(CUresult, cuStreamCreateWithPriority, CUstream, (pStream, flags, priority),
+                 flags, priority, 1, CUstream *pStream, unsigned int flags, int priority)
+#undef HP_STREAM_CREATE
+
+/* ── Host functions in stream order ─────────────────────────────────── */
+/* The runtime runs a host function on its own thread once the stream's
+ * earlier work is done, and the stream's later work waits for it to
+ * return. The hook passes a trampoline that times the call and emits it as
+ * a stream-ordered span (no call stack: the runtime's thread's would say
+ * nothing about the program). */
+typedef void (*cudaHostFn_t)(void *);
+typedef void (*cudaStreamCallback_t)(cudaStream_t, cudaError_t, void *);
+typedef struct {
+    cudaHostFn_t         fn;
+    cudaStreamCallback_t cb;
+    void                *user;
+    uint64_t             lid;
+    int                  sid, dev;
+    char                 name[96];
+} HostFnCtx;
+
+static void host_fn_ran(const HostFnCtx *c, uint64_t t0, uint64_t t1) {
+    if (!hp_tx_enabled()) return;
+    char x[256];
+    int n = snprintf(x, sizeof(x), "type=host_func,op=host_func,stream=%d,side=gpu,rt=cuda,"
+                     "timing=host,exec=host,lid=%llu", c->sid, (unsigned long long)c->lid);
+    if (c->dev >= 0 && n > 0 && (size_t)n < sizeof(x))
+        snprintf(x + n, sizeof(x) - (size_t)n, ",hdev=%d", c->dev);
+    hp_tx_emitf("span:cuda:%d:%d:%llu:%llu:%s:%s\n", (int)hp_tx_pid(), (int)gettid_compat(),
+                (unsigned long long)t0, (unsigned long long)(t1 - t0), c->name, x);
+}
+
+static void host_fn_tramp(void *arg) {
+    HostFnCtx *c = (HostFnCtx *)arg;
+    uint64_t t0 = now_ns();
+    c->fn(c->user);
+    host_fn_ran(c, t0, now_ns());
+    free(c);
+}
+
+static void stream_cb_tramp(cudaStream_t stream, cudaError_t status, void *arg) {
+    HostFnCtx *c = (HostFnCtx *)arg;
+    uint64_t t0 = now_ns();
+    c->cb(stream, status, c->user);
+    host_fn_ran(c, t0, now_ns());
+    free(c);
+}
+
+static HostFnCtx *host_fn_ctx(void *fn_addr, cudaHostFn_t fn, cudaStreamCallback_t cb, void *user,
+                              cudaStream_t stream) {
+    HostFnCtx *c = (HostFnCtx *)calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->fn = fn;
+    c->cb = cb;
+    c->user = user;
+    c->sid = get_stream_id(stream);
+    Dl_info info;
+    if (dladdr(fn_addr, &info) && info.dli_sname)
+        snprintf(c->name, sizeof(c->name), "%s", info.dli_sname);
+    else
+        snprintf(c->name, sizeof(c->name), "host_func");
+    return c;
+}
+
+/* The enqueue call's span; c (NULL: not wrapped) gets the lid its
+ * execution span links back with. */
+static void host_fn_enqueued(Sub *u, const char *api, HostFnCtx *c, cudaStream_t stream, int ret) {
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=launch,op=host_func,stream=%d", get_stream_id(stream));
+    sub_host(u, "cuda", api, tags, ret);
+}
+
+#define HP_HOST_FN(RET, FNAME, STREAM_T, FN_T, MAKE_CTX, TRAMP, ...)           \
+RET FNAME(__VA_ARGS__) {                                                       \
+    typedef RET (*fn_t)(__VA_ARGS__);                                          \
+    static fn_t real = NULL;                                                   \
+    if (!real) real = (fn_t)find_cuda_sym(#FNAME);                             \
+    if (!real) return (RET)-1;                                                 \
+    if (in_hook || !fn) return real(HP_HOST_FN_ARGS(fn, userData));            \
+    in_hook = 1;                                                               \
+    Sub u;                                                                     \
+    sub_begin(&u, NULL, 0);                                                    \
+    HostFnCtx *c = MAKE_CTX;                                                   \
+    if (c) c->lid = u.lid;                                                     \
+    RET ret = c ? real(HP_HOST_FN_ARGS((FN_T)TRAMP, c))                        \
+                : real(HP_HOST_FN_ARGS(fn, userData));                         \
+    sub_end(&u);                                                               \
+    if (c) c->dev = u.dev;                                                     \
+    host_fn_enqueued(&u, #FNAME, c, (cudaStream_t)stream, (int)ret);           \
+    if (c && ret != 0) free(c);           /* never runs */                     \
+    in_hook = 0;                                                               \
+    return ret;                                                                \
+}
+#define HP_HOST_FN_ARGS(F, U) stream, F, U
+HP_HOST_FN(cudaError_t, cudaLaunchHostFunc, cudaStream_t, cudaHostFn_t,
+           host_fn_ctx((void *)fn, fn, NULL, userData, stream), host_fn_tramp,
+           cudaStream_t stream, cudaHostFn_t fn, void *userData)
+HP_HOST_FN(CUresult, cuLaunchHostFunc, CUstream, cudaHostFn_t,
+           host_fn_ctx((void *)fn, fn, NULL, userData, (cudaStream_t)stream), host_fn_tramp,
+           CUstream stream, cudaHostFn_t fn, void *userData)
+#undef HP_HOST_FN_ARGS
+#define HP_HOST_FN_ARGS(F, U) stream, F, U, flags
+HP_HOST_FN(cudaError_t, cudaStreamAddCallback, cudaStream_t, cudaStreamCallback_t,
+           host_fn_ctx((void *)fn, NULL, fn, userData, stream), stream_cb_tramp,
+           cudaStream_t stream, cudaStreamCallback_t fn, void *userData, unsigned int flags)
+#undef HP_HOST_FN_ARGS
+#undef HP_HOST_FN
+
+/* sync: cudaMemset, which blocks the host only for a pinned host target
+ * (blocking=1). */
 static cudaError_t memset_common(const char *api, cudaError_t (*call)(void*, int, size_t, cudaStream_t),
-                                 void *ptr, int value, size_t count, cudaStream_t stream) {
+                                 void *ptr, int value, size_t count, cudaStream_t stream, int sync) {
     int sid = get_stream_id(stream);
-    char host[96], dev[96];
-    snprintf(host, sizeof(host), "type=launch,op=memset,bytes=%zu,stream=%d", count, sid);
+    char host[112], dev[96];
     snprintf(dev, sizeof(dev), "type=memset,op=memset,bytes=%zu,stream=%d", count, sid);
     Sub u;
     sub_begin(&u, stream, 1);
     cudaError_t ret = call(ptr, value, count, stream);
     sub_end(&u);
+    snprintf(host, sizeof(host), "type=launch,op=memset,bytes=%zu,stream=%d%s", count, sid,
+             sync && mem_kind(ptr) == 'h' ? ",blocking=1" : "");
     sub_host(&u, "memory", api, host, (int)ret);
     if (ret == 0) sub_proxy(&u, stream, "memory", "memset", dev);
     else          sub_abort(&u);
@@ -1115,7 +1315,7 @@ cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
     in_hook = 1;
     /* Asynchronous w.r.t. the host (except for pinned host targets), on the
      * legacy default stream. */
-    cudaError_t ret = memset_common("cudaMemset", call_memset, devPtr, value, count, NULL);
+    cudaError_t ret = memset_common("cudaMemset", call_memset, devPtr, value, count, NULL, 1);
     in_hook = 0;
     return ret;
 }
@@ -1128,7 +1328,7 @@ cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t 
     if (in_hook) return real(devPtr, value, count, stream);
     in_hook = 1;
 
-    cudaError_t ret = memset_common("cudaMemsetAsync", real, devPtr, value, count, stream);
+    cudaError_t ret = memset_common("cudaMemsetAsync", real, devPtr, value, count, stream, 0);
     in_hook = 0;
     return ret;
 }

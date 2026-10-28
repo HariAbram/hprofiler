@@ -22,6 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
+from src.core.hookdir import hooks_dir  # noqa: E402  (HPROFILER_HOOKS_DIR, else build/lib)
 HP = [sys.executable, str(ROOT / "hprofiler")]
 
 
@@ -44,7 +45,7 @@ class TestNodeCollector(unittest.TestCase):
         env = _mpi_env()
         mpicc = shutil.which("mpicc", path=env.get("PATH"))
         mpirun = shutil.which("mpirun", path=env.get("PATH"))
-        if not mpicc or not mpirun or not (ROOT / "build/lib/libhprofiler_mpi.so").exists():
+        if not mpicc or not mpirun or not (hooks_dir() / "libhprofiler_mpi.so").exists():
             self.skipTest("needs mpicc/mpirun and the MPI hook")
         exe = os.path.join(self.tmp, "mpi_status")
         if subprocess.run([mpicc, "-O1", str(ROOT / "tests/fixtures/mpi_status.c"), "-o", exe], env=env,
@@ -75,7 +76,7 @@ class TestNodeCollector(unittest.TestCase):
         self.assertEqual(t.metadata.command, "(node collector)")
 
     def test_exec_waits_for_its_collector(self):
-        if not shutil.which("gcc") or not (ROOT / "build/lib/libhprofiler_gomp.so").exists():
+        if not shutil.which("gcc") or not (hooks_dir() / "libhprofiler_gomp.so").exists():
             self.skipTest("needs gcc and the GNU libgomp hook")
         exe = os.path.join(self.tmp, "gomp_mini")
         subprocess.run(["gcc", "-fopenmp", "-O1", str(ROOT / "tests/fixtures/gomp_mini.c"), "-o", exe],

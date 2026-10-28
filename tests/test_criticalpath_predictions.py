@@ -130,10 +130,19 @@ class TestOpenMPRendezvous(unittest.TestCase):
         return {(s.tid, d.tid, c) for s, d, k, c in edges(_trace(spans)) if k == "arrival"}
 
     def test_non_barrier_sync_regions_are_no_rendezvous(self):
-        for name in ("omp_critical_wait", "omp_taskwait", "omp_taskgroup", "omp_reduction"):
-            spans = [_span(name, "sync", 100, 500, tid=1, psid="7"),
-                     _span(name, "sync", 200, 300, tid=2, psid="7")]
+        for name, sk in (("omp_critical_wait", None), ("omp_taskwait", "5"),
+                         ("omp_taskgroup", "6"), ("omp_reduction", "7")):
+            kw = {"sk": sk} if sk else {}
+            spans = [_span(name, "sync", 100, 500, tid=1, psid="7", **kw),
+                     _span(name, "sync", 200, 300, tid=2, psid="7", **kw)]
             self.assertEqual(self._arrivals(spans), set(), name)
+
+    def test_legacy_omp_reduction_is_a_workshare_barrier(self):
+        # OMPT traces before sk=: the implicit barrier of a worksharing loop
+        # (kind 8) was named omp_reduction
+        spans = [_span("omp_reduction", "sync", 100, 500, tid=1, psid="7"),
+                 _span("omp_reduction", "sync", 400, 200, tid=2, psid="7")]
+        self.assertEqual(self._arrivals(spans), {(2, 1, "high")})
 
     def test_barriers_still_rendezvous(self):
         spans = [_span("omp_barrier_implicit", "sync", 100, 500, tid=1, psid="7"),

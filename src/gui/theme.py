@@ -275,6 +275,28 @@ def confidence_color(confidence: str, dark: bool) -> str:
     pal = _DARK if dark else _LIGHT
     return {"certain": pal["text"], "high": pal["accent"]}.get(confidence, pal["textMuted"])
 
+# Critical-path evidence encodings (timeline_paint, the Timeline panels):
+# blocking time no recorded dependency releases ("unknown" -- never drawn
+# like a dependency-gated wait), edges the clocks or timestamps contradict,
+# an alternative world's edges, and path membership across variants /
+# alternative worlds (robust = every one, partial = some only).
+_EVIDENCE_COLORS: dict[str, tuple[str, str]] = {
+    "unknown":      ("#f472b6", "#be185d"),
+    "contradicted": ("#fb7185", "#be123c"),
+    "alternative":  ("#a78bfa", "#6d28d9"),
+    "ambiguous":    ("#fbbf24", "#b45309"),
+    "robust":       ("#34d399", "#047857"),
+    "partial":      ("#fbbf24", "#b45309"),
+}
+
+
+def evidence_color(key: str, dark: bool) -> str:
+    pair = _EVIDENCE_COLORS.get(key)
+    if pair is None:
+        return text_muted_color(dark)
+    return pair[0] if dark else pair[1]
+
+
 # Non-color layout tokens -- spacing/radius/typography/row/button scales.
 # Unlike the palettes above, these don't vary with the dark/light toggle,
 # so they're plain constants exposed as @Property(int, constant=True)
@@ -451,6 +473,11 @@ class Theme(QObject):
     @Slot(str, bool, result=str)
     def causeColor(self, cause: str, dark: bool | None = None) -> str:
         return cause_color(cause, self._dark if dark is None else dark)
+
+    @Slot(str, result=str)
+    @Slot(str, bool, result=str)
+    def evidenceColor(self, key: str, dark: bool | None = None) -> str:
+        return evidence_color(key, self._dark if dark is None else dark)
 
     # ── Semantic severity aliases ───────────────────────────────────────
     # Additive, not a replacement: severityColor()'s "red"/"yellow"/

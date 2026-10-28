@@ -48,12 +48,12 @@ typedef enum {
     ompt_sync_region_barrier_implicit         = 2,
     ompt_sync_region_barrier_explicit         = 3,
     ompt_sync_region_barrier_implementation   = 4,
-    ompt_sync_region_taskwait                 = 6,
-    ompt_sync_region_taskgroup                = 7,
-    ompt_sync_region_reduction                = 8,
-    ompt_sync_region_barrier_implicit_workshare = 9,
-    ompt_sync_region_barrier_implicit_parallel  = 10,
-    ompt_sync_region_barrier_teams              = 11,
+    ompt_sync_region_taskwait                 = 5,
+    ompt_sync_region_taskgroup                = 6,
+    ompt_sync_region_reduction                = 7,
+    ompt_sync_region_barrier_implicit_workshare = 8,
+    ompt_sync_region_barrier_implicit_parallel  = 9,
+    ompt_sync_region_barrier_teams              = 10,
 } ompt_sync_region_t;
 
 typedef enum {
@@ -72,11 +72,14 @@ typedef enum {
 } ompt_work_t;
 
 typedef enum {
-    ompt_target_submit        = 5,
-    ompt_target_enter_data    = 1,
-    ompt_target_exit_data     = 2,
-    ompt_target               = 3,
+    ompt_target               = 1,
+    ompt_target_enter_data    = 2,
+    ompt_target_exit_data     = 3,
     ompt_target_update        = 4,
+    ompt_target_nowait        = 9,      /* 5.1: +8 for each nowait form */
+    ompt_target_enter_data_nowait = 10,
+    ompt_target_exit_data_nowait  = 11,
+    ompt_target_update_nowait     = 12,
 } ompt_target_t;
 
 /* Callback event IDs (from omp-tools.h) */
@@ -206,11 +209,14 @@ static __thread const void  *tls_work_codeptr[MAX_DEPTH];
 static __thread int          tls_work_depth      = 0;
 static __thread uint64_t     tls_sync_start[MAX_DEPTH];
 static __thread const void  *tls_sync_codeptr[MAX_DEPTH];
+static __thread uint64_t     tls_sync_par[MAX_DEPTH];   /* region id, captured at begin */
+static __thread uint64_t     tls_sync_task[MAX_DEPTH];  /* encountering task id */
 static __thread int          tls_sync_depth      = 0;
 static __thread uint64_t     tls_target_start[MAX_DEPTH];
 static __thread int          tls_target_depth    = 0;
 static __thread uint64_t     tls_itask_start[MAX_DEPTH];
 static __thread uint64_t     tls_itask_par[MAX_DEPTH];
+static __thread uint64_t     tls_itask_id[MAX_DEPTH];
 static __thread unsigned int tls_itask_index[MAX_DEPTH];
 static __thread int          tls_itask_depth     = 0;
 
@@ -220,6 +226,13 @@ static __thread int          tls_itask_depth     = 0;
 typedef struct { uint64_t id; uint64_t start_ns; int in_use; } TaskSlot;
 static __thread TaskSlot     tls_tasks[MAX_TASK_DEPTH];
 static uint64_t              g_task_id_seq     = 1;
+/* Implicit tasks get ids too (task= on a taskwait names the task whose
+ * children it waits for, parent= on a task_create the task that created
+ * it), in their own range: HP_TASK_IMPLICIT set. cb_task_schedule never
+ * opens an omp_task fragment for them -- their time is omp_implicit_task. */
+#define HP_TASK_IMPLICIT (1ULL << 63)
+static uint64_t              g_itask_id_seq    = 1;
+static int is_explicit_task(uint64_t id) { return id != 0 && !(id & HP_TASK_IMPLICIT); }
 static uint64_t              g_parallel_id_seq = 1;
 
 /* ── Callbacks ───────────────────────────────────────────────────────── */
@@ -294,13 +307,16 @@ static void cb_implicit_task(
     ompt_data_t *task_data, unsigned int actual_parallelism,
     unsigned int index, int flags)
 {
-    (void)task_data; (void)actual_parallelism;
+    (void)actual_parallelism;
     if (flags & 0x1 /* ompt_task_initial */) return;
     if (endpoint == ompt_scope_begin) {
+        uint64_t itask = HP_TASK_IMPLICIT | (uint64_t)__sync_fetch_and_add(&g_itask_id_seq, 1);
+        if (task_data) task_data->value = itask;
         if (tls_itask_depth < MAX_DEPTH) {
             tls_itask_start[tls_itask_depth] = now_ns();
             tls_itask_par[tls_itask_depth]   = (parallel_data ? parallel_data->value : 0);
             tls_itask_index[tls_itask_depth] = index;
+            tls_itask_id[tls_itask_depth]    = itask;
         }
         tls_itask_depth++;  /* unconditional -- see cb_parallel_begin */
     } else if (endpoint == ompt_scope_end && tls_itask_depth > 0) {
@@ -309,12 +325,14 @@ static void cb_implicit_task(
         uint64_t t0 = tls_itask_start[tls_itask_depth];
         char extra[128];
         if (tls_itask_par[tls_itask_depth])
-            snprintf(extra, sizeof(extra), "type=implicit_task,index=%u,psid=%llu",
+            snprintf(extra, sizeof(extra), "type=implicit_task,index=%u,psid=%llu,itask=%llu",
                      tls_itask_index[tls_itask_depth],
-                     (unsigned long long)tls_itask_par[tls_itask_depth]);
+                     (unsigned long long)tls_itask_par[tls_itask_depth],
+                     (unsigned long long)tls_itask_id[tls_itask_depth]);
         else
-            snprintf(extra, sizeof(extra), "type=implicit_task,index=%u",
-                     tls_itask_index[tls_itask_depth]);
+            snprintf(extra, sizeof(extra), "type=implicit_task,index=%u,itask=%llu",
+                     tls_itask_index[tls_itask_depth],
+                     (unsigned long long)tls_itask_id[tls_itask_depth]);
         emit_span("openmp", gettid_compat(), t0, now_ns() - t0,
                   "omp_implicit_task", extra);
     }
@@ -365,21 +383,31 @@ static void cb_sync_region(
     ompt_data_t *parallel_data, ompt_data_t *task_data,
     const void *codeptr_ra)
 {
-    (void)task_data;
     uint64_t par_id = (parallel_data && parallel_data->value) ? parallel_data->value : 0;
+    /* indexed by ompt_sync_region_t (OpenMP 5.0: 1-7, 5.1: 8-10). Hooks
+     * before this table was corrected named kinds 5-10 one slot late (the
+     * implicit barrier of a worksharing loop came out as omp_reduction);
+     * sk= records the kind itself. */
     static const char *snames[] = {
         "", "omp_barrier", "omp_barrier_implicit", "omp_barrier_explicit",
-        "omp_barrier_impl", "", "omp_taskwait", "omp_taskgroup",
-        "omp_reduction", "omp_barrier_workshare", "omp_barrier_parallel",
-        "omp_barrier_teams"
+        "omp_barrier_impl", "omp_taskwait", "omp_taskgroup", "omp_reduction",
+        "omp_barrier_workshare", "omp_barrier_parallel", "omp_barrier_teams"
     };
-    const char *sname = (kind <= 11) ? snames[kind] : "omp_sync";
+    const char *sname = (kind >= 0 && kind <= 10) ? snames[kind] : "omp_sync";
     if (*sname == '\0') sname = "omp_sync";
 
     if (endpoint == ompt_scope_begin) {
         if (tls_sync_depth < MAX_DEPTH) {
             tls_sync_start[tls_sync_depth]   = now_ns();
             tls_sync_codeptr[tls_sync_depth] = codeptr_ra;
+            /* The region id at BEGIN: at the end of a parallel region's
+             * implicit barrier parallel_data may be NULL (OMPT 5.x), and the
+             * barrier's team was then lost (grouped by time overlap). Fall
+             * back to the enclosing implicit task's region. */
+            if (!par_id && tls_itask_depth > 0 && tls_itask_depth <= MAX_DEPTH)
+                par_id = tls_itask_par[tls_itask_depth - 1];
+            tls_sync_par[tls_sync_depth]  = par_id;
+            tls_sync_task[tls_sync_depth] = task_data ? task_data->value : 0;
         }
         tls_sync_depth++;  /* unconditional -- see cb_parallel_begin's comment */
     } else if (tls_sync_depth > 0) {
@@ -387,11 +415,20 @@ static void cb_sync_region(
         if (tls_sync_depth >= MAX_DEPTH) return;  /* overflowed level -- never captured, omit */
         uint64_t t0      = tls_sync_start[tls_sync_depth];
         const void *cptr = tls_sync_codeptr[tls_sync_depth];
+        if (!par_id) par_id = tls_sync_par[tls_sync_depth];
+        uint64_t task    = tls_sync_task[tls_sync_depth];
         char extra[EXTRA_SZ];
+        int n;
         if (par_id)
-            snprintf(extra, sizeof(extra), "type=sync,psid=%llu", (unsigned long long)par_id);
+            n = snprintf(extra, sizeof(extra), "type=sync,sk=%d,psid=%llu", (int)kind,
+                         (unsigned long long)par_id);
         else
-            snprintf(extra, sizeof(extra), "type=sync");
+            n = snprintf(extra, sizeof(extra), "type=sync,sk=%d", (int)kind);
+        /* taskwait / taskgroup: the task whose children (descendants) it
+         * waits for. */
+        if (task && (kind == ompt_sync_region_taskwait || kind == ompt_sync_region_taskgroup)
+            && n > 0 && (size_t)n < sizeof(extra))
+            snprintf(extra + n, sizeof(extra) - (size_t)n, ",task=%llu", (unsigned long long)task);
         hprofiler_append_codeptr_tag(extra, sizeof(extra), cptr);
         emit_span("sync", gettid_compat(), t0, now_ns() - t0,
                   sname, extra);
@@ -405,12 +442,19 @@ static void cb_task_create(
     int flags, int has_dependences,
     const void *codeptr_ra)
 {
-    (void)encountering_task_data; (void)encountering_task_frame;
-    (void)flags; (void)has_dependences;
+    (void)encountering_task_frame;
     uint64_t task_id = (uint64_t)__sync_fetch_and_add(&g_task_id_seq, 1);
     if (new_task_data) new_task_data->value = task_id;
+    uint64_t parent = encountering_task_data ? encountering_task_data->value : 0;
+    uint64_t region = (tls_itask_depth > 0 && tls_itask_depth <= MAX_DEPTH)
+                      ? tls_itask_par[tls_itask_depth - 1] : 0;
     char extra[EXTRA_SZ];
-    snprintf(extra, sizeof(extra), "type=task_create,id=%llu", (unsigned long long)task_id);
+    snprintf(extra, sizeof(extra), "type=task_create,id=%llu,parent=%llu,region=%llu%s%s%s%s",
+             (unsigned long long)task_id, (unsigned long long)parent, (unsigned long long)region,
+             (flags & 0x8) ? ",target=1" : "",                 /* ompt_task_target */
+             (flags & 0x08000000) ? ",undeferred=1" : "",      /* ompt_task_undeferred */
+             (flags & 0x10000000) ? ",untied=1" : "",          /* ompt_task_untied */
+             has_dependences ? ",deps=1" : "");
     hprofiler_append_codeptr_tag(extra, sizeof(extra), codeptr_ra);
     uint64_t now = now_ns();
     emit_span("openmp", gettid_compat(), now, 0, "omp_task_create", extra);
@@ -437,7 +481,7 @@ static void cb_task_schedule(
     uint64_t now = now_ns();
     /* Complete / suspend prior task -- find it by ID among open slots,
      * not by assuming it's the most-recently-pushed one. */
-    if (prior_task_data && prior_task_data->value) {
+    if (prior_task_data && is_explicit_task(prior_task_data->value)) {
         for (int i = 0; i < MAX_TASK_DEPTH; i++) {
             if (tls_tasks[i].in_use && tls_tasks[i].id == prior_task_data->value) {
                 char extra[80];
@@ -456,7 +500,7 @@ static void cb_task_schedule(
     }
     /* Claim any free slot (tasks are found by id). With all MAX_TASK_DEPTH
      * slots in use the task is not tracked. */
-    if (next_task_data && next_task_data->value) {
+    if (next_task_data && is_explicit_task(next_task_data->value)) {
         for (int i = 0; i < MAX_TASK_DEPTH; i++) {
             if (!tls_tasks[i].in_use) {
                 tls_tasks[i].id = next_task_data->value;
@@ -617,12 +661,16 @@ static void cb_target(
     ompt_id_t target_id, const void *codeptr_ra)
 {
     (void)task_data; (void)target_id; (void)codeptr_ra;
+    /* indexed by ompt_target_t; a nowait form (5.1) is its blocking kind
+     * + 8. Hooks before this table was corrected named target regions
+     * omp_target_enter_data and enter-data regions omp_target_exit_data. */
     static const char *tnames[] = {
-        "", "omp_target_enter_data", "omp_target_exit_data",
-        "omp_target", "omp_target_update", "omp_target_submit"
+        "", "omp_target", "omp_target_enter_data", "omp_target_exit_data",
+        "omp_target_update"
     };
-    const char *tname = (kind <= 5) ? tnames[kind] : "omp_target";
-    if (*tname == '\0') tname = "omp_target";
+    int nowait = kind >= ompt_target_nowait && kind <= ompt_target_update_nowait;
+    int base = nowait ? (int)kind - 8 : (int)kind;
+    const char *tname = (base >= 1 && base <= 4) ? tnames[base] : "omp_target";
 
     if (endpoint == ompt_scope_begin) {
         if (tls_target_depth < MAX_DEPTH)
@@ -632,7 +680,8 @@ static void cb_target(
         tls_target_depth--;
         if (tls_target_depth >= MAX_DEPTH) return;  /* overflowed level -- never captured, omit */
         char extra[64];
-        snprintf(extra, sizeof(extra), "type=offload,device=%d", device_num);
+        snprintf(extra, sizeof(extra), "type=offload,device=%d%s", device_num,
+                 nowait ? ",nowait=1" : "");
         emit_span("openmp", gettid_compat(),
                   tls_target_start[tls_target_depth],
                   now_ns() - tls_target_start[tls_target_depth],

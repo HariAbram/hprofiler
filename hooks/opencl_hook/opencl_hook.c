@@ -10,10 +10,15 @@
  *   clLinkProgram                         are saved for disassembly, and the
  *                                         kernel spans carry mod=, the id of
  *                                         the binary they ran (hp_module.h)
+ *   clEnqueueMarker/BarrierWithWaitList   host enqueue spans (ordering only)
  *   clFinish, clWaitForEvents             host waits ("sync")
  *   clCreateBuffer, clReleaseMemObject    opencl_memory_bytes counter
  *   dlopen, dlsym                         ACPP SSCP .jit.so CPU kernels, which
  *                                         never go through an enqueue call
+ *
+ * Every enqueue names its queue (queue=, ooo=1 on an out-of-order queue),
+ * the event it returned to the caller (ev=) and its wait list (wait=); see
+ * "Queue and event identities" below.
  */
 
 #define _GNU_SOURCE
@@ -128,7 +133,7 @@ static void emit_span(const char *cat, pid_t tid, uint64_t start_ns,
 /* Context for the event callback. `category` ("opencl" or "memory") comes
  * from the caller, which knows what it timed. `name` is a heap copy of any
  * length (kernel names from SYCL/JIT compilers run to hundreds of chars). */
-typedef struct { char *name; char extra[160]; char category[16]; } event_cb_data_t;
+typedef struct { char *name; char extra[256]; char category[16]; } event_cb_data_t;
 
 static void event_cb_free(event_cb_data_t *d) {
     if (!d) return;
@@ -343,6 +348,147 @@ static uint64_t kernel_module_id(cl_kernel kernel, cl_command_queue q) {
     return mod ? mod : (nprog == 1 ? only : 0);
 }
 
+/* A host enqueue span's sid= (hp_ids.h); its device span's psid= links back. */
+static uint32_t g_ocl_seq = 0;
+static uint64_t next_span_id(void) {
+    return hp_span_id(HP_ID_OPENCL, (uint32_t)getpid(), __atomic_add_fetch(&g_ocl_seq, 1, __ATOMIC_RELAXED));
+}
+
+/* ── Queue and event identities ──────────────────────────────────────── */
+
+/* Per-process ids, so the analysis can order commands within a queue and
+ * follow wait lists:
+ *   queue=<n>         every enqueue and clFinish; ooo=1 on an out-of-order
+ *                     queue (no implicit order between its commands)
+ *   ev=<n>            the event an enqueue handed to the caller
+ *   wait=<n>;<n>...   an enqueue's / clWaitForEvents' wait list (at most
+ *                     HP_OCL_WAIT_MAX ids), nwait= its full length,
+ *                     wait_unknown= how many of its events the hook cannot
+ *                     name (created by a call it does not record -- a user
+ *                     event, clEnqueueCopyBuffer... -- or no longer in the
+ *                     table) */
+#define CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE (1<<0)
+#define CL_QUEUE_PROPERTIES     0x1093
+#define CL_EVENT_COMMAND_QUEUE  0x11D0
+#define HP_OCL_WAIT_MAX         12
+
+typedef cl_int (*GetQueueInfo_t)(cl_command_queue, cl_uint, size_t, void*, size_t*);
+typedef cl_int (*GetEventInfo_t)(cl_event, cl_uint, size_t, void*, size_t*);
+
+static int queue_is_ooo(cl_command_queue q) {
+    static GetQueueInfo_t gqi = NULL;
+    if (!gqi) gqi = (GetQueueInfo_t)find_real_ocl("clGetCommandQueueInfo");
+    cl_command_queue_properties p = 0;
+    return gqi && q && gqi(q, CL_QUEUE_PROPERTIES, sizeof(p), &p, NULL) == CL_SUCCESS
+           && (p & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE);
+}
+
+typedef struct { cl_command_queue q; uint32_t id; int ooo; } OclQueue;
+#define OCL_QUEUE_CAP 256
+static OclQueue        g_queues[OCL_QUEUE_CAP];
+static int             g_nqueues;
+static uint32_t        g_queue_seq;
+static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* The queue's id (0 for NULL). fresh: q was just created -- a released
+ * queue's address reused by a new one gets a new id. A queue first seen
+ * here (created through a call the hook does not wrap) is registered now.
+ * Past OCL_QUEUE_CAP live queues, the oldest slots are reused. */
+static uint32_t queue_id(cl_command_queue q, int fresh, int *ooo_out) {
+    uint32_t id = 0;
+    int ooo = 0;
+    if (q) {
+        pthread_mutex_lock(&g_queue_mutex);
+        int slot = -1;
+        for (int i = 0; i < g_nqueues; i++)
+            if (g_queues[i].q == q) { slot = i; break; }
+        if (slot < 0 || fresh) {
+            if (slot < 0)
+                slot = g_nqueues < OCL_QUEUE_CAP ? g_nqueues++ : (int)(g_queue_seq % OCL_QUEUE_CAP);
+            g_queues[slot] = (OclQueue){q, ++g_queue_seq, queue_is_ooo(q)};
+        }
+        id = g_queues[slot].id;
+        ooo = g_queues[slot].ooo;
+        pthread_mutex_unlock(&g_queue_mutex);
+    }
+    if (ooo_out) *ooo_out = ooo;
+    return id;
+}
+
+/* Events, direct-mapped by address: a newer event in the same slot evicts
+ * the older one (it then becomes wait_unknown). */
+#define OCL_EV_SLOTS 16384
+typedef struct { cl_event ev; cl_command_queue q; uint64_t id; } OclEvent;
+static OclEvent        g_events[OCL_EV_SLOTS];
+static uint64_t        g_ev_seq;
+static pthread_mutex_t g_ev_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t ev_slot(cl_event ev) {
+    uintptr_t p = (uintptr_t)ev;
+    return (size_t)((p >> 4) ^ (p >> 18)) & (OCL_EV_SLOTS - 1);
+}
+
+static uint64_t event_register(cl_event ev, cl_command_queue q) {
+    if (!ev) return 0;
+    pthread_mutex_lock(&g_ev_mutex);
+    uint64_t id = ++g_ev_seq;
+    g_events[ev_slot(ev)] = (OclEvent){ev, q, id};
+    pthread_mutex_unlock(&g_ev_mutex);
+    return id;
+}
+
+/* The id of an event the hook registered, 0 otherwise. The event's own
+ * queue must still be the registered one: an event at a released event's
+ * address, from a call the hook does not record, is not mistaken for it
+ * (unless it is on the same queue). */
+static uint64_t event_lookup(cl_event ev) {
+    if (!ev) return 0;
+    pthread_mutex_lock(&g_ev_mutex);
+    OclEvent e = g_events[ev_slot(ev)];
+    pthread_mutex_unlock(&g_ev_mutex);
+    if (e.ev != ev) return 0;
+    static GetEventInfo_t gei = NULL;
+    if (!gei) gei = (GetEventInfo_t)find_real_ocl("clGetEventInfo");
+    cl_command_queue q = NULL;
+    if (gei && gei(ev, CL_EVENT_COMMAND_QUEUE, sizeof(q), &q, NULL) == CL_SUCCESS && q != e.q)
+        return 0;
+    return e.id;
+}
+
+/* Appends to buf: ",queue=<n>[,ooo=1]" when q is set, ",ev=<n>" when
+ * ev_id is, then the wait list. Truncates at a whole entry. */
+static void append_command_tags(char *buf, size_t cap, cl_command_queue q, uint64_t ev_id,
+                                cl_uint nwl, const cl_event *ewl) {
+    size_t len = strlen(buf);
+#define HP_APPEND(...) do { \
+        int w_ = len < cap ? snprintf(buf + len, cap - len, __VA_ARGS__) : -1; \
+        if (w_ < 0 || (size_t)w_ >= cap - len) { buf[len < cap ? len : cap - 1] = '\0'; return; } \
+        len += (size_t)w_; \
+    } while (0)
+    if (q) {
+        int ooo = 0;
+        uint32_t qid = queue_id(q, 0, &ooo);
+        HP_APPEND(",queue=%u%s", qid, ooo ? ",ooo=1" : "");
+    }
+    if (ev_id) HP_APPEND(",ev=%llu", (unsigned long long)ev_id);
+    if (!nwl || !ewl) return;
+    unsigned unknown = 0, shown = 0;
+    char ids[HP_OCL_WAIT_MAX * 21 + 8];
+    size_t il = 0;
+    for (cl_uint i = 0; i < nwl; i++) {
+        uint64_t id = event_lookup(ewl[i]);
+        if (!id) { unknown++; continue; }
+        if (shown == HP_OCL_WAIT_MAX) continue;
+        il += (size_t)snprintf(ids + il, sizeof(ids) - il, "%s%llu", shown ? ";" : "",
+                               (unsigned long long)id);
+        shown++;
+    }
+    if (shown) HP_APPEND(",wait=%s", ids);
+    HP_APPEND(",nwait=%u", nwl);
+    if (unknown) HP_APPEND(",wait_unknown=%u", unknown);
+#undef HP_APPEND
+}
+
 /* ── clCreateCommandQueue ────────────────────────────────────────────── */
 
 cl_command_queue clCreateCommandQueue(
@@ -355,7 +501,9 @@ cl_command_queue clCreateCommandQueue(
     if (!real) real = (fn_t)find_real_ocl("clCreateCommandQueue");
     if (!real) { if (err) *err = -6; return NULL; }
     /* Force profiling on. */
-    return real(ctx, dev, props | CL_QUEUE_PROFILING_ENABLE, err);
+    cl_command_queue q = real(ctx, dev, props | CL_QUEUE_PROFILING_ENABLE, err);
+    if (q) queue_id(q, 1, NULL);
+    return q;
 }
 
 /* clCreateCommandQueueWithProperties (OpenCL 2.0+) */
@@ -391,7 +539,9 @@ cl_command_queue clCreateCommandQueueWithProperties(
         new_props[n++] = CL_QUEUE_PROFILING_ENABLE;
     }
     new_props[n] = 0;
-    return real(ctx, dev, new_props, err);
+    cl_command_queue q = real(ctx, dev, new_props, err);
+    if (q) queue_id(q, 1, NULL);
+    return q;
 }
 
 /* ── clEnqueueNDRangeKernel ──────────────────────────────────────────── */
@@ -427,14 +577,16 @@ cl_int clEnqueueNDRangeKernel(
     if (ret == CL_SUCCESS && *event) {
         /* CPU-side span: time from enqueue call to return (scheduling latency),
            with a span id (hp_ids.h) the GPU execution span links back to. */
-        static uint32_t ocl_seq = 0;
-        uint64_t sid = hp_span_id(HP_ID_OPENCL, (uint32_t)getpid(),
-                                  __atomic_add_fetch(&ocl_seq, 1, __ATOMIC_RELAXED));
-        char modtag[24], cpu_extra[96], gpu_extra[64];
+        uint64_t sid = next_span_id();
+        char modtag[24], cpu_extra[512], gpu_extra[160];
+        uint64_t ev_id = our_event ? 0 : event_register(*event, q);
         hp_mod_tag(modtag, sizeof(modtag), kernel_module_id(kernel, q));
         snprintf(cpu_extra, sizeof(cpu_extra), "type=kernel,side=cpu,sid=%llu%s",
                  (unsigned long long)sid, modtag);
+        append_command_tags(cpu_extra, sizeof(cpu_extra), q, ev_id,
+                            num_events_in_wait_list, event_wait_list);
         snprintf(gpu_extra, sizeof(gpu_extra), "type=kernel,side=gpu%s", modtag);
+        append_command_tags(gpu_extra, sizeof(gpu_extra), q, ev_id, 0, NULL);
         emit_span("opencl", gettid_compat(), cpu_t0, cpu_dur, kname, cpu_extra);
         /* GPU-side span: async callback carries psid= linking back to the CPU span. */
         register_event_callback(*event, kname, gpu_extra, sid, "opencl");
@@ -450,6 +602,35 @@ cl_int clEnqueueNDRangeKernel(
     return ret;
 }
 
+/* ── Transfers ───────────────────────────────────────────────────────── */
+
+/* The host span of a transfer (blocking=1: the call returned only once the
+ * copy was done) and, for a non-blocking one, its device span from the
+ * event's completion callback -- a blocking call's host span already covers
+ * the whole transfer, and a device span would count it twice. *ev is the
+ * event the call returned; caller_ev: the caller asked for it. */
+static void record_transfer(const char *name, const char *gpu_name, const char *type, size_t size,
+                            cl_bool blocking, cl_command_queue q, cl_uint nwl, const cl_event *ewl,
+                            cl_event *ev, int caller_ev, uint64_t t0, cl_int ret) {
+    uint64_t t1 = now_ns();
+    uint64_t ev_id = (ret == CL_SUCCESS && caller_ev) ? event_register(*ev, q) : 0;
+    int device_span = ret == CL_SUCCESS && *ev && !blocking;
+    uint64_t sid = device_span ? next_span_id() : 0;
+    char extra[512], gpu_extra[160];
+    snprintf(extra, sizeof(extra), "type=%s,bytes=%zu%s", type, size, blocking ? ",blocking=1" : "");
+    if (sid) {
+        size_t n = strlen(extra);
+        snprintf(extra + n, sizeof(extra) - n, ",sid=%llu", (unsigned long long)sid);
+    }
+    append_command_tags(extra, sizeof(extra), q, ev_id, nwl, ewl);
+    emit_span("memory", gettid_compat(), t0, t1 - t0, name, extra);
+    if (device_span) {
+        snprintf(gpu_extra, sizeof(gpu_extra), "type=%s,bytes=%zu,side=gpu", type, size);
+        append_command_tags(gpu_extra, sizeof(gpu_extra), q, ev_id, 0, NULL);
+        register_event_callback(*ev, gpu_name, gpu_extra, sid, "memory");
+    }
+}
+
 /* ── clEnqueueSVMMemcpy (ACPP uses SVM for transfers) ───────────────── */
 
 cl_int clEnqueueSVMMemcpy(
@@ -462,17 +643,13 @@ cl_int clEnqueueSVMMemcpy(
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clEnqueueSVMMemcpy");
     if (!real) return -1; /* CL_INVALID_OPERATION */
-    char extra[64]; snprintf(extra, sizeof(extra), "type=svm_memcpy,bytes=%zu", size);
     cl_event iev = NULL;
+    int caller_ev = ev != NULL;
     if (!ev) ev = &iev;
     uint64_t t0 = now_ns();
     cl_int ret = real(q, blocking, dst, src, size, nwl, ewl, ev);
-    emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueSVMMemcpy", extra);
-    /* Device callback only for non-blocking calls: a blocking call's host
-     * span already covers the whole transfer, and a callback span would
-     * count it twice. */
-    if (ret == CL_SUCCESS && *ev && !blocking)
-        register_event_callback(*ev, "clEnqueueSVMMemcpy", extra, 0, "memory");
+    record_transfer("clEnqueueSVMMemcpy", "clEnqueueSVMMemcpy", "svm_memcpy", size, blocking, q,
+                    nwl, ewl, ev, caller_ev, t0, ret);
     return ret;
 }
 
@@ -489,14 +666,12 @@ cl_int clEnqueueReadBuffer(
     if (!real) return -1; /* CL_INVALID_OPERATION */
 
     cl_event iev = NULL;
+    int caller_ev = ev != NULL;
     if (!ev) ev = &iev;
-    char extra[64]; snprintf(extra, sizeof(extra), "type=read,bytes=%zu", size);
     uint64_t t0 = now_ns();
     cl_int ret = real(q, buf, blocking, offset, size, ptr, nwl, ewl, ev);
-    emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueReadBuffer", extra);
-    /* Non-blocking only (see clEnqueueSVMMemcpy). */
-    if (ret == CL_SUCCESS && *ev && !blocking)
-        register_event_callback(*ev, "clReadBuffer_gpu", extra, 0, "memory");
+    record_transfer("clEnqueueReadBuffer", "clReadBuffer_gpu", "read", size, blocking, q,
+                    nwl, ewl, ev, caller_ev, t0, ret);
     return ret;
 }
 
@@ -511,14 +686,12 @@ cl_int clEnqueueWriteBuffer(
     if (!real) return -1; /* CL_INVALID_OPERATION */
 
     cl_event iev = NULL;
+    int caller_ev = ev != NULL;
     if (!ev) ev = &iev;
-    char extra[64]; snprintf(extra, sizeof(extra), "type=write,bytes=%zu", size);
     uint64_t t0 = now_ns();
     cl_int ret = real(q, buf, blocking, offset, size, ptr, nwl, ewl, ev);
-    emit_span("memory", gettid_compat(), t0, now_ns()-t0, "clEnqueueWriteBuffer", extra);
-    /* NON-blocking only -- see clEnqueueSVMMemcpy's comment above. */
-    if (ret == CL_SUCCESS && *ev && !blocking)
-        register_event_callback(*ev, "clWriteBuffer_gpu", extra, 0, "memory");
+    record_transfer("clEnqueueWriteBuffer", "clWriteBuffer_gpu", "write", size, blocking, q,
+                    nwl, ewl, ev, caller_ev, t0, ret);
     return ret;
 }
 
@@ -755,15 +928,50 @@ cl_program clLinkProgram(
     return prog;
 }
 
+/* ── Markers and barriers (ordering only) ────────────────────────────── */
+
+/* A marker completes once its wait list (empty: every earlier command of
+ * the queue) has; a barrier also holds back every later command of the
+ * queue -- the only order between commands of an out-of-order queue
+ * besides wait lists. */
+static cl_int enqueue_ordering(const char *sym, const char *type, cl_command_queue q,
+                               cl_uint nwl, const cl_event *ewl, cl_event *ev) {
+    typedef cl_int (*fn_t)(cl_command_queue, cl_uint, const cl_event*, cl_event*);
+    fn_t real = (fn_t)find_real_ocl(sym);
+    if (!real) return -59; /* CL_INVALID_OPERATION */
+    uint64_t t0 = now_ns();
+    cl_int ret = real(q, nwl, ewl, ev);
+    uint64_t t1 = now_ns();
+    char extra[512];
+    snprintf(extra, sizeof(extra), "type=%s,side=cpu", type);
+    append_command_tags(extra, sizeof(extra), q, (ret == CL_SUCCESS && ev) ? event_register(*ev, q) : 0,
+                        nwl, ewl);
+    emit_span("opencl", gettid_compat(), t0, t1 - t0, sym, extra);
+    return ret;
+}
+
+cl_int clEnqueueMarkerWithWaitList(cl_command_queue q, cl_uint nwl, const cl_event *ewl, cl_event *ev) {
+    return enqueue_ordering("clEnqueueMarkerWithWaitList", "marker", q, nwl, ewl, ev);
+}
+
+cl_int clEnqueueBarrierWithWaitList(cl_command_queue q, cl_uint nwl, const cl_event *ewl, cl_event *ev) {
+    return enqueue_ordering("clEnqueueBarrierWithWaitList", "barrier", q, nwl, ewl, ev);
+}
+
 /* ── clFinish / clWaitForEvents sync spans ──────────────────────────── */
 
+/* clFinish: every command enqueued to its queue= so far is done when it
+ * returns. clWaitForEvents: the events of its wait=. */
 cl_int clFinish(cl_command_queue queue) {
     typedef cl_int (*fn_t)(cl_command_queue);
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clFinish");
     uint64_t t0 = now_ns();
     cl_int ret = real ? real(queue) : -1;
-    emit_span("sync", gettid_compat(), t0, now_ns()-t0, "clFinish", "type=sync");
+    uint64_t t1 = now_ns();
+    char extra[64] = "type=sync";
+    append_command_tags(extra, sizeof(extra), queue, 0, 0, NULL);
+    emit_span("sync", gettid_compat(), t0, t1 - t0, "clFinish", extra);
     return ret;
 }
 
@@ -771,7 +979,10 @@ cl_int clWaitForEvents(cl_uint num_events, const cl_event *event_list) {
     typedef cl_int (*fn_t)(cl_uint, const cl_event*);
     static fn_t real = NULL;
     if (!real) real = (fn_t)find_real_ocl("clWaitForEvents");
-    char extra[64]; snprintf(extra, sizeof(extra), "type=sync,count=%u", num_events);
+    char extra[512];
+    snprintf(extra, sizeof(extra), "type=sync,count=%u", num_events);
+    /* the ids before the call: the caller may release the events after it */
+    append_command_tags(extra, sizeof(extra), NULL, 0, num_events, event_list);
     uint64_t t0 = now_ns();
     cl_int ret = real ? real(num_events, event_list) : -1;
     emit_span("sync", gettid_compat(), t0, now_ns()-t0, "clWaitForEvents", extra);

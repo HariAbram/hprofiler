@@ -98,12 +98,12 @@ def all_paths(g):
     return paths
 
 
-def weight(g, path, gap_as_work=True, zero=()):
+def weight(g, path, gap_as_work=True, zero=(), gated_hi=False):
     tot = 0
     for e in path:
-        if g.mode[e] == cm.BUSY and g.owner[e] in zero:
+        if g.mode[e] in (cm.BUSY, cm.WAIT) and g.owner[e] in zero:
             continue
-        tot += cm._w(g.mode[e], g.d[e], gap_as_work)
+        tot += cm._w(g.mode[e], g.d[e], gap_as_work, g.whi[e], gated_hi)
     return tot
 
 
@@ -181,6 +181,7 @@ class TestInvariants(unittest.TestCase):
         self.assertEqual(g.t[w.sink], ext[1])
         # compositions
         self.assertEqual(sum(res.work_by_category.values()) + sum(res.in_call_by_category.values())
+                         + sum(res.unmatched_by_category.values())
                          + res.unrecorded_ns + res.device_idle_ns + sum(res.dependency_by_kind.values()),
                          res.covered_ns)
         self.assertEqual(sum(res.by_tier.values()), res.covered_ns)
@@ -206,6 +207,18 @@ class TestInvariants(unittest.TestCase):
         self.assertEqual(res.modeled_direct_only_ns, max(weight(g, p) for p in direct))
         self.assertLessEqual(res.modeled_unrecorded_idle_ns, res.modeled_ns)
         self.assertLessEqual(res.modeled_direct_only_ns, res.modeled_ns)
+        self.assertEqual(res.modeled_gated_tail_ns, max(weight(g, p, gated_hi=True) for p in paths))
+        for e in range(len(g)):                 # required time's upper bound: within the edge
+            self.assertLessEqual(0, g.whi[e])
+            self.assertLessEqual(g.whi[e], g.d[e])
+        # every variant: its walk and its longest path with the same parameters
+        for name, (gaps, direct, gated) in cm.VARIANTS.items():
+            ok = [p for p in paths if not direct or not any(g.inferred(e) for e in p)]
+            self.assertEqual(res.variants[name]["modeled_ns"],
+                             max(weight(g, p, gap_as_work=gaps, gated_hi=gated) for p in ok), name)
+        lo, hi = res.modeled_range_ns
+        self.assertLessEqual(lo, res.modeled_ns)
+        self.assertLessEqual(res.modeled_ns, hi)
         self.assertLessEqual(res.modeled_ns, wall)
         longest_paths = [p for p in paths if weight(g, p) == L]
         busy_spans = lambda p: {g.owner[e] for e in p if g.mode[e] == cm.BUSY and g.d[e] > 0}
@@ -222,6 +235,10 @@ class TestInvariants(unittest.TestCase):
                 {j for j in range(g.n) if g.cat[j] == r["category"] and g.name(j) == r["name"]}
             self.assertEqual(L - max(weight(g, p, zero=zero) for p in paths), r["modeled_reduction_ns"])
             self.assertGreaterEqual(r["modeled_reduction_ns"], 0)
+            # the replay is monotone (max-plus) and 1-Lipschitz in the work removed
+            removed = sum(g.d[e] for e in range(len(g)) if g.mode[e] == cm.BUSY and g.owner[e] in zero)
+            self.assertGreaterEqual(r["replay_reduction_ns"], 0)
+            self.assertLessEqual(r["replay_reduction_ns"], removed)
             self.assertLessEqual(r["modeled_reduction_ns"], r["work_on_longest_ns"] if r["scope"] == "span"
                                  else sum(g.d[e] for e in range(len(g))
                                           if g.mode[e] == cm.BUSY and g.owner[e] in zero))
@@ -445,6 +462,91 @@ class TestAmbiguity(unittest.TestCase):
         t = _trace([coll(1, 0, 100), coll(1, 100, 300), coll(2, 120, 310)])
         confs = {c for _v, pl in cp.build_dependency_graph(t)[1].items() for _u, k, c in pl if k == "arrival"}
         self.assertEqual(confs, {"medium"})
+
+
+# ── gated and unmatched blocking calls ─────────────────────────────────────
+
+class TestGatedAndUnmatched(unittest.TestCase):
+    def modes(self, res, name):
+        g = res.graph
+        return {cm.MODES[g.mode[e]] for e in range(len(g)) if g.owner[e] >= 0 and g.name(g.owner[e]) == name}
+
+    def test_an_unmatched_receive_is_unknown_not_work(self):
+        res = model(_trace([work("a", 1, 0, 100), recv(1, 100, 300, 0, 1, 9)]))
+        self.assertEqual(self.modes(res, "MPI_Recv"), {"unknown"})
+        self.assertNotIn("mpi", res.work_by_category)
+        self.assertEqual(res.unmatched_by_category, {"mpi": 200})
+        self.assertEqual(res.covered_ns, 300)
+        # counted as work only where unrecorded time is
+        self.assertEqual(res.modeled_unrecorded_idle_ns, 100)
+        self.assertEqual(res.modeled_ns, 300)
+        notes = cp._model_notes(res, res.covered_ns)
+        self.assertTrue(any("not counted as work" in n for n in notes), notes)
+        rep = cp.analyze(_trace([work("a", 1, 0, 100), recv(1, 100, 300, 0, 1, 9)]))
+        self.assertEqual(rep.path_unmatched_by_category, {"mpi": 200})
+        self.assertEqual(sum(rep.time_on_path_by_category.values()) + sum(rep.wait_caused_by_category.values()),
+                         rep.total_path_ns)
+
+    def test_a_matched_receive_is_waiting_with_a_processing_tail(self):
+        # the message's source event at 50: [50, 200] may be processing
+        res = model(_trace([send(2, 50, 1, 0, 9), recv(1, 0, 200, 0, 1, 9)]))
+        self.assertEqual(self.modes(res, "MPI_Recv"), {"wait"})
+        g = res.graph
+        tail = [g.whi[e] for e in range(len(g)) if g.mode[e] == cm.WAIT]
+        self.assertEqual(tail, [150])
+        self.assertEqual(res.modeled_ns, 10)                 # the send's own time
+        self.assertEqual(res.modeled_gated_tail_ns, 150)
+        self.assertEqual(res.variants["gated_tail_as_work"]["modeled_ns"], 150)
+        self.assertEqual(res.modeled_range_ns, (10, 150))
+
+    def test_the_tail_follows_the_releasing_dependency(self):
+        # rank 2's work, then the message (send at 900, receive returns at
+        # 1000), then solve: as processing, the receive's last 100 follow
+        # the send, so the chain through the message is 900 + 100 + 600
+        res = model(_trace([work("work", 2, 0, 900), send(2, 900, 1, 0, 9, end=950), work("post", 2, 1100, 1400),
+                            work("prep", 1, 0, 200), recv(1, 200, 1000, 0, 1, 9), work("solve", 1, 1000, 1600)]))
+        g = res.graph
+        self.assertEqual([g.whi[e] for e in range(len(g)) if g.mode[e] == cm.DEP], [100])
+        self.assertEqual(res.variants["default"]["modeled_ns"], 1500)
+        self.assertEqual(res.variants["gated_tail_as_work"]["modeled_ns"], 1600)
+        self.assertEqual(res.modeled_gated_tail_ns, 1600)
+        self.assertEqual(res.modeled_range_ns, (1250, 1600))
+
+    def test_the_tail_after_the_release_includes_nested_calls(self):
+        # released at 100; after it: waiting 100..200, a nested call 200..250,
+        # waiting 250..300 -- 200 of required time at most, on the lane and
+        # on the message
+        res = model(_trace([work("w", 2, 0, 100), send(2, 100, 1, 0, 9), recv(1, 0, 300, 0, 1, 9),
+                            work("cb", 1, 200, 250)]))
+        g = res.graph
+        self.assertEqual([g.whi[e] for e in range(len(g)) if g.mode[e] == cm.DEP], [200])
+        self.assertEqual(res.variants["gated_tail_as_work"]["modeled_ns"], 300)
+
+    def test_a_message_there_first_leaves_the_whole_call_as_tail(self):
+        res = model(_trace([send(2, 0, 1, 0, 9), recv(1, 50, 120, 0, 1, 9)]))
+        g = res.graph
+        self.assertEqual([g.whi[e] for e in range(len(g)) if g.mode[e] == cm.WAIT], [70])
+
+    def test_the_last_arriver_of_a_rendezvous_is_released_by_itself(self):
+        def coll(pid, a, b):
+            return mpi("MPI_Allreduce", pid, a, b, type="allreduce", rank=pid - 1, commid=0)
+        res = model(_trace([coll(1, 0, 100), coll(2, 80, 100)]))
+        g = res.graph
+        for name in ("MPI_Allreduce",):
+            self.assertEqual(self.modes(res, name), {"wait"})
+        self.assertEqual(sorted(g.whi[e] for e in range(len(g)) if g.mode[e] == cm.WAIT), [20, 20])
+        self.assertEqual(res.unmatched_by_category, {})
+
+    def test_variants_name_the_same_choices_for_walk_and_longest_path(self):
+        res = model(random_trace(4))
+        self.assertEqual(set(res.variants), set(cm.VARIANTS))
+        for name, (gaps, direct, gated) in cm.VARIANTS.items():
+            v = res.variants[name]
+            self.assertEqual((v["gaps_as_work"], v["direct_evidence_only"], v["gated_tail_as_work"]),
+                             (gaps, direct, gated))
+            self.assertLessEqual(v["covered_ns"], res.variants["default"]["covered_ns"] + 10 ** 9)
+        self.assertEqual(res.variants["default"]["modeled_ns"], res.modeled_unrecorded_idle_ns)
+        self.assertEqual(res.variants["unrecorded_as_work"]["modeled_ns"], res.modeled_ns)
 
 
 # ── multiple equal-length paths ────────────────────────────────────────────

@@ -81,10 +81,27 @@ def compute_comparison_data(candidate: Trace, baseline: Trace, *,
     }
 
 
-def _compact(r: dict[str, Any]) -> dict[str, Any]:
+def _wait_delta(r: dict[str, Any]) -> float | None:
+    """A wait's measured change in waiting time (self time of a wait node)."""
+    a, b = r["measured"]["waitNs"]
+    if a is None or b is None:
+        return None
+    return float(b - a)
+
+
+def _pair_delta(pair) -> float | None:
+    a, b = pair
+    return None if a is None or b is None else float(b - a)
+
+
+def _compact(r: dict[str, Any], joint: dict[int, list[dict]] | None = None) -> dict[str, Any]:
     """A contributor row as the ranked lists show it."""
     origin = r["chain"][-1] if r.get("chain") else None
+    joint = joint or {}
     return {
+        "jointOrigins": 1 + len(r.get("jointFrom") or []) if r.get("propagatedFrom") is not None and r.get("jointFrom") else 0,
+        "jointWaits": len(joint.get(r["id"], [])),
+        "waitBlameDeltaNs": _pair_delta(r["derived"].get("waitBlameNs", (None, None))),
         "id": r["id"], "rank": r.get("rank", 0), "label": dash.fmt_kernel_name(r["label"]),
         "roles": r["roles"], "path": r["path"], "cause": r["cause"], "causeLabel": r["causeLabel"],
         "impactNs": float(r["impactNs"]), "criticalDeltaNs": float(r.get("criticalDeltaNs", r["impactNs"])),
@@ -111,6 +128,8 @@ class ComparisonBridge(QObject):
         self._selected_phase = -1
         self._report: dict[str, Any] = {}
         self._rows_by_id: dict[int, dict[str, Any]] = {}
+        self._all_rows: dict[int, dict[str, Any]] = {}
+        self._joint_waits: dict[int, list[dict[str, Any]]] = {}
         self._rows: list[dict[str, Any]] = []
         self._report_rows: list[dict[str, Any]] = []
         self._bucket_rows: list[dict[str, Any]] = []
@@ -188,11 +207,30 @@ class ComparisonBridge(QObject):
         for key in ("contributors", "propagated", "offCriticalPath", "improvements", "newWork", "removedWork"):
             for r in self._report.get(key, []):
                 self._rows_by_id.setdefault(r["id"], r)
+        # joint releases: every wait whose change traces to several origins,
+        # indexed by origin -- an origin off the path (direct impact 0) still
+        # jointly caused the wait
+        # every identity's row (the lists hold only those above the noise
+        # floor): a chain step or a joint origin below it is still reachable
+        self._all_rows: dict[int, dict[str, Any]] = dict(self._detail.get("rows") or {})
+        for i, r in self._rows_by_id.items():
+            self._all_rows.setdefault(i, r)
+        self._joint_waits: dict[int, list[dict[str, Any]]] = {}
+        for r in self._all_rows.values():
+            o = r.get("propagatedFrom")
+            if o is None:
+                continue
+            origins = [o] + [x for x in (r.get("jointFrom") or []) if x != o]
+            dw = _wait_delta(r)
+            for x in origins:
+                self._joint_waits.setdefault(x, []).append({
+                    "wait": r["id"], "origins": origins, "waitDeltaNs": dw,
+                    "shareNs": None if dw is None else dw / len(origins), "joint": len(origins) > 1})
         if self._selected_phase >= len(self._report.get("phases", [])):
             self._selected_phase = -1
 
     def _list(self, key: str) -> list[dict[str, Any]]:
-        return [_compact(r) for r in self._report.get(key, [])]
+        return [_compact(r, self._joint_waits) for r in self._report.get(key, [])]
 
     @Property(bool, constant=True)
     def available(self) -> bool:
@@ -281,7 +319,7 @@ class ComparisonBridge(QObject):
             r = self._rows_by_id.get(t["identity"])
             if r is None:
                 continue
-            c = _compact(r)
+            c = _compact(r, self._joint_waits)
             c["rank"] = i + 1
             c["impactNs"] = float(t["impactNs"])
             out.append(c)
@@ -343,7 +381,7 @@ class ComparisonBridge(QObject):
         """Everything the details panel shows for one contributor, incl.
         the timeline ranges to jump to (candidate = the trace on screen) and
         the source location with a snippet when the file exists here."""
-        r = self._rows_by_id.get(identity)
+        r = self._rows_by_id.get(identity) or self._all_rows.get(identity)
         if r is None:
             return {}
         f = dash.fmt_ns
@@ -362,7 +400,8 @@ class ComparisonBridge(QObject):
                 row("queue delay", m["queueNs"], "measured" if m["queueNs"][0] is not None else "unavailable"),
                 row("overlapped with other work", m["overlapNs"], "measured"),
                 row("critical-path time", d["criticalNs"], "derived"),
-                row("idle on the path blamed on it", d["blameNs"], "derived")]
+                row("idle on the path blamed on it", d["blameNs"], "derived"),
+                row("waiting it caused (wait blame)", d.get("waitBlameNs", (None, None)), "derived")]
         if m["waitNs"][0] is not None or m["waitNs"][1] is not None:
             rows.insert(2, row("waiting", m["waitNs"], "measured"))
         pair = None
@@ -393,8 +432,12 @@ class ComparisonBridge(QObject):
             "explanation": r["explanation"],
             "alsoCauses": [f"{c['label']} ({_signed(c['ns'])})" for c in r["alsoCauses"]],
             "rows": rows, "evidence": list(r["evidence"]),
-            "chain": [{"label": c["label"], "roles": c["roles"], "cause": c["cause"],
+            "chain": [{"identity": c["identity"], "label": c["label"], "roles": c["roles"], "cause": c["cause"],
+                       "selectable": c["identity"] in self._all_rows,
                        "causeLabel": cc.CAUSE_LABELS.get(c["cause"], c["cause"] or "—")} for c in r["chain"]],
+            "attribution": self._attribution(r),
+            "jointOrigins": self._joint_origins(r),
+            "jointWaits": self._waits_released(r["id"]),
             "confidence": -1.0 if r["confidence"] is None else float(r["confidence"]),
             "matchKind": r["match"]["kind"],
             "matchScore": -1.0 if r["match"]["score"] is None else float(r["match"]["score"]),
@@ -406,6 +449,69 @@ class ComparisonBridge(QObject):
             "baselineRangeText": (f"{f(base['endNs'] - base['startNs'])} window in the baseline"
                                   if base else "not in the baseline"),
         }
+
+    def _attribution(self, r: dict[str, Any]) -> dict[str, Any]:
+        """Three separate quantities: its own critical-path change (direct),
+        its share of the waits it released with others (jointly caused),
+        and the change of the waiting cp_attribution charges to its work
+        (propagated wait blame)."""
+        released = self._joint_waits.get(r["id"], [])
+        joint = [w for w in released if w["shareNs"] is not None]
+        wb = _pair_delta(r["derived"].get("waitBlameNs", (None, None)))
+        return {
+            "directNs": float(r.get("criticalDeltaNs", r["impactNs"])), "receivedNs": float(r.get("receivedNs", 0)),
+            "impactNs": float(r["impactNs"]),
+            "jointWaitNs": float(sum(w["shareNs"] for w in joint)) if joint else None,
+            "jointWaits": len(released),
+            "waitBlameDeltaNs": wb,
+        }
+
+    def _identity_brief(self, ident: int) -> dict[str, Any]:
+        r = self._all_rows.get(ident)
+        if r is None:
+            return {"id": ident, "label": f"identity {ident}", "roles": "", "available": False, "hasTimeline": False}
+        tl = (r.get("timeline") or {}).get("candidate")
+        return {"id": ident, "label": dash.fmt_kernel_name(r["label"]), "roles": r["roles"], "available": True,
+                "directNs": float(r.get("criticalDeltaNs", r["impactNs"])), "impactNs": float(r["impactNs"]),
+                "waitBlameDeltaNs": _pair_delta(r["derived"].get("waitBlameNs", (None, None))),
+                "hasTimeline": tl is not None, "timelineStartNs": float(tl["startNs"]) if tl else 0.0,
+                "timelineEndNs": float(tl["endNs"]) if tl else 0.0,
+                "category": r["category"], "rawName": r["rawName"]}
+
+    def _joint_origins(self, r: dict[str, Any]) -> list[dict[str, Any]]:
+        """A wait released jointly: every origin, the chain's and the joint
+        ones, each with its own direct impact and its share of the wait."""
+        o = r.get("propagatedFrom")
+        joint = [x for x in (r.get("jointFrom") or []) if x != o]
+        if o is None or not joint:
+            return []
+        dw = _wait_delta(r)
+        n = 1 + len(joint)
+        out = []
+        for x, role in [(o, "chain origin")] + [(j, "joint origin") for j in joint]:
+            b = self._identity_brief(x)
+            b["role"] = role
+            b["shareNs"] = None if dw is None else dw / n
+            out.append(b)
+        return out
+
+    def _waits_released(self, ident: int) -> list[dict[str, Any]]:
+        out = []
+        for w in self._joint_waits.get(ident, []):
+            b = self._identity_brief(w["wait"])
+            b["shareNs"] = w["shareNs"]
+            b["waitDeltaNs"] = w["waitDeltaNs"]
+            b["joint"] = w["joint"]
+            b["coOrigins"] = [self._identity_brief(x)["label"] + " (" + self._identity_brief(x)["roles"] + ")"
+                              for x in w["origins"] if x != ident]
+            out.append(b)
+        return out
+
+    @Slot(int, result='QVariantMap')
+    def identityTimeline(self, identity: int) -> dict[str, Any]:
+        """Where any compared identity ran in the candidate (for "Show in
+        Timeline" from a chain step, a joint origin or a released wait)."""
+        return self._identity_brief(int(identity))
 
     @Slot(int, result='QVariantMap')
     def phaseRange(self, index: int) -> dict[str, Any]:

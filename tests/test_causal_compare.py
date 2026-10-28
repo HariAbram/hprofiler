@@ -218,6 +218,23 @@ class TestOverlapAndCriticalPath(unittest.TestCase):
         # rank 1's own compute did not change
         self.assertFalse(find(r["contributors"] + r["offCriticalPath"], "compute", rank="rank1"))
 
+    def test_a_joint_release_is_blamed_on_both_origins(self):
+        # the observed path runs through one sender (a tie); the wait waited
+        # for both: jointFrom names the other, and the waiting blame
+        # (cp_attribution) is split equally between them, on both sides
+        r = cc.compare_traces(S.mpi_waitall_two_senders(False), S.mpi_waitall_two_senders(True))
+        wait = find(r["propagated"], "MPI_Waitall", rank="rank1")
+        self.assertEqual(len(wait), 1)
+        wait = wait[0]
+        origins = {wait["propagatedFrom"], *wait["jointFrom"]}
+        computes = [c for c in r["contributors"] + r["offCriticalPath"] if c["label"] == "compute"]
+        self.assertEqual({c["roleMap"]["rank"] for c in computes if c["id"] in origins}, {"rank0", "rank2"})
+        blame = [c["derived"]["waitBlameNs"] for c in computes]
+        self.assertEqual(len(blame), 2)
+        self.assertEqual(blame[0], blame[1])
+        self.assertAlmostEqual(blame[0][0], 10 * MS, delta=MS)          # 5 waits of ~4 ms, halved
+        self.assertAlmostEqual(blame[0][1], 35 * MS, delta=MS)          # 5 waits of ~14 ms, halved
+
     def test_critical_path_views_and_decomposition(self):
         r = cc.compare_traces(S.becomes_critical(False), S.becomes_critical(True))
         cpv = r["criticalPath"]

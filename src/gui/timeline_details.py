@@ -142,11 +142,29 @@ def event_details(m, lane: int, eid: int) -> dict[str, Any]:
         if eid in an.slack_of_eid:
             cpf.append(_f("Slack", fmt(an.slack_of_eid[eid]), "derived",
                           "how much one of its busy segments could grow before the modeled path does"))
+        cpf.extend(_blocking_fields(m, an, eid))
+        cpf.extend(_membership_fields(an, eid, on))
+        if eid in an.blame_of_eid:
+            cpf.append(_f("Waiting it caused", fmt(an.blame_of_eid[eid]), "derived",
+                          "other calls' waiting time this call's work delayed (blame; joint releases shared)"))
+        if eid in an.passed_on_of_eid:
+            cpf.append(_f("Waiting passed on", fmt(an.passed_on_of_eid[eid]), "derived",
+                          "blame charged to it while it was itself waiting, passed on to what released it"))
+        if an.joint_of_eid.get(eid):
+            n = len(an.joint_of_eid[eid])
+            cpf.append(_f("Joint release", f"released {n} wait(s) together with other sources", "derived",
+                          "sources within 1 µs of the latest (or the clocks' uncertainty) share the wait equally"))
+        replayed = False
         for r in an.sensitivity:
             if r.get("eid") == eid:
+                replayed = True
                 cpf.append(_f("Counterfactual", f"busy time → 0 shortens the modeled path by "
-                              f"{fmt(r['modeled_reduction_ns'])}", "estimated",
-                              "a graph counterfactual, not a measured speedup"))
+                              f"{fmt(r['modeled_reduction_ns'])}; replayed, the run ends "
+                              f"{fmt(r.get('replay_reduction_ns', 0))} earlier", "estimated",
+                              "a graph counterfactual and a replay with recorded residuals, not measured speedups"))
+        if not replayed and (on or eid in an.on_some):
+            cpf.append(_unavail("Replay", "computed only for the sensitivity candidates "
+                                          "(Critical path ▸ Sensitivity), not for this event"))
         for w in an.waits:
             if w.eid == eid:
                 cause = an.edges[w.edge] if 0 <= w.edge < len(an.edges) else None
@@ -165,6 +183,7 @@ def event_details(m, lane: int, eid: int) -> dict[str, Any]:
                 "edge": k, "direction": "in" if incoming else "out", "kind": e.kind, "family": e.family,
                 "runtime": e.runtime, "tier": e.tier, "provenance": e.provenance, "class": e.cls,
                 "reason": cm.edge_reason(e.kind, e.provenance, e.tier), "onPath": e.on_path,
+                "status": e.status, "statusShown": _status_shown(an, e), "alternatives": e.alternatives,
                 "partner": other.name if other is not None else "?", "partnerLane": other_lane,
                 "partnerSpanIdx": float(other_eid), "partnerPlace": m._lane_display(other_lane),
                 "latencyNs": float(abs(e.t_dst - e.t_src)),
@@ -200,28 +219,262 @@ def event_details(m, lane: int, eid: int) -> dict[str, Any]:
             "sections": sections, "dependencies": deps}
 
 
+def _blocking_fields(m, an, eid: int) -> list[dict[str, Any]]:
+    """A blocking call: unknown (no recorded dependency releases it -- never
+    described as a gated wait) or gated, with its release and the upper bound
+    of its processing after it."""
+    t0 = float(m._view_start)
+    if eid in an.unknown_eids:
+        return [_f("Blocking call", "unknown: no recorded dependency releases it — waiting for something the "
+                                    "trace did not record, or processing", "derived",
+                   "counted as work in the 'unrecorded / unknown time as work' variant, as idle otherwise; "
+                   "never as a dependency-gated wait")]
+    gt = an.gated_of_eid.get(eid)
+    if gt is None:
+        return []
+    if gt["selfReleased"]:
+        how = "released by its own arrival (a rendezvous's last arriver, or a member nobody gates)"
+    else:
+        e = an.edges[gt["edge"]] if 0 <= gt["edge"] < len(an.edges) else None
+        how = f"released at +{fmt(gt['releaseNs'] - t0)}" + (
+            f" by {e.kind} from {m._lane_display(e.src_lane)} ({e.tier})" if e is not None else "")
+    call = gt["callEndNs"] - gt["callStartNs"]
+    return [_f("Blocking call", f"gated: {how}", "derived", "a dependency from another lane gates its end"),
+            _f("Gated tail", f"at most {fmt(gt['tailNs'])} of its {fmt(call)} may have been processing "
+                             "(the time after its release)", "derived",
+               "the upper bound of its required time; the 'gated calls' tails as processing' variant counts it")]
+
+
+def _membership_fields(an, eid: int, on: bool) -> list[dict[str, Any]]:
+    """Path membership across the variants and the alternative worlds --
+    "not evaluated" when the worlds were not evaluated, never "every"."""
+    from .timeline_analysis import VARIANT_LABELS
+    out = []
+    in_v = [k for k, v in an.variant_eids.items() if eid in v]
+    if in_v and len(in_v) == len(an.variant_eids):
+        out.append(_f("Across variants", "on the observed path in every variant (stable)", "derived",
+                      "the four ways of counting time the trace cannot decide (Critical path ▸ Variants)"))
+    elif in_v:
+        out.append(_f("Across variants", "only in: " + ", ".join(VARIANT_LABELS.get(k, k) for k in in_v)
+                      + " (variant-only)", "derived",
+                      "the four ways of counting time the trace cannot decide (Critical path ▸ Variants)"))
+    if eid in an.near_eids:
+        out.append(_f("Near-critical", f"yes: modeled slack within 1% of the modeled length ({an.near_basis})",
+                      "derived", "busy work that would join the longest path after a small change"))
+    st = an.alternatives_state
+    if not an.alternatives_evaluated:
+        out.append(_unavail("Across alternatives", an.alternatives_reason or "not evaluated"))
+    elif st == "none_found":
+        out.append(_f("Across alternatives", "no alternative worlds: none were found", "derived",
+                      an.alternatives_reason))
+    elif on or eid in an.robust_some:
+        v = ("on the path in every evaluated world" if eid in an.robust_every
+             else "on the path in some evaluated worlds only")
+        if st == "truncated":
+            v += " (evaluation truncated)"
+        out.append(_f("Across alternatives", v, "derived", an.alternatives_reason))
+    else:
+        out.append(_f("Across alternatives", "on no evaluated world's path", "derived", an.alternatives_reason))
+    return out
+
+
+def _status_shown(an, e) -> str:
+    """An edge's status as the GUI may state it: without evaluated
+    alternative worlds no other candidates were generated, so nothing is
+    called unambiguous."""
+    if not e.status:
+        return ""
+    if not an.alternatives_evaluated and e.status in ("observed", "inferred"):
+        return e.status + " (alternatives not evaluated)"
+    return e.status
+
+
+def _evidence_tree(nodes: list[dict], depth: int = 0) -> list[dict[str, Any]]:
+    out = []
+    for n in nodes:
+        out.append({"depth": depth, "kind": n["kind"], "class": n["class"], "what": n["what"]})
+        out.extend(_evidence_tree(n.get("derived_from") or [], depth + 1))
+    return out
+
+
+def _records(x: dict) -> list[str]:
+    """The raw tags each supporting evidence kind was read from, one line each."""
+    out = []
+    for n in x.get("for", []) + x.get("against", []):
+        for r in n.get("record", []) or []:
+            tags = ", ".join(f"{k}={v}" for k, v in r.items() if k not in ("role", "span"))
+            out.append(f"{n['kind']}: {r.get('role')} {r.get('span')}  {tags}")
+    return out
+
+
+def _candidate_spans(m, an, cand_rows: list[int]) -> dict[int, Any]:
+    """{span ordinal: SpanEvent} for the endpoints of these candidates."""
+    es = an.evidence
+    out = {}
+    for c in cand_rows:
+        for o in (int(es.cand["src"][c]), int(es.cand["dst"][c])):
+            if o not in out and 0 <= o < len(an.eid_of_ord):
+                s = m._store.event_by_id(int(an.eid_of_ord[o]))
+                if s is not None:
+                    out[o] = s
+    return out
+
+
+def _endpoint(m, an, o: int, t0: float) -> dict[str, Any]:
+    if not (0 <= o < len(an.eid_of_ord)):
+        return {"name": "?", "laneIndex": -1, "spanIdx": -1.0, "place": "?", "atNs": 0.0, "at": ""}
+    eid, lane = int(an.eid_of_ord[o]), int(an.lane_of_ord[o])
+    s = m._store.event_by_id(eid)
+    start = float(an.start_of_ord[o])
+    return {"name": s.name if s else "?", "laneIndex": lane, "spanIdx": float(eid), "place": m._lane_display(lane),
+            "atNs": start, "at": "+" + fmt(start - t0)}
+
+
+def _candidate_rows(m, an, c: int, t0: float) -> tuple[dict, list[dict], list[dict], list[str]]:
+    """explain(c) as display rows: its group, the other candidates of the
+    group, the evidence tree for and against it, the raw tags."""
+    es = an.evidence
+    gid = int(es.cand["group"][c])
+    members = [int(x) for x in es.group_members(gid).tolist()]
+    x = es.explain(c, _candidate_spans(m, an, members))
+    others = []
+    for o in members:
+        if o == c:
+            continue
+        xo = es.explain(o)
+        others.append({"candidate": o, "status": xo["status"], "selected": xo["selected"],
+                       "kind": xo["kind"], "tier": xo["tier"],
+                       "why": ", ".join(n["kind"] for n in xo["for"]) or "—",
+                       "source": _endpoint(m, an, xo["src"], t0), "target": _endpoint(m, an, xo["dst"], t0)})
+    tree = {"for": _evidence_tree(x["for"]), "against": _evidence_tree(x["against"])}
+    return x["group"], others, tree["for"] + [dict(t, against=True) for t in tree["against"]], _records(x)
+
+
+def _probability_text(an, e) -> str:
+    from .timeline_analysis import edge_probability
+    rep = an.report
+    cal = getattr(rep, "calibration", None) if rep is not None else None
+    if cal is None:
+        return "unquantified (no calibration given)"
+    p = edge_probability(an, e)
+    if p is None:
+        return f"unquantified: the calibration ({cal.dataset or 'unnamed dataset'}) has no stratum for this edge"
+    return f"{p:.2f}, calibrated on {cal.dataset or 'an unnamed dataset'}"
+
+
 def edge_details(m, edge_id: int) -> dict[str, Any]:
     an = m._analysis
-    if an is None or not an.ok or edge_id < 0 or edge_id >= len(an.edges):
+    if an is None or not an.ok or edge_id < 0 or edge_id >= len(an.edges) + len(an.extra_edges):
         return {}
+    if edge_id >= len(an.edges):
+        return _extra_edge_details(m, an, edge_id)
     e = an.edges[edge_id]
     src = m._store.event_by_id(e.src_eid) if e.src_eid >= 0 else None
     dst = m._store.event_by_id(e.dst_eid) if e.dst_eid >= 0 else None
     t0 = float(m._view_start)
     from .timeline_analysis import FAMILY_LABELS
+    why_for = why_against = ""
+    group: dict[str, Any] = {}
+    others: list[dict] = []
+    tree: list[dict] = []
+    records: list[str] = []
+    if an.evidence is not None and e.candidate >= 0:
+        x = an.evidence.explain(e.candidate)
+        why_for = "; ".join(f"{n['kind']} ({n['class']})" for n in x["for"])
+        why_against = "; ".join(n["kind"] for n in x["against"]) or "nothing"
+        group, others, tree, records = _candidate_rows(m, an, e.candidate, t0)
+    if not an.alternatives_evaluated:
+        why = an.alternatives_reason or "alternative worlds were not generated"
+        alt_text = why if why.startswith("not evaluated") else "not evaluated — " + why
+    elif e.alternatives > 0:
+        alt_text = f"{e.alternatives} other candidate(s) for the same question"
+    else:
+        alt_text = "none found"
     return {
         "id": edge_id, "kind": e.kind, "family": e.family, "familyLabel": FAMILY_LABELS.get(e.family, e.family),
         "runtime": e.runtime, "tier": e.tier, "provenance": e.provenance, "class": e.cls,
         "provenanceText": cm.PROVENANCE[e.provenance][1], "reason": cm.edge_reason(e.kind, e.provenance, e.tier),
-        "onPath": e.on_path, "latencyNs": float(e.t_dst - e.t_src),
+        "onPath": e.on_path, "latencyNs": float(e.t_dst - e.t_src), "role": "active",
         "source": {"name": src.name if src else "?", "laneIndex": e.src_lane, "spanIdx": float(e.src_eid),
                    "place": m._lane_display(e.src_lane), "event": e.src_end, "atNs": float(e.t_src),
                    "at": "+" + fmt(e.t_src - t0)},
         "target": {"name": dst.name if dst else "?", "laneIndex": e.dst_lane, "spanIdx": float(e.dst_eid),
                    "place": m._lane_display(e.dst_lane), "event": e.dst_end, "atNs": float(e.t_dst),
                    "at": "+" + fmt(e.t_dst - t0)},
-        "note": "evidence classes are not probabilities: nothing calibrates the tiers",
+        "status": e.status, "statusShown": _status_shown(an, e), "statusText": _STATUS_TEXT.get(e.status, ""),
+        "alternatives": e.alternatives, "alternativesText": alt_text, "alternativesEvaluated": an.alternatives_evaluated,
+        "group": {"kind": group.get("kind", ""), "cardinality": group.get("cardinality", ""),
+                  "cardinalityText": _CARD_TEXT.get(group.get("cardinality", ""), ""),
+                  "members": int(group.get("members", 0))},
+        "candidates": others, "evidenceTree": tree, "records": records,
+        "evidenceFor": why_for, "evidenceAgainst": why_against,
+        "probability": _probability_text(an, e),
+        "note": "evidence classes are not probabilities unless a calibration is given",
     }
+
+
+def _extra_edge_details(m, an, edge_id: int) -> dict[str, Any]:
+    """A dependency that is not active: contradicted (disabled / dropped) or
+    an alternative world's edge."""
+    from .timeline_analysis import FAMILY_LABELS
+    x = an.extra_edges[edge_id - len(an.edges)]
+    t0 = float(m._view_start)
+    src = m._store.event_by_id(x.src_eid) if x.src_eid >= 0 else None
+    dst = m._store.event_by_id(x.dst_eid) if x.dst_eid >= 0 else None
+    if x.role == "disabled":
+        status = "contradicted"
+        why = (_EVIDENCE_TEXT["clock_bound"] if x.reason == "clock_bound" else _EVIDENCE_TEXT["time_contradiction"])
+        role_text = "not an active dependency: " + why
+    else:
+        status = "unsupported"
+        labels = [an.worlds[w]["label"] for w in x.worlds if 0 <= w < len(an.worlds)]
+        role_text = "an alternative no builder chose, used by " + (", ".join(labels) or "an evaluated world")
+    group, others, tree, records = ({}, [], [], [])
+    if an.evidence is not None and 0 <= x.candidate < len(an.evidence):
+        group, others, tree, records = _candidate_rows(m, an, x.candidate, t0)
+    return {
+        "id": edge_id, "kind": x.kind, "family": x.family, "familyLabel": FAMILY_LABELS.get(x.family, x.family),
+        "runtime": "", "tier": x.tier, "provenance": "", "class": "inferred", "provenanceText": "",
+        "reason": role_text, "onPath": False, "latencyNs": float(x.t_dst - x.t_src), "role": x.role,
+        "source": {"name": src.name if src else "?", "laneIndex": x.src_lane, "spanIdx": float(x.src_eid),
+                   "place": m._lane_display(x.src_lane), "event": "", "atNs": float(x.t_src),
+                   "at": "+" + fmt(x.t_src - t0)},
+        "target": {"name": dst.name if dst else "?", "laneIndex": x.dst_lane, "spanIdx": float(x.dst_eid),
+                   "place": m._lane_display(x.dst_lane), "event": "", "atNs": float(x.t_dst),
+                   "at": "+" + fmt(x.t_dst - t0)},
+        "status": status, "statusShown": status, "statusText": _STATUS_TEXT.get(status, ""),
+        "alternatives": len(others), "alternativesText": f"{len(others)} other candidate(s) in its group",
+        "alternativesEvaluated": an.alternatives_evaluated,
+        "group": {"kind": group.get("kind", ""), "cardinality": group.get("cardinality", ""),
+                  "cardinalityText": _CARD_TEXT.get(group.get("cardinality", ""), ""),
+                  "members": int(group.get("members", 0))},
+        "candidates": others, "evidenceTree": tree, "records": records,
+        "evidenceFor": ", ".join(t["kind"] for t in tree if not t.get("against")),
+        "evidenceAgainst": ", ".join(t["kind"] for t in tree if t.get("against")) or x.reason,
+        "probability": "unquantified (not an active dependency)",
+        "note": role_text,
+    }
+
+
+_STATUS_TEXT = {
+    "observed": "direct evidence, the only candidate, consistent timestamps",
+    "inferred": "chosen by a rule (posting order, call order, time overlap) or a weaker tier",
+    "ambiguous": "its question has other candidates the evidence does not rule out",
+    "contradicted": "the timestamps or the clocks' bounds rule it out (kept, not in the graph)",
+    "unsupported": "an alternative no builder chose",
+}
+
+_CARD_TEXT = {
+    "exactly_one": "exactly one candidate is the answer",
+    "at_most_one": "at most one (the answer may be a lost record)",
+    "any_subset": "any subset of the candidates",
+}
+
+_EVIDENCE_TEXT = {
+    "clock_bound": "no offsets of the clock domains within their bounds satisfy it together with the other "
+                   "dependencies",
+    "time_contradiction": "its source event lies after its destination beyond the clock tolerance",
+}
 
 
 # ── jump to ───────────────────────────────────────────────────────────────
@@ -466,8 +719,15 @@ def export_figure(m, path: str, a: float, b: float, width: int) -> None:
     rows = m._rows
     lane_w = max(200, int(width) - label_w - 2 * pad)
     families = sorted({an_e for an_e in (m._overlay.get("families") or [])})
+    mode = m._overlay.get("membership") or ""
+    strip = {"near": "near-critical (slack within 1% of the modeled length)",
+             "variant": f"observed path of the variant {m._overlay.get('variant', '')}",
+             "world": "the selected alternative world's observed path"}.get(mode, "")
     legend = tp.legend_entries(style.dark, color_mode=m._color_mode, has_density=True, has_unobserved=True,
-                               families=families, critical=bool(m._overlay.get("criticalPath")))
+                               families=families, critical=bool(m._overlay.get("criticalPath")),
+                               contradicted=bool(m._overlay.get("disabledEdges")), alternative=mode == "world",
+                               membership={"variants": "variant", "worlds": "evaluated world"}.get(mode, ""),
+                               strip_label=strip)
     legend_h = 18 * len(legend) + 24
     H = top_h + row_h * len(rows) + legend_h + pad
     W = label_w + lane_w + 2 * pad

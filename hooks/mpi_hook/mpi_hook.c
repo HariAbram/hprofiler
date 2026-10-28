@@ -8,7 +8,8 @@
  * Mprobe/Improbe/Mrecv/Imrecv (as markers), Wait*, Test*, Cancel),
  * non-blocking collectives (Ibarrier, Ibcast, Iallreduce, Ireduce,
  * Iallgather, Ialltoall, Iscatter, Igather), persistent requests
- * (Send_init, Bsend_init, Ssend_init, Rsend_init, Recv_init, Start, Startall), collectives (Bcast, Reduce,
+ * (Send_init, Bsend_init, Ssend_init, Rsend_init, Recv_init, Start, Startall,
+ * Request_free), collectives (Bcast, Reduce,
  * Allreduce, Alltoall, Allgather, Scatter, Gather, Allgatherv, Alltoallv,
  * Gatherv, Scatterv, Reduce_scatter, Reduce_scatter_block, Barrier, Scan,
  * Exscan), one-sided (Put, Get, Accumulate, Win_fence/flush/flush_all/lock/
@@ -16,7 +17,13 @@
  * Comm_dup/split/create/free (only for commid= and rank translation).
  *
  * Request linking: a posted request gets an id (sid=); completion calls
- * report the ids they completed (psid=).
+ * report the ids they completed (psid=). Every MPI_Start (and each request
+ * an MPI_Startall starts) is reported as a post of its own -- ptype=send|
+ * recv with the template's peer/tag/communicator and a fresh sid= -- so
+ * persistent messages pair like Isend/Irecv.
+ *
+ * Rooted collectives (Bcast, Reduce, Scatter(v), Gather(v) and their
+ * non-blocking forms) carry root= and wroot= (the root's world rank).
  *
  * Statuses: a status (array) the caller passes goes to PMPI_* unchanged.
  * Only when the caller passes MPI_STATUS(ES)_IGNORE and the hook needs a
@@ -1435,12 +1442,36 @@ int FNAME(__VA_ARGS__) {                                                \
     return ret;                                                         \
 }
 
-_COLL(MPI_Bcast,
+/* Rooted collectives also carry root= (the root's rank in the communicator)
+ * and wroot= (its MPI_COMM_WORLD rank, when it can be translated): which
+ * members wait for which depends on the root (criticalpath.py's rooted
+ * collective semantics). */
+#define _COLLR(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)            \
+int FNAME(__VA_ARGS__) {                                                \
+    char extra[224];                                                    \
+    size_t nb = (BYTES_EXPR);                                           \
+    int64_t cid = comm_id_for(comm);                                    \
+    int wroot = world_rank_of(comm, root);                              \
+    if (wroot >= 0)                                                     \
+        snprintf(extra, sizeof(extra),                                  \
+                 "type=%s,bytes=%zu,rank=%d,commid=%lld,root=%d,wroot=%d", \
+                 TYPE_STR, nb, g_mpi_rank, (long long)cid, root, wroot);\
+    else                                                                \
+        snprintf(extra, sizeof(extra),                                  \
+                 "type=%s,bytes=%zu,rank=%d,commid=%lld,root=%d",       \
+                 TYPE_STR, nb, g_mpi_rank, (long long)cid, root);       \
+    uint64_t t0 = now_ns();                                             \
+    int ret = PMPI_CALL;                                                \
+    emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                  \
+    return ret;                                                         \
+}
+
+_COLLR(MPI_Bcast,
       PMPI_Bcast(buffer, count, datatype, root, comm),
       "bcast", (size_t)count * dtype_size(datatype),
       void *buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm)
 
-_COLL(MPI_Reduce,
+_COLLR(MPI_Reduce,
       PMPI_Reduce(sendbuf, recvbuf, count, datatype, op, root, comm),
       "reduce", (size_t)count * dtype_size(datatype),
       const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype,
@@ -1464,13 +1495,13 @@ _COLL(MPI_Allgather,
       const void *sendbuf, int sendcount, MPI_Datatype sendtype,
       void *recvbuf, int recvcount, MPI_Datatype recvtype, MPI_Comm comm)
 
-_COLL(MPI_Scatter,
+_COLLR(MPI_Scatter,
       PMPI_Scatter(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, root, comm),
       "scatter", (size_t)sendcount * dtype_size(sendtype),
       const void *sendbuf, int sendcount, MPI_Datatype sendtype,
       void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm)
 
-_COLL(MPI_Gather,
+_COLLR(MPI_Gather,
       PMPI_Gather(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, root, comm),
       "gather", (size_t)sendcount * dtype_size(sendtype),
       const void *sendbuf, int sendcount, MPI_Datatype sendtype,
@@ -1534,7 +1565,7 @@ _COLL(MPI_Alltoallv,
       void *recvbuf, const int recvcounts[], const int rdispls[], MPI_Datatype recvtype,
       MPI_Comm comm)
 
-_COLL(MPI_Gatherv,
+_COLLR(MPI_Gatherv,
       PMPI_Gatherv(sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype, root, comm),
       "gatherv",
       sendbuf == MPI_IN_PLACE ? own_count(recvcounts, comm) * dtype_size(recvtype)
@@ -1542,7 +1573,7 @@ _COLL(MPI_Gatherv,
       const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf,
       const int recvcounts[], const int displs[], MPI_Datatype recvtype, int root, MPI_Comm comm)
 
-_COLL(MPI_Scatterv,
+_COLLR(MPI_Scatterv,
       PMPI_Scatterv(sendbuf, sendcounts, displs, sendtype, recvbuf, recvcount, recvtype, root, comm),
       "scatterv",
       recvbuf == MPI_IN_PLACE ? own_count(sendcounts, comm) * dtype_size(sendtype)
@@ -1703,6 +1734,28 @@ int FNAME(__VA_ARGS__, MPI_Request *request) {                           \
     return ret;                                                           \
 }
 
+/* _ICOLL with root= / wroot= (see _COLLR). */
+#define _ICOLLR(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)            \
+int FNAME(__VA_ARGS__, MPI_Request *request) {                           \
+    size_t nb = (BYTES_EXPR);                                            \
+    int64_t cid = comm_id_for(comm);                                     \
+    int wroot = world_rank_of(comm, root);                               \
+    uint64_t t0 = now_ns();                                              \
+    int ret = PMPI_CALL;                                                  \
+    uint64_t req_id = (ret == MPI_SUCCESS && request &&                  \
+                       *request != MPI_REQUEST_NULL)                     \
+                      ? req_register(*request, TYPE_STR, -1, 0, nb, 0) : 0;\
+    char extra[224], rtag[48], stag[40];                                  \
+    if (wroot >= 0) snprintf(rtag, sizeof(rtag), ",root=%d,wroot=%d", root, wroot); \
+    else            snprintf(rtag, sizeof(rtag), ",root=%d", root);       \
+    stag[0] = '\0';                                                       \
+    if (req_id) snprintf(stag, sizeof(stag), ",sid=%llu", (unsigned long long)req_id); \
+    snprintf(extra, sizeof(extra), "type=%s,bytes=%zu,rank=%d,commid=%lld%s%s", \
+             TYPE_STR, nb, g_mpi_rank, (long long)cid, rtag, stag);      \
+    emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                   \
+    return ret;                                                           \
+}
+
 int MPI_Ibarrier(MPI_Comm comm, MPI_Request *request) {
     int64_t cid = comm_id_for(comm);
     uint64_t t0 = now_ns();
@@ -1720,7 +1773,7 @@ int MPI_Ibarrier(MPI_Comm comm, MPI_Request *request) {
     return ret;
 }
 
-_ICOLL(MPI_Ibcast,
+_ICOLLR(MPI_Ibcast,
        PMPI_Ibcast(buffer, count, datatype, root, comm, request),
        "ibcast", (size_t)count * dtype_size(datatype),
        void *buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm)
@@ -1731,7 +1784,7 @@ _ICOLL(MPI_Iallreduce,
        const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype,
        MPI_Op op, MPI_Comm comm)
 
-_ICOLL(MPI_Ireduce,
+_ICOLLR(MPI_Ireduce,
        PMPI_Ireduce(sendbuf, recvbuf, count, datatype, op, root, comm, request),
        "ireduce", (size_t)count * dtype_size(datatype),
        const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype,
@@ -1751,14 +1804,14 @@ _ICOLL(MPI_Ialltoall,
        const void *sendbuf, int sendcount, MPI_Datatype sendtype,
        void *recvbuf, int recvcount, MPI_Datatype recvtype, MPI_Comm comm)
 
-_ICOLL(MPI_Iscatter,
+_ICOLLR(MPI_Iscatter,
        PMPI_Iscatter(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype,
                      root, comm, request),
        "iscatter", (size_t)sendcount * dtype_size(sendtype),
        const void *sendbuf, int sendcount, MPI_Datatype sendtype,
        void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm)
 
-_ICOLL(MPI_Igather,
+_ICOLLR(MPI_Igather,
        PMPI_Igather(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype,
                     root, comm, request),
        "igather", (size_t)sendcount * dtype_size(sendtype),
@@ -1767,16 +1820,83 @@ _ICOLL(MPI_Igather,
 
 /* ── Persistent requests ────────────────────────────────────────────── */
 
-/* Persistent requests are recorded (with commid=) but their messages are not
- * paired by the critical path: a communicator with persistent traffic has
- * an incomplete message order there. */
+/* A persistent request (MPI_*_init) is a template: each MPI_Start /
+ * MPI_Startall posts one message with its peer, tag and communicator. The
+ * handle table keeps those per request handle, so every start is reported
+ * as a post the point-to-point matcher can pair (type=start,ptype=send|recv
+ * with peer=/wpeer=/tag=/commid=) and is registered like an Isend/Irecv
+ * (its completion names it with psid=). Entries leave at MPI_Request_free;
+ * a re-initialised handle overwrites its entry. */
+#define PERSIST_CAP 1024
+typedef struct {
+    MPI_Request req;
+    int         send;          /* 1: a send template, 0: a receive */
+    int         peer, tag;
+    size_t      bytes;
+    MPI_Comm    comm;
+    int64_t     commid;
+} PersistRec;
+static PersistRec      g_persist[PERSIST_CAP];
+static int             g_persist_n = 0;
+static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void persist_add(MPI_Request req, int send, int peer, int tag, size_t nb, MPI_Comm comm) {
+    if (req == MPI_REQUEST_NULL) return;
+    pthread_mutex_lock(&g_persist_mutex);
+    int slot = -1;
+    for (int i = 0; i < g_persist_n; i++)
+        if (g_persist[i].req == req) { slot = i; break; }
+    if (slot < 0 && g_persist_n < PERSIST_CAP) slot = g_persist_n++;
+    if (slot >= 0)
+        g_persist[slot] = (PersistRec){req, send, peer, tag, nb, comm, comm_id_for(comm)};
+    pthread_mutex_unlock(&g_persist_mutex);
+}
+
+static int persist_get(MPI_Request req, PersistRec *out) {
+    int found = 0;
+    pthread_mutex_lock(&g_persist_mutex);
+    for (int i = 0; i < g_persist_n; i++)
+        if (g_persist[i].req == req) { *out = g_persist[i]; found = 1; break; }
+    pthread_mutex_unlock(&g_persist_mutex);
+    return found;
+}
+
+static void persist_drop(MPI_Request req) {
+    pthread_mutex_lock(&g_persist_mutex);
+    for (int i = 0; i < g_persist_n; i++)
+        if (g_persist[i].req == req) { g_persist[i] = g_persist[--g_persist_n]; break; }
+    pthread_mutex_unlock(&g_persist_mutex);
+}
+
 static int persistent_init(const void *site, const char *name, const char *type, int ret,
-                           uint64_t t0, size_t nb, int peer, int tag, MPI_Comm comm) {
+                           uint64_t t0, size_t nb, int peer, int tag, MPI_Comm comm,
+                           MPI_Request *request) {
     char extra[192];
     snprintf(extra, sizeof(extra), "type=%s,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld",
              type, nb, g_mpi_rank, peer, tag, (long long)comm_id_for(comm));
     emit_span_at(site, "mpi", t0, now_ns() - t0, name, extra);
+    if (ret == MPI_SUCCESS && request)
+        persist_add(*request, strncmp(type, "recv", 4) != 0, peer, tag, nb, comm);
     return ret;
+}
+
+/* Registers one started persistent request and writes its post tags
+ * (",ptype=..,peer=..,tag=..,commid=..[,wpeer=..|,null=1][,sid=..]") into buf. */
+static void persist_started(MPI_Request req, char *buf, size_t cap) {
+    PersistRec pr;
+    buf[0] = '\0';
+    if (req == MPI_REQUEST_NULL || !persist_get(req, &pr)) return;
+    int wildcard = !pr.send && (pr.peer == MPI_ANY_SOURCE || pr.tag == MPI_ANY_TAG);
+    Xlate *xl = (wildcard && pr.comm != MPI_COMM_WORLD) ? xlate_acquire(pr.comm) : NULL;
+    uint64_t id = req_register_ex(req, pr.send ? "isend" : "irecv", pr.peer, pr.tag, pr.bytes,
+                                  wildcard, pr.comm, xl);
+    char ptag[40];
+    peer_tags(ptag, sizeof(ptag), pr.comm, pr.peer);
+    int n = snprintf(buf, cap, ",ptype=%s,peer=%d,tag=%d,commid=%lld,bytes=%zu%s%s",
+                     pr.send ? "send" : "recv", pr.peer, pr.tag, (long long)pr.commid, pr.bytes,
+                     ptag, wildcard ? ",wildcard=1" : "");
+    if (id && n > 0 && (size_t)n < cap)
+        snprintf(buf + n, cap - (size_t)n, ",sid=%llu", (unsigned long long)id);
 }
 
 #define _PERSISTENT_SEND(FNAME, TYPE) \
@@ -1785,7 +1905,7 @@ int FNAME(const void *buf, int count, MPI_Datatype datatype, int dest, int tag, 
     uint64_t t0 = now_ns(); \
     int ret = P##FNAME(buf, count, datatype, dest, tag, comm, request); \
     return persistent_init(__builtin_return_address(0), #FNAME, TYPE, ret, t0, \
-                           (size_t)count * dtype_size(datatype), dest, tag, comm); \
+                           (size_t)count * dtype_size(datatype), dest, tag, comm, request); \
 }
 _PERSISTENT_SEND(MPI_Send_init,  "send_init")
 _PERSISTENT_SEND(MPI_Bsend_init, "bsend_init")
@@ -1798,31 +1918,48 @@ int MPI_Recv_init(void *buf, int count, MPI_Datatype datatype,
     uint64_t t0 = now_ns();
     int ret = PMPI_Recv_init(buf, count, datatype, source, tag, comm, request);
     return persistent_init(__builtin_return_address(0), "MPI_Recv_init", "recv_init", ret, t0,
-                           (size_t)count * dtype_size(datatype), source, tag, comm);
+                           (size_t)count * dtype_size(datatype), source, tag, comm, request);
 }
 
 int MPI_Start(MPI_Request *request) {
-    MPI_Request saved = request ? *request : MPI_REQUEST_NULL;
     uint64_t t0 = now_ns();
     int ret = PMPI_Start(request);
-    uint64_t req_id = (ret == MPI_SUCCESS && request && *request != MPI_REQUEST_NULL)
-                      ? req_register(*request, "start", -1, 0, 0, 0) : 0;
-    char extra[96];
-    if (req_id)
-        snprintf(extra, sizeof(extra), "type=start,rank=%d,sid=%llu",
-                 g_mpi_rank, (unsigned long long)req_id);
-    else
-        snprintf(extra, sizeof(extra), "type=start,rank=%d", g_mpi_rank);
+    char post[192], extra[256];
+    post[0] = '\0';
+    if (ret == MPI_SUCCESS && request && *request != MPI_REQUEST_NULL)
+        persist_started(*request, post, sizeof(post));
+    snprintf(extra, sizeof(extra), "type=start,rank=%d%s", g_mpi_rank, post);
     emit_span("mpi", t0, now_ns()-t0, "MPI_Start", extra);
-    (void)saved;
     return ret;
 }
 
+/* One MPI_Startall span, plus a zero-length MPI_Start span per started
+ * request at the call's start (as MPI_Sendrecv's .send part): each is one
+ * post the matcher pairs. */
 int MPI_Startall(int count, MPI_Request requests[]) {
     uint64_t t0 = now_ns();
     int ret = PMPI_Startall(count, requests);
+    uint64_t t1 = now_ns();
+    if (ret == MPI_SUCCESS && requests) {
+        for (int i = 0; i < count; i++) {
+            if (requests[i] == MPI_REQUEST_NULL) continue;
+            char post[192], extra[256];
+            persist_started(requests[i], post, sizeof(post));
+            if (!post[0]) continue;
+            snprintf(extra, sizeof(extra), "type=start,rank=%d%s,startall=1", g_mpi_rank, post);
+            emit_span("mpi", t0, 0, "MPI_Start", extra);
+        }
+    }
     char extra[64];
     snprintf(extra, sizeof(extra), "type=startall,count=%d,rank=%d", count, g_mpi_rank);
-    emit_span("mpi", t0, now_ns()-t0, "MPI_Startall", extra);
+    emit_span("mpi", t0, t1-t0, "MPI_Startall", extra);
+    return ret;
+}
+
+/* Frees a request: a persistent template leaves the handle table. */
+int MPI_Request_free(MPI_Request *request) {
+    MPI_Request r = request ? *request : MPI_REQUEST_NULL;
+    int ret = PMPI_Request_free(request);
+    if (r != MPI_REQUEST_NULL) persist_drop(r);
     return ret;
 }

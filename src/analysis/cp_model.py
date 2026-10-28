@@ -30,7 +30,21 @@ Lane edges -- a thread's or a device operation's own time:
       wait  inside a call whose end a dependency from another lane gates
             (a receive completion, a collective, a barrier, a sync call,
             a parallel region's join): the trace cannot split its time
-            into waiting and processing, so none of it is required  w = 0
+            into waiting and processing. Required time w in [0, d_post],
+            d_post the part after the latest source event of the
+            dependencies gating it (processing can only follow the
+            release; the whole call when the source came first, and for
+            the last arriver of a rendezvous): w = 0 by default, w =
+            d_post in the "gated_tail_as_work" variant -- where each
+            dependency that gates the call carries the call's required
+            time after its release too, since that processing follows
+            whichever source arrived last
+      unknown  inside a call that waits for another lane by its runtime's
+            semantics (semantics.blocking_wait: a receive, a collective, a
+            barrier, a sync call...) but no recorded dependency gates it --
+            an unmatched receive, a lost message: waiting for something the
+            trace did not record, or processing. w in [0, d], treated as
+            "gap" (never as plain work)
       gap   no recorded call open: untraced work or idle time, the trace
             cannot tell -- both are computed (see "Bounds")
   * Device work (and other device-timed spans): one edge S -> E, busy, or
@@ -58,6 +72,21 @@ They come from the persisted span-level edges (criticalpath.build_edges):
   repeated. An edge whose source event lies after its destination (beyond
   the clock tolerance for host/device edges) contradicts the timestamps:
   it is dropped and counted, never bent.
+
+Clocks
+------
+Timestamps come from several clock domains (cp_clock.py): each node's host
+clock, mapped device clocks, OpenCL's calibrated device clock, NCCL's
+asynchronous reference events. Their unknown offsets are bounded, and the
+dependencies constrain them further (source no later than destination): a
+simple temporal network solved over the domains. Edges no offset within the
+bounds can satisfy together with the rest are contradicted and disabled
+(counted); a domain with no bound and no correction of its own (OpenCL)
+whose recorded times contradict its dependencies is shifted by the smallest
+amount that satisfies them before the graph is built. The walk compares two
+releases from different domains by their offset interval: when the clocks
+cannot tell which came last, the step is "undecidable" (counted, with the
+time at stake).
 
 Observed critical path
 ----------------------
@@ -93,17 +122,32 @@ time. From it:
     (or every span of one name's) exclusive busy time set to zero. Graph
     estimates under the model's assumptions, not measured speedups: real
     dependencies the trace did not record, contention and the timing of
-    the dependencies themselves are not modeled.
+    the dependencies themselves are not modeled. Alongside, the same
+    intervention replayed (cp_attribution.replay: every event as early as
+    its predecessors allow plus its recorded residual) -- how much earlier
+    the run would end with waits and dependency latencies adapting.
+
+Attribution (cp_attribution.py) answers three questions separately: the
+observed path is the witness (where it runs), blame charges every gated
+call's waiting time to the work that delayed its release (joint releases
+shared), and the replay above is the intervention.
 
 Bounds and alternatives
 -----------------------
 Where the data does not decide, the model is computed both ways instead of
-enumerating paths: unrecorded thread time as work and as idle (modeled
-length), gap edges releasing at their end instead of their start
-(observed path, "unrecorded_as_work"), and with direct-evidence dependency
-edges only. Spans on the observed path of every variant vs. only some show
-how much the path rests on those choices. A few walks and linear passes:
-no exponential search.
+enumerating paths. VARIANTS name the choices, and each variant's observed
+walk and modeled longest path use the same parameters:
+  gaps      unrecorded / unknown time as idle (released at its start) or as
+            work ("unrecorded_as_work")
+  evidence  every dependency edge, or direct-evidence ones only
+            ("direct_evidence_only")
+  gated     a gated call's tail after its release as waiting (w = 0) or as
+            processing ("gated_tail_as_work")
+"default" is the observed path as recorded (gaps idle, every edge, tails
+waiting); the headline modeled length keeps counting unrecorded time as
+work (modeled_ns), with the range over all variants alongside. Spans on the
+observed path of every variant vs. only some show how much the path rests
+on those choices. A few walks and linear passes: no exponential search.
 
 Evidence
 --------
@@ -130,11 +174,20 @@ if TYPE_CHECKING:
 
 # ── edge vocabulary ───────────────────────────────────────────────────────────
 
-BUSY, WAIT, GAP, IDLE, DEP = range(5)
-MODES = ("busy", "wait", "gap", "idle", "dependency")
+BUSY, WAIT, GAP, IDLE, DEP, UNKNOWN = range(6)
+MODES = ("busy", "wait", "gap", "idle", "dependency", "unknown")
+
+# name -> (gaps as work, direct evidence only, gated tails as work)
+VARIANTS: dict[str, tuple[bool, bool, bool]] = {
+    "default": (False, False, False),
+    "unrecorded_as_work": (True, False, False),
+    "direct_evidence_only": (False, True, False),
+    "gated_tail_as_work": (False, False, True),
+}
 
 KINDS = ("thread", "device_work", "stream_order", "event_wait", "launch", "device_wait",
-         "device_sync", "p2p", "arrival", "fork", "join", "explicit_span_id", "sequential")
+         "device_sync", "p2p", "arrival", "fork", "join", "explicit_span_id", "sequential",
+         "task_join", "task_dependence", "lock_handoff")
 _K = {k: i for i, k in enumerate(KINDS)}
 
 CONFS = ("certain", "high", "medium", "low")          # criticalpath.EDGE_CONFS order
@@ -159,6 +212,15 @@ PROVENANCE: dict[str, tuple[str, str]] = {
                                "calling-order rule)"),
     "nccl_seq": ("direct", "the NCCL communicator id and sequence number recorded by the hook"),
     "time_overlap": ("inferred", "calls grouped because their time intervals overlap"),
+    "task_id": ("direct", "the OMPT task ids on a task's creation (parent=), its execution (id=) and the "
+                          "taskwait / taskgroup of its parent (task=), or a recorded task dependence"),
+    "lock_handoff": ("inferred", "the release of the same lock (wait_id= / lock=) just before a contended "
+                                 "acquisition, by another thread, on one clock"),
+    "nccl_pseq": ("direct", "NCCL pairs the sends and receives between two ranks of a communicator in "
+                            "issue order; the hook numbered them (pseq=)"),
+    "rooted_flow": ("inferred", "a rooted collective's data flow with the root its members recorded "
+                                "(wroot=): from the root (bcast, scatter) or to it (reduce, gather), "
+                                "members grouped by call order"),
 }
 PROVS = tuple(PROVENANCE)
 _P = {p: i for i, p in enumerate(PROVS)}
@@ -194,7 +256,9 @@ def edge_reason(kind: str, prov: str, conf: str) -> str:
 
 def runtime_of_edge(kind: str, src_cat: str, dst_cat: str) -> str:
     if kind == "p2p":
-        return "mpi"
+        return "nccl" if dst_cat == "nccl" else "mpi"
+    if kind in ("task_join", "task_dependence", "lock_handoff"):
+        return "openmp"
     if kind in ("fork", "join"):
         return "openmp"
     if kind == "arrival":
@@ -214,7 +278,9 @@ def _i32() -> str:
 
 class EventGraph:
     """Nodes 2i (start) and 2i+1 (end) of span ordinal i; edges in typed
-    arrays (src, dst, mode, kind, prov, conf, owner span, observed d)."""
+    arrays (src, dst, mode, kind, prov, conf, owner span, observed d, and
+    origin: the index of the span-level edge it came from, -1 for lane
+    edges)."""
 
     def __init__(self, n: int) -> None:
         self.n = n
@@ -229,6 +295,9 @@ class EventGraph:
         self.conf = array.array("b")
         self.owner = array.array(I32)
         self.d = array.array("q")
+        self.whi = array.array("q")               # required time's upper bound (see "Lane edges")
+        self.origin = array.array("q")
+        self._origin = -1                          # span-level edge being added
         self.enabled = bytearray()
         self.order = array.array(_i32())          # active nodes, topological order
         # per span
@@ -237,10 +306,21 @@ class EventGraph:
         self.names: list[str] = []
         self.device = bytearray(n)
         self.gated = bytearray(n)
-        self.rooted = bytearray(n)
+        self.blocking = bytearray(n)              # semantics.blocking_wait
+        self.release = array.array("q", [-1]) * n  # gated call: latest source event of its gates
+        self.rooted = bytearray(n)                # rooted collective, root not recorded
+        self.rootflow = bytearray(n)              # rooted collective with its root recorded
         self.excluded = bytearray(n)
         # diagnostics
         self.dropped: Counter = Counter()        # dependency kind -> edges contradicting timestamps
+        self.dropped_edges = array.array("q")     # their span-level edge indices
+        self.dropped_pairs: list[tuple[int, int, int, int]] = []   # (u, v, kind, conf) event nodes
+        self.domain = array.array(_i32(), bytes(4 * n))   # span -> clock domain id (cp_clock)
+        self.clock = None                         # cp_clock.ClockAnalysis
+        self.clock_contradicted = 0               # edges disabled: no clock offsets satisfy them
+        self.clock_disabled: set[int] = set()     # their event edge ids
+        self.skeleton = None                      # Skeleton (build_event_graph(keep_skeleton=True))
+        self.skipped_edges = array.array("q")     # span-level edges with no event edge (same lane, unmapped)
         self.improper_nesting = 0
         self.cycle_edges_dropped = 0
         self.unmapped: Counter = Counter()
@@ -251,6 +331,9 @@ class EventGraph:
         if d < 0:
             if -d > tol:
                 self.dropped[KINDS[kind]] += 1
+                if self._origin >= 0:
+                    self.dropped_edges.append(self._origin)
+                self.dropped_pairs.append((u, v, kind, conf))
                 return False
             d = 0
         self.src.append(u)
@@ -261,6 +344,7 @@ class EventGraph:
         self.conf.append(conf)
         self.owner.append(owner)
         self.d.append(d)
+        self.origin.append(self._origin)
         self.active[u] = self.active[v] = 1
         return True
 
@@ -306,64 +390,293 @@ def _excluded(s) -> bool:
     return is_annotation(s) or is_sampled(s) or s.category.value == "sched"
 
 
-def build_event_graph(trace: "Trace", graph) -> EventGraph:
-    """The event-point graph of a trace from its persisted span-level edges
-    (criticalpath.Graph). Spans are read once, in ordinal (= seq) order."""
+@dataclass
+class Skeleton:
+    """What build_event_graph reads from the spans -- everything but the
+    dependency edges -- kept (keep_skeleton=True) so the graphs of
+    alternative worlds (cp_alternatives) are assembled without reading the
+    spans again (graph_with_edges)."""
+    n: int
+    t: array.array
+    cat: list
+    name_id: array.array
+    names: list
+    device: bytearray
+    excluded: bytearray
+    rooted: bytearray
+    rootflow: bytearray
+    blocking: bytearray
+    domain: array.array
+    stream_key: dict
+    lane: array.array
+    resolved_wildcard: bytearray
+    lanes: list
+    dom_keys: list
+    dom_bounds: list
+
+
+def _read_spans(trace: "Trace", graph) -> Skeleton:
+    from . import cp_clock
     from . import criticalpath as cp
+    from .semantics import blocking_wait
 
     n = len(graph.seqs)
-    g = EventGraph(n)
-    stream_key: dict[int, tuple] = {}
-    lane = array.array(_i32(), [-1]) * n           # thread lane of each host span
-    resolved_wildcard = bytearray(n)
+    node_bounds = cp_clock.node_bounds_of(getattr(trace, "metadata", None))
+    dom_ids: dict[tuple, int] = {}
+    sk = Skeleton(n=n, t=array.array("q", bytes(16 * n)), cat=[""] * n,
+                  name_id=array.array(_i32(), bytes(4 * n)), names=[], device=bytearray(n),
+                  excluded=bytearray(n), rooted=bytearray(n), rootflow=bytearray(n), blocking=bytearray(n),
+                  domain=array.array(_i32(), bytes(4 * n)), stream_key={},
+                  lane=array.array(_i32(), [-1]) * n, resolved_wildcard=bytearray(n), lanes=[],
+                  dom_keys=[], dom_bounds=[])
     name_ids: dict[str, int] = {}
     lanes: dict[tuple[int, int], array.array] = defaultdict(lambda: array.array("q"))
     count = 0
     for i, s in enumerate(trace.iter_spans()):
         count += 1
         st = cp._effective_start_ns(s)
-        g.t[2 * i] = st
-        g.t[2 * i + 1] = st + max(0, s.duration_ns)
-        g.cat[i] = s.category.value
+        key, bound = cp_clock.domain_of(s, node_bounds)
+        di = dom_ids.get(key)
+        if di is None:
+            di = dom_ids[key] = len(sk.dom_keys)
+            sk.dom_keys.append(key)
+            sk.dom_bounds.append(bound)
+        elif bound > sk.dom_bounds[di]:
+            sk.dom_bounds[di] = bound
+        sk.domain[i] = di
+        sk.t[2 * i] = st
+        sk.t[2 * i + 1] = st + max(0, s.duration_ns)
+        sk.cat[i] = s.category.value
         nid = name_ids.get(s.name)
         if nid is None:
-            nid = name_ids[s.name] = len(g.names)
-            g.names.append(s.name)
-        g.name_id[i] = nid
+            nid = name_ids[s.name] = len(sk.names)
+            sk.names.append(s.name)
+        sk.name_id[i] = nid
         tags = s.tags
         if _excluded(s):
-            g.excluded[i] = 1
+            sk.excluded[i] = 1
             continue
         if is_device_timed(s):
-            g.device[i] = 1
-            stream_key[i] = (s.pid, tags.get("rt") or s.category.value, tags.get("stream"), tags.get("dev"))
+            sk.device[i] = 1
+            if "queue" in tags and not tags.get("rt"):      # an OpenCL command queue
+                sk.stream_key[i] = (s.pid, "opencl", "q" + str(tags["queue"]), None)
+            else:
+                sk.stream_key[i] = (s.pid, tags.get("rt") or s.category.value, tags.get("stream"),
+                                    tags.get("dev"))
         else:
             lanes[(s.pid, s.tid)].append(i)
         if s.category.value == "mpi" and ("rpeer" in tags or "rmatches" in tags):
-            resolved_wildcard[i] = 1
-        if tags.get("type") in cp.ROOTED_COLLECTIVE_TYPES:
-            g.rooted[i] = 1
+            sk.resolved_wildcard[i] = 1
+        typ = tags.get("type")
+        if typ in cp.ROOTED_COLLECTIVE_TYPES or typ in cp._FROM_ROOT or typ in cp._TO_ROOT:
+            if "wroot" in tags and typ not in ("scan", "exscan"):
+                sk.rootflow[i] = 1
+            elif typ in cp.ROOTED_COLLECTIVE_TYPES:
+                sk.rooted[i] = 1
+        if blocking_wait(s):
+            sk.blocking[i] = 1
     if count != n:
         raise ValueError(f"{count} spans, but the graph has {n} ordinals")
-    for li, members in enumerate(lanes.values()):
+    sk.lanes = list(lanes.values())
+    for li, members in enumerate(sk.lanes):
         for j in members:
-            lane[j] = li
+            sk.lane[j] = li
+    if cp_clock.REFERENCE not in dom_ids:
+        sk.dom_keys.append(cp_clock.REFERENCE)
+        sk.dom_bounds.append(0.0)
+    return sk
 
-    _add_dependency_edges(g, graph.edges, cp.EDGE_KINDS, stream_key, lane, resolved_wildcard)
-    del stream_key, lane, resolved_wildcard
-    # a call whose end a dependency from another lane gates can wait inside
+
+def _shifted(sk: Skeleton, shift: dict) -> Skeleton:
+    """sk with the timestamps of the shifted domains moved."""
+    from dataclasses import replace
+    t = array.array("q", sk.t)
+    by_id = {i: shift[k] for i, k in enumerate(sk.dom_keys) if k in shift}
+    for j in range(sk.n):
+        d = by_id.get(sk.domain[j])
+        if d:
+            t[2 * j] += d
+            t[2 * j + 1] += d
+    return replace(sk, t=t)
+
+
+def _assemble(sk: Skeleton, edges, *, clocks: bool, prior_clock=None) -> EventGraph:
+    """The event graph of the skeleton's spans with these span-level edges.
+    The per-span arrays are shared with the skeleton (read only)."""
+    from . import criticalpath as cp
+    n = sk.n
+    g = EventGraph(n)
+    g.t = array.array("q", sk.t)
+    g.cat, g.name_id, g.names = sk.cat, sk.name_id, sk.names
+    g.device, g.excluded, g.rooted, g.rootflow, g.blocking = sk.device, sk.excluded, sk.rooted, sk.rootflow, \
+        sk.blocking
+    g.domain = sk.domain
+    _add_dependency_edges(g, edges, cp.EDGE_KINDS, sk.stream_key, sk.lane, sk.resolved_wildcard)
+    # a call whose end a dependency from another lane gates can wait inside;
+    # it is released at the latest source event of those dependencies. The
+    # last arriver of a rendezvous gates the others and is released by its
+    # own arrival: all of its time may be processing.
+    arrival = _K["arrival"]
     for e in range(len(g)):
-        if g.mode[e] == DEP and g.dst[e] & 1:
-            g.gated[g.dst[e] >> 1] = 1
-    for key in list(lanes):
-        _add_thread_lane(g, lanes.pop(key))
+        if g.mode[e] != DEP:
+            continue
+        if g.dst[e] & 1:
+            j = g.dst[e] >> 1
+            g.gated[j] = 1
+            ts = g.t[g.src[e]]
+            if ts > g.release[j]:
+                g.release[j] = ts
+        if g.kind[e] == arrival:
+            u = g.src[e] >> 1
+            if not g.gated[u] and g.blocking[u]:
+                g.gated[u] = 1
+                g.release[u] = max(g.release[u], g.t[2 * u])
+    # a rooted collective's member that, by the data flow, waits for nobody
+    for j in range(n):
+        if g.rootflow[j] and g.blocking[j] and not g.gated[j]:
+            g.gated[j] = 1
+            g.release[j] = g.t[2 * j]
+    for members in sk.lanes:
+        _add_thread_lane(g, members)
     kind, prov = _K["device_work"], _P["device_interval"]
     for j in range(n):
         if g.device[j] and not g.excluded[j]:
             g.add(2 * j, 2 * j + 1, WAIT if g.gated[j] else BUSY, kind, prov, 0, j)
+    _required_upper_bounds(g)
     g.finish()
+    _gating_dependency_bounds(g)
+    if clocks:
+        g.clock = _clock_analysis(g, sk.dom_keys, sk.dom_bounds)
+        _disable_clock_contradicted(g, g.clock)
+    else:
+        g.clock = prior_clock
     _break_cycles(g)
     return g
+
+
+def build_event_graph(trace: "Trace", graph, *, clocks: bool = True, keep_skeleton: bool = False) -> EventGraph:
+    """The event-point graph of a trace from its persisted span-level edges
+    (criticalpath.Graph). Spans are read once, in ordinal (= seq) order.
+    clocks: analyze the clock domains (see "Clocks"); a shiftable domain
+    whose times contradict its dependencies is shifted and the graph
+    assembled once more. keep_skeleton: keep what was read from the spans
+    (g.skeleton) for graph_with_edges."""
+    sk = _read_spans(trace, graph)
+    g = _assemble(sk, graph.edges, clocks=clocks)
+    if clocks:
+        ca = g.clock
+        shift = {sk.dom_keys[i]: sft for i, sft in enumerate(ca.shift) if sft}
+        if shift:
+            sk = _shifted(sk, shift)
+            g = _assemble(sk, graph.edges, clocks=True)
+            g.clock.shift = [shift.get(k, 0) for k in g.clock.keys]
+            g.clock.feasible_as_recorded = False
+            g.clock.relaxed = ca.relaxed + g.clock.relaxed
+    if keep_skeleton:
+        g.skeleton = sk
+    return g
+
+
+def graph_with_edges(base: EventGraph, edges) -> EventGraph:
+    """The event graph of base's spans with other span-level edges (an
+    alternative world), from base's skeleton (its timestamps already
+    shifted where base's clocks needed it; the offsets are solved again for
+    the world's edges). base must be built with keep_skeleton=True."""
+    return _assemble(base.skeleton, edges, clocks=True)
+
+
+def _clock_analysis(g: EventGraph, keys: list[tuple], bounds: list[float]):
+    """cp_clock over every dependency edge of g, those add() dropped as
+    contradicting the fixed tolerance included (constraint ids len(g)+k)."""
+    from . import cp_clock
+    cons = []
+    for e in range(len(g)):
+        if g.mode[e] in (DEP, IDLE):
+            cons.append((e, g.src[e], g.dst[e], 0 if g.inferred(e) else 1))
+    m = len(g)
+    for k, (u, v, kind, conf) in enumerate(g.dropped_pairs):
+        cons.append((m + k, u, v, 0 if conf >= _C["medium"] else 1))
+    dom = g.domain
+    return cp_clock.analyze_clocks(lambda v: dom[v >> 1], g.t, cons, keys, bounds)
+
+
+def _disable_clock_contradicted(g: EventGraph, ca) -> None:
+    for cid in ca.contradicted:
+        if cid < len(g) and g.enabled[cid]:
+            g.enabled[cid] = 0
+            g.clock_contradicted += 1
+            g.clock_disabled.add(cid)
+
+
+def _required_upper_bounds(g: EventGraph) -> None:
+    """whi per edge: d for busy, gap and unknown time; for time in a gated
+    call, its overlap with [release, end] of that call (all of it when the
+    release came before the call); 0 for dependency and device-idle edges
+    (_gating_dependency_bounds sets the dependencies into a gated call's
+    end once the adjacency exists)."""
+    whi = g.whi
+    t, src, dst, mode, d, owner, release = g.t, g.src, g.dst, g.mode, g.d, g.owner, g.release
+    for e in range(len(src)):
+        m = mode[e]
+        if m == WAIT:
+            j = owner[e]
+            lo = max(t[src[e]], release[j])
+            whi.append(max(0, min(t[dst[e]], t[2 * j + 1]) - lo) if lo < t[dst[e]] else 0)
+        elif m in (BUSY, GAP, UNKNOWN):
+            whi.append(d[e])
+        else:
+            whi.append(0)
+
+
+def _lane_in(g: EventGraph, v: int) -> int:
+    """The lane edge into node v (-1: none)."""
+    for k in range(g.in_ptr[v], g.in_ptr[v + 1]):
+        e = g.in_idx[k]
+        if g.mode[e] in (BUSY, WAIT, GAP, UNKNOWN):
+            return e
+    return -1
+
+
+def _tail_after_release(g: EventGraph, j: int) -> int:
+    """Gated call j's required time after its release, at most: the upper
+    bounds of its lane edges from the release to its end (nested calls
+    included; an edge across the release counts its part after it)."""
+    t, src, mode, whi = g.t, g.src, g.mode, g.whi
+    rel = g.release[j]
+    v, total = 2 * j + 1, 0
+    while v != 2 * j:
+        e = _lane_in(g, v)
+        if e < 0:
+            break
+        w = whi[e] if mode[e] in (BUSY, WAIT, UNKNOWN) else 0
+        if t[src[e]] >= rel:
+            total += w
+            v = src[e]
+            continue
+        total += min(w, max(0, t[v] - rel))
+        break
+    return total
+
+
+def _gating_dependency_bounds(g: EventGraph) -> None:
+    """whi of a dependency into a gated call's end: the call's required time
+    after its release (_tail_after_release), within the dependency's own
+    duration. Counted only in the gated_tail_as_work variant, where the
+    processing after the release follows whichever gating source came
+    last -- a chain through the dependency carries it, not only the call's
+    own lane."""
+    tails: dict[int, int] = {}
+    whi, d, dst, mode = g.whi, g.d, g.dst, g.mode
+    for e in range(len(g)):
+        if mode[e] != DEP or not dst[e] & 1:
+            continue
+        j = dst[e] >> 1
+        if not g.gated[j]:
+            continue
+        r = tails.get(j)
+        if r is None:
+            r = tails[j] = _tail_after_release(g, j)
+        whi[e] = min(r, d[e])
 
 
 def _chunks(edges, size: int = 65536):
@@ -376,56 +689,74 @@ def _chunks(edges, size: int = 65536):
 def _add_dependency_edges(g: EventGraph, edges, edge_kinds, stream_key, lane, resolved_wildcard) -> None:
     tol = ga.CLOCK_TOLERANCE_NS
     high = _C["high"]
-    for v, u, k, c in _chunks(edges):
-        if g.excluded[u] or g.excluded[v]:
-            continue
-        kind = edge_kinds[k]
-        S_u, E_u, S_v, E_v = 2 * u, 2 * u + 1, 2 * v, 2 * v + 1
-        same_lane = lane[u] >= 0 and lane[u] == lane[v]
-        if kind == "sequential":
-            du, dv = g.device[u], g.device[v]
-            if du and dv:
-                if stream_key.get(u) == stream_key.get(v):
-                    g.add(E_u, S_v, IDLE, _K["stream_order"], _P["stream_fifo"], c, -1, tol)
-                else:
-                    g.add(E_u, S_v, DEP, _K["event_wait"], _P["event_record"], c, -1, tol)
-            elif du and g.cat[v] == "sync":           # pre-split: a stream sync waits for its stream
-                g.add(E_u, E_v, DEP, _K["device_sync"], _P["stream_fifo"], c, -1, tol)
-            elif du or dv:                            # pre-split: a device span and its launching thread
-                g.add(E_u, S_v, DEP, _K["sequential"], _P["stream_fifo"] if g.cat[u] == "sync"
-                      else _P["thread_timeline"], c, -1, tol)
-            elif not same_lane:
-                g.unmapped["sequential across threads"] += 1
-        elif kind == "launch":
-            g.add(S_u, S_v, DEP, _K["launch"], _P["correlation_id"], c, -1, tol)
-        elif kind == "device_wait":
-            g.add(E_u, E_v, DEP, _K["device_wait"], _P["sync_target"], c, -1, tol)
-        elif kind == "device_sync":
-            g.add(E_u, E_v, DEP, _K["device_sync"], _P["sync_target"], c, -1, tol)
-        elif kind == "p2p":
-            prov = "status_resolved" if resolved_wildcard[v] and c == high else "posting_order"
-            g.add(S_u, E_v, DEP, _K["p2p"], _P[prov], c, -1)
-        elif kind == "arrival":
-            if c == high:
-                prov = "nccl_seq" if g.cat[v] == "nccl" else "call_order"
+    for idx, (v, u, k, c) in enumerate(_chunks(edges)):
+        g._origin = idx
+        n_before = len(g.src) + len(g.dropped_edges)
+        _add_dependency_edge(g, v, u, k, c, edge_kinds, stream_key, lane, resolved_wildcard, tol, high)
+        if len(g.src) + len(g.dropped_edges) == n_before:
+            g.skipped_edges.append(idx)
+    g._origin = -1
+
+
+def _add_dependency_edge(g: EventGraph, v, u, k, c, edge_kinds, stream_key, lane, resolved_wildcard,
+                         tol, high) -> None:
+    if g.excluded[u] or g.excluded[v]:
+        return
+    kind = edge_kinds[k]
+    S_u, E_u, S_v, E_v = 2 * u, 2 * u + 1, 2 * v, 2 * v + 1
+    same_lane = lane[u] >= 0 and lane[u] == lane[v]
+    if kind == "sequential":
+        du, dv = g.device[u], g.device[v]
+        if du and dv:
+            if stream_key.get(u) == stream_key.get(v):
+                g.add(E_u, S_v, IDLE, _K["stream_order"], _P["stream_fifo"], c, -1, tol)
             else:
-                prov = "time_overlap"
-            g.add(S_u, E_v, DEP, _K["arrival"], _P[prov], c, -1)
-        elif kind == "explicit_span_id":
-            if same_lane:
-                continue
-            tu0, tu1, tv0 = g.t[S_u], g.t[E_u], g.t[S_v]
-            if tu0 <= tv0 <= tu1 and g.cat[u] == "openmp":
-                g.add(S_u, S_v, DEP, _K["fork"], _P["fork_join"], c, -1)
-                g.add(E_v, E_u, DEP, _K["join"], _P["fork_join"], c, -1)
-            elif tu1 <= tv0:
-                g.add(E_u, S_v, DEP, _K["explicit_span_id"], _P["explicit_id"], c, -1)
-            elif tu0 <= tv0:
-                g.add(S_u, S_v, DEP, _K["explicit_span_id"], _P["explicit_id"], c, -1)
-            else:
-                g.add(S_u, E_v, DEP, _K["explicit_span_id"], _P["explicit_id"], c, -1)
+                g.add(E_u, S_v, DEP, _K["event_wait"], _P["event_record"], c, -1, tol)
+        elif du and g.cat[v] == "sync":           # pre-split: a stream sync waits for its stream
+            g.add(E_u, E_v, DEP, _K["device_sync"], _P["stream_fifo"], c, -1, tol)
+        elif du or dv:                            # pre-split: a device span and its launching thread
+            g.add(E_u, S_v, DEP, _K["sequential"], _P["stream_fifo"] if g.cat[u] == "sync"
+                  else _P["thread_timeline"], c, -1, tol)
+        elif not same_lane:
+            g.unmapped["sequential across threads"] += 1
+    elif kind == "launch":
+        g.add(S_u, S_v, DEP, _K["launch"], _P["correlation_id"], c, -1, tol)
+    elif kind == "device_wait":
+        g.add(E_u, E_v, DEP, _K["device_wait"], _P["sync_target"], c, -1, tol)
+    elif kind == "device_sync":
+        g.add(E_u, E_v, DEP, _K["device_sync"], _P["sync_target"], c, -1, tol)
+    elif kind == "p2p":
+        prov = "nccl_pseq" if g.cat[v] == "nccl" else \
+            "status_resolved" if resolved_wildcard[v] and c == high else "posting_order"
+        g.add(S_u, E_v, DEP, _K["p2p"], _P[prov], c, -1)
+    elif kind == "task_join":
+        g.add(E_u, E_v, DEP, _K["task_join"], _P["task_id"], c, -1)
+    elif kind == "task_dep":
+        g.add(E_u, S_v, DEP, _K["task_dependence"], _P["task_id"], c, -1)
+    elif kind == "lock_order":
+        g.add(E_u, E_v, DEP, _K["lock_handoff"], _P["lock_handoff"], c, -1, tol)
+    elif kind == "arrival":
+        if c == high:
+            prov = "nccl_seq" if g.cat[v] == "nccl" else \
+                "rooted_flow" if g.rootflow[u] or g.rootflow[v] else "call_order"
         else:
-            g.unmapped[kind] += 1
+            prov = "time_overlap"
+        g.add(S_u, E_v, DEP, _K["arrival"], _P[prov], c, -1)
+    elif kind == "explicit_span_id":
+        if same_lane:
+            return
+        tu0, tu1, tv0 = g.t[S_u], g.t[E_u], g.t[S_v]
+        if tu0 <= tv0 <= tu1 and g.cat[u] == "openmp":
+            g.add(S_u, S_v, DEP, _K["fork"], _P["fork_join"], c, -1)
+            g.add(E_v, E_u, DEP, _K["join"], _P["fork_join"], c, -1)
+        elif tu1 <= tv0:
+            g.add(E_u, S_v, DEP, _K["explicit_span_id"], _P["explicit_id"], c, -1)
+        elif tu0 <= tv0:
+            g.add(S_u, S_v, DEP, _K["explicit_span_id"], _P["explicit_id"], c, -1)
+        else:
+            g.add(S_u, E_v, DEP, _K["explicit_span_id"], _P["explicit_id"], c, -1)
+    else:
+        g.unmapped[kind] += 1
 
 
 def _add_thread_lane(g: EventGraph, members) -> None:
@@ -449,7 +780,8 @@ def _add_thread_lane(g: EventGraph, members) -> None:
                 if inner < 0:
                     g.add(prev, nd, GAP, kind, prov, 0, -1)
                 else:
-                    g.add(prev, nd, WAIT if g.gated[inner] else BUSY, kind, prov, 0, inner)
+                    g.add(prev, nd, WAIT if g.gated[inner] else UNKNOWN if g.blocking[inner] else BUSY,
+                          kind, prov, 0, inner)
             if node >= 0:
                 if nd & 1:
                     if open_ and open_[-1] == j:
@@ -506,8 +838,17 @@ def _break_cycles(g: EventGraph) -> None:
     g.order = order
 
 
-def _w(mode: int, d: int, gap_as_work: bool) -> int:
-    return d if mode == BUSY or (mode == GAP and gap_as_work) else 0
+def _w(mode: int, d: int, gap_as_work: bool, whi: int = 0, gated_hi: bool = False) -> int:
+    """Required time of an edge: busy time always; unrecorded / unknown time
+    when counted as work; a gated call's tail (whi), on its lane and on the
+    dependencies that release it, when counted as processing."""
+    if mode == BUSY:
+        return d
+    if mode in (GAP, UNKNOWN):
+        return d if gap_as_work else 0
+    if mode in (WAIT, DEP) and gated_hi:
+        return whi
+    return 0
 
 
 # ── observed critical path ──────────────────────────────────────────────────
@@ -520,6 +861,11 @@ class Walk:
     sink: int
     ties: int = 0
     tie_samples: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
+    # steps whose release the clocks cannot order against another candidate
+    undecidable: int = 0
+    undecidable_ns: int = 0          # how much later the chosen release was, summed
+    undecidable_samples: list[dict] = field(default_factory=list)
+    undecidable_steps: list[tuple[int, int]] = field(default_factory=list)   # (chosen, alternative) edge
 
     @property
     def length(self) -> int:
@@ -548,12 +894,14 @@ def last_events(g: EventGraph) -> list[int]:
     return sorted(free or at, reverse=True)
 
 
-def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False) -> Walk:
+def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False,
+         gated_hi: bool = False) -> Walk:
     """The chain of last-releasing edges, backwards from the last event
     (several at the latest instant: the highest node, counted as a tie).
-    Release time of an edge: t(source) + w, gap edges counted as work only
-    when gap_as_work. Tie order: stay on the lane, the stronger tier, the
-    later source node."""
+    Release time of an edge: t(source) + w, gap / unknown edges counted as
+    work only when gap_as_work, a gated call's tail only when gated_hi.
+    Tie order: stay on the lane, the stronger tier, the later source
+    node."""
     ends = last_events(g)
     steps = array.array(_i32())
     cover = array.array("q")
@@ -565,7 +913,14 @@ def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False)
     if len(ends) > 1:
         ties = 1
         samples.append((g.t[sink], ("end of trace",)))
-    t, src, mode, d, conf, enabled = g.t, g.src, g.mode, g.d, g.conf, g.enabled
+    t, src, mode, d, conf, enabled, whi = g.t, g.src, g.mode, g.d, g.conf, g.enabled, g.whi
+    ca = g.clock
+    dom = g.domain
+    dlo = ca.lo if ca is not None else None
+    dhi = ca.hi if ca is not None else None
+    undecidable = undecidable_ns = 0
+    u_samples: list[dict] = []
+    u_steps: list[tuple[int, int]] = []
     seen = bytearray(2 * g.n)
     front = t[sink]
     v = sink
@@ -578,7 +933,7 @@ def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False)
             e = g.in_idx[k]
             if not enabled[e] or (direct_only and g.inferred(e)):
                 continue
-            rel = t[src[e]] + _w(mode[e], d[e], gap_as_work)
+            rel = t[src[e]] + _w(mode[e], d[e], gap_as_work, whi[e], gated_hi)
             cands.append((rel, e))
             key = (rel, mode[e] != DEP, -conf[e], src[e])
             if best_key is None or key > best_key:
@@ -590,6 +945,27 @@ def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False)
             if len(samples) < 8:
                 samples.append((t[v], tuple(sorted({KINDS[g.kind[e]] for rel, e in cands
                                                     if rel == best_key[0]}))))
+        if dlo is not None and len(cands) > 1:
+            # could another candidate's release, on its own clock, have
+            # come after the chosen one's?
+            a = dom[src[best] >> 1]
+            alt, margin = -1, 0
+            for rel, e in cands:
+                if e == best or rel >= best_key[0]:
+                    continue
+                b = dom[src[e] >> 1]
+                if a == b:
+                    continue
+                gap = best_key[0] - rel
+                if gap + (dlo[a] - dhi[b]) < 0 and (alt < 0 or gap < margin):
+                    alt, margin = e, gap
+            if alt >= 0:
+                undecidable += 1
+                undecidable_ns += margin
+                u_steps.append((best, alt))
+                if len(u_samples) < 8:
+                    u_samples.append({"at_ns": t[v], "chosen": KINDS[g.kind[best]],
+                                      "alternative": KINDS[g.kind[alt]], "margin_ns": margin})
         u = src[best]
         lo = min(t[u], front)
         cover.append(max(0, min(t[v], front) - lo))
@@ -598,17 +974,18 @@ def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False)
         v = u
     steps.reverse()
     cover.reverse()
-    return Walk(steps, cover, v, sink, ties, samples)
+    return Walk(steps, cover, v, sink, ties, samples, undecidable, undecidable_ns, u_samples, u_steps)
 
 
 # ── modeled longest path ─────────────────────────────────────────────────────
 
 def longest(g: EventGraph, *, gap_as_work: bool = True, direct_only: bool = False,
-            zero_owners: set[int] | None = None) -> tuple[array.array, int]:
+            zero_owners: set[int] | None = None, gated_hi: bool = False) -> tuple[array.array, int]:
     """Forward longest-path values by required time, and the maximum."""
     F = array.array("q", bytes(16 * g.n))
-    in_ptr, in_idx, src, enabled, mode, d, owner = (g.in_ptr, g.in_idx, g.src, g.enabled, g.mode,
-                                                     g.d, g.owner)
+    in_ptr, in_idx, src, enabled, mode, d, owner, whi = (g.in_ptr, g.in_idx, g.src, g.enabled, g.mode,
+                                                          g.d, g.owner, g.whi)
+    dst = g.dst
     best_all = 0
     for v in g.order:
         best = 0
@@ -619,10 +996,14 @@ def longest(g: EventGraph, *, gap_as_work: bool = True, direct_only: bool = Fals
             m = mode[e]
             if m == BUSY:
                 w = 0 if zero_owners is not None and owner[e] in zero_owners else d[e]
-            elif m == GAP and gap_as_work:
+            elif m in (GAP, UNKNOWN) and gap_as_work:
                 w = d[e]
+            elif m == WAIT and gated_hi:
+                w = 0 if zero_owners is not None and owner[e] in zero_owners else whi[e]
             elif m == DEP and direct_only and g.inferred(e):
                 continue
+            elif m == DEP and gated_hi:
+                w = 0 if zero_owners is not None and dst[e] >> 1 in zero_owners else whi[e]
             else:
                 w = 0
             val = F[src[e]] + w
@@ -634,15 +1015,15 @@ def longest(g: EventGraph, *, gap_as_work: bool = True, direct_only: bool = Fals
     return F, best_all
 
 
-def _backward(g: EventGraph, gap_as_work: bool = True) -> array.array:
+def _backward(g: EventGraph, gap_as_work: bool = True, gated_hi: bool = False) -> array.array:
     B = array.array("q", bytes(16 * g.n))
-    out_ptr, out_idx, dst, enabled, mode, d = g.out_ptr, g.out_idx, g.dst, g.enabled, g.mode, g.d
+    out_ptr, out_idx, dst, enabled, mode, d, whi = g.out_ptr, g.out_idx, g.dst, g.enabled, g.mode, g.d, g.whi
     for u in reversed(g.order):
         best = 0
         for k in range(out_ptr[u], out_ptr[u + 1]):
             e = out_idx[k]
             if enabled[e]:
-                val = B[dst[e]] + _w(mode[e], d[e], gap_as_work)
+                val = B[dst[e]] + _w(mode[e], d[e], gap_as_work, whi[e], gated_hi)
                 if val > best:
                     best = val
         B[u] = best
@@ -788,11 +1169,19 @@ class ModelResult:
     crit: Criticality | None = None
     sensitivity: list[dict] = field(default_factory=list)
     sensitivity_note: str = ""
+    blame: object = None                     # cp_attribution.Blame
     variants: dict[str, dict] = field(default_factory=dict)
+    variant_spans: dict[str, set] = field(default_factory=dict)   # variant -> spans on its observed path
     stable_spans: int = 0
     variant_only_spans: int = 0
     variant_only_ns: int = 0
     graph_evidence: dict = field(default_factory=dict)
+    # time in blocking calls no recorded dependency gates ("unknown" mode)
+    unmatched_by_category: dict[str, int] = field(default_factory=dict)
+    modeled_gated_tail_ns: int = 0
+    modeled_range_ns: tuple[int, int] = (0, 0)
+    # the observed path's extent when it starts and ends on different clocks
+    covered_range_ns: tuple[int, int] = (0, 0)
 
     def dependency_steps(self, limit: int | None = None) -> list[dict]:
         """The dependency steps of the observed path with their evidence,
@@ -830,7 +1219,7 @@ def path_rows(g: EventGraph, w: Walk) -> list[PathRow]:
         m = g.mode[e]
         u, v = g.src[e], g.dst[e]
         kind, conf = KINDS[g.kind[e]], CONFS[g.conf[e]]
-        if m in (BUSY, WAIT):
+        if m in (BUSY, WAIT, UNKNOWN):
             o = g.owner[e]
             last = rows[-1] if rows else None
             if last is not None and last.span == o and last.mode == MODES[m] and last.end_ns == g.t[u]:
@@ -868,7 +1257,7 @@ def _span_view(g: EventGraph, w: Walk):
     for e, ns in zip(w.steps, w.cover):
         m = g.mode[e]
         kind, conf = legacy_kind(KINDS[g.kind[e]]), CONFS[g.conf[e]]
-        if m in (BUSY, WAIT):
+        if m in (BUSY, WAIT, UNKNOWN):
             credited[intro(g.owner[e], kind, conf)] += ns
             intro(g.dst[e] >> 1, kind, conf)
         else:
@@ -876,19 +1265,19 @@ def _span_view(g: EventGraph, w: Walk):
     return order, credited, gaps, kinds[1:], confs[1:]
 
 
-def observed_path(trace: "Trace", graph) -> tuple[EventGraph, Walk]:
-    g = build_event_graph(trace, graph)
+def observed_path(trace: "Trace", graph, *, keep_skeleton: bool = False) -> tuple[EventGraph, Walk]:
+    g = build_event_graph(trace, graph, keep_skeleton=keep_skeleton)
     return g, walk(g)
 
 
 def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
-                  sensitivity_node_limit: int = 4_000_000) -> ModelResult:
+                  sensitivity_node_limit: int = 4_000_000, keep_skeleton: bool = False) -> ModelResult:
     """The observed path, its composition and evidence, the modeled longest
     path, criticality, alternatives and (top `sensitivity` candidates)
     counterfactual reductions. sensitivity=None: 5 when the graph has at
     most `sensitivity_node_limit` event nodes, else none (each candidate is
     a full longest-path pass); 0: none."""
-    g, w = observed_path(trace, graph)
+    g, w = observed_path(trace, graph, keep_skeleton=keep_skeleton)
     work: dict[str, int] = defaultdict(int)
     in_call: dict[str, int] = defaultdict(int)
     dep_kind: dict[str, int] = defaultdict(int)
@@ -896,6 +1285,7 @@ def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
     tier: dict[str, int] = defaultdict(int)
     cls: dict[str, int] = defaultdict(int)
     prov: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    unmatched: dict[str, int] = defaultdict(int)
     unrecorded = idle = 0
     for e, ns in zip(w.steps, w.cover):
         m = g.mode[e]
@@ -903,6 +1293,8 @@ def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
             work[g.cat[g.owner[e]]] += ns
         elif m == WAIT:
             in_call[g.cat[g.owner[e]]] += ns
+        elif m == UNKNOWN:
+            unmatched[g.cat[g.owner[e]]] += ns
         elif m == GAP:
             unrecorded += ns
         elif m == IDLE:
@@ -923,14 +1315,22 @@ def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
         dependency_by_kind=dict(dep_kind), dependency_by_source_category=dict(dep_src),
         by_tier=dict(tier), by_class=dict(cls), by_provenance={k: (v[0], v[1]) for k, v in prov.items()},
         rows=path_rows(g, w), path_spans=spans, credited=credited, gaps=gaps,
-        entering_kinds=kinds, entering_confs=confs,
+        entering_kinds=kinds, entering_confs=confs, unmatched_by_category=dict(unmatched),
     )
     res.graph_evidence = _graph_evidence(g)
+    res.covered_range_ns = (w.length, w.length)
+    if g.clock is not None and w.first >= 0:
+        a, b = g.domain[w.sink >> 1], g.domain[w.first >> 1]
+        if a != b:
+            lo, hi = g.clock.offset_range(a, b)
+            res.covered_range_ns = (max(0, int(w.length + lo)) if lo != float("-inf") else 0,
+                                    int(w.length + hi) if hi != float("inf") else -1)
     if g.order:
         F, L = longest(g)
         res.modeled_ns = L
         res.modeled_unrecorded_idle_ns = longest(g, gap_as_work=False)[1]
         res.modeled_direct_only_ns = longest(g, direct_only=True)[1]
+        res.modeled_gated_tail_ns = longest(g, gated_hi=True)[1]
         res.crit = criticality(g, F, L)
         k = sensitivity
         if k is None:
@@ -942,6 +1342,9 @@ def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
             else:
                 k = 5
         _sensitivity(res, g, L, k)
+        if 2 * g.n <= sensitivity_node_limit:
+            from .cp_attribution import blame
+            res.blame = blame(g)
     _alternatives(res, g, w)
     return res
 
@@ -965,26 +1368,40 @@ def _graph_evidence(g: EventGraph) -> dict:
     return {"by_provenance": dict(by_prov), "by_class": dict(by_cls), "by_tier": dict(by_tier),
             "by_kind": dict(by_kind), "rooted_collective_edges": rooted,
             "dropped_contradicting_time": dict(g.dropped), "dropped_in_cycles": g.cycle_edges_dropped,
+            "clock_contradicted": g.clock_contradicted,
+            "clocks": g.clock.to_dict() if g.clock is not None else None,
             "improper_nesting": g.improper_nesting, "unmapped": dict(g.unmapped)}
 
 
 def _alternatives(res: ModelResult, g: EventGraph, w: Walk) -> None:
-    variants = {"default": w, "unrecorded_as_work": walk(g, gap_as_work=True),
-                "direct_evidence_only": walk(g, direct_only=True)}
+    """Every VARIANTS entry: its observed walk and its modeled longest path,
+    with the same parameters."""
+    variants = {}
+    modeled = {}
+    for name, (gaps, direct, gated) in VARIANTS.items():
+        variants[name] = w if name == "default" else walk(g, gap_as_work=gaps, direct_only=direct,
+                                                           gated_hi=gated)
+        modeled[name] = longest(g, gap_as_work=gaps, direct_only=direct, gated_hi=gated)[1] if g.order else 0
     sets = {k: v.spans(g) for k, v in variants.items()}
+    res.variant_spans = sets
     every = set.intersection(*sets.values())
     some = set.union(*sets.values())
     res.stable_spans = len(every)
     res.variant_only_spans = len(some - every)
     owned: dict[int, int] = defaultdict(int)
     for e, ns in zip(w.steps, w.cover):
-        if g.mode[e] in (BUSY, WAIT):
+        if g.mode[e] in (BUSY, WAIT, UNKNOWN):
             owned[g.owner[e]] += ns
     res.variant_only_ns = sum(ns for j, ns in owned.items() if j not in every)
     for name, v in variants.items():
+        gaps, direct, gated = VARIANTS[name]
         res.variants[name] = {"covered_ns": v.length, "spans": len(sets[name]),
                               "first_ns": g.t[v.first] if v.first >= 0 else None,
-                              "same_spans_as_default": sets[name] == sets["default"]}
+                              "same_spans_as_default": sets[name] == sets["default"],
+                              "modeled_ns": modeled[name],
+                              "gaps_as_work": gaps, "direct_evidence_only": direct, "gated_tail_as_work": gated}
+    vals = list(modeled.values()) + ([res.modeled_ns] if g.order else [])
+    res.modeled_range_ns = (min(vals), max(vals)) if vals else (0, 0)
 
 
 def _sensitivity(res: ModelResult, g: EventGraph, L: int, k: int) -> None:
@@ -995,6 +1412,12 @@ def _sensitivity(res: ModelResult, g: EventGraph, L: int, k: int) -> None:
     crit = res.crit
     if k <= 0 or crit is None or not crit.work_on_some:
         return
+    from .cp_attribution import replay, residuals, run_end
+    resid = residuals(g)
+    T = run_end(g)
+
+    def replayed(zero: set[int]) -> int:
+        return int(round(T - replay(g, {j: 0.0 for j in zero}, resid)[1]))
     work_by_name: dict[tuple[str, int], int] = defaultdict(int)
     for j, ns in crit.work_on_some.items():
         work_by_name[(g.cat[j], g.name_id[j])] += ns
@@ -1008,11 +1431,11 @@ def _sensitivity(res: ModelResult, g: EventGraph, L: int, k: int) -> None:
         L2 = longest(g, zero_owners=members[key])[1]
         res.sensitivity.append({"scope": "name", "category": key[0], "name": g.names[key[1]],
                                 "spans": len(members[key]), "work_on_longest_ns": ns,
-                                "modeled_reduction_ns": L - L2})
+                                "modeled_reduction_ns": L - L2, "replay_reduction_ns": replayed(members[key])})
     singles = sorted(crit.work_on_some.items(), key=lambda kv: (kv[0] not in crit.on_all, -kv[1]))[:k]
     for j, ns in singles:
         L2 = longest(g, zero_owners={j})[1]
         res.sensitivity.append({"scope": "span", "category": g.cat[j], "name": g.name(j), "span": j,
                                 "start_ns": g.t[2 * j], "work_on_longest_ns": ns,
                                 "on_every_longest_path": j in crit.on_all, "slack_ns": crit.slack.get(j, 0),
-                                "modeled_reduction_ns": L - L2})
+                                "modeled_reduction_ns": L - L2, "replay_reduction_ns": replayed({j})})

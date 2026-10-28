@@ -300,7 +300,7 @@ def match_nodes(pa: TraceProjection, nodes_a: list[ProjectedNode], pb: TraceProj
 
 # ── identities ───────────────────────────────────────────────────────────────
 
-_FIELDS = ("count", "total_ns", "self_ns", "queue_ns", "queued", "overlap_ns", "cp_ns", "blame_ns")
+_FIELDS = ("count", "total_ns", "self_ns", "queue_ns", "queued", "overlap_ns", "cp_ns", "blame_ns", "wait_blame_ns")
 
 
 @dataclass
@@ -313,6 +313,7 @@ class _Side:
     overlap_ns: int = 0
     cp_ns: int = 0
     blame_ns: int = 0
+    wait_blame_ns: int = 0
     first_start: int | None = None
     last_end: int | None = None
 
@@ -660,14 +661,60 @@ class _Explainer:
         until one whose own measured time regressed / improved -- the
         origin. Symmetric so that swapping baseline and candidate swaps the
         attribution instead of changing it."""
+        return self._chain_from(ident.id, improved, {ident.id})
+
+    def _gating_shifts(self, cur: int, improved: bool, seen: set[int]) -> list[tuple[int, float]]:
+        """(predecessor, its end shift in the chain's direction) of the
+        gating predecessors that finish within cur's own span."""
+        preds = self.preds_a if improved else self.preds_b
+        ends = self.end_a if improved else self.end_b
+        sign = -1.0 if improved else 1.0
+        out = []
+        cur_end = ends.get(cur)
+        for s, kind in sorted(preds.get(cur, ())):
+            if s in seen or kind not in _GATING_KINDS:
+                continue
+            s_end = ends.get(s)
+            if cur_end is not None and s_end is not None and s_end > cur_end + 50_000:
+                continue
+            end_shift = self.shift.get(s, (None, None))[1]
+            if end_shift is not None:
+                out.append((s, sign * end_shift))
+        return out
+
+    def joint_origins(self, ident: Identity, chain: list[int], improved: bool = False) -> list[int]:
+        """Joint release: the other gating predecessors of `ident` whose end
+        moved as much as the chain's first step (within half the noise
+        floor) -- the wait waited for all of them --, each followed to its
+        own origin."""
+        if not chain:
+            return []
+        c = self.c
+        shifts = self._gating_shifts(ident.id, improved, {ident.id})
+        best = dict(shifts).get(chain[0])
+        if best is None:
+            return []
+        origin_status = cmp.STATUS_IMPROVED if improved else cmp.STATUS_REGRESSED
+        out = []
+        for s, sh in shifts:
+            if s == chain[0] or sh < c.noise_ns / 2 or best - sh > c.noise_ns / 2:
+                continue
+            own = self.status.get(s) == origin_status and \
+                self.cause.get(s) in ("increased_work", "more_invocations", "queueing")
+            sub = [s] if own else [s] + self._chain_from(s, improved, {ident.id, s})
+            if self.status.get(sub[-1]) == origin_status and sub[-1] != chain[-1]:
+                out.append(sub[-1])
+        return sorted(set(out))
+
+    def _chain_from(self, start: int, improved: bool, seen: set[int]) -> list[int]:
         c = self.c
         preds = self.preds_a if improved else self.preds_b
         ends = self.end_a if improved else self.end_b
         sign = -1.0 if improved else 1.0
         origin_status = cmp.STATUS_IMPROVED if improved else cmp.STATUS_REGRESSED
         out: list[int] = []
-        seen = {ident.id}
-        cur = ident.id
+        seen = set(seen)
+        cur = start
         tol = 50_000
         for _ in range(MAX_CHAIN):
             best, best_shift = None, 0.0
@@ -866,29 +913,39 @@ def _attribute_to_origins(rows: dict[int, dict], comp: _Comparison, noise_pct: f
         r["receivedNs"] = 0
         r["passedOnNs"] = 0
     # regressions (sign +1) and, mirrored, improvements (sign -1): an
-    # improved wait is credited to the origin whose work shrank
+    # improved wait is credited to the origin whose work shrank. A wait
+    # released jointly by several origins (jointFrom) is split equally
+    # between them before each origin's cap.
     for sign in (1, -1):
-        groups: dict[int, list[dict]] = defaultdict(list)
+        groups: dict[int, list[tuple[dict, float]]] = defaultdict(list)
         for r in rows.values():
             o = r["propagatedFrom"]
             if o is not None and o in rows and sign * r["criticalDeltaNs"] > 0:
-                groups[o].append(r)
+                origins = [o] + [x for x in r.get("jointFrom", ()) if x in rows and x != o]
+                for x in origins:
+                    groups[x].append((r, 1.0 / len(origins)))
+        residual_of: dict[int, float] = defaultdict(float)
         for o, symptoms in groups.items():
             ro = rows[o]
             if sign * ro["ownDeltaNs"] < 0:
                 # an origin whose own time moved the other way is no origin
                 # of this direction's change (and must keep the impact the
                 # other pass gave it): its symptoms keep their own change
+                for r, wgt in symptoms:
+                    residual_of[r["id"]] += wgt * sign * r["criticalDeltaNs"]
                 continue
             base = max(sign * ro["criticalDeltaNs"], 0)
-            total = sum(sign * r["criticalDeltaNs"] for r in symptoms)
+            total = sum(wgt * sign * r["criticalDeltaNs"] for r, wgt in symptoms)
             give = max(0, min(total, max(base, sign * ro["ownDeltaNs"]) - base))
             ro["impactNs"] = sign * (base + give)
             ro["receivedNs"] = sign * give
             residual = total - give
-            for r in symptoms:
-                r["impactNs"] = sign * int(round(residual * sign * r["criticalDeltaNs"] / total)) if total else 0
-                r["passedOnNs"] = r["criticalDeltaNs"] - r["impactNs"]
+            for r, wgt in symptoms:
+                residual_of[r["id"]] += residual * wgt * sign * r["criticalDeltaNs"] / total if total else 0
+        for rid, res in residual_of.items():
+            r = rows[rid]
+            r["impactNs"] = sign * int(round(res))
+            r["passedOnNs"] = r["criticalDeltaNs"] - r["impactNs"]
     idents = comp.identities
     for r in rows.values():
         ident = idents[r["id"]]
@@ -981,6 +1038,8 @@ def _ident_row(ident: Identity, comp: _Comparison, ex: _Explainer, alignment_con
     derived = {
         "criticalNs": [a.cp_ns if has_a else None, b.cp_ns if has_b else None],
         "blameNs": [a.blame_ns if has_a else None, b.blame_ns if has_b else None],
+        # every gated call's waiting time this node's work delayed (cp_attribution)
+        "waitBlameNs": [a.wait_blame_ns if has_a else None, b.wait_blame_ns if has_b else None],
         "onCriticalPath": [a.cp_ns > 0 if has_a else None, b.cp_ns > 0 if has_b else None],
     }
     evidence: list[dict[str, Any]] = []
@@ -1018,6 +1077,7 @@ def _ident_row(ident: Identity, comp: _Comparison, ex: _Explainer, alignment_con
               "ownDeltaNs": idents[c].b.own_ns - idents[c].a.own_ns} for c in chain_ids]
     origin = chain[-1] if chain and chain[-1]["status"] == (
         cmp.STATUS_IMPROVED if improve else cmp.STATUS_REGRESSED) else None
+    joint = ex.joint_origins(ident, chain_ids, improved=improve) if origin else []
     match_kind = "exact" if (has_a and has_b and ident.ka == ident.kb) else \
         ("structural" if has_a and has_b else ("new" if has_b else "removed"))
     explanation = _explain(ident, cause, components, measured, chain, origin, evidence, regress, noise_ns)
@@ -1038,6 +1098,8 @@ def _ident_row(ident: Identity, comp: _Comparison, ex: _Explainer, alignment_con
         "components": {k: v for k, v in components.items()},
         "measured": measured, "derived": derived, "evidence": evidence, "chain": chain,
         "propagatedFrom": origin["identity"] if origin else None,
+        # joint release: other origins the wait waited for as much
+        "jointFrom": joint,
         "explanation": explanation,
         "match": {"kind": match_kind, "score": round(ident.match_score, 4) if has_a and has_b else None},
         "confidence": round(ident.match_score * alignment_conf, 4) if has_a and has_b else None,

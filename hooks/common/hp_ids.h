@@ -23,7 +23,8 @@ enum {
     HP_ID_MPI    = 3,     /* requests and their completions (mpi_hook.c) */
     HP_ID_OMPT   = 4,     /* parallel regions (ompt_tool.c) */
     HP_ID_NVTX   = 5,     /* NVTX ranges (cuda_hook.c) */
-    HP_ID_OPENCL = 6,     /* host-side kernel spans (opencl_hook.c) */
+    HP_ID_OPENCL = 6,     /* host-side kernel / transfer spans (opencl_hook.c) */
+    HP_ID_NCCL   = 7,     /* host calls with HPROFILER_NCCL_ASYNC=1 (nccl_hook.c) */
 };
 
 static inline uint64_t hp_span_id(unsigned tag, uint32_t pid, uint32_t n) {
