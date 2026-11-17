@@ -534,6 +534,12 @@ def assemble(trace: "Trace") -> dict:
         vk = vendor_key(spans[ds[0]])
         if vk is not None and op_of(spans[ds[0]]) != "graph":
             learned[vk].add(hstream)
+    # stream_info (CUPTI's stream-created callback) names both ids directly
+    for s in spans:
+        t = s.tags
+        if t.get("op") == "stream_info" and t.get("nstream") is not None and t.get("stream") is not None \
+                and t.get("ctx") is not None:
+            learned[(s.pid, t.get("rt", "cuda"), t["ctx"], "s", t["nstream"])].add(t["stream"])
 
     for i, s in enumerate(spans):
         # Every native record (incl. CUPTI sync records, timing=host);

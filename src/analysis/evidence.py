@@ -102,7 +102,9 @@ EVIDENCE: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "nccl_pseq": ("direct", "the per-peer send / receive numbers the NCCL hook recorded (pseq=) and NCCL's "
                             "in-order pairing", ("hook_id", "runtime_order")),
     "several_candidates": ("against", "the identifying data matched more than one candidate", ()),
-    "event_loss": ("against", "the process lost events: an ordinal pairing may be shifted", ()),
+    "event_loss": ("against", "the records do not fix the pairing's order (the process lost events, a "
+                              "sequence-number gap the analysis could not place, or posts that overlapped "
+                              "on two threads): an ordinal pairing may be shifted", ()),
     "time_contradiction": ("against", "the source event lies after the destination event beyond the "
                                       "clock tolerance", ()),
     "cycle": ("against", "the edge closed a cycle among simultaneous events", ()),
@@ -115,6 +117,15 @@ EVIDENCE: dict[str, tuple[str, str, tuple[str, ...]]] = {
                                 "last arriver: it may have been the last", ()),
     "shared_correlation": ("inferred", "another host submission with the device operation's correlation id",
                            ("correlation_id",)),
+    "dependence_rules": ("inferred", "a task's depend clauses as the GNU libgomp hook decoded them, and "
+                                     "OpenMP's dependence rules over the earlier sibling tasks", ("hook_id",)),
+    "graph_topology": ("direct", "the CUDA graph exec's own edge between two of its nodes, recorded at "
+                                 "instantiation", ("hook_id",)),
+    "os_wakeup": ("inferred", "the kernel's record of which thread woke the blocking call's thread from its "
+                              "last sleep in the call; that this waking released the call is inferred", ()),
+    "lifecycle_sync": ("inferred", "MPI_Init / MPI_Finalize synchronizing every process: what common "
+                                   "implementations do (Open MPI: a PMIx fence), not what the MPI standard "
+                                   "requires", ()),
 }
 EVIDENCE_KINDS = tuple(EVIDENCE)
 assert len(EVIDENCE_KINDS) <= 32, "ev_for / ev_against are 32-bit masks"
@@ -139,6 +150,10 @@ PROV_EVIDENCE: dict[str, tuple[str, ...]] = {
     "nccl_pseq": ("nccl_pseq",),
     "nccl_seq": ("nccl_seq",),
     "time_overlap": ("time_overlap",),
+    "dep_rules": ("dependence_rules",),
+    "graph_edge": ("graph_topology",),
+    "os_wakeup": ("os_wakeup",),
+    "lifecycle_sync": ("lifecycle_sync",),
 }
 
 GROUP_KINDS = ("single", "p2p", "launch", "device_wait", "arrival")
@@ -165,10 +180,12 @@ def kinds_of(m: int) -> list[str]:
 
 def _fallback_prov(kind: str, conf: str) -> str:
     """Provenance of a span-level edge the event graph did not map."""
+    if kind in ("task_join", "task_dep") and conf == "high":
+        return "dep_rules"
     return {"p2p": "posting_order", "launch": "correlation_id", "device_wait": "sync_target",
             "device_sync": "sync_target", "sequential": "thread_timeline",
             "explicit_span_id": "explicit_id", "task_join": "task_id", "task_dep": "task_id",
-            "lock_order": "lock_handoff"}.get(kind) or (
+            "lock_order": "lock_handoff", "graph_dep": "graph_edge", "wakeup": "os_wakeup"}.get(kind) or (
         "call_order" if conf in ("certain", "high") else "time_overlap")
 
 
@@ -425,23 +442,31 @@ def _mark_ambiguous(cand: np.ndarray, groups: np.ndarray) -> None:
 
 
 def with_alternatives(es: EvidenceSet, alts: list[tuple[int, int, int, int, int, str]],
-                      contested: list[int] = ()) -> EvidenceSet:
+                      contested: list[int] = (), new_groups: list[tuple[str, int, int]] = ()) -> EvidenceSet:
     """es plus alternative candidates (dst, src, kind code, conf code, group
     id, evidence kind): unsupported, not selected, not in the model; the
     groups they join become ambiguous, and so do the `contested` candidates
-    (an at_most_one group whose answer may be "none of them")."""
+    (an at_most_one group whose answer may be "none of them"). new_groups:
+    (kind, cardinality, key) of groups only alternatives answer (a
+    destination no selected candidate enters), ids len(es.groups) on."""
     if not alts and not contested:
         return es
+    groups = es.groups
+    if new_groups:
+        extra_g = np.empty(len(new_groups), dtype=GROUP_DTYPE)
+        for i, (kind, card, key) in enumerate(new_groups):
+            extra_g[i] = (_G[kind], card, key)
+        groups = np.concatenate([es.groups, extra_g])
     extra = np.zeros(len(alts), dtype=CAND_DTYPE)
     for i, (dst, src, kind, conf, gid, why) in enumerate(alts):
         extra[i] = (dst, src, kind, conf, -1, UNSUPPORTED, 0, 0, gid, mask(why, "time_feasible"), 0)
     cand = np.concatenate([es.cand, extra])
-    _mark_ambiguous(cand, es.groups)
+    _mark_ambiguous(cand, groups)
     for i in contested:
         if cand["status"][i] in (OBSERVED, INFERRED):
             cand["status"][i] = AMBIGUOUS
             cand["ev_against"][i] |= _BIT["several_candidates"]
-    return EvidenceSet(cand, es.groups, es.n_selected)
+    return EvidenceSet(cand, groups, es.n_selected)
 
 
 def build_evidence(trace: "Trace", graph=None, g=None) -> EvidenceSet:

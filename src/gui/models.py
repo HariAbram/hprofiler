@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 import zlib
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -138,6 +139,25 @@ class TimelineModel(QObject):
             self._lane_tid[lane_name] = tid
             self._lane_stream[lane_name] = stream
 
+        # Stream numbers per process: 0 is the default stream (id 0), the
+        # others 1, 2, ... in the order their work first appears. The id
+        # itself -- a hash of the program's stream handle, or the vendor's
+        # stream / queue id when no handle was matched -- means nothing to
+        # read, so it is shown only in the event details.
+        first_ns: dict[tuple[int, str], int] = {}
+        for lane_name, info in self._infos.items():
+            _cat, kind, ident, _pid = parsed[lane_name]
+            if kind == "stream":
+                k = (info.pid, ident)
+                first_ns[k] = min(first_ns.get(k, info.min_start), info.min_start)
+        self._stream_num: dict[tuple[int, str], int] = {}
+        for pid in sorted({p for p, _ in first_ns}):
+            if (pid, "0") in first_ns:
+                self._stream_num[(pid, "0")] = 0
+            others = sorted((t, ident) for (p, ident), t in first_ns.items() if p == pid and ident != "0")
+            for n, (_t, ident) in enumerate(others, 1):
+                self._stream_num[(pid, ident)] = n
+
         def _sort_key(name: str) -> tuple[int, int, str]:
             cat, kind, ident, pid = parsed[name]
             if kind == "thread":
@@ -145,10 +165,9 @@ class TimelineModel(QObject):
                 if k is not None:
                     return (tid_seq.get(k, 9999), 0, cat)
             elif kind == "stream":
-                try:
-                    return (10000 + int(ident), pid or 0, cat)
-                except ValueError:
-                    pass
+                n = self._stream_num.get((self._infos[name].pid, ident))
+                if n is not None:
+                    return (10000 + n, pid or 0, cat)
             elif kind == "device":
                 return (20000, pid or 0, cat)
             return (0, pid or 0, cat)
@@ -165,7 +184,7 @@ class TimelineModel(QObject):
                 k = _thread_key(lane_name)
                 label = f"{cat} T{tid_seq.get(k, '?')}" if k is not None else cat
             elif kind == "stream":
-                label = f"{cat} S{ident}"
+                label = f"{cat} S{self._stream_num.get((self._infos[lane_name].pid, ident), ident)}"
             elif kind == "device":
                 label = f"{cat} device"
             else:
@@ -185,33 +204,61 @@ class TimelineModel(QObject):
         # and for path-switch classification: the device of a stream lane is
         # the hook's hdev= (else the native dev=) of its first span; the node
         # of a merged multi-node trace is the `node` tag merge-nodes adds.
+        # CUPTI synchronization records name their context but no device:
+        # they take the device of the kernels / copies of the same context
+        # (a CUDA context belongs to one device) instead of an unnumbered
+        # "device" of their own. They time the host thread's wait
+        # (timing=host), which their lane's label says.
         from . import timeline_hierarchy as th
         merged = bool((trace.metadata.clock or {}).get("merge"))
         node_of_pid: dict[int, str | None] = {}
+        firsts: dict[str, Any] = {}
+        ctx_devices: dict[tuple, set[str]] = defaultdict(set)
+        for lane_name in self._lane_names:
+            kind, pid = parsed[lane_name][1], self._infos[lane_name].pid
+            if kind in ("stream", "device") or (merged and pid not in node_of_pid):
+                first = next(iter(self._store.iter_spans(lane=lane_name)), None)
+                if first is None:
+                    continue
+                if merged and pid not in node_of_pid:
+                    node_of_pid[pid] = first.tags.get("node")
+                if kind in ("stream", "device"):
+                    firsts[lane_name] = first
+                    dv = first.tags.get("hdev", first.tags.get("dev"))
+                    if dv is not None and first.tags.get("ctx") is not None:
+                        ctx_devices[(pid, first.tags.get("rt"), first.tags["ctx"])].add(str(dv))
         self._lane_extra: list[dict[str, Any]] = []
         metas: list[Any] = []
         for i, lane_name in enumerate(self._lane_names):
             cat, kind, ident, pid_suffix = parsed[lane_name]
             info = self._infos[lane_name]
             pid = info.pid
-            device = None
-            if kind in ("stream", "device") or (merged and pid not in node_of_pid):
-                first = next(iter(self._store.iter_spans(lane=lane_name)), None)
-                if first is not None:
-                    if kind in ("stream", "device"):
-                        dv = first.tags.get("hdev", first.tags.get("dev"))
-                        device = None if dv is None else str(dv)
-                    if merged and pid not in node_of_pid:
-                        node_of_pid[pid] = first.tags.get("node")
+            device = device_from = None
+            host_timed = False
+            first = firsts.get(lane_name)
+            if first is not None:
+                dv = first.tags.get("hdev", first.tags.get("dev"))
+                if dv is not None:
+                    device = str(dv)
+                elif first.tags.get("ctx") is not None:
+                    devs = ctx_devices.get((pid, first.tags.get("rt"), first.tags["ctx"]), ())
+                    if len(devs) == 1:
+                        device, device_from = next(iter(devs)), "context"
+                host_timed = first.tags.get("timing") == "host"
+            stream_num = self._stream_num.get((pid, ident)) if kind == "stream" else None
             tid = self._lane_tid.get(lane_name)
             k = _thread_key(lane_name)
             extra = {"pid": pid, "tid": tid, "rank": pid_rank.get(pid), "node": node_of_pid.get(pid),
-                     "device": device, "kind": kind, "ident": ident, "category": cat,
+                     "device": device, "deviceFrom": device_from, "hostTimed": host_timed,
+                     "kind": kind, "ident": ident, "category": cat,
+                     "streamNum": stream_num, "streamLabel": self._stream_label(pid, ident) if kind == "stream" else "",
                      "threadLabel": f"T{tid_seq.get(k, '?')} · tid {tid}" if k is not None else ""}
             self._lane_extra.append(extra)
             metas.append(th.LaneMeta(i, lane_name, cat, kind, ident, pid, info.count, tid=tid,
                                      rank=extra["rank"], node=extra["node"], device=device,
-                                     thread_label=extra["threadLabel"]))
+                                     thread_label=extra["threadLabel"], stream_label=extra["streamLabel"],
+                                     stream_order=stream_num if stream_num is not None else -1,
+                                     host_timed=host_timed))
         host = trace.metadata.hostname
         self._tree = th.build_tree(metas, system_label=f"System · {host}" if host else "System")
         self._tree_nodes: dict[str, Any] = {}
@@ -599,7 +646,10 @@ class TimelineModel(QObject):
             key = self._group_key_for_lane(lane, self._grouping)
             group_id = f"{self._grouping}:{key}"
             if group_id not in groups:
-                groups[group_id] = {"label": self._group_label(self._grouping, key),
+                label = self._group_label(self._grouping, key)
+                if self._grouping == "stream" and key is not None:
+                    label = self._stream_ident_label(key).capitalize()
+                groups[group_id] = {"label": label,
                                      "laneIndexes": [], "laneRows": []}
                 order.append(group_id)
             groups[group_id]["laneIndexes"].append(r["laneIndex"])
@@ -686,17 +736,19 @@ class TimelineModel(QObject):
         processes = sorted({p for p in self._lane_pid.values()})
         threads = sorted({t for t in self._lane_tid.values() if t is not None})
         runtimes = sorted({parse_lane_name(name)[0] for name in self._lane_names})
-        streams = sorted({s for s in self._lane_stream.values() if s is not None})
+        streams = sorted({s for s in self._lane_stream.values() if s is not None},
+                         key=lambda s: (min((n for (_p, i), n in self._stream_num.items() if i == s), default=1 << 30), s))
         devices = sorted({ex["device"] for ex in self._lane_extra if ex["device"] is not None})
 
-        def _dim(key: str, label: str, values: list, supported: bool = True, reason: str = "") -> dict[str, Any]:
+        def _dim(key: str, label: str, values: list, supported: bool = True, reason: str = "",
+                 label_of=str) -> dict[str, Any]:
             is_available = supported and bool(values)
             return {
                 "key": key,
                 "label": label,
                 "available": is_available,
                 "reason": "" if is_available else reason,
-                "values": [{"value": v, "label": str(v)} for v in values],
+                "values": [{"value": v, "label": label_of(v)} for v in values],
             }
 
         return [
@@ -704,7 +756,8 @@ class TimelineModel(QObject):
             _dim("process", "Process", processes, reason="only one process in this trace"),
             _dim("thread", "Thread", threads, reason="no per-thread lanes in this trace"),
             _dim("runtime", "Runtime", runtimes, reason="no runtime categories in this trace"),
-            _dim("stream", "Stream", streams, reason="no GPU stream tags in this trace"),
+            _dim("stream", "Stream", streams, reason="no GPU stream tags in this trace",
+                 label_of=self._stream_ident_label),
             _dim("device", "Device", devices,
                  reason="no hdev=/dev= tag on device work in this trace (older hooks, host-only runs)"),
             _dim("bucket", "Activity", list(activity_buckets.BUCKETS)),
@@ -2156,8 +2209,24 @@ class TimelineModel(QObject):
         if ex["kind"] == "thread":
             where += f" {ex['threadLabel'].split(' · ')[0]}"
         elif ex["kind"] == "stream":
-            where += f" stream {ex['ident']}" + (f" (device {ex['device']})" if ex["device"] else "")
+            where += f" {ex['streamLabel']}" + (f" (device {ex['device']})" if ex["device"] else "")
         return f"{ex['category']} · {where}"
+
+    def _stream_label(self, pid: int, ident: str) -> str:
+        """A stream's name in process `pid` (its number, see __init__)."""
+        n = self._stream_num.get((pid, ident))
+        if n is None:
+            return f"stream {ident}"
+        return "stream 0 (default)" if n == 0 else f"stream {n}"
+
+    def _stream_ident_label(self, ident: str) -> str:
+        """The name of stream id `ident` where it is not tied to one process
+        (stream filter values, grouping by stream): every process's name
+        for it, when they differ."""
+        nums = sorted({n for (_p, i), n in self._stream_num.items() if i == ident})
+        if not nums:
+            return f"stream {ident}"
+        return " / ".join("stream 0 (default)" if n == 0 else f"stream {n}" for n in nums)
 
     @Property('QVariantMap', notify=analysisChanged)
     def criticalSummary(self) -> dict[str, Any]:

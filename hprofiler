@@ -908,8 +908,13 @@ def efficiency(trace_file, baseline, interconnect_bw, use_cp):
 @click.option("--json", "json_out", default=None, type=click.Path(), metavar="FILE",
               help="Also write the whole analysis as JSON: composition, variants, clocks, evidence, "
                    "alternative worlds, blame, probabilities, the path's dependency steps.")
+@click.option("--window", type=click.Choice(["process-begin", "first-event"]), default="process-begin",
+              show_default=True,
+              help="Where the measured wall time and the observed path start: the earliest process-begin "
+                   "marker (a hook's constructor, before main; the first recorded event in traces without "
+                   "markers), or the first recorded event.")
 def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high, n_alternatives, calibration,
-                      json_out):
+                      json_out, window):
     """Compute and print the cross-runtime critical path of a saved trace.
 
     Builds a dependency graph over the captured spans (CUDA/ROCm/OpenCL/
@@ -921,9 +926,11 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high, n_al
     twice. Reported separately (DOCUMENTATION.md, Critical path):
 
     \b
-      measured wall time   first to last recorded event
+      measured wall time   process begin (or the first recorded event:
+                           --window) to the last recorded event
       observed path        the chain of last-releasing dependencies, back
-                           from the end of the run: each instant once
+                           from the end of the run to the window's start:
+                           each instant once
       modeled path         the longest chain of required work (waiting and
                            dependency latency count zero): a model
       evidence             each dependency step's kind, tier, provenance,
@@ -949,7 +956,8 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high, n_al
     if calibration:
         from src.analysis.edge_calibration import Calibration
         cal = Calibration.load(calibration)
-    report = cpmod.analyze(trace, sensitivity=sensitivity, alternatives=n_alternatives, calibration=cal)
+    report = cpmod.analyze(trace, sensitivity=sensitivity, alternatives=n_alternatives, calibration=cal,
+                           window=window.replace("-", "_"))
     m = report.model
 
     def fmt_ns(ns):
@@ -978,9 +986,20 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high, n_al
     click.echo(f"\n{'='*72}")
     click.echo(f"  Critical Path Analysis: {trace_file}")
     click.echo(f"{'='*72}")
-    click.echo(f"  Measured wall time          : {fmt_ns(report.wall_ns)}  (first to last recorded event)")
+    if report.window_start == "process_begin":
+        click.echo(f"  Window                      : from process begin (the earliest hook constructor), "
+                   f"{fmt_ns(report.window_lead_ns)} before the first recorded event")
+    elif window == "process-begin":
+        click.echo("  Window                      : from the first recorded event (no process-begin marker "
+                   "before it in this trace)")
+    else:
+        click.echo("  Window                      : from the first recorded event (--window first-event)")
+    click.echo(f"  Measured wall time          : {fmt_ns(report.wall_ns)}  (window start to last recorded event)")
     click.echo(f"  Observed critical path      : {fmt_ns(total)}  (each instant once; "
                f"{len(report.path_span_indices)} spans)")
+    if report.unconnected_tail_records:
+        click.echo(f"    ends before the last event: {fmt_ns(report.unconnected_tail_ns)}  "
+                   f"({report.unconnected_tail_records} later records it cannot connect; see the notes)")
     click.echo(f"  Modeled longest path        : {fmt_ns(report.modeled_path_ns)}  (required work only; "
                f"a model, not a measurement)")
     click.echo(f"    unrecorded time as idle   : {fmt_ns(report.modeled_unrecorded_idle_ns)}")
@@ -1008,6 +1027,9 @@ def critical_path_cmd(trace_file, top, sensitivity, export, exact_p2p_high, n_al
     if report.path_device_idle_ns:
         click.echo(f"    device idle between stream operations{'':<13}{fmt_ns(report.path_device_idle_ns):>12}"
                    f"  {pct(report.path_device_idle_ns)}")
+    if report.path_thread_idle_ns:
+        click.echo(f"    OpenMP worker idle after its region's join{'':<8}{fmt_ns(report.path_thread_idle_ns):>12}"
+                   f"  {pct(report.path_thread_idle_ns)}")
     if report.wait_caused_by_category:
         click.echo(f"    non-call time by what it waited for (source category):")
         rows(report.wait_caused_by_category)

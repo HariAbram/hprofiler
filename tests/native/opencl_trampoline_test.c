@@ -10,7 +10,10 @@
  * Only slot i is populated while trampoline i is called, so a trampoline
  * reading any other slot is detected (the recorder is not called).
  *
- * Also checks the span names extract_kernel_name() gives ACPP SSCP
+ * Also checks the Intel USM extension wrappers (ext_wrap): each platform's
+ * wrapper calls that platform's real function, a fifth platform gets the
+ * real pointer back (counted), other names pass through untouched; and the
+ * span names extract_kernel_name() gives ACPP SSCP
  * kernels: the short name when "ZZ<len><name>" follows, otherwise the WHOLE
  * symbol -- it used to keep the first 64 characters, which merged
  * mixbench's 100 templated SYCL kernels into 2 names.
@@ -22,6 +25,56 @@ static int g_called_with = -1;
 static void recorder(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     g_called_with = (int)(intptr_t)a0;
+}
+
+/* Intel USM extension wrappers: fake real functions, one per platform
+ * slot, report which one ran (an error return keeps the recording off the
+ * event table). */
+static int g_ext_ran = -1;
+#define FAKE_EXT(K) \
+static cl_int fake_memcpy_##K(cl_command_queue q, cl_bool b, void *d, const void *s, size_t n, cl_uint nwl, \
+                              const cl_event *ewl, cl_event *ev) { \
+    (void)q; (void)b; (void)d; (void)s; (void)n; (void)nwl; (void)ewl; (void)ev; g_ext_ran = K; return -5; } \
+static cl_int fake_fill_##K(cl_command_queue q, void *p, const void *pat, size_t ps, size_t n, cl_uint nwl, \
+                            const cl_event *ewl, cl_event *ev) { \
+    (void)q; (void)p; (void)pat; (void)ps; (void)n; (void)nwl; (void)ewl; (void)ev; g_ext_ran = 10 + K; return -5; }
+FAKE_EXT(0)
+FAKE_EXT(1)
+FAKE_EXT(2)
+FAKE_EXT(3)
+FAKE_EXT(4)
+static void *const g_fake_memcpy[5] = {(void *)fake_memcpy_0, (void *)fake_memcpy_1, (void *)fake_memcpy_2,
+                                       (void *)fake_memcpy_3, (void *)fake_memcpy_4};
+static void *const g_fake_fill[5] = {(void *)fake_fill_0, (void *)fake_fill_1, (void *)fake_fill_2,
+                                     (void *)fake_fill_3, (void *)fake_fill_4};
+
+static int check_ext(void) {
+    int bad = 0;
+    void *other = (void *)check_ext;
+    if (ext_wrap((cl_platform_id)0x10, "clGetKernelSubGroupInfoKHR", other) != other) bad++;   /* not ours */
+    if (ext_wrap((cl_platform_id)0x10, "clEnqueueMemcpyINTEL", NULL) != NULL) bad++;
+    void *cpy[5], *fill[5];
+    for (int k = 0; k < 5; k++) {                       /* platforms 0x10..0x14; slot 4 does not exist */
+        cpy[k] = ext_wrap((cl_platform_id)(intptr_t)(0x10 + k), "clEnqueueMemcpyINTEL", g_fake_memcpy[k]);
+        fill[k] = ext_wrap((cl_platform_id)(intptr_t)(0x10 + k), "clEnqueueMemFillINTEL", g_fake_fill[k]);
+    }
+    /* the same platform again: the same wrapper */
+    if (ext_wrap((cl_platform_id)0x11, "clEnqueueMemcpyINTEL", g_fake_memcpy[1]) != cpy[1]) bad++;
+    for (int k = 0; k < 5; k++) {
+        int wrapped = k < EXT_PLATFORMS;
+        if ((cpy[k] == g_fake_memcpy[k]) == wrapped || (fill[k] == g_fake_fill[k]) == wrapped) {
+            fprintf(stderr, "platform %d: wrapped=%d expected %d\n", k, cpy[k] != g_fake_memcpy[k], wrapped);
+            bad++;
+        }
+        g_ext_ran = -1;
+        ((memcpy_intel_t)cpy[k])(NULL, 0, NULL, NULL, 8, 0, NULL, NULL);
+        if (g_ext_ran != k) { fprintf(stderr, "memcpy wrapper %d ran %d\n", k, g_ext_ran); bad++; }
+        g_ext_ran = -1;
+        ((fill_intel_t)fill[k])(NULL, NULL, NULL, 4, 8, 0, NULL, NULL);
+        if (g_ext_ran != 10 + k) { fprintf(stderr, "fill wrapper %d ran %d\n", k, g_ext_ran); bad++; }
+    }
+    if (g_ext_unwrapped != 2) { fprintf(stderr, "unwrapped=%llu want 2\n", (unsigned long long)g_ext_unwrapped); bad++; }
+    return bad;
 }
 
 static int check_name(const char *sym, const char *want) {
@@ -63,7 +116,9 @@ int main(void) {
             bad++;
         }
     }
+    int ext_bad = check_ext();
     printf("RESULT trampolines=%d wrong=%d\n", TRAMPOLINE_N, bad);
     printf("RESULT names_wrong=%d\n", names_bad);
-    return (bad || names_bad) ? 1 : 0;
+    printf("RESULT ext_wrong=%d\n", ext_bad);
+    return (bad || names_bad || ext_bad) ? 1 : 0;
 }

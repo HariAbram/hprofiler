@@ -5,7 +5,10 @@
  * running (rocprof_trace.c), otherwise from a hipEvent pair around the call
  * (timing=proxy_*). Also recorded: sync calls, event record / stream wait,
  * allocations (device and pinned_memory_bytes counters, unreleased memory
- * reported at exit), ROCTx ranges and marks, module loads (kernel names and
+ * reported at exit), stream creation / destruction (stream lives, see
+ * "Stream and event identity"), host functions (hipLaunchHostFunc,
+ * hipStreamAddCallback), cooperative and Ext launches, the 2D / peer /
+ * device-to-device / async copy forms, ROCTx ranges and marks, module loads (kernel names and
  * code objects saved for disassembly; launches carry mod=, the id of the
  * module they ran, see hp_module.h), HIPRTC compilation (front-end JIT,
  * stage=frontend).
@@ -195,9 +198,20 @@ static void pin_track_rem(void *ptr) {
     emit_ctr("memory", "pinned_memory_bytes", total, "bytes");
 }
 
-/* ── Stream ID assignment ────────────────────────────────────────────────── */
-/* Small display id from the pointer value (MurmurHash3 fmix64), as in
- * cuda_hook.c's get_stream_id(). */
+/* ── Stream and event identity ───────────────────────────────────────────
+ * As cuda_hook.c's: stream= / event= is the pointer hash (MurmurHash3
+ * fmix64) for a handle's first life and a fresh number (>= HP_FRESH_ID_BASE)
+ * for each later life of the same address -- HIP, like CUDA, hands a
+ * destroyed stream's or event's address to the next one. Lives begin and
+ * end at the hipStreamCreate* / hipStreamDestroy and hipEventCreate* /
+ * hipEventDestroy wrappers below; a handle first seen in use starts its
+ * first life then (a stream's flags are queried once: stream_info,
+ * queried=1). NULL and hipStreamLegacy are the null stream (0);
+ * hipStreamPerThread is the calling thread's own (a fresh number per
+ * thread). Tables: HANDLE_SHARDS shards of open-addressing slots (16 B),
+ * doubled up to HANDLE_SLOTS_MAX per shard (64 Ki handles per kind, 1 MiB);
+ * a handle that finds no slot keeps its hash for all its lives (counted:
+ * rocm_handle_table_full at exit). */
 static int handle_id(const void *h) {
     if (!h) return 0;
     uint64_t v = (uint64_t)(uintptr_t)h;
@@ -206,7 +220,99 @@ static int handle_id(const void *h) {
     v ^= v >> 33;
     return (int)(v % 999983) + 1;
 }
-static int get_stream_id(const void *stream) { return handle_id(stream); }
+
+#define HANDLE_SHARDS     16
+#define HANDLE_SLOTS_MAX  4096
+#define HP_FRESH_ID_BASE  1000000
+typedef struct { const void *h; int id; int alive; } HSlot;
+typedef struct { pthread_mutex_t mu; HSlot *s; uint32_t cap, n; } HShard;
+typedef struct { HShard sh[HANDLE_SHARDS]; } HTable;
+#define HSH { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0 }
+#define HTABLE_INIT {{ HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH }}
+static HTable g_streams = HTABLE_INIT, g_events = HTABLE_INIT;
+static int g_fresh_id = HP_FRESH_ID_BASE;
+static uint64_t g_handle_full = 0;
+static __thread int tls_ptds_id = 0;
+
+static uint32_t handle_mix(const void *h) {
+    uint64_t v = (uint64_t)(uintptr_t)h;
+    v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL; v ^= v >> 29;
+    return (uint32_t)v;
+}
+
+static HSlot *hslot(HShard *sh, const void *h, uint32_t mix, int insert) {
+    if (insert && (sh->n + 1) * 4 > sh->cap * 3 && sh->cap < HANDLE_SLOTS_MAX) {
+        uint32_t ncap = sh->cap ? sh->cap * 2 : 64;
+        HSlot *ns = (HSlot *)calloc(ncap, sizeof(HSlot));
+        if (ns) {
+            for (uint32_t i = 0; i < sh->cap; i++) {
+                if (!sh->s[i].h) continue;
+                uint32_t j = (handle_mix(sh->s[i].h) / HANDLE_SHARDS) & (ncap - 1);
+                while (ns[j].h) j = (j + 1) & (ncap - 1);
+                ns[j] = sh->s[i];
+            }
+            free(sh->s);
+            sh->s = ns;
+            sh->cap = ncap;
+        }
+    }
+    for (uint32_t i = 0; i < sh->cap; i++) {
+        HSlot *t = &sh->s[(mix + i) & (sh->cap - 1)];
+        if (t->h == h) return t;
+        if (!t->h) return (insert && (sh->n + 1) * 8 <= sh->cap * 7) ? t : NULL;
+    }
+    return NULL;
+}
+
+enum { H_USE, H_BORN, H_DIED };
+
+static int handle_op(HTable *t, const void *h, int op, int *fresh) {
+    if (fresh) *fresh = 0;
+    uint32_t mix = handle_mix(h);
+    HShard *sh = &t->sh[mix % HANDLE_SHARDS];
+    mix /= HANDLE_SHARDS;
+    int id;
+    pthread_mutex_lock(&sh->mu);
+    HSlot *s = hslot(sh, h, mix, op != H_DIED);
+    if (s && s->h == h) {
+        if (op == H_BORN) {
+            s->id = __atomic_fetch_add(&g_fresh_id, 1, __ATOMIC_RELAXED);
+            s->alive = 1;
+        } else if (op == H_DIED) {
+            s->alive = 0;
+        }
+        id = s->id;
+    } else if (s) {
+        *s = (HSlot){h, handle_id(h), op != H_DIED};
+        sh->n++;
+        id = s->id;
+        if (fresh && op == H_USE) *fresh = 1;
+    } else {
+        id = handle_id(h);
+        if (op != H_DIED) __atomic_add_fetch(&g_handle_full, 1, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_unlock(&sh->mu);
+    return id;
+}
+
+static void stream_first_seen(const void *stream, int id);
+
+static int get_stream_id(const void *stream) {
+    uintptr_t v = (uintptr_t)stream;
+    if (v == 0 || v == 1) return 0;               /* NULL, hipStreamLegacy */
+    if (v == 2) {                                 /* hipStreamPerThread */
+        if (!tls_ptds_id) tls_ptds_id = __atomic_fetch_add(&g_fresh_id, 1, __ATOMIC_RELAXED);
+        return tls_ptds_id;
+    }
+    int fresh = 0;
+    int id = handle_op(&g_streams, stream, H_USE, &fresh);
+    if (fresh) stream_first_seen(stream, id);
+    return id;
+}
+
+static int event_id(const void *event) {
+    return event ? handle_op(&g_events, event, H_USE, NULL) : 0;
+}
 
 /* ── GPU-accurate timing via hipEvent pairs ──────────────────────────────── */
 #define MAX_PENDING 512
@@ -907,7 +1013,7 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
     in_hook = 1;
 
     char tags[96];
-    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=event,event=%d", handle_id(event));
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=event,event=%d", event_id(event));
     Sub u;
     sub_begin(&u, NULL, 0);
     hipError_t ret = real(event);
@@ -953,7 +1059,7 @@ hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
 
     char tags[96];
     snprintf(tags, sizeof(tags), "type=event_record,op=event_record,event=%d,stream=%d",
-             handle_id(event), get_stream_id(stream));
+             event_id(event), get_stream_id(stream));
     Sub u;
     sub_begin(&u, NULL, 0);
     hipError_t ret = real(event, stream);
@@ -974,7 +1080,7 @@ hipError_t hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int
 
     char tags[96];
     snprintf(tags, sizeof(tags), "type=stream_wait,op=stream_wait,event=%d,stream=%d",
-             handle_id(event), get_stream_id(stream));
+             event_id(event), get_stream_id(stream));
     Sub u;
     sub_begin(&u, NULL, 0);
     hipError_t ret = real(stream, event, flags);
@@ -1031,6 +1137,365 @@ hipError_t hipMemset(void *dst, int value, size_t size) {
     in_hook = 0;
     return ret;
 }
+
+/* ── Streams: creation, destruction, flags ───────────────────────────────
+ * type=stream_create,op=stream_create,stream=<n>[,nonblocking=1]
+ * [,priority=<p>] (hipStreamNonBlocking = 0x1: no synchronization with the
+ * null stream) and type=stream_destroy naming the life that ended (see
+ * "Stream and event identity"). */
+static void stream_first_seen(const void *stream, int id) {
+    typedef hipError_t (*gf_t)(hipStream_t, unsigned int *);
+    typedef hipError_t (*gp_t)(hipStream_t, int *);
+    static gf_t gf;
+    static gp_t gp;
+    static int tried;
+    if (!tried) {
+        gf = (gf_t)_real_hip_sym("hipStreamGetFlags");
+        gp = (gp_t)_real_hip_sym("hipStreamGetPriority");
+        tried = 1;
+    }
+    unsigned flags = 0;
+    int prio = 0;
+    int saved = in_hook;
+    in_hook = 1;
+    int okf = gf && gf((hipStream_t)stream, &flags) == 0;
+    int okp = okf && gp && gp((hipStream_t)stream, &prio) == 0;
+    in_hook = saved;
+    if (!okf) return;
+    char x[192];
+    int n = snprintf(x, sizeof(x), "type=stream_info,op=stream_info,side=cpu,rt=rocm,timing=host,src=queried,"
+                     "stream=%d,nonblocking=%u", id, flags & 1u);
+    if (okp && n > 0 && (size_t)n < sizeof(x)) snprintf(x + n, sizeof(x) - (size_t)n, ",priority=%d", prio);
+    emit_span("rocm", gettid_compat(), now_ns(), 0, "stream_info", x);
+}
+
+static void stream_created(const Sub *u, const char *api, int ret, hipStream_t stream, unsigned flags, int prio,
+                           int has_prio) {
+    char tags[128];
+    int id = 0;
+    if (ret == 0 && stream) id = handle_op(&g_streams, stream, H_BORN, NULL);
+    int n = snprintf(tags, sizeof(tags), "type=stream_create,op=stream_create,stream=%d%s", id,
+                     (flags & 0x1) ? ",nonblocking=1" : "");
+    if (has_prio && n > 0 && (size_t)n < sizeof(tags))
+        snprintf(tags + n, sizeof(tags) - (size_t)n, ",priority=%d", prio);
+    sub_host(u, "rocm", api, tags, ret);
+}
+
+#define HP_STREAM_CREATE(FNAME, CALL_ARGS, FLAGS, PRIO, HAS_PRIO, ...)        \
+hipError_t FNAME(__VA_ARGS__) {                                               \
+    typedef hipError_t (*fn_t)(__VA_ARGS__);                                  \
+    static fn_t real = NULL;                                                  \
+    if (!real) real = (fn_t)_real_hip_sym(#FNAME);                            \
+    if (!real) return -1;                                                     \
+    if (in_hook) return real CALL_ARGS;                                       \
+    in_hook = 1;                                                              \
+    Sub u;                                                                    \
+    sub_begin(&u, NULL, 0);                                                   \
+    hipError_t ret = real CALL_ARGS;                                          \
+    sub_end(&u);                                                              \
+    stream_created(&u, #FNAME, (int)ret, (ret == 0 && pStream) ? *pStream : NULL, (FLAGS), (PRIO), (HAS_PRIO)); \
+    in_hook = 0;                                                              \
+    return ret;                                                               \
+}
+HP_STREAM_CREATE(hipStreamCreate, (pStream), 0, 0, 0, hipStream_t *pStream)
+HP_STREAM_CREATE(hipStreamCreateWithFlags, (pStream, flags), flags, 0, 0, hipStream_t *pStream, unsigned int flags)
+HP_STREAM_CREATE(hipStreamCreateWithPriority, (pStream, flags, priority), flags, priority, 1,
+                 hipStream_t *pStream, unsigned int flags, int priority)
+#undef HP_STREAM_CREATE
+
+hipError_t hipStreamDestroy(hipStream_t stream) {
+    typedef hipError_t (*fn_t)(hipStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipStreamDestroy");
+    if (!real) return -1;
+    if (in_hook) return real(stream);
+    in_hook = 1;
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=stream_destroy,op=stream_destroy,stream=%d", get_stream_id(stream));
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    hipError_t ret = real(stream);
+    sub_end(&u);
+    if (ret == 0 && stream) handle_op(&g_streams, stream, H_DIED, NULL);
+    sub_host(&u, "rocm", "hipStreamDestroy", tags, (int)ret);
+    in_hook = 0;
+    return ret;
+}
+
+/* Event lives: no span of their own (the hook's own timing events are made
+ * through f_evCreate, the real functions, and are not counted). */
+#define HP_EVENT_LIFE(FNAME, PARAMS, ARGS, EV, OP)                            \
+hipError_t FNAME PARAMS {                                                     \
+    typedef hipError_t (*fn_t) PARAMS;                                        \
+    static fn_t real = NULL;                                                  \
+    if (!real) real = (fn_t)_real_hip_sym(#FNAME);                            \
+    if (!real) return -1;                                                     \
+    hipError_t ret = real ARGS;                                               \
+    if (ret == 0 && !in_hook && (EV)) handle_op(&g_events, (const void *)(EV), (OP), NULL); \
+    return ret;                                                               \
+}
+HP_EVENT_LIFE(hipEventCreate, (hipEvent_t *event), (event), event ? *event : NULL, H_BORN)
+HP_EVENT_LIFE(hipEventCreateWithFlags, (hipEvent_t *event, unsigned flags), (event, flags), event ? *event : NULL,
+              H_BORN)
+HP_EVENT_LIFE(hipEventDestroy, (hipEvent_t event), (event), event, H_DIED)
+#undef HP_EVENT_LIFE
+
+/* ── Host functions in stream order (as cuda_hook.c's) ──────────────────
+ * The runtime runs a host function once the stream's earlier work is done;
+ * its later work waits for it. The hook passes a trampoline that times the
+ * call: span type=host_func,op=host_func,side=gpu,rt=rocm,timing=host with
+ * the enqueue's lid= (the enqueue call's span: type=launch,op=host_func). */
+typedef void (*hipHostFn_t)(void *);
+typedef void (*hipStreamCallback_t)(hipStream_t, hipError_t, void *);
+typedef struct {
+    hipHostFn_t fn;
+    hipStreamCallback_t cb;
+    void *user;
+    uint64_t lid;
+    int sid, dev;
+    char name[96];
+} HostFnCtx;
+
+static void host_fn_ran(const HostFnCtx *c, uint64_t t0, uint64_t t1) {
+    if (!hp_tx_enabled()) return;
+    char x[256];
+    int n = snprintf(x, sizeof(x), "type=host_func,op=host_func,stream=%d,side=gpu,rt=rocm,timing=host,exec=host,"
+                     "lid=%llu", c->sid, (unsigned long long)c->lid);
+    if (c->dev >= 0 && n > 0 && (size_t)n < sizeof(x))
+        snprintf(x + n, sizeof(x) - (size_t)n, ",hdev=%d", c->dev);
+    hp_tx_emitf("span:rocm:%d:%d:%llu:%llu:%s:%s\n", (int)hp_tx_pid(), (int)gettid_compat(),
+                (unsigned long long)t0, (unsigned long long)(t1 - t0), c->name, x);
+}
+
+static void host_fn_tramp(void *arg) {
+    HostFnCtx *c = (HostFnCtx *)arg;
+    uint64_t t0 = now_ns();
+    c->fn(c->user);
+    host_fn_ran(c, t0, now_ns());
+    free(c);
+}
+
+static void stream_cb_tramp(hipStream_t stream, hipError_t status, void *arg) {
+    HostFnCtx *c = (HostFnCtx *)arg;
+    uint64_t t0 = now_ns();
+    c->cb(stream, status, c->user);
+    host_fn_ran(c, t0, now_ns());
+    free(c);
+}
+
+/* As cuda_hook.c's: a host function enqueued while its stream is being
+ * captured into a graph becomes a node that runs once per graph launch, so
+ * the trampoline's one-shot context cannot carry it -- it is passed through
+ * unwrapped (captured=1, its runs not timed). hipStreamIsCapturing (capture
+ * status None = 0); a failing query counts as capturing, a runtime without
+ * it has no capture. */
+static int stream_capturing(hipStream_t stream) {
+    typedef hipError_t (*q_t)(hipStream_t, int *);
+    static q_t q = NULL;
+    static int tried = 0;
+    if (!tried) { q = (q_t)_real_hip_sym("hipStreamIsCapturing"); tried = 1; }
+    if (!q) return 0;
+    int status = 0;
+    return q(stream, &status) != 0 || status != 0;
+}
+
+static HostFnCtx *host_fn_ctx(void *fn_addr, hipHostFn_t fn, hipStreamCallback_t cb, void *user,
+                              hipStream_t stream) {
+    HostFnCtx *c = (HostFnCtx *)calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->fn = fn;
+    c->cb = cb;
+    c->user = user;
+    c->sid = get_stream_id(stream);
+    Dl_info info;
+    if (dladdr(fn_addr, &info) && info.dli_sname)
+        snprintf(c->name, sizeof(c->name), "%s", info.dli_sname);
+    else
+        snprintf(c->name, sizeof(c->name), "host_func");
+    return c;
+}
+
+hipError_t hipLaunchHostFunc(hipStream_t stream, hipHostFn_t fn, void *userData) {
+    typedef hipError_t (*fn_t)(hipStream_t, hipHostFn_t, void *);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipLaunchHostFunc");
+    if (!real) return -1;
+    if (in_hook || !fn) return real(stream, fn, userData);
+    in_hook = 1;
+    int captured = stream_capturing(stream);
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    HostFnCtx *c = captured ? NULL : host_fn_ctx((void *)fn, fn, NULL, userData, stream);
+    if (c) c->lid = u.lid;
+    hipError_t ret = c ? real(stream, host_fn_tramp, c) : real(stream, fn, userData);
+    sub_end(&u);
+    if (c) c->dev = u.dev;
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=launch,op=host_func,stream=%d%s", get_stream_id(stream),
+             captured ? ",captured=1" : "");
+    sub_host(&u, "rocm", "hipLaunchHostFunc", tags, (int)ret);
+    if (c && ret != 0) free(c);
+    in_hook = 0;
+    return ret;
+}
+
+hipError_t hipStreamAddCallback(hipStream_t stream, hipStreamCallback_t cb, void *userData, unsigned int flags) {
+    typedef hipError_t (*fn_t)(hipStream_t, hipStreamCallback_t, void *, unsigned int);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipStreamAddCallback");
+    if (!real) return -1;
+    if (in_hook || !cb) return real(stream, cb, userData, flags);
+    in_hook = 1;
+    int captured = stream_capturing(stream);
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    HostFnCtx *c = captured ? NULL : host_fn_ctx((void *)cb, NULL, cb, userData, stream);
+    if (c) c->lid = u.lid;
+    hipError_t ret = c ? real(stream, stream_cb_tramp, c, flags) : real(stream, cb, userData, flags);
+    sub_end(&u);
+    if (c) c->dev = u.dev;
+    char tags[96];
+    snprintf(tags, sizeof(tags), "type=launch,op=host_func,stream=%d%s", get_stream_id(stream),
+             captured ? ",captured=1" : "");
+    sub_host(&u, "rocm", "hipStreamAddCallback", tags, (int)ret);
+    if (c && ret != 0) free(c);
+    in_hook = 0;
+    return ret;
+}
+
+/* ── More launches: cooperative, Ext ────────────────────────────────────
+ * The same records as hipLaunchKernel. hipExtLaunchKernel's own start /
+ * stop events are the application's (recorded on its stream by the call). */
+static hipError_t launch_record(const char *api, const void *fn, dim3 grid, dim3 block, hipStream_t stream,
+                                Sub *u, hipError_t ret, const char *more) {
+    uint64_t mod;
+    const char *kname = resolve_name(fn, &mod);
+    int sid = get_stream_id(stream);
+    char host[128], dev[224], modtag[24];
+    hp_mod_tag(modtag, sizeof(modtag), mod);
+    snprintf(host, sizeof(host), "type=launch,op=kernel,stream=%d%s%s", sid, modtag, more);
+    snprintf(dev, sizeof(dev), "type=kernel,op=kernel,stream=%d,grid=%dx%dx%d,block=%dx%dx%d%s%s", sid, grid.x,
+             grid.y, grid.z, block.x, block.y, block.z, modtag, more);
+    sub_host(u, "rocm", api, host, (int)ret);
+    if (ret == 0) sub_proxy(u, stream, "rocm", kname, dev);
+    else          sub_abort(u);
+    return ret;
+}
+
+hipError_t hipLaunchCooperativeKernel(const void *f, dim3 grid, dim3 block, void **args, unsigned int shmem,
+                                      hipStream_t stream) {
+    typedef hipError_t (*fn_t)(const void *, dim3, dim3, void **, unsigned int, hipStream_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipLaunchCooperativeKernel");
+    if (!real) return -1;
+    if (in_hook) return real(f, grid, block, args, shmem, stream);
+    in_hook = 1;
+    Sub u;
+    sub_begin(&u, stream, 1);
+    hipError_t ret = real(f, grid, block, args, shmem, stream);
+    sub_end(&u);
+    launch_record("hipLaunchCooperativeKernel", f, grid, block, stream, &u, ret, ",cooperative=1");
+    in_hook = 0;
+    return ret;
+}
+
+hipError_t hipExtLaunchKernel(const void *f, dim3 grid, dim3 block, void **args, size_t shmem, hipStream_t stream,
+                              hipEvent_t start, hipEvent_t stop, int flags) {
+    typedef hipError_t (*fn_t)(const void *, dim3, dim3, void **, size_t, hipStream_t, hipEvent_t, hipEvent_t, int);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)_real_hip_sym("hipExtLaunchKernel");
+    if (!real) return -1;
+    if (in_hook) return real(f, grid, block, args, shmem, stream, start, stop, flags);
+    in_hook = 1;
+    Sub u;
+    sub_begin(&u, stream, 1);
+    hipError_t ret = real(f, grid, block, args, shmem, stream, start, stop, flags);
+    sub_end(&u);
+    char more[64] = "";
+    if (start || stop)       /* events this launch records (event_record semantics) */
+        snprintf(more, sizeof(more), ",start_event=%d,stop_event=%d", event_id(start), event_id(stop));
+    launch_record("hipExtLaunchKernel", f, grid, block, stream, &u, ret, more);
+    in_hook = 0;
+    return ret;
+}
+
+/* ── More copies: 2D, peer, device to device, async forms ───────────────
+ * Blocking forms: the call is the transfer (type=memcpy, category memory);
+ * asynchronous forms: a launch span and the device span (as
+ * hipMemcpyAsync). bytes= is width x height for the 2D forms. */
+static hipError_t copy_blocking_end(const char *api, const char *dir, size_t bytes, Sub *u, hipError_t ret) {
+    char host[128];
+    snprintf(host, sizeof(host), "type=memcpy,op=memcpy,dir=%s,bytes=%zu", dir, bytes);
+    sub_host(u, "memory", api, host, (int)ret);
+    return ret;
+}
+
+static hipError_t copy_async_end(const char *api, const char *dir, size_t bytes, hipStream_t stream, Sub *u,
+                                 hipError_t ret) {
+    int sid = get_stream_id(stream);
+    char host[128], dev[128], dname[32];
+    snprintf(host, sizeof(host), "type=launch,op=memcpy,dir=%s,bytes=%zu,stream=%d", dir, bytes, sid);
+    snprintf(dev, sizeof(dev), "type=memcpy_async,op=memcpy,dir=%s,bytes=%zu,stream=%d", dir, bytes, sid);
+    snprintf(dname, sizeof(dname), "memcpy %s", dir);
+    sub_host(u, "memory", api, host, (int)ret);
+    if (ret == 0) sub_proxy(u, stream, "memory", dname, dev);
+    else          sub_abort(u);
+    return ret;
+}
+
+#define HP_COPY_SYNC(FNAME, DIR, BYTES, CALL_ARGS, ...)                       \
+hipError_t FNAME(__VA_ARGS__) {                                               \
+    typedef hipError_t (*fn_t)(__VA_ARGS__);                                  \
+    static fn_t real = NULL;                                                  \
+    if (!real) real = (fn_t)_real_hip_sym(#FNAME);                            \
+    if (!real) return -1;                                                     \
+    if (in_hook) return real CALL_ARGS;                                       \
+    in_hook = 1;                                                              \
+    pk_flush(NULL, 1);                                                        \
+    Sub u;                                                                    \
+    sub_begin(&u, NULL, 0);                                                   \
+    hipError_t ret = real CALL_ARGS;                                          \
+    sub_end(&u);                                                              \
+    copy_blocking_end(#FNAME, (DIR), (BYTES), &u, ret);                       \
+    in_hook = 0;                                                              \
+    return ret;                                                               \
+}
+#define HP_COPY_ASYNC(FNAME, DIR, BYTES, CALL_ARGS, ...)                      \
+hipError_t FNAME(__VA_ARGS__) {                                               \
+    typedef hipError_t (*fn_t)(__VA_ARGS__);                                  \
+    static fn_t real = NULL;                                                  \
+    if (!real) real = (fn_t)_real_hip_sym(#FNAME);                            \
+    if (!real) return -1;                                                     \
+    if (in_hook) return real CALL_ARGS;                                       \
+    in_hook = 1;                                                              \
+    Sub u;                                                                    \
+    sub_begin(&u, stream, 1);                                                 \
+    hipError_t ret = real CALL_ARGS;                                          \
+    sub_end(&u);                                                              \
+    copy_async_end(#FNAME, (DIR), (BYTES), stream, &u, ret);                  \
+    in_hook = 0;                                                              \
+    return ret;                                                               \
+}
+HP_COPY_SYNC(hipMemcpy2D, memcpy_dir(kind), width * height, (dst, dpitch, src, spitch, width, height, kind),
+             void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height,
+             hipMemcpyKind kind)
+HP_COPY_ASYNC(hipMemcpy2DAsync, memcpy_dir(kind), width * height,
+              (dst, dpitch, src, spitch, width, height, kind, stream),
+              void *dst, size_t dpitch, const void *src, size_t spitch, size_t width, size_t height,
+              hipMemcpyKind kind, hipStream_t stream)
+HP_COPY_SYNC(hipMemcpyPeer, "PtoP", size, (dst, dstDev, src, srcDev, size),
+             void *dst, int dstDev, const void *src, int srcDev, size_t size)
+HP_COPY_ASYNC(hipMemcpyPeerAsync, "PtoP", size, (dst, dstDev, src, srcDev, size, stream),
+              void *dst, int dstDev, const void *src, int srcDev, size_t size, hipStream_t stream)
+HP_COPY_SYNC(hipMemcpyDtoD, "DtoD", size, (dst, src, size), void *dst, void *src, size_t size)
+HP_COPY_ASYNC(hipMemcpyDtoDAsync, "DtoD", size, (dst, src, size, stream), void *dst, void *src, size_t size,
+              hipStream_t stream)
+HP_COPY_ASYNC(hipMemcpyHtoDAsync, "HtoD", size, (dst, src, size, stream), void *dst, void *src, size_t size,
+              hipStream_t stream)
+HP_COPY_ASYNC(hipMemcpyDtoHAsync, "DtoH", size, (dst, src, size, stream), void *dst, void *src, size_t size,
+              hipStream_t stream)
+#undef HP_COPY_SYNC
+#undef HP_COPY_ASYNC
 
 /* ── Native HIP AoT kernel registration ─────────────────────────────────── */
 static uint64_t _save_rocm_bin(const void *image, char *out_path, size_t path_cap);
@@ -1332,6 +1797,9 @@ __attribute__((destructor))  static void fini(void) {
     pthread_mutex_unlock(&g_alloc_mutex);
     if (leaked > 0)
         emit_ctr("memory", "gpu_memory_leaked_bytes", leaked, "bytes");
+    uint64_t full = __atomic_load_n(&g_handle_full, __ATOMIC_RELAXED);
+    if (full)   /* see "Stream and event identity" */
+        emit_ctr("rocm", "rocm_handle_table_full", (int64_t)full, "uses");
     hp_tx_shutdown(1);
     if (g_hip_lib)   { dlclose(g_hip_lib); g_hip_lib = NULL; }
 }

@@ -214,6 +214,22 @@ class TestHierarchy(unittest.TestCase):
             (2, "T2 · tid 11 · openmp"), (2, "device 0"), (3, "stream 7 · cuda"),
             (1, "rank 1 · pid 2"), (2, "T3 · tid 20 · mpi")])
 
+    def test_streams_by_their_number_and_host_waits_named(self):
+        L = th.LaneMeta
+        ms = [L(0, "cuda/stream-900001", "cuda", "stream", "900001", 1, 3, device="0", stream_label="stream 2",
+                stream_order=2),
+              L(1, "cuda/stream-5", "cuda", "stream", "5", 1, 3, device="0", stream_label="stream 11",
+                stream_order=11),
+              L(2, "sync/stream-5", "sync", "stream", "5", 1, 3, device="0", stream_label="stream 11",
+                stream_order=11, host_timed=True),
+              L(3, "sync/device", "sync", "device", "", 1, 3, device="0", host_timed=True),
+              L(4, "opencl/device", "opencl", "device", "", 1, 3, device="1")]
+        rows = th.flatten(th.build_tree(ms), {}, lane_row=self.lane_row)
+        self.assertEqual([(r["level"], r.get("hierLabel") or r["label"]) for r in rows], [
+            (0, "System"), (1, "pid 1"), (2, "device 0"), (3, "stream 2 · cuda"), (3, "stream 11"),
+            (4, "cuda"), (4, "sync (host waits)"), (3, "sync (host waits)"),
+            (2, "device 1"), (3, "opencl (no stream)")])
+
     def test_collapsed_header_hides_members_and_carries_them(self):
         tree = th.build_tree(self.metas())
         rows = th.flatten(tree, {"p1": True}, lane_row=self.lane_row)

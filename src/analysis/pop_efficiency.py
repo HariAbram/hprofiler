@@ -95,10 +95,26 @@ def _wall_ns(trace: "Trace") -> int:
     # original run's start, making trace.duration_ns meaningless for a saved
     # trace (see the same fix/note in criticalpath.py's _wall_ns). Only
     # reachable here for a trace with no timed spans at all.
+    if _has_lifecycle(trace):
+        lo = hi = None
+        for a, b in trace.store.iter_intervals(exclude_types=_LIFECYCLE_TYPES):
+            lo = a if lo is None else min(lo, a)
+            hi = b if hi is None else max(hi, b)
+        return 1 if lo is None else max(hi - lo, 1)
     ext = trace.store.span_extent(timed_only=True)
     if ext is None:
         return 1
     return max(ext[1] - ext[0], 1)
+
+
+# MPI_Init / MPI_Init_thread / MPI_Finalize spans (mpi_hook.c, type=init /
+# finalize): POP's metrics describe the run between them -- the usual focus
+# of analysis -- so they count neither in the runtime nor as communication.
+_LIFECYCLE_TYPES = frozenset({"init", "finalize"})
+
+
+def _has_lifecycle(trace: "Trace") -> bool:
+    return any(s.tags.get("type") in _LIFECYCLE_TYPES for s in trace.iter_spans(categories=("mpi",)))
 
 
 # ── Load Balance / Communication Efficiency (exact) ────────────────────────────
@@ -167,7 +183,7 @@ def _comm_spans_with_bytes(trace: "Trace") -> list["SpanEvent"]:
 def _all_comm_spans(trace: "Trace") -> list["SpanEvent"]:
     """Every mpi/nccl span, regardless of whether it carries a bytes= tag.
     Used as the "total communication time" denominator for serialization
-    efficiency -- MPI_Barrier/MPI_Init/ncclCommInitAll etc. carry no bytes=
+    efficiency -- MPI_Barrier/ncclCommInitAll etc. carry no bytes=
     tag (they don't transfer application data) but are still real
     communication/sync cost; excluding them would make Serialization
     Efficiency look artificially good whenever a lot of the actual overhead
@@ -182,10 +198,12 @@ def _all_comm_spans(trace: "Trace") -> list["SpanEvent"]:
     every grouped operation's duration in the "total communication time"
     denominator. No corresponding MPI construct needs the same exclusion
     (PMPI's profiling-interface convention doesn't produce a wrapper span
-    like this for any MPI call)."""
+    like this for any MPI call). MPI_Init / MPI_Finalize are outside POP's
+    window (_LIFECYCLE_TYPES)."""
     return [
         s for s in trace.iter_spans(categories=_COMM_CATS)
         if s.duration_ns > 0 and s.tags.get("type") != "group"
+        and not (s.category.value == "mpi" and s.tags.get("type") in _LIFECYCLE_TYPES)
     ]
 
 

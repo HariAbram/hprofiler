@@ -80,7 +80,8 @@ class TraceStore(abc.ABC):
         carrying a span_id or parent_span_id only."""
 
     @abc.abstractmethod
-    def iter_instants(self) -> Iterator[InstantEvent]: ...
+    def iter_instants(self, *, name: str | None = None) -> Iterator[InstantEvent]:
+        """In arrival order; `name`: only the instants of that name."""
 
     @abc.abstractmethod
     def iter_counters(self, *, order: str = "seq") -> Iterator[CounterEvent]:

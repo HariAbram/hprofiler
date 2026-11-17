@@ -202,6 +202,110 @@ class TestLastArriver(unittest.TestCase):
         _g, _res, a = run(t)
         self.assertEqual(a.units, {})
 
+    # rooted collectives whose members recorded the root (wroot=): bcast /
+    # scatter members wait for the root, not for the last arriver; the root
+    # of a reduce / gather for the last arriver, the others for nobody
+
+    @staticmethod
+    def rooted(name, typ, starts, nodes, root=0, end=300_000):
+        """One collective of len(starts) ranks (rank r = pid r + 1) on the
+        given nodes, each after its own work."""
+        spans = []
+        for r, (st, node) in enumerate(zip(starts, nodes)):
+            spans.append(work(f"w{r}", r + 1, 0, st))
+            s = mpi(name, r + 1, st, end, type=typ, rank=r, wroot=root, commid=0, cseq=1, csize=len(starts))
+            s.tags["node"] = str(node)
+            spans.append(s)
+        return _trace(spans)
+
+    @staticmethod
+    def three_nodes(t, bound=50_000):
+        class Meta:
+            clock = {"merge": {"nodes": [{"bound_ns": 0}, {"bound_ns": bound}, {"bound_ns": bound}]}}
+        t.metadata = Meta()
+        return t
+
+    def test_a_bcast_whose_root_starts_first_has_none(self):
+        t = self.rooted("MPI_Bcast", "bcast", [100_000, 150_000, 151_000], [0, 0, 0])
+        _es, units = units_of(t)
+        self.assertEqual(units, [])
+
+    def test_a_bcast_across_clock_domains_has_none(self):
+        # bounds (50 us) far wider than the gaps (1 us between the members,
+        # 50 us to the root): the members still wait for the root alone
+        t = self.three_nodes(self.rooted("MPI_Bcast", "bcast", [100_000, 150_000, 151_000], [0, 1, 2]))
+        _es, units = units_of(t)
+        self.assertEqual(units, [])
+        _g, _res, a = run(t)
+        self.assertEqual(a.units, {})
+
+    def test_a_reduce_redirects_only_the_roots_edge(self):
+        # the two latest non-root arrivals (ranks 2 and 1) 1 us apart on two
+        # nodes whose clocks are 50 us uncertain: either may have been last
+        t = self.three_nodes(self.rooted("MPI_Reduce", "reduce", [100_000, 150_000, 151_000], [0, 1, 2]))
+        spans = list(t.iter_spans())
+        ordinal = {(s.pid, s.name): i for i, s in enumerate(spans)}
+        root, r1, r2 = (ordinal[(p, "MPI_Reduce")] for p in (1, 2, 3))
+        es, units = units_of(t)
+        self.assertEqual([u.generator for u in units], ["last_arriver"])
+        opt = units[0].options[1]
+        pairs = lambda ids: sorted((int(es.cand["src"][c]), int(es.cand["dst"][c])) for c in ids)
+        self.assertEqual(pairs(opt.remove), [(r2, root)])
+        self.assertEqual(pairs(opt.add), [(r1, root)])
+        self.assertEqual(es.cand["status"][opt.add[0]], ev.UNSUPPORTED)
+
+    def test_a_barrier_tie_on_one_clock_is_one_unit(self):
+        t = _trace([work("w0", 1, 0, 100_000), mpi("MPI_Barrier", 1, 100_000, 200_000, type="barrier", rank=0,
+                                                   commid=0, cseq=1, csize=3),
+                    work("w1", 2, 0, 100_000), mpi("MPI_Barrier", 2, 100_000, 200_000, type="barrier", rank=1,
+                                                   commid=0, cseq=1, csize=3),
+                    work("w2", 3, 0, 50_000), mpi("MPI_Barrier", 3, 50_000, 200_000, type="barrier", rank=2,
+                                                  commid=0, cseq=1, csize=3)])
+        es, units = units_of(t)
+        self.assertEqual([u.generator for u in units], ["last_arriver"])
+        opt = units[0].options[1]
+        spans = list(t.iter_spans())
+        # rank 0 was taken as the last (first on the tie); rank 1 may have been
+        self.assertEqual(sorted((spans[int(es.cand["src"][c])].pid, spans[int(es.cand["dst"][c])].pid)
+                                for c in opt.remove), [(1, 2), (1, 3)])
+        self.assertEqual(sorted((spans[int(es.cand["src"][c])].pid, spans[int(es.cand["dst"][c])].pid)
+                                for c in opt.add), [(2, 1), (2, 3)])
+        _g, _res, a = run(t)
+        self.assertEqual(a.units, {"last_arriver": 1})
+
+    def nonblocking(self, typ, name, posts, waits, root=None):
+        spans = []
+        for r, (p, w) in enumerate(zip(posts, waits)):
+            tags = dict(type=typ, rank=r, commid=0, cseq=1, csize=len(posts))
+            if root is not None:
+                tags["wroot"] = root
+            spans.append(work(f"w{r}", r + 1, 0, p))
+            spans.append(mpi(name, r + 1, p, p + 1_000, sid=f"q{r}", **tags))
+            spans.append(mpi("MPI_Wait", r + 1, w, 300_000, psid=f"q{r}", type="wait", rank=r))
+        return _trace(spans)
+
+    def test_an_ibcasts_waits_are_not_arrivals(self):
+        # the members' MPI_Wait calls start after the root's post: they are
+        # completions, never candidate last arrivers (650 such units on
+        # osu_ibcast, campaign smoke2)
+        t = self.nonblocking("ibcast", "MPI_Ibcast", [100_000, 120_000, 121_000], [200_000, 220_000, 221_000],
+                             root=0)
+        _es, units = units_of(t)
+        self.assertEqual(units, [])
+
+    def test_a_nonblocking_tie_redirects_the_completions(self):
+        # two MPI_Iallreduce posts at one instant: the other poster as the
+        # last; its edges go to the members' completions (MPI_Wait)
+        t = self.nonblocking("iallreduce", "MPI_Iallreduce", [100_000, 100_000, 50_000], [200_000, 210_000, 220_000])
+        es, units = units_of(t)
+        self.assertEqual([u.generator for u in units], ["last_arriver"])
+        spans = list(t.iter_spans())
+        opt = units[0].options[1]
+        self.assertEqual(sorted((spans[int(es.cand["src"][c])].name, spans[int(es.cand["src"][c])].pid,
+                                 spans[int(es.cand["dst"][c])].name, spans[int(es.cand["dst"][c])].pid)
+                                for c in opt.add),
+                         [("MPI_Iallreduce", 2, "MPI_Wait", 1), ("MPI_Iallreduce", 2, "MPI_Wait", 3)])
+
 
 class TestLaunchCorrelation(unittest.TestCase):
     def test_a_reused_correlation_id_offers_the_other_submission(self):

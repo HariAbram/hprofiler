@@ -11,7 +11,10 @@ scenario per process (the transport reads its configuration once):
             whose mmap layout TSan rejects; skipped (not failed) when TSan
             cannot start here at all.
 
-See tests/native/transport_test.c for what each scenario does.
+See tests/native/transport_test.c for what each scenario does. Every
+process image that records something also sends one process-begin marker
+(hp_transport.h; not one of the scenario's lines, but emitted and sent):
+the forked child none (the parent's claim), the exec'd image its own.
 """
 from __future__ import annotations
 
@@ -24,7 +27,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 NATIVE = REPO / "tests" / "native"
-SCENARIOS = ("order", "long", "newline", "overflow", "wait", "threads", "fork", "nocollector", "exec")
+SCENARIOS = ("order", "long", "newline", "overflow", "wait", "threads", "fork", "nocollector", "exec",
+             "vfork")
 
 
 def _gcc_ok(*flags: str) -> bool:
@@ -97,16 +101,21 @@ class _TransportScenarios:
         self.assertEqual(r["dropped_lost"], 0, r)
         self.assertEqual(r["final"] >= 1, True, r)
 
+    def assert_one_marker(self, r: dict, own: int = 1) -> None:
+        self.assertEqual((r["marks"], r["mark_self"]), (1, own), r)
+
     def test_order(self):
         r = self.run_scenario("order")
         self.assert_clean(r)
+        self.assert_one_marker(r)
         self.assertEqual((r["lines"], r["gaps"], r["emitted"], r["sent"], r["dropped_full"]),
-                         (160000, 0, 160000, 160000, 0), r)
+                         (160000, 0, 160001, 160001, 0), r)
 
     def test_long_records_intact_oversize_counted(self):
         r = self.run_scenario("long")
+        self.assert_one_marker(r)
         self.assertEqual((r["long_ok"], r["long_bad"], r["oversize"], r["emitted"], r["sent"]),
-                         (2, 0, 1, 3, 2), r)
+                         (2, 0, 1, 4, 3), r)
 
     def test_embedded_newlines_sanitized(self):
         r = self.run_scenario("newline")
@@ -116,8 +125,8 @@ class _TransportScenarios:
         r = self.run_scenario("overflow")
         self.assert_clean(r)
         self.assertGreater(r["dropped_full"], 0, r)
-        self.assertEqual(r["lines"] + r["dropped_full"], r["emitted"], r)
-        self.assertEqual(r["emitted"], 80001, r)
+        self.assertEqual(r["lines"] + r["marks"] + r["dropped_full"], r["emitted"], r)
+        self.assertEqual(r["emitted"], 80002, r)
         self.assertEqual(r["waits"], 0, "HPROFILER_RING_WAIT_MS=0 must never wait")
 
     def test_bounded_wait_loses_nothing(self):
@@ -129,12 +138,14 @@ class _TransportScenarios:
     def test_short_lived_threads_drained(self):
         r = self.run_scenario("threads")
         self.assert_clean(r)
-        self.assertEqual((r["lines"], r["gaps"], r["emitted"]), (30000, 0, 30000), r)
+        self.assert_one_marker(r)
+        self.assertEqual((r["lines"], r["gaps"], r["emitted"]), (30000, 0, 30001), r)
 
     def test_fork_child_gets_its_own_transport(self):
         r = self.run_scenario("fork")
         self.assert_clean(r)
         self.assertEqual((r["lines"], r["pids"], r["final"], r["images"], r["gaps"]), (3000, 2, 2, 2, 0), r)
+        self.assert_one_marker(r)          # the parent's: the child shares its claim
 
     def test_no_collector_never_hangs(self):
         if "nocollector" not in self.RUN:
@@ -151,6 +162,22 @@ class _TransportScenarios:
         # 500 records from the pre-exec image + 1 from the new image, both
         # with a final status; same pid, told apart by image=
         self.assertEqual((r["lines"], r["pids"], r["images"], r["final"]), (501, 1, 2, 2), r)
+        # the exec'd image's own (the forked child before it shares the
+        # parent's claim, and the parent records nothing)
+        self.assert_one_marker(r, own=0)
+
+    def test_vfork_child_leaves_the_parents_transport_alone(self):
+        # Python's subprocess (Triton's cc): a vfork child runs the execv
+        # wrapper in the parent's memory. It used to fill the parent's pid
+        # cache with its own pid when the parent had recorded nothing yet --
+        # every later record carried the child's pid and the parent's
+        # marker was never sent -- and to shut the parent's transport down.
+        r = self.run_scenario("vfork")
+        self.assert_clean(r)
+        self.assertEqual((r["lines"], r["self_lines"], r["pids"], r["gaps"]), (2000, 2000, 1, 0), r)
+        self.assert_one_marker(r)
+        if "-fsanitize=thread" not in self.FLAGS:     # TSan turns vfork into fork
+            self.assertEqual(r["ring"], 1, r)
 
 
 class TestTransportPlain(_TransportScenarios, unittest.TestCase):
@@ -185,6 +212,7 @@ class TestOpenclTrampolines(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertIn("RESULT trampolines=256 wrong=0", p.stdout)
             self.assertIn("RESULT names_wrong=0", p.stdout)
+            self.assertIn("RESULT ext_wrong=0", p.stdout)
 
 
 if __name__ == "__main__":

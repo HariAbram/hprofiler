@@ -37,6 +37,18 @@ def _unavail(label: str, reason: str) -> dict[str, Any]:
     return _f(label, "", "unavailable", reason)
 
 
+def _stream_id_field(ident: str) -> dict[str, Any]:
+    """The lane's stream id (gpu_activity.py's stream unification): the
+    hooks' hash of the program's stream handle, else the vendor's id."""
+    if ident.startswith("n"):
+        return _f("Stream id", ident, "measured", "CUPTI's stream id: no program stream handle was matched")
+    if ident.startswith("q"):
+        return _f("Stream id", ident, "measured", "the HSA queue: no program stream handle was matched")
+    if ident == "0":
+        return _f("Stream id", ident, "measured", "the default (NULL) stream")
+    return _f("Stream id", ident, "measured", "hprofiler's id for the program's stream handle (a hash of it)")
+
+
 # ── one event ─────────────────────────────────────────────────────────────
 
 def event_details(m, lane: int, eid: int) -> dict[str, Any]:
@@ -81,11 +93,28 @@ def event_details(m, lane: int, eid: int) -> dict[str, Any]:
     if ex["kind"] == "thread":
         place.append(_f("Thread", ex["threadLabel"]))
     elif ex["kind"] in ("stream", "device"):
-        place.append(_f("Device", ex["device"]) if ex.get("device") is not None
-                     else _unavail("Device", "no hdev=/dev= tag"))
-        place.append(_f("Stream / queue", ex["ident"]) if ex["kind"] == "stream"
-                     else _unavail("Stream / queue", "device work without a stream tag"))
-        place.append(_f("Launched by thread", f"tid {s.tid}"))
+        if ex.get("device") is None:
+            place.append(_unavail("Device", "no hdev=/dev= tag"))
+        elif ex.get("deviceFrom") == "context":
+            place.append(_f("Device", ex["device"], "derived",
+                            "the record names only its CUDA context; this is the device of that context's work"))
+        else:
+            place.append(_f("Device", ex["device"]))
+        if ex["kind"] == "stream":
+            place.append(_f("Stream / queue", ex["streamLabel"] or ex["ident"]))
+            place.append(_stream_id_field(ex["ident"]))
+        else:
+            place.append(_unavail("Stream / queue", "device work without a stream tag"))
+        if tags.get("nstream") is not None:
+            place.append(_f("CUPTI stream id", tags["nstream"], "measured",
+                            "the id CUPTI and Nsight Systems use for this stream"))
+        if tags.get("queue") is not None and tags.get("rt") == "rocm":
+            place.append(_f("HSA queue", tags["queue"]))
+        if ex.get("hostTimed"):
+            place.append(_f("Waiting thread", f"tid {s.tid}", "measured",
+                            "CUPTI times this host thread's wait, not device work"))
+        else:
+            place.append(_f("Launched by thread", f"tid {s.tid}"))
     place.append(_f("Lane", m._lane_meta[lane]["label"]))
     sections.append({"title": "Where", "fields": place})
 
@@ -514,9 +543,13 @@ def resolve_jump(m, text: str) -> dict[str, Any]:
         return _lane_jump(m, lanes, t)
     mt = re.fullmatch(r"(?:stream|s|queue)\s*(\S+)", t, re.IGNORECASE)
     if mt:
-        lanes = [i for i, ex in enumerate(m._lane_extra) if ex.get("kind") == "stream" and ex.get("ident") == mt.group(1)]
+        q = mt.group(1)
+        # the shown number ("stream 2", in every process that has one), else the id
+        lanes = [i for i, ex in enumerate(m._lane_extra) if ex.get("kind") == "stream"
+                 and q.isdigit() and ex.get("streamNum") == int(q)]
+        lanes = lanes or [i for i, ex in enumerate(m._lane_extra) if ex.get("kind") == "stream" and ex.get("ident") == q]
         if lanes:
-            return _lane_jump(m, lanes, f"stream {mt.group(1)}")
+            return _lane_jump(m, lanes, f"stream {q}")
     names = sorted({r["name"] for r in m._store.aggregate_stats()})
     exact = [n for n in names if n == t]
     cands = exact or [n for n in names if t.lower() in n.lower()]

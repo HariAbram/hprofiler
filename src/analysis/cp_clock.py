@@ -14,8 +14,10 @@ the mapping: |delta_D| <= b_D.
   host of node k (merge-nodes)    the merge plan's bound for the node
   device (CUPTI / ROCprofiler)    max(the clock tolerance, any drift
                                   correction applied to its spans)
-  OpenCL device                   unbounded: the hook's single offset can be
-                                  late by the first callback's latency
+  OpenCL device (host_timer)      its clGetDeviceAndHostTimer calibration's
+                                  bound (clock_err_ns=), per device
+  OpenCL device (callback_end)    unbounded: the device's offset can be late
+                                  by its first callback's latency
   NCCL asynchronous timing        the reference event's uncertainty (ref_err=)
 
 A dependency from event u to event v says u happened no later than v:
@@ -63,7 +65,14 @@ def domain_of(span, node_bounds: dict[str, float]) -> tuple[tuple, float]:
             return ("nccl_async", node, span.pid), float(tags.get("ref_err", 0) or 0)
         if cat in ("opencl", "memory") and tags.get("rt") not in ga.RUNTIMES and (
                 tags.get("side") == "gpu" or span.name.endswith("_gpu")):
-            return ("opencl", node, span.pid), INF
+            # per device (dev=); clGetDeviceAndHostTimer calibrated: its bound
+            # (clock_err_ns=, the calibration's half bracket plus the drift
+            # allowance since); else (callback_end, older hooks) unbounded
+            err = tags.get("clock_err_ns")
+            dev = (str(tags["dev"]),) if tags.get("dev") is not None else ()
+            if tags.get("clock") == "host_timer" and err is not None:
+                return ("opencl_dev", node, span.pid) + dev, max(float(ga.CLOCK_TOLERANCE_NS), float(err))
+            return ("opencl", node, span.pid) + dev, INF
         if ga.is_device_span(span) and ga.timing_source(span) == ga.TIMING_DEVICE:
             corr = float(tags.get("clock_corr_ns", 0) or 0)
             return ("device", node, span.pid, tags.get("rt"), tags.get("dev") or tags.get("ctx") or ""), \

@@ -40,6 +40,13 @@ uint64_t hp_cuda_function_module(const void *fn) {
     if (fn == FN_LOADED) return 0xfedcba9876543210ULL;
     return 0;
 }
+/* cuda_hook.c's stream lives: a new life gets the next fresh number */
+static int g_lives = 1000000;
+int hp_cuda_stream_born(const void *stream) { (void)stream; return g_lives++; }
+void hp_cuda_stream_died(const void *stream) { printf("died:%p\n", stream); }
+int hp_cuda_stream_id(const void *stream) { (void)stream; return 7; }
+/* cuda_hook.c's event numbering: the handle's low bits, for the test */
+int hp_cuda_event_id(const void *event) { return (int)((uintptr_t)event & 0xffff); }
 
 #ifdef HP_CUPTI_MEMCPY6
 typedef CUpti_ActivityMemcpy6 memcpy_rec_t;
@@ -64,6 +71,7 @@ static void kernel(uint32_t corr, uint32_t stream, uint64_t start, uint64_t end,
     k.name = name;
     k.queued = queued; k.submitted = submitted;
     k.graphId = graph;
+    k.graphNodeId = graph ? 8589934592ULL + graph : 0;
     hp_cupti_test_handle_record(&k);
 }
 
@@ -103,6 +111,26 @@ _Static_assert(offsetof(cuLaunchKernelEx_params, f) == sizeof(void *)
                && offsetof(cuLaunchKernelEx_ptsz_params, f) == sizeof(void *)
                && offsetof(cudaLaunchKernelExC_v11060_params, func) == sizeof(void *)
                && offsetof(cudaLaunchKernelExC_ptsz_v11060_params, func) == sizeof(void *), "config, f");
+
+/* An event sync / query callback: the event handle as its parameters, and
+ * the call's return value (0, or a not-ready query's 600). */
+static void cb_event(int runtime, CUpti_ApiCallbackSite site, const char *fn, uint32_t corr, uint64_t *slot,
+                     const void *params, int ret) {
+    CUpti_CallbackData d;
+    memset(&d, 0, sizeof(d));
+    d.callbackSite = site;
+    d.functionName = fn;
+    d.correlationId = corr;
+    d.correlationData = slot;
+    d.functionParams = params;
+    d.functionReturnValue = &ret;
+    hp_cupti_test_api_callback(runtime, &d);
+}
+/* ... whose event cupti_trace.c reads as the first parameter */
+_Static_assert(offsetof(cudaEventSynchronize_v3020_params, event) == 0
+               && offsetof(cudaEventQuery_v3020_params, event) == 0
+               && offsetof(cuEventSynchronize_params, hEvent) == 0
+               && offsetof(cuEventQuery_params, hEvent) == 0, "event first");
 
 /* A launch callback with its id and parameters (the real param structs). */
 static void cb_params(int runtime, CUpti_ApiCallbackSite site, uint32_t cbid, const char *fn,
@@ -261,6 +289,32 @@ int main(void) {
     cb(1, CUPTI_API_EXIT,  "cudaStreamWaitEvent_v3020", 751, &slot_a);
     hp_cupti_test_set_cb_syncs(0);
 
+    /* Event syncs and completed event queries outside any wrapper (driver
+     * API, a runtime no wrapper sees): always, with event=. A not-ready
+     * query is a poll: nothing. A runtime query's own driver call is the
+     * same call. */
+    cudaEventSynchronize_v3020_params es = { (cudaEvent_t)0x7f0031 };
+    cuEventSynchronize_params des = { (CUevent)0x7f0032 };
+    cuEventQuery_params deq = { (CUevent)0x7f0033 };
+    cudaEventQuery_v3020_params eq = { (cudaEvent_t)0x7f0034 };
+    slot_a = 0;
+    cb_event(1, CUPTI_API_ENTER, "cudaEventSynchronize_v3020", 752, &slot_a, &es, 0);
+    cb_event(1, CUPTI_API_EXIT,  "cudaEventSynchronize_v3020", 752, &slot_a, &es, 0);
+    slot_a = 0;
+    cb_event(0, CUPTI_API_ENTER, "cuEventSynchronize", 753, &slot_a, &des, 0);
+    cb_event(0, CUPTI_API_EXIT,  "cuEventSynchronize", 753, &slot_a, &des, 0);
+    slot_a = 0;
+    cb_event(0, CUPTI_API_ENTER, "cuEventQuery", 754, &slot_a, &deq, 0);
+    cb_event(0, CUPTI_API_EXIT,  "cuEventQuery", 754, &slot_a, &deq, 0);
+    slot_a = 0;
+    cb_event(1, CUPTI_API_ENTER, "cudaEventQuery_v3020", 755, &slot_a, &eq, 600);
+    cb_event(1, CUPTI_API_EXIT,  "cudaEventQuery_v3020", 755, &slot_a, &eq, 600);
+    slot_a = slot_b = 0;
+    cb_event(1, CUPTI_API_ENTER, "cudaEventQuery_v3020", 756, &slot_a, &eq, 0);
+    cb_event(0, CUPTI_API_ENTER, "cuEventQuery", 757, &slot_b, &deq, 0);
+    cb_event(0, CUPTI_API_EXIT,  "cuEventQuery", 757, &slot_b, &deq, 0);
+    cb_event(1, CUPTI_API_EXIT,  "cudaEventQuery_v3020", 756, &slot_a, &eq, 0);
+
     /* Launches with their parameters: the function's module id on the span.
      * cuLaunchKernelEx through dlsym (Triton): config first, then f. */
     CUlaunchConfig lc;
@@ -301,5 +355,17 @@ int main(void) {
               &slot_a, &bogus);
     cb_params(0, CUPTI_API_EXIT,  CUPTI_DRIVER_TRACE_CBID_cuMemcpyHtoDAsync_v2, "cuMemcpyHtoDAsync_v2", 765,
               &slot_a, &bogus);
+
+    /* Resource callbacks: a stream's creation begins a new life (its
+     * stream_info names it; without libcuda / CUPTI loaded here the flags
+     * and CUPTI ids are absent, not guessed), its destruction ends it. */
+    CUpti_ResourceData rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.resourceHandle.stream = (CUstream)0x5000;
+    hp_cupti_test_resource_callback(CUPTI_CBID_RESOURCE_STREAM_CREATED, &rd);
+    hp_cupti_test_resource_callback(CUPTI_CBID_RESOURCE_STREAM_DESTROY_STARTING, &rd);
+    hp_cupti_test_resource_callback(CUPTI_CBID_RESOURCE_STREAM_CREATED, &rd);
+    /* graph kernels and copies name their exec node */
+    kernel(106, 9, 2500000, 2550000, "_Z9graphnodev", 0, 0, 78);
     return 0;
 }

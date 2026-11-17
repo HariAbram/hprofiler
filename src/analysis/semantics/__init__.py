@@ -15,10 +15,12 @@ from __future__ import annotations
 
 # MPI calls that wait: receives (and the receive half of Sendrecv),
 # completions, blocking probes, synchronous sends (they return once the
-# receive has started), collectives and barriers.
+# receive has started), collectives and barriers, and MPI_Init /
+# MPI_Finalize (common implementations synchronize the processes there).
 MPI_BLOCKING_TYPES = frozenset({
+    "init", "finalize",
     "recv", "sendrecv", "sendrecv_replace", "ssend", "wait", "waitall", "waitany", "waitsome",
-    "probe", "mrecv",
+    "probe", "mprobe", "mrecv",
     "allreduce", "bcast", "reduce", "alltoall", "allgather", "scatter", "gather", "barrier", "scan",
     "exscan", "allgatherv", "alltoallv", "gatherv", "scatterv", "reduce_scatter", "reduce_scatter_block",
     "win_fence", "win_flush", "win_flush_all", "win_unlock", "win_unlock_all",

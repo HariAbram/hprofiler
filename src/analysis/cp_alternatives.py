@@ -22,8 +22,16 @@ a channel whose every call was recorded pairs by MPI's non-overtaking rule
                   later ones of its run moved back by one (its send was the
                   lost record)
   last_arriver    a rendezvous whose last arriver (by start) arrived within
-                  the clocks' uncertainty of another member (cp_clock.py):
-                  the other one as the last, for every member at once
+                  the clocks' uncertainty of another member (cp_clock.py;
+                  on one clock: started in the same nanosecond): the other
+                  one as the last, for every member at once. Only where the
+                  edges come from a last arriver: the members of an
+                  all-to-all rendezvous; the root of a reduce / gather[v]
+                  whose members recorded it (another last arriver redirects
+                  only the root's edge, or removes it when the root may have
+                  been the last); never the members of a bcast / scatter[v]
+                  whose members recorded the root -- they wait for the root.
+                  A non-blocking collective's members by their posts' starts
   launch_corr     device operations whose correlation ids matched several
                   host submissions. One unit per group sharing candidate
                   submissions: a submission launches one operation, so an
@@ -165,10 +173,22 @@ class _Builder:
         self.alts: list[tuple[int, int, int, int, int, str]] = []
         self.units: list[ChoiceUnit] = []
         self.contested: list[int] = []      # selected candidates with a "none of them" option
+        self.new_groups: list[tuple[str, int, int]] = []
+        self._new_arrival: dict[int, int] = {}
 
     def alt(self, dst: int, src: int, kind: int, conf: int, gid: int, why: str) -> int:
         self.alts.append((dst, src, kind, conf, gid, why))
         return len(self.es) + len(self.alts) - 1
+
+    def arrival_group(self, dst: int) -> int:
+        """A new arrival group (exactly one last arriver) for a destination
+        no recorded arrival edge enters: the last arriver's own call, which
+        an alternative last arriver would gate."""
+        gid = self._new_arrival.get(dst)
+        if gid is None:
+            gid = self._new_arrival[dst] = len(self.es.groups) + len(self.new_groups)
+            self.new_groups.append(("arrival", ev.EXACTLY_ONE, dst))
+        return gid
 
 
 def _p2p_alignment(b: _Builder, spans_by_cat, edges, g) -> None:
@@ -180,8 +200,16 @@ def _p2p_alignment(b: _Builder, spans_by_cat, edges, g) -> None:
         if t.get("type") in _SEND_TYPES or (t.get("type") == "start" and t.get("ptype") == "send"):
             key = (t.get("rank"), t.get("wpeer", t.get("peer")), t.get("tag"), t.get("commid"))
             sends[key].append(i)
+    from .criticalpath import _seq_value
+    mpi = spans_by_cat.get("mpi", {})
     for lst in sends.values():
-        lst.sort(key=lambda i: g.t[2 * i])
+        # the matcher's order: sseq= where every send has one, else start time
+        seqs = [_seq_value(mpi[i].tags.get("sseq")) for i in lst]
+        if all(q is not None for q in seqs):
+            order = dict(zip(lst, seqs))
+            lst.sort(key=order.__getitem__)
+        else:
+            lst.sort(key=lambda i: g.t[2 * i])
     pos = {i: (key, k) for key, lst in sends.items() for k, i in enumerate(lst)}
     by_key: dict[tuple, list[int]] = defaultdict(list)
     for c in np.flatnonzero(edges["kind"] == p2p).tolist():
@@ -236,33 +264,89 @@ def _p2p_alignment(b: _Builder, spans_by_cat, edges, g) -> None:
             b.units.append(ChoiceUnit("p2p_alignment", opts, set(dsts) | set(lst)))
 
 
-def _last_arriver(b: _Builder, edges, g) -> None:
-    from .criticalpath import _KIND_CODE
+def _last_arriver(b: _Builder, edges, g, mpi) -> None:
+    """Rendezvous whose last arriver the clocks do not decide (module
+    docstring). Only where the arrival edges come from a last arriver: every
+    member of an all-to-all rendezvous (collectives without a recorded root,
+    barriers, MPI_Init / MPI_Finalize, OpenMP barriers, NCCL collectives),
+    the root of a reduce / gather[v] whose members recorded it -- another
+    last arriver redirects only the root's edge -- never the members of a
+    bcast / scatter[v] whose members recorded the root: they wait for the
+    root, whoever arrived last. Members by their call's start (a
+    non-blocking collective's post, not the MPI_Wait* completing it). mpi:
+    criticalpath.mpi_collective_groups() of the trace's MPI spans."""
+    from .criticalpath import _CONF_CODE, _KIND_CODE, _mpi_group_rule
     arrival = _KIND_CODE["arrival"]
     ca = g.clock
     if ca is None:
         return
-    by_src: dict[int, list[int]] = defaultdict(list)
-    for c in np.flatnonzero(edges["kind"] == arrival).tolist():
-        by_src[int(edges["src"][c])].append(c)
-    for last, cs in by_src.items():
-        members = [int(edges["dst"][c]) for c in cs]
-        if not members:
-            continue
-        runner = max(members, key=lambda j: g.t[2 * j])
-        gap = g.t[2 * last] - g.t[2 * runner]        # >= 0: the builder took the latest start
+    arr = np.flatnonzero(edges["kind"] == arrival).tolist()
+    edge_of: dict[tuple[int, int], int] = {}
+    group_of: dict[int, int] = {}                 # destination -> its arrival group
+    for c in arr:
+        u, v = int(edges["src"][c]), int(edges["dst"][c])
+        edge_of.setdefault((u, v), c)
+        group_of.setdefault(v, int(b.es.cand["group"][c]))
+
+    def undecided(last: int, runner: int) -> bool:
+        """May `runner` have started after `last`? On one clock only on a
+        tie; across clock domains where their offsets allow it."""
+        gap = g.t[2 * last] - g.t[2 * runner]
         a, d = g.domain[runner], g.domain[last]
         if a == d:
-            if gap > 0:                               # one clock: only a tie is undecided
+            return gap <= 0
+        return ca.offset_range(a, d)[1] > gap      # largest delta_runner - delta_last
+
+    def add_unit(remove: list[int], pairs: list[tuple[int, int]], conf: int, touches: set[int]) -> None:
+        if not remove and not pairs:
+            return
+        adds = [b.alt(v, u, arrival, conf, group_of[v] if v in group_of else b.arrival_group(v), "clock_order")
+                for u, v in pairs]
+        b.units.append(ChoiceUnit("last_arriver", [Option([], []), Option(remove, adds)], touches))
+
+    groups, info, start = mpi
+    for members, conf_name in groups:
+        if len(members) < 2:
+            continue
+        rule, root = _mpi_group_rule(members, info)
+        if rule == "from_root":
+            continue                                  # they wait for the root, not for the last
+        conf = _CONF_CODE[conf_name]
+        comp = {m: info.completion(m) for m in members}
+        last = max(members, key=start.__getitem__)    # the builder's (first on a tie)
+        if rule == "to_root":
+            others = [m for m in members if m != last]
+            runner = max(others, key=lambda j: g.t[2 * j])
+            if comp[root] is None or not undecided(last, runner):
                 continue
-        elif ca.offset_range(a, d)[1] <= gap:         # largest delta_runner - delta_last
+            remove = [edge_of[(last, comp[root])]] if (last, comp[root]) in edge_of else []
+            pairs = [] if runner == root else [(runner, comp[root])]
+            add_unit(remove, pairs, conf, {last, runner, root, comp[root]})
+            continue
+        others = [m for m in members if m != last]
+        runner = max(others, key=lambda j: g.t[2 * j])
+        if not undecided(last, runner):
+            continue
+        remove = [edge_of[(last, comp[m])] for m in others if (last, comp[m]) in edge_of]
+        pairs = [(runner, comp[m]) for m in members if m != runner and comp[m] is not None]
+        add_unit(remove, pairs, conf, set(members) | {c for c in comp.values() if c is not None})
+
+    # the other runtimes' rendezvous: the source is the member that started
+    # last, every other member a destination
+    mpi_calls = set(info.calls)
+    by_src: dict[int, list[int]] = defaultdict(list)
+    for c in arr:
+        u = int(edges["src"][c])
+        if u not in mpi_calls:
+            by_src[u].append(c)
+    for last, cs in by_src.items():
+        members = [int(edges["dst"][c]) for c in cs]
+        runner = max(members, key=lambda j: g.t[2 * j])
+        if not undecided(last, runner):
             continue
         conf = int(edges["conf"][cs[0]])
-        adds = []
-        for j in [last] + [m for m in members if m != runner]:
-            gid = int(b.es.cand["group"][cs[0]]) if j == last else int(b.es.cand["group"][cs[members.index(j)]])
-            adds.append(b.alt(j, runner, arrival, conf, gid, "clock_order"))
-        b.units.append(ChoiceUnit("last_arriver", [Option([], []), Option(list(cs), adds)], {last, *members}))
+        pairs = [(runner, j) for j in [last] + [m for m in members if m != runner]]
+        add_unit(list(cs), pairs, conf, {last, *members})
 
 
 def _launch_corr(b: _Builder, spans_by_cat, edges, g) -> None:
@@ -345,9 +429,10 @@ def generate(trace: "Trace", graph, g, es: ev.EvidenceSet) -> tuple[ev.EvidenceS
             spans_by_cat["_all"][i] = s
     b = _Builder(es)
     _p2p_alignment(b, spans_by_cat, edges, g)
-    _last_arriver(b, edges, g)
+    from .criticalpath import mpi_collective_groups
+    _last_arriver(b, edges, g, mpi_collective_groups(spans_by_cat.get("mpi", {}).items()))
     _launch_corr(b, spans_by_cat, edges, g)
-    return ev.with_alternatives(es, b.alts, contested=b.contested), b.units
+    return ev.with_alternatives(es, b.alts, contested=b.contested, new_groups=b.new_groups), b.units
 
 
 # ── worlds ───────────────────────────────────────────────────────────────────

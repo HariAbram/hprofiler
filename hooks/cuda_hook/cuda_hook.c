@@ -5,7 +5,9 @@
  * emits a host span (side=cpu) and a device span (side=gpu): from CUPTI
  * activity records when native tracing is active (cupti_trace.c), otherwise
  * from a cudaEvent pair around the call (timing=proxy_*). Also recorded:
- * sync calls, event record / stream wait (to resolve event syncs),
+ * sync calls, event queries that found the event complete (CUPTI reports
+ * them as event synchronizations), event record / stream wait (to resolve
+ * event syncs),
  * allocations (device and pinned_memory_bytes counters), NVTX v1/v2 ranges
  * (libnvToolsExt is replaced), module loads (kernel names for
  * cuLaunchKernel; JIT blobs saved for disassembly; launches carry mod=, the
@@ -162,8 +164,9 @@ static void native_init_once(void) {
 static void native_ensure(void) { pthread_once(&g_native_once, native_init_once); }
 static int want_proxy(void) { return !g_native_active || g_device_mode == 2; }
 
-/* Stable small id for an opaque handle (stream, event): same hash as
- * get_stream_id() below, so ids agree across hooks with no shared state. */
+/* The pointer hash of an opaque handle (stream, event): the number of its
+ * first life (see "Stream and event identity"), the same in every hook that
+ * hashes the handle. */
 static int handle_id(const void *h) {
     if (!h) return 0;
     uint64_t v = (uint64_t)(uintptr_t)h;
@@ -397,12 +400,141 @@ static void pin_track_rem(void *ptr) {
     emit_ctr("memory", "pinned_memory_bytes", total, "bytes");
 }
 
-/* ── Stream ID assignment ────────────────────────────────────────────────── */
-/* Small display id from the pointer value (MurmurHash3 fmix64), not from
- * first-seen order: cuda_hook and nccl_hook are separate libraries without
- * shared state, and hashing makes both report the same stream=N for the same
- * handle. A collision only makes two streams share a display id. */
-static int get_stream_id(const void *stream) { return handle_id(stream); }
+/* ── Stream and event identity ───────────────────────────────────────────
+ * stream= / event= name a handle by a small number. For the handle's first
+ * life it is handle_id(), the pointer hash -- the number the NCCL hook and
+ * older traces compute for the same handle; for every later life of the
+ * same address a fresh number from HP_FRESH_ID_BASE up: the driver hands a
+ * destroyed stream's or event's address to the next one, and two streams
+ * must never be read as one FIFO (or two events as one record).
+ *
+ * A stream's life begins at its creation and ends at its destruction, as
+ * reported by CUPTI's resource callbacks while native tracing is active
+ * (every stream, whatever API or library made it; cupti_trace.c calls
+ * hp_cuda_stream_born / _died), else by the stream create and destroy
+ * wrappers below. An event's by the event create and destroy wrappers
+ * (CUPTI reports no event lifetimes). A handle first seen in use (created
+ * before tracing, or by a call nothing intercepted) starts its first life
+ * then; such a stream's flags are queried once (stream_info, queried=1).
+ * NULL and cudaStreamLegacy are the legacy default stream (0);
+ * cudaStreamPerThread is the calling thread's own default stream (a fresh
+ * number per thread).
+ *
+ * Tables: HANDLE_SHARDS shards (each with its own mutex) of open-addressing
+ * slots (16 B), doubled up to HANDLE_SLOTS_MAX per shard (64 Ki handles of
+ * each kind, 1 MiB); a handle that finds no slot keeps its hash for all of
+ * its lives (counted: cuda_handle_table_full at exit). The NCCL hook asks
+ * hprofiler_cuda_stream_id() (exported) for the same numbers. */
+#define HANDLE_SHARDS     16
+#define HANDLE_SLOTS_MAX  4096
+#define HP_FRESH_ID_BASE  1000000
+typedef struct { const void *h; int id; int alive; } HSlot;      /* h NULL: empty */
+typedef struct { pthread_mutex_t mu; HSlot *s; uint32_t cap, n; } HShard;
+typedef struct { HShard sh[HANDLE_SHARDS]; } HTable;
+#define HSH { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0 }
+#define HTABLE_INIT {{ HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH, HSH }}
+static HTable g_streams = HTABLE_INIT, g_events = HTABLE_INIT;
+static int g_fresh_id = HP_FRESH_ID_BASE;
+static uint64_t g_handle_full = 0;
+static __thread int tls_ptds_id = 0;          /* cudaStreamPerThread of this thread */
+
+static uint32_t handle_mix(const void *h) {
+    uint64_t v = (uint64_t)(uintptr_t)h;
+    v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL; v ^= v >> 29;
+    return (uint32_t)v;
+}
+
+/* Caller holds sh->mu: the slot of h, else (insert) a free one, else NULL. */
+static HSlot *hslot(HShard *sh, const void *h, uint32_t mix, int insert) {
+    if (insert && (sh->n + 1) * 4 > sh->cap * 3 && sh->cap < HANDLE_SLOTS_MAX) {
+        uint32_t ncap = sh->cap ? sh->cap * 2 : 64;
+        HSlot *ns = (HSlot *)calloc(ncap, sizeof(HSlot));
+        if (ns) {
+            for (uint32_t i = 0; i < sh->cap; i++) {
+                if (!sh->s[i].h) continue;
+                uint32_t j = (handle_mix(sh->s[i].h) / HANDLE_SHARDS) & (ncap - 1);
+                while (ns[j].h) j = (j + 1) & (ncap - 1);
+                ns[j] = sh->s[i];
+            }
+            free(sh->s);
+            sh->s = ns;
+            sh->cap = ncap;
+        }
+    }
+    for (uint32_t i = 0; i < sh->cap; i++) {
+        HSlot *t = &sh->s[(mix + i) & (sh->cap - 1)];
+        if (t->h == h) return t;
+        if (!t->h) return (insert && (sh->n + 1) * 8 <= sh->cap * 7) ? t : NULL;
+    }
+    return NULL;
+}
+
+enum { H_USE, H_BORN, H_DIED };
+
+/* The number of `h` for `op`: in use (its current life, the first one begun
+ * if unseen; *fresh set then), born (a new life), died (keeps the number). */
+static int handle_op(HTable *t, const void *h, int op, int *fresh) {
+    if (fresh) *fresh = 0;
+    uint32_t mix = handle_mix(h);
+    HShard *sh = &t->sh[mix % HANDLE_SHARDS];
+    mix /= HANDLE_SHARDS;
+    int id;
+    pthread_mutex_lock(&sh->mu);
+    HSlot *s = hslot(sh, h, mix, op != H_DIED);
+    if (s && s->h == h) {                         /* seen before */
+        if (op == H_BORN) {
+            s->id = __atomic_fetch_add(&g_fresh_id, 1, __ATOMIC_RELAXED);
+            s->alive = 1;
+        } else if (op == H_DIED) {
+            s->alive = 0;
+        }
+        id = s->id;
+    } else if (s) {                               /* a first life */
+        *s = (HSlot){h, handle_id(h), op != H_DIED};
+        sh->n++;
+        id = s->id;
+        if (fresh && op == H_USE) *fresh = 1;
+    } else {
+        id = handle_id(h);
+        if (op != H_DIED) __atomic_add_fetch(&g_handle_full, 1, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_unlock(&sh->mu);
+    return id;
+}
+
+static void stream_first_seen(const void *stream, int id);
+
+static int get_stream_id(const void *stream) {
+    uintptr_t v = (uintptr_t)stream;
+    if (v == 0 || v == 1) return 0;               /* NULL, cudaStreamLegacy */
+    if (v == 2) {                                 /* cudaStreamPerThread */
+        if (!tls_ptds_id) tls_ptds_id = __atomic_fetch_add(&g_fresh_id, 1, __ATOMIC_RELAXED);
+        return tls_ptds_id;
+    }
+    int fresh = 0;
+    int id = handle_op(&g_streams, stream, H_USE, &fresh);
+    if (fresh) stream_first_seen(stream, id);
+    return id;
+}
+
+static int event_id(const void *event) {
+    return event ? handle_op(&g_events, event, H_USE, NULL) : 0;
+}
+
+int hp_cuda_stream_born(const void *stream) {
+    return ((uintptr_t)stream <= 2) ? get_stream_id(stream) : handle_op(&g_streams, stream, H_BORN, NULL);
+}
+void hp_cuda_stream_died(const void *stream) {
+    if ((uintptr_t)stream > 2) handle_op(&g_streams, stream, H_DIED, NULL);
+}
+int hp_cuda_stream_id(const void *stream) { return get_stream_id(stream); }
+int hp_cuda_event_id(const void *event) { return event_id(event); }
+
+/* For the NCCL hook (same process, another library): the stream= number of
+ * `stream`, with the lives this hook tracks. */
+__attribute__((visibility("default"))) int hprofiler_cuda_stream_id(const void *stream) {
+    return get_stream_id(stream);
+}
 
 /* ── GPU-accurate timing via cudaEvent pairs ──────────────────────────────── */
 #define MAX_PENDING 512
@@ -1059,13 +1191,43 @@ cudaError_t cudaEventSynchronize(cudaEvent_t event) {
     in_hook = 1;
 
     char tags[96];
-    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=event,event=%d", handle_id(event));
+    snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=event,event=%d", event_id(event));
     Sub u;
     sub_begin(&u, NULL, 0);
     cudaError_t ret = real(event);
     sub_end(&u);
     pk_flush(NULL, 1);   /* proxy pending list isn't keyed by event: flush all */
     sub_host(&u, "sync", "cudaEventSynchronize", tags, (int)ret);
+
+    in_hook = 0;
+    return ret;
+}
+
+/* An event query is recorded when the event was complete (cudaSuccess):
+ * the same ordering as a returned cudaEventSynchronize, and the calls CUPTI
+ * reports as an event synchronization record (sync=event; seen with the
+ * CUPTI of CUDA 12.8 and 13). A not-ready poll is not recorded -- CUPTI
+ * reports none, and a polling loop would add a record per poll. */
+cudaError_t cudaEventQuery(cudaEvent_t event) {
+    typedef cudaError_t (*fn_t)(cudaEvent_t);
+    static fn_t real = NULL;
+    if (!real) real = (fn_t)find_cuda_sym("cudaEventQuery");
+    if (!real) return -1;
+    if (in_hook) return real(event);
+    in_hook = 1;
+
+    Sub u;
+    sub_begin(&u, NULL, 0);
+    cudaError_t ret = real(event);
+    if (ret == 0) {
+        sub_end(&u);
+        char tags[96];
+        snprintf(tags, sizeof(tags), "type=sync,op=sync,sync=event,event=%d", event_id(event));
+        sub_host(&u, "sync", "cudaEventQuery", tags, 0);
+    } else {
+        uint32_t c1, c2;
+        hp_cupti_disarm(&c1, &c2);
+    }
 
     in_hook = 0;
     return ret;
@@ -1106,7 +1268,7 @@ cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream) {
 
     char tags[96];
     snprintf(tags, sizeof(tags), "type=event_record,op=event_record,event=%d,stream=%d",
-             handle_id(event), get_stream_id(stream));
+             event_id(event), get_stream_id(stream));
     Sub u;
     sub_begin(&u, NULL, 0);
     cudaError_t ret = real(event, stream);
@@ -1127,7 +1289,7 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned
 
     char tags[96];
     snprintf(tags, sizeof(tags), "type=stream_wait,op=stream_wait,event=%d,stream=%d",
-             handle_id(event), get_stream_id(stream));
+             event_id(event), get_stream_id(stream));
     Sub u;
     sub_begin(&u, NULL, 0);
     cudaError_t ret = real(stream, event, flags);
@@ -1153,6 +1315,35 @@ static void stream_created(const Sub *u, const char *api, int ret, void *stream,
     sub_host(u, "cuda", api, tags, ret);
 }
 
+/* A stream first seen in use (see "Stream and event identity"): its flags
+ * and priority, queried once (cuStreamGetFlags fails on a handle that is no
+ * stream: then nothing is said). */
+static void stream_first_seen(const void *stream, int id) {
+    typedef int (*gf_t)(void *, unsigned int *);
+    typedef int (*gp_t)(void *, int *);
+    static gf_t gf;
+    static gp_t gp;
+    static int tried;
+    if (!tried) {
+        gf = (gf_t)find_cuda_sym("cuStreamGetFlags");
+        gp = (gp_t)find_cuda_sym("cuStreamGetPriority");
+        tried = 1;
+    }
+    unsigned flags = 0;
+    int prio = 0;
+    int saved = in_hook;
+    in_hook = 1;
+    int okf = gf && gf((void *)stream, &flags) == 0;
+    int okp = okf && gp && gp((void *)stream, &prio) == 0;
+    in_hook = saved;
+    if (!okf) return;
+    char x[192];
+    int n = snprintf(x, sizeof(x), "type=stream_info,op=stream_info,side=cpu,rt=cuda,timing=host,src=queried,"
+                     "stream=%d,nonblocking=%u", id, flags & 1u);
+    if (okp && n > 0 && (size_t)n < sizeof(x)) snprintf(x + n, sizeof(x) - (size_t)n, ",priority=%d", prio);
+    emit_span("cuda", gettid_compat(), now_ns(), 0, "stream_info", x);
+}
+
 #define HP_STREAM_CREATE(RET, FNAME, PTYPE, CALL_ARGS, FLAGS, PRIO, HAS_PRIO, ...)  \
 RET FNAME(__VA_ARGS__) {                                                       \
     typedef RET (*fn_t)(__VA_ARGS__);                                          \
@@ -1165,6 +1356,9 @@ RET FNAME(__VA_ARGS__) {                                                       \
     sub_begin(&u, NULL, 0);                                                    \
     RET ret = real CALL_ARGS;                                                  \
     sub_end(&u);                                                               \
+    /* a new life (unless CUPTI's resource callback already began it) */      \
+    if (ret == 0 && pStream && !hp_cupti_streams_tracked())                    \
+        hp_cuda_stream_born((const void *)*pStream);                           \
     stream_created(&u, #FNAME, (int)ret, (ret == 0 && pStream) ? (void *)*pStream : NULL, \
                    (FLAGS), (PRIO), (HAS_PRIO));                               \
     in_hook = 0;                                                               \
@@ -1182,12 +1376,66 @@ HP_STREAM_CREATE(CUresult, cuStreamCreateWithPriority, CUstream, (pStream, flags
                  flags, priority, 1, CUstream *pStream, unsigned int flags, int priority)
 #undef HP_STREAM_CREATE
 
+/* Destruction ends the stream's life: its number is not given to the next
+ * stream at that address. type=stream_destroy names the life that ended. */
+#define HP_STREAM_DESTROY(RET, FNAME, STYPE)                                   \
+RET FNAME(STYPE stream) {                                                     \
+    typedef RET (*fn_t)(STYPE);                                                \
+    static fn_t real = NULL;                                                   \
+    if (!real) real = (fn_t)find_cuda_sym(#FNAME);                             \
+    if (!real) return (RET)-1;                                                 \
+    if (in_hook) return real(stream);                                          \
+    in_hook = 1;                                                               \
+    char tags[96];                                                             \
+    snprintf(tags, sizeof(tags), "type=stream_destroy,op=stream_destroy,stream=%d", \
+             get_stream_id((const void *)stream));                             \
+    Sub u;                                                                     \
+    sub_begin(&u, NULL, 0);                                                    \
+    RET ret = real(stream);                                                    \
+    sub_end(&u);                                                               \
+    if (ret == 0 && !hp_cupti_streams_tracked()) hp_cuda_stream_died((const void *)stream); \
+    sub_host(&u, "cuda", #FNAME, tags, (int)ret);                              \
+    in_hook = 0;                                                               \
+    return ret;                                                                \
+}
+HP_STREAM_DESTROY(cudaError_t, cudaStreamDestroy, cudaStream_t)
+HP_STREAM_DESTROY(CUresult, cuStreamDestroy, CUstream)
+HP_STREAM_DESTROY(CUresult, cuStreamDestroy_v2, CUstream)
+#undef HP_STREAM_DESTROY
+
+/* Event lives (see "Stream and event identity"): no span of their own. */
+#define HP_EVENT_LIFE(RET, FNAME, PARAMS, ARGS, EV, OP)                        \
+RET FNAME PARAMS {                                                             \
+    typedef RET (*fn_t) PARAMS;                                                \
+    static fn_t real = NULL;                                                   \
+    if (!real) real = (fn_t)find_cuda_sym(#FNAME);                             \
+    if (!real) return (RET)-1;                                                 \
+    RET ret = real ARGS;                                                       \
+    if (ret == 0 && !in_hook && (EV)) handle_op(&g_events, (const void *)(EV), (OP), NULL); \
+    return ret;                                                                \
+}
+HP_EVENT_LIFE(cudaError_t, cudaEventCreate, (cudaEvent_t *event), (event), event ? *event : NULL, H_BORN)
+HP_EVENT_LIFE(cudaError_t, cudaEventCreateWithFlags, (cudaEvent_t *event, unsigned int flags), (event, flags),
+              event ? *event : NULL, H_BORN)
+HP_EVENT_LIFE(CUresult, cuEventCreate, (void **event, unsigned int flags), (event, flags),
+              event ? *event : NULL, H_BORN)
+HP_EVENT_LIFE(cudaError_t, cudaEventDestroy, (cudaEvent_t event), (event), event, H_DIED)
+HP_EVENT_LIFE(CUresult, cuEventDestroy, (void *event), (event), event, H_DIED)
+HP_EVENT_LIFE(CUresult, cuEventDestroy_v2, (void *event), (event), event, H_DIED)
+#undef HP_EVENT_LIFE
+
 /* ── Host functions in stream order ─────────────────────────────────── */
 /* The runtime runs a host function on its own thread once the stream's
  * earlier work is done, and the stream's later work waits for it to
  * return. The hook passes a trampoline that times the call and emits it as
  * a stream-ordered span (no call stack: the runtime's thread's would say
- * nothing about the program). */
+ * nothing about the program). The trampoline's context is per call and
+ * freed after its one run -- so a host function enqueued while its stream
+ * is being captured into a CUDA graph is passed through unwrapped: it then
+ * becomes a graph node that runs once per launch of the graph (on whatever
+ * stream that launch names), and a wrapped one would run on a freed
+ * context from the second launch on. Its enqueue says captured=1; its runs
+ * are not timed. */
 typedef void (*cudaHostFn_t)(void *);
 typedef void (*cudaStreamCallback_t)(cudaStream_t, cudaError_t, void *);
 typedef struct {
@@ -1226,6 +1474,22 @@ static void stream_cb_tramp(cudaStream_t stream, cudaError_t status, void *arg) 
     free(c);
 }
 
+/* Whether `stream` is being captured into a graph (cudaStreamIsCapturing /
+ * cuStreamIsCapturing; capture status None = 0). A failing query counts as
+ * capturing: passing the function through unwrapped is always safe. A
+ * runtime without the query (before CUDA 10) has no stream capture. */
+static int stream_capturing(cudaStream_t stream, int driver) {
+    typedef int (*is_capturing_t)(void *, int *);
+    static is_capturing_t rt_q = NULL, drv_q = NULL;
+    static int rt_tried = 0, drv_tried = 0;
+    if (driver && !drv_tried) { drv_q = (is_capturing_t)find_cuda_sym("cuStreamIsCapturing"); drv_tried = 1; }
+    if (!driver && !rt_tried) { rt_q = (is_capturing_t)find_cuda_sym("cudaStreamIsCapturing"); rt_tried = 1; }
+    is_capturing_t q = driver ? drv_q : rt_q;
+    if (!q) return 0;
+    int status = 0;
+    return q((void *)stream, &status) != 0 || status != 0;
+}
+
 static HostFnCtx *host_fn_ctx(void *fn_addr, cudaHostFn_t fn, cudaStreamCallback_t cb, void *user,
                               cudaStream_t stream) {
     HostFnCtx *c = (HostFnCtx *)calloc(1, sizeof(*c));
@@ -1243,14 +1507,18 @@ static HostFnCtx *host_fn_ctx(void *fn_addr, cudaHostFn_t fn, cudaStreamCallback
 }
 
 /* The enqueue call's span; c (NULL: not wrapped) gets the lid its
- * execution span links back with. */
-static void host_fn_enqueued(Sub *u, const char *api, HostFnCtx *c, cudaStream_t stream, int ret) {
+ * execution span links back with. captured: enqueued into a graph being
+ * captured (not run now; see above). */
+static void host_fn_enqueued(Sub *u, const char *api, HostFnCtx *c, cudaStream_t stream, int ret,
+                             int captured) {
+    (void)c;
     char tags[96];
-    snprintf(tags, sizeof(tags), "type=launch,op=host_func,stream=%d", get_stream_id(stream));
+    snprintf(tags, sizeof(tags), "type=launch,op=host_func,stream=%d%s", get_stream_id(stream),
+             captured ? ",captured=1" : "");
     sub_host(u, "cuda", api, tags, ret);
 }
 
-#define HP_HOST_FN(RET, FNAME, STREAM_T, FN_T, MAKE_CTX, TRAMP, ...)           \
+#define HP_HOST_FN(RET, FNAME, STREAM_T, FN_T, DRIVER, MAKE_CTX, TRAMP, ...)   \
 RET FNAME(__VA_ARGS__) {                                                       \
     typedef RET (*fn_t)(__VA_ARGS__);                                          \
     static fn_t real = NULL;                                                   \
@@ -1258,29 +1526,30 @@ RET FNAME(__VA_ARGS__) {                                                       \
     if (!real) return (RET)-1;                                                 \
     if (in_hook || !fn) return real(HP_HOST_FN_ARGS(fn, userData));            \
     in_hook = 1;                                                               \
+    int captured = stream_capturing((cudaStream_t)stream, DRIVER);             \
     Sub u;                                                                     \
     sub_begin(&u, NULL, 0);                                                    \
-    HostFnCtx *c = MAKE_CTX;                                                   \
+    HostFnCtx *c = captured ? NULL : MAKE_CTX;                                 \
     if (c) c->lid = u.lid;                                                     \
     RET ret = c ? real(HP_HOST_FN_ARGS((FN_T)TRAMP, c))                        \
                 : real(HP_HOST_FN_ARGS(fn, userData));                         \
     sub_end(&u);                                                               \
     if (c) c->dev = u.dev;                                                     \
-    host_fn_enqueued(&u, #FNAME, c, (cudaStream_t)stream, (int)ret);           \
+    host_fn_enqueued(&u, #FNAME, c, (cudaStream_t)stream, (int)ret, captured); \
     if (c && ret != 0) free(c);           /* never runs */                     \
     in_hook = 0;                                                               \
     return ret;                                                                \
 }
 #define HP_HOST_FN_ARGS(F, U) stream, F, U
-HP_HOST_FN(cudaError_t, cudaLaunchHostFunc, cudaStream_t, cudaHostFn_t,
+HP_HOST_FN(cudaError_t, cudaLaunchHostFunc, cudaStream_t, cudaHostFn_t, 0,
            host_fn_ctx((void *)fn, fn, NULL, userData, stream), host_fn_tramp,
            cudaStream_t stream, cudaHostFn_t fn, void *userData)
-HP_HOST_FN(CUresult, cuLaunchHostFunc, CUstream, cudaHostFn_t,
+HP_HOST_FN(CUresult, cuLaunchHostFunc, CUstream, cudaHostFn_t, 1,
            host_fn_ctx((void *)fn, fn, NULL, userData, (cudaStream_t)stream), host_fn_tramp,
            CUstream stream, cudaHostFn_t fn, void *userData)
 #undef HP_HOST_FN_ARGS
 #define HP_HOST_FN_ARGS(F, U) stream, F, U, flags
-HP_HOST_FN(cudaError_t, cudaStreamAddCallback, cudaStream_t, cudaStreamCallback_t,
+HP_HOST_FN(cudaError_t, cudaStreamAddCallback, cudaStream_t, cudaStreamCallback_t, 0,
            host_fn_ctx((void *)fn, NULL, fn, userData, stream), stream_cb_tramp,
            cudaStream_t stream, cudaStreamCallback_t fn, void *userData, unsigned int flags)
 #undef HP_HOST_FN_ARGS
@@ -1837,6 +2106,18 @@ void nvtxMarkW(const wchar_t *message) {
 
 /* ── CUDA Graph launch interception ─────────────────────────────────────── */
 
+/* The launch's host tags: gexec= / gver= name the exec and its version
+ * (cupti_trace.c "Graph versions"; absent without native tracing), which
+ * the exec's structure (graph_exec instants) belongs to. */
+static void graph_launch_tags(char *buf, size_t cap, const void *exec, int sid) {
+    uint32_t gexec = hp_cupti_graph_exec_id(exec);
+    if (gexec)
+        snprintf(buf, cap, "type=launch,op=graph,stream=%d,gexec=%u,gver=%u", sid, gexec,
+                 hp_cupti_graph_exec_version(gexec));
+    else
+        snprintf(buf, cap, "type=launch,op=graph,stream=%d", sid);
+}
+
 /* Runtime API: cudaGraphLaunch */
 cudaError_t cudaGraphLaunch(void *graphExec, cudaStream_t stream) {
     typedef cudaError_t (*fn_t)(void*, cudaStream_t);
@@ -1847,14 +2128,14 @@ cudaError_t cudaGraphLaunch(void *graphExec, cudaStream_t stream) {
     in_hook = 1;
 
     int sid = get_stream_id(stream);
-    char host[64], dev[64];
-    snprintf(host, sizeof(host), "type=launch,op=graph,stream=%d", sid);
+    char host[112], dev[64];
+    Sub u;
+    sub_begin(&u, stream, 1);                  /* (starts native tracing: the exec id needs it) */
+    graph_launch_tags(host, sizeof(host), graphExec, sid);
     snprintf(dev, sizeof(dev), "type=graph_launch,op=graph,stream=%d", sid);
 
     /* Native tracing reports each node's kernel/copy (all with this call's
      * correlation id); the proxy can only time the graph as a whole. */
-    Sub u;
-    sub_begin(&u, stream, 1);
     cudaError_t ret = real(graphExec, stream);
     sub_end(&u);
     sub_host(&u, "cuda", "cudaGraphLaunch", host, (int)ret);
@@ -1876,14 +2157,14 @@ CUresult cuGraphLaunch(void *hGraphExec, CUstream hStream) {
 
     cudaStream_t stream = (cudaStream_t)hStream;
     int sid = get_stream_id(stream);
-    char host[64], dev[64];
-    snprintf(host, sizeof(host), "type=launch,op=graph,stream=%d", sid);
+    char host[112], dev[64];
+    Sub u;
+    sub_begin(&u, stream, 1);
+    graph_launch_tags(host, sizeof(host), hGraphExec, sid);
     snprintf(dev, sizeof(dev), "type=graph_launch,op=graph,stream=%d", sid);
 
     /* Native tracing reports each node's kernel/copy (all with this call's
      * correlation id); the proxy can only time the graph as a whole. */
-    Sub u;
-    sub_begin(&u, stream, 1);
     CUresult ret = real(hGraphExec, hStream);
     sub_end(&u);
     sub_host(&u, "cuda", "cuGraphLaunch", host, (int)ret);
@@ -2124,6 +2405,9 @@ static void hprofiler_cuda_fini(void) {
     } else {
         pthread_mutex_unlock(&g_alloc_mutex);
     }
+    uint64_t full = __atomic_load_n(&g_handle_full, __ATOMIC_RELAXED);
+    if (full)   /* handle uses that found no slot (see "Stream and event identity") */
+        emit_ctr("cuda", "cuda_handle_table_full", (int64_t)full, "uses");
 
     hp_tx_shutdown(1);
 }

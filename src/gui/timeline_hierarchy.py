@@ -9,6 +9,8 @@ Hierarchical rows of the Timeline -- Qt-free.
             │   └── openmp    and thread in the trace store)
             └── Device <d>    device work: per device (`dev`/`hdev`), then
                 └── stream    per queue / stream, then per runtime
+                              (named "stream <n>" by the model: 0 is the
+                              default stream, then the order of first work)
 
 A level is only shown when it carries information: one node is not a row,
 a thread or stream with a single lane is one row ("T3 · openmp"), lanes
@@ -42,6 +44,9 @@ class LaneMeta:
     node: str | None = None
     device: str | None = None
     thread_label: str = ""
+    stream_label: str = ""     # "stream 2" (the model's per-process number)
+    stream_order: int = -1     # its number; -1: none, sort by the id
+    host_timed: bool = False   # device-side records timing a host wait
 
 
 @dataclass
@@ -114,16 +119,21 @@ def build_tree(lanes: list[LaneMeta], *, system_label: str = "System") -> TreeNo
                 skey = (ln.pid, dkey, ln.ident)
                 s = streams.get(skey)
                 if s is None:
-                    try:
-                        num = int(ln.ident)
-                    except ValueError:
-                        num = 1 << 30
-                    s = streams[skey] = TreeNode(f"s{ln.pid}.{dkey}.{ln.ident}", "stream", f"stream {ln.ident}",
-                                                 (num, ln.ident))
+                    num = ln.stream_order
+                    if num < 0:
+                        try:
+                            num = int(ln.ident)
+                        except ValueError:
+                            num = 1 << 30
+                    s = streams[skey] = TreeNode(f"s{ln.pid}.{dkey}.{ln.ident}", "stream",
+                                                 ln.stream_label or f"stream {ln.ident}", (num, ln.ident))
                     d.children.append(s)
+                if ln.host_timed:
+                    leaf.label = f"{ln.category} (host waits)"
                 s.children.append(leaf)
             else:
-                leaf.label = f"{ln.category} (no stream)"
+                leaf.label = f"{ln.category} ({'host waits' if ln.host_timed else 'no stream'})"
+                leaf.sort = (1 << 31,) + leaf.sort          # after the device's streams
                 d.children.append(leaf)
         else:
             leaf.sort = (2,) + leaf.sort

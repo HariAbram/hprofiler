@@ -2,8 +2,8 @@
 OpenCL queue, event and wait-list ids through the real OpenCL hook
 (tests/fixtures/ocl_deps.c, on any OpenCL device): every enqueue names its
 queue (queue=, ooo=1 on an out-of-order one), the event it returned
-(ev=) and its wait list (wait=, nwait=, wait_unknown= for an event the hook
-cannot name -- here a user event); a blocking transfer says so
+(ev=) and its wait list (wait=, nwait=; a user event is named too); a
+blocking transfer says so
 (blocking=1); clFinish names its queue and clWaitForEvents its events; a
 non-blocking transfer's device span links to its enqueue (psid= -> sid=).
 Skips without gcc, OpenCL headers or a device, or with a hook library that
@@ -75,10 +75,13 @@ class TestOpenCLDependencyIds(unittest.TestCase):
         self.assertEqual(waits.tags["wait"].split(";"), [read.tags["ev"], marker.tags["ev"]])
         self.assertEqual(len({k1.tags["ev"], k2.tags["ev"], read.tags["ev"], marker.tags["ev"]}), 4)
 
-    def test_an_unnamed_event_is_counted_not_guessed(self):
+    def test_a_user_event_is_named(self):
+        # (it used to be wait_unknown=1: the hook did not wrap clCreateUserEvent;
+        # events it cannot name are covered by test_opencl_events' table pressure)
         gated = self.host("k1", 1)                  # waits for a user event
-        self.assertEqual((gated.tags.get("nwait"), gated.tags.get("wait_unknown")), ("1", "1"))
-        self.assertNotIn("wait", gated.tags)
+        user = next(s for s in self.spans if s.name == "clCreateUserEvent")
+        self.assertEqual((gated.tags.get("nwait"), gated.tags.get("wait")), ("1", user.tags["ev"]))
+        self.assertNotIn("wait_unknown", gated.tags)
         self.assertNotIn("ev", gated.tags)          # the caller asked for no event
 
     def test_blocking_transfers(self):

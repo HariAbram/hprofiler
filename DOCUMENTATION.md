@@ -472,6 +472,7 @@ Settings read by the hooks or the collector (export them before
 | `HPROFILER_DEBUG` | off | CLI tracebacks; OpenCL hook debug log |
 | `HPROFILER_HOOKS_DIR` | `build/lib` | Directory the hook libraries are loaded from (a build elsewhere; the integration tests honour it too) |
 | `HPROFILER_NCCL_ASYNC` | off | `1`: NCCL operations are not waited for; device spans are resolved later, against a reference event ([`nccl` backend](#nccl-backend)) |
+| `HPROFILER_GOMP_DEPEND` | off | `force`: decode GNU libgomp depend arrays of the new layout also on an ABI newer than the checked `GOMP_5.1.2` ([Dependency capture by runtime](#dependency-capture-by-runtime)) |
 | `HPROFILER_EDGE_CALIBRATION` | none | An edge calibration file for the critical path's probabilities ([Probabilities](#probabilities-calibration-method-only)) |
 
 Set by `hprofiler run` itself (do not set them by hand): `HPROFILER_SOCKET`
@@ -480,7 +481,9 @@ Set by `hprofiler run` itself (do not set them by hand): `HPROFILER_SOCKET`
 (`--gpu-pc-sampling`), `LD_PRELOAD`, `OMP_TOOL_LIBRARIES`. Used only by the
 test suite or internally: `HPROFILER_GUI_SELFTEST`,
 `HPROFILER_READY_MARKER`, `HPROFILER_STRESS_EVENTS`,
-`HPROFILER_CUPTI_INCLUDE`, `HPROFILER_ROCPROFILER_SDK_INCLUDE`.
+`HPROFILER_CUPTI_INCLUDE`, `HPROFILER_ROCPROFILER_SDK_INCLUDE`,
+`HPROFILER_GOMP_ABI_LEVEL` (replaces the detected libgomp ABI level),
+`HPROFILER_OCL_EVENT_CAP` (a smaller OpenCL event table).
 
 ---
 
@@ -594,10 +597,18 @@ kernel of a graph launch), and `src=cupti` / `src=rocprofiler`.
   around each intercepted call and records the CUPTI correlation ids of the
   outermost runtime and driver call made inside it (`corr`, `corr2` --
   kernel records may carry either; memcpy records carry the driver id plus
-  the runtime id). Kernel launches, copies and memsets made through calls
-  the LD_PRELOAD layer cannot see (libraries with a statically linked
-  runtime, e.g. cuBLAS) get a host span from the callback itself
-  (`src=cupti_cb`). `libcupti` is opened with `dlopen` at the first
+  the runtime id). Kernel launches, copies, memsets, event synchronizations
+  and completed event queries made through calls the LD_PRELOAD layer
+  cannot see (the driver API -- `cuEventSynchronize`, `cuEventQuery` --,
+  libraries with a statically linked runtime, e.g. cuBLAS) get a host span
+  from the callback itself (`src=cupti_cb`; event calls with `event=`, the
+  handle from the call's parameters). CUPTI reports every **completed event
+  query** (`cudaEventQuery` / `cuEventQuery` returning success) as an event
+  synchronization record (`sync event`, `sync=event`) -- seen with the CUPTI
+  of CUDA 12.8 and of CUDA 13 (PyTorch 2.11's) on driver 580; a not-ready
+  query gave none. Each such record needs its host call: without one it
+  has no thread that waited ([Observed critical path](#observed-critical-path)).
+  `libcupti` is opened with `dlopen` at the first
   intercepted CUDA call -- never in shells or launchers that merely
   inherit `LD_PRELOAD` -- trying, in order: a copy already loaded in the
   process (a second copy is never loaded next to it), `$HPROFILER_CUPTI_LIB`,
@@ -633,8 +644,9 @@ cannot be intercepted with LD_PRELOAD. The Runner detects such binaries
 constructor and its callbacks report launches, copies, memsets, syncs,
 event records and stream waits (without stream/event handles, which only
 the wrappers see -- device spans then use CUPTI's stream ids, and event
-syncs fall back to the device-wide wait rule). Without libcupti a static
-binary still records nothing.
+syncs fall back to the device-wide wait rule; event syncs and queries
+name their event, `event=`, as in every program, but the record that set
+it is not named). Without libcupti a static binary still records nothing.
 
 #### What each timestamp is
 
@@ -758,6 +770,8 @@ timing=host,lid=N,sid=N` and, with CUPTI, `corr=`/`corr2=`):
 | `cudaDeviceSynchronize` / `cuCtxSynchronize` / `cudaDeviceReset` | `sync` | `type=sync,op=sync,sync=device` | -- |
 | `cudaStreamSynchronize` / `cuStreamSynchronize` | `sync` | `type=sync,op=sync,sync=stream,stream=N` | -- |
 | `cudaEventSynchronize` | `sync` | `type=sync,op=sync,sync=event,event=N` | -- |
+| `cudaEventQuery` (recorded only when it returns `cudaSuccess`) | `sync` | `type=sync,op=sync,sync=event,event=N` | -- |
+| `cuEventSynchronize`, `cuEventQuery` (driver API; from the CUPTI callback, `src=cupti_cb`, not a wrapper) | `sync` | `type=sync,op=sync,sync=event,event=N` | -- |
 | `cudaEventRecord` | `cuda` | `type=event_record,op=event_record,event=N,stream=N` | -- |
 | `cudaStreamWaitEvent` | `cuda` | `type=stream_wait,op=stream_wait,event=N,stream=N` | -- |
 | `cudaMalloc*` / `cudaFree*` / `cudaHostAlloc` / `cuMemAlloc*` / `cuMemFree*` | `memory` | `type=alloc...,bytes=N` / `type=free...` | -- |
@@ -766,6 +780,17 @@ timing=host,lid=N,sid=N` and, with CUPTI, `corr=`/`corr2=`):
 `stream=` and `event=` are the same pointer hash, so an event sync or a
 cross-stream wait can be resolved to the stream its event was recorded on
 ([Critical path](#critical-path)). A failed call carries `err=<code>` and produces no device span.
+
+An **event query** is recorded when it found the event complete: the same
+ordering as a returned `cudaEventSynchronize` (the analysis treats it as an
+event sync), and exactly the calls CUPTI reports as event synchronization
+records ([Native tracing](#native-tracing-preferred-and-the-proxy-fallback)).
+A not-ready poll is not recorded -- CUPTI reports none for it, and a polling
+loop would add a record per poll. Before 2026-11-11 no query was recorded:
+Triton's benchmark sweeps (`elapsed_time` queries both events) left one
+`sync event` record per query without a host call -- 1476 in the tutorial
+vector add -- which the observed path then started on when one was the
+trace's last event ([Observed critical path](#observed-critical-path)).
 
 All memory-transfer variants use category `memory`, not `cuda`; only the
 kernel-launch/graph-launch calls and event bookkeeping are category `cuda`.
@@ -906,15 +931,44 @@ buffer-transfer timestamps via event callbacks, and emits `jit` spans for
 | `dlopen` / `dlsym` | `jit`, `sycl` | ACPP SSCP `.jit.so` CPU kernels, which never go through an enqueue call: a `jit` span per loaded module and a `sycl` span (`type=jit_kernel,side=cpu`) per kernel call via a trampoline (up to 256 kernels). This is SYCL work run on the host -- no OpenCL is involved, this hook only times it; older hooks wrote `opencl`, which hprofiler relabels (on ingestion, and once when opening an older store) |
 | `clEnqueueMarkerWithWaitList` / `clEnqueueBarrierWithWaitList` | `opencl` | The enqueue (`type=marker\|barrier,side=cpu`): ordering only, for the critical path |
 | `clFinish` / `clWaitForEvents` | `sync` | Host-side synchronisation barriers (`queue=` / `wait=`) |
+| `clEnqueueCopyBuffer[Rect]`, `Read/WriteBufferRect`, `FillBuffer`, `Map/UnmapMemObject`, image reads/writes/fills/copies and maps, `MigrateMemObjects`, `SVMMemFill`, `SVMMap`, `SVMUnmap`, `SVMMigrateMem`, `clEnqueueTask` | `memory` / `opencl` | The same records as the transfers (kernels for `clEnqueueTask`) |
+| `clEnqueueMarker`, `clEnqueueBarrier`, `clEnqueueWaitForEvents` (OpenCL 1.1) | `opencl` | Ordering records |
+| `clCreateUserEvent`, `clSetUserEventStatus`, `clRetainEvent`, `clReleaseEvent` | — | User events (`ev=`) and the event table's references |
+| `clGetExtensionFunctionAddress[ForPlatform]` | `memory` | Hands out wrappers for the Intel USM enqueues `clEnqueueMemcpyINTEL`, `clEnqueueMemFillINTEL`, `clEnqueueMigrateMemINTEL` (`type=usm_memcpy\|usm_fill\|usm_migrate`), recorded like the transfers -- AdaptiveCpp's OpenCL backend does its copies, fills and prefetches this way. One set of wrappers per platform, four platforms; a fifth gets the real pointers, unrecorded (`ocl_ext_unwrapped`) |
 
 **Queues, events and wait lists.** Every enqueue names its queue
 (`queue=`, `ooo=1` on an out-of-order one), the event it handed back to the
-caller (`ev=`) and its wait list (`wait=`, `nwait=`, `wait_unknown=` for
-events the hook cannot name: a user event, an unwrapped call's event);
+caller (`ev=`) and its wait list (`wait=` every id, up to 4096, then
+`wait_omitted=`; `nwait=` its length; `wait_unknown=` for events the hook
+cannot name: an unwrapped call's event, or one beyond the event table);
 `clFinish` names its queue and `clWaitForEvents` its events; a blocking
-transfer says `blocking=1`. Ids are per process; an event is recognized by
-its address and checked against its own queue (`clGetEventInfo`), so a
-released event's reused address on another queue is not mistaken for it.
+transfer says `blocking=1`. A user event (`clCreateUserEvent`) gets an id
+like any other, and a command waiting for it waits for the
+`clSetUserEventStatus` call that completed it. Ids are per process. The
+event table follows the application's own references (1 at creation, +1
+per `clRetainEvent`, -1 per `clReleaseEvent`) and drops an event at its
+last release, so an address the driver hands to a later event never
+inherits the old id; each event is also checked against its own queue
+(`clGetEventInfo`). An event that finds no slot (64 Ki live events;
+`HPROFILER_OCL_EVENT_CAP` lowers the per-shard cap, for tests) gets no id --
+counted as `ocl_event_table_full` -- and its waiters count it in
+`wait_unknown=`, never under another event's id.
+
+**Device clocks.** Each device's timestamps are mapped onto the host clock
+on their own. Where the device has `clGetDeviceAndHostTimer` (OpenCL 2.1+)
+the hook reads the device time between two host-clock reads (the tightest
+of 8 tries): the offset is the bracket's midpoint, the bound half the
+bracket; it re-calibrates at a completion when the last calibration is
+100 ms old, and between two calibrations the bound grows by 100 ppm of the
+elapsed time (an assumed crystal drift, not a measurement). Device spans
+then say `clock=host_timer` and `clock_err_ns=`. Otherwise the offset comes
+from the device's first completed command (`clock=callback_end`): the
+completion callback runs at or after the command's end, so the device's
+times may be late by the callback's delivery latency, which nothing bounds.
+Device spans carry `dev=` (the process's device number); each
+(re)calibration is an instant `ocl_clock` (`dev=`, `method=`, `offset_ns=`,
+`bound_ns=`, the device name). The critical path's clock model gives each
+device its own domain ([Clock domains and timestamp bounds](#clock-domains-and-timestamp-bounds)).
 The critical path uses them ([Runtime semantics](#runtime-semantics)).
 
 **Kernel launches and non-blocking transfers emit two spans, blocking transfers one:** each
@@ -991,7 +1045,7 @@ exported at all on Ubuntu 24.04/GCC 13). Registered callbacks:
 | Callback | Category | What it captures |
 |----------|---------|-----------------|
 | `ompt_callback_parallel_begin/end` | `openmp` | `parallel_region` spans (primary thread only) |
-| `ompt_callback_implicit_task` | `openmp` | `omp_implicit_task` spans — each thread's own share of a region (`type=implicit_task`, `index=`, `psid=` region id); the initial task is skipped |
+| `ompt_callback_implicit_task` | `openmp` | `omp_implicit_task` spans — each thread's own share of a region (`type=implicit_task`, `index=`, `psid=` region id); the initial task is skipped. LLVM libomp delivers a worker's implicit-task end, and the end of its implicit barrier at the end of the region, when the worker is released for the next region (or at exit), not when the barrier completed; the hook records the times as delivered, and the critical path ends such spans at their region's join ([Runtime semantics](#runtime-semantics)) |
 | `ompt_callback_work` | `openmp` | `omp_loop`, `omp_sections`, `omp_taskloop`, etc. |
 | `ompt_callback_task_create` | `openmp` | `omp_task_create` spans (one per `#pragma omp task`) |
 | `ompt_callback_task_schedule` | `openmp` | `omp_task`: explicit tasks only (ids from `ompt_callback_task_create`; an implicit task's time is `omp_implicit_task`). One span per execution fragment on its thread: a fragment that ends in a suspension (`taskyield`, a task switch at `taskwait` or another scheduling point) carries `fragment=1`, the last one the status that ended it (`status=1` complete). So the `omp_task` spans without `fragment=1` are the tasks executed, one each, and a task's fragments (same `id=`) add up to its execution time, the tasks it waited for not included |
@@ -1203,19 +1257,47 @@ too.
 
 | Category | Functions |
 |----------|----------|
-| Point-to-point | `MPI_Send`, `MPI_Ssend`, `MPI_Bsend`, `MPI_Rsend`, `MPI_Recv`, `MPI_Isend`, `MPI_Issend`, `MPI_Ibsend`, `MPI_Irsend`, `MPI_Irecv`, `MPI_Sendrecv`, `MPI_Sendrecv_replace`, `MPI_Probe`, `MPI_Iprobe`, `MPI_Wait`, `MPI_Waitall`, `MPI_Waitany`, `MPI_Waitsome`, `MPI_Test`, `MPI_Testany`, `MPI_Testsome`, `MPI_Testall`, `MPI_Cancel`; `MPI_Mprobe`, `MPI_Improbe`, `MPI_Mrecv`, `MPI_Imrecv` as instants (their messages are not paired) |
-| Non-blocking collectives | `MPI_Ibarrier`, `MPI_Ibcast`, `MPI_Iallreduce`, `MPI_Ireduce`, `MPI_Iallgather`, `MPI_Ialltoall`, `MPI_Iscatter`, `MPI_Igather` |
-| Persistent requests | `MPI_Send_init`, `MPI_Bsend_init`, `MPI_Ssend_init`, `MPI_Rsend_init`, `MPI_Recv_init` (with `commid=`; their messages are not paired), `MPI_Start`, `MPI_Startall` |
+| Point-to-point | `MPI_Send`, `MPI_Ssend`, `MPI_Bsend`, `MPI_Rsend`, `MPI_Recv`, `MPI_Isend`, `MPI_Issend`, `MPI_Ibsend`, `MPI_Irsend`, `MPI_Irecv`, `MPI_Sendrecv`, `MPI_Sendrecv_replace`, `MPI_Probe`, `MPI_Iprobe`, `MPI_Wait`, `MPI_Waitall`, `MPI_Waitany`, `MPI_Waitsome`, `MPI_Test`, `MPI_Testany`, `MPI_Testsome`, `MPI_Testall`, `MPI_Cancel`; `MPI_Mprobe`, `MPI_Improbe`, `MPI_Mrecv`, `MPI_Imrecv` (linked by `mid=`, see "Matched probes" below) |
+| Non-blocking collectives | `MPI_Ibarrier`, `MPI_Ibcast`, `MPI_Iallreduce`, `MPI_Ireduce`, `MPI_Iallgather`, `MPI_Ialltoall`, `MPI_Iscatter`, `MPI_Igather`, `MPI_Iallgatherv`, `MPI_Ialltoallv`, `MPI_Igatherv`, `MPI_Iscatterv`, `MPI_Ireduce_scatter`, `MPI_Ireduce_scatter_block`, `MPI_Iscan`, `MPI_Iexscan` |
+| Persistent requests | `MPI_Send_init`, `MPI_Bsend_init`, `MPI_Ssend_init`, `MPI_Rsend_init`, `MPI_Recv_init`; with MPI 4 the persistent collectives `MPI_Barrier_init`, `MPI_Bcast_init`, `MPI_Reduce_init`, `MPI_Allreduce_init`, `MPI_Allgather_init`, `MPI_Alltoall_init`, `MPI_Gather_init`, `MPI_Scatter_init`, `MPI_Reduce_scatter_block_init`; `MPI_Start`, `MPI_Startall`, `MPI_Request_free` |
 | Collectives | `MPI_Bcast`, `MPI_Reduce`, `MPI_Allreduce`, `MPI_Alltoall`, `MPI_Allgather`, `MPI_Scatter`, `MPI_Gather`, `MPI_Allgatherv`, `MPI_Alltoallv`, `MPI_Gatherv`, `MPI_Scatterv`, `MPI_Reduce_scatter`, `MPI_Reduce_scatter_block`, `MPI_Barrier`, `MPI_Scan`, `MPI_Exscan` |
 | One-sided | `MPI_Put`, `MPI_Get`, `MPI_Accumulate`, `MPI_Win_fence`, `MPI_Win_flush`, `MPI_Win_flush_all`, `MPI_Win_lock`, `MPI_Win_lock_all`, `MPI_Win_unlock`, `MPI_Win_unlock_all` |
-| Lifecycle | `MPI_Init`, `MPI_Init_thread`, `MPI_Finalize` |
-| Communicators | `MPI_Comm_dup`, `MPI_Comm_split`, `MPI_Comm_create`, `MPI_Comm_free` (hooked only for `commid=` and rank translation, see below) |
+| Lifecycle | `MPI_Init`, `MPI_Init_thread`, `MPI_Finalize` -- spans of their own (`type=init\|finalize`, `rank=`, `commid=0`, `csize=`; `MPI_Init_thread` also `required=`/`provided=`, `MPI_THREAD_*` as 0-3), see "MPI_Init and MPI_Finalize" below |
+| Communicators | `MPI_Comm_dup`, `MPI_Comm_split`, `MPI_Comm_split_type`, `MPI_Comm_create`, `MPI_Comm_create_group`, `MPI_Cart_create`, `MPI_Cart_sub`, `MPI_Graph_create`, `MPI_Dist_graph_create[_adjacent]`, `MPI_Intercomm_merge`, `MPI_Comm_free` (hooked only for `commid=`, rank translation and the sequence numbers, see below) |
+
+**MPI_Init and MPI_Finalize** are recorded as the application sees the
+calls: each span runs from the wrapper's entry to its return, so the hook's
+own work in them -- registering `MPI_COMM_WORLD`, the capture counters and
+with them the transport's first connection, `HPROFILER_CLOCK_SYNC`, the
+final drain -- is inside the span, never in the application's time around
+it. `hook_ns=` says how much of the span that work took (the rest is the
+`PMPI_` call): after `PMPI_Init` for `MPI_Init`, before `PMPI_Finalize` for
+`MPI_Finalize`. `MPI_Init`'s start is taken on entry, before `PMPI_Init`;
+its span is sent last, once the rank is known and the transport is up
+(its call-site tags resolved before its end is taken). For `MPI_Finalize`
+the hook first sends everything it buffered (launchers may kill a rank
+soon after `MPI_Finalize` returns; see the transport's final drain), then
+calls `PMPI_Finalize` and sends the span synchronously as soon as it
+returns: a launcher that kills the rank in that instant loses that span
+alone. (A first version timed the `PMPI_` call alone: the knownpath
+harness then charged the drain before `PMPI_Finalize`, 2.4 ms on one
+rank, to the application's own time on the critical path.) Measured on
+the development machine (4 Intel MPI ranks, 3 runs, no clock
+synchronization; the program's own clock around each call minus the
+span): what the hook leaves outside the spans is 3 µs median (2–4) in
+`MPI_Init` and 12 µs (7–30) in `MPI_Finalize` -- the span's own push and
+synchronous send; `hook_ns=` was 0.33–0.47 ms in `MPI_Init` and
+0.04–0.13 ms in `MPI_Finalize`. The span records themselves cost about
+0.3 µs through the ring and about 1.9 µs sent synchronously
+(microbenchmark of `hp_transport.h`, median of 30 processes). How the critical
+path treats both calls: [Runtime semantics](#runtime-semantics).
 
 **Not wrapped** (calls to them are not recorded, and messages they carry
-get no dependency edge): the `v`/`w` variants of the non-blocking and
-neighborhood collectives (`MPI_Iallgatherv`, `MPI_Ialltoallw`,
-`MPI_Neighbor_*`, ...), `MPI_Iscan`/`MPI_Iexscan`, `MPI_Ireduce_scatter*`,
-the MPI-4 `MPI_Isendrecv`, partitioned and large-count (`_c`) functions,
+get no dependency edge and take no sequence number): the `w` variants
+of the collectives, the neighborhood collectives (`MPI_Ialltoallw`,
+`MPI_Neighbor_*`, ...), the MPI-4 `MPI_Isendrecv`, the persistent forms of
+the `v`/`w`, scan and neighborhood collectives, partitioned and large-count
+(`_c`) functions, the Fortran bindings,
 and every other one-sided call (`MPI_Rput`, `MPI_Get_accumulate`,
 `MPI_Fetch_and_op`, `MPI_Compare_and_swap`,
 `MPI_Win_post`/`start`/`complete`/`wait`).
@@ -1269,7 +1351,24 @@ outgoing message, and `MPI_Sendrecv` (`type=recv,op=sendrecv`) for the whole
 call — what it waited for. Two spans keep the dependency graph acyclic when
 two ranks exchange with each other. **Probes:** `MPI_Probe` is a span and
 `MPI_Iprobe` an instant (`flag=`), both with the probed `rpeer=`/`rtag=`
-(`rwpeer=`); they create no edges. **`MPI_Rsend`/`MPI_Issend`** are sends
+(`rwpeer=`); they create no edges.
+
+**Matched probes:** a successful `MPI_Mprobe`/`MPI_Improbe` takes the
+message off the matching queue -- for message order it is the receive --
+and hands back an `MPI_Message` that a later `MPI_Mrecv`/`MPI_Imrecv`
+(maybe on another thread) receives. The hook gives each such message an id
+from its request-id space and keeps it in a table keyed by the live handle:
+`MPI_Mprobe` (a span, `type=mprobe`) carries `sid=<mid>`, `rseq=` and the
+resolved `rpeer=`/`rtag=`/`rwpeer=`; `MPI_Improbe` (an instant, `flag=`)
+the same with `mid=`; `MPI_Mrecv`/`MPI_Imrecv` carry `psid=<mid>`, the
+probe's channel and `via=mprobe|improbe` (`MPI_Imrecv` also its request's
+`sid=`, which its `Wait`/`Test` names). The entry leaves the table when its
+message is received, so a handle the library reuses gets a new id. The
+critical path pairs the message with its send on the probe's channel and
+puts the edge on the call that received it. A receive whose probe the hook
+did not see (or the table was full) says `mid_unknown=1`: no edge, and its
+process's channel order is incomplete (`matched_receive_unlinked`).
+`MPI_MESSAGE_NO_PROC` is `null=1`. **`MPI_Rsend`/`MPI_Issend`** are sends
 like `MPI_Send`/`MPI_Isend` (`type=rsend`/`issend`); **`MPI_Ibarrier`** is a
 non-blocking collective whose completing `Wait*` links back to it.
 
@@ -1348,12 +1447,33 @@ sequence number)`, so two *different* communicators bootstrapped by two
 different world ranks (e.g. two disjoint halves of an `MPI_Comm_split`)
 cannot collide on the same id even though each starts counting from 1
 independently (see `comm_id_register()` in `mpi_hook.c`). `commid=-1` means
-"unregistered": `MPI_COMM_SELF` or a communicator created via an API this
-hook doesn't intercept (`MPI_Comm_create_group`, `MPI_Cart_create`,
-`MPI_Intercomm_create`, …). Messages on such communicators are still paired
-on world ranks and tag, but under the one id `-1`: two unregistered
-communicators between the same ranks with the same tag cannot be told
-apart.
+"unregistered": `MPI_COMM_SELF`, an intercommunicator (the broadcast would
+need `MPI_ROOT` on one side), `MPI_Comm_idup`, `MPI_Comm_spawn`'s and other
+unwrapped constructors, or the table full. Messages on such communicators
+are still paired on world ranks and tag, but under the one id `-1`: two
+unregistered communicators between the same ranks with the same tag cannot
+be told apart.
+
+**Sequence numbers (`sseq=`, `rseq=`, `cseq=`):** every registered
+communicator counts its traffic in the process, taken at the call's entry:
+each send post carries `sseq=<n>`, the n-th send to that destination on
+that communicator; each receive post (receives, persistent receive starts,
+the receive half of `MPI_Sendrecv`, a successful matched probe) `rseq=<n>`,
+the n-th on that communicator; each collective call (blocking, non-blocking
+initiation, persistent init and start) `cseq=<n>` and `csize=` (the
+communicator's size). MPI requires every member to call its collectives in
+the same order, so (`commid`, `cseq`) names one collective on every rank.
+A number missing between two recorded ones is a record the hook made but
+the trace does not hold: it shows that a call is missing and where, never
+what it was. Calls the hook does not wrap take no number and leave no gap;
+unregistered communicators get none (counted at `MPI_Finalize` as
+`mpi_seq_unkeyed`). Concurrent calls from several threads get numbers in
+the order they entered the hook, which for calls that overlap in time need
+not be the library's matching order -- the analysis treats such pairs as
+unordered. `MPI_Init` emits `mpi_seq_version` (1) and `mpi_thread_level`
+(the level the library provided); `MPI_Finalize` `mpi_seq_unkeyed` and
+`mpi_msg_untracked` (matched probes beyond the table). How the analysis
+uses them: [Dependency capture by runtime](#dependency-capture-by-runtime).
 
 **Build and use:** `hprofiler build` builds the library when MPI is found
 (CMake target `hprofiler_mpi`); `hprofiler run --backend mpi` preloads it.
@@ -1435,13 +1555,49 @@ every other hook operates at.
 #### What it captures
 
 An eBPF CO-RE (Compile Once – Run Everywhere) program,
-`sched_trace.bpf.c`, attached to three kernel scheduler tracepoints:
+`sched_trace.bpf.c`, attached to three kernel scheduler tracepoints
+(the lines are formatted by `sched_event_fmt.h`):
 
 | Tracepoint | Emitted as | Meaning |
 |---|---|---|
-| `sched_switch` | `span:sched:0:<tid>:<start>:<dur>:off_cpu:comm=<name>` | One event per off-CPU period: how long a thread was switched out before it ran again — directly comparable to any instrumented span's idle gap |
-| `sched_wakeup` | `inst:sched:0:<tid>:<ts>:wakeup:comm=<name>,target_cpu=N` | A sleeping thread became runnable (pairing this with the next matching `off_cpu` span's end gives run-queue/scheduling latency — not decomposed in-kernel) |
+| `sched_switch` | `span:sched:0:<tid>:<start>:<dur>:off_cpu:comm=,task_pid=,sleep=0\|1[,waker_pid=,waker_tid=,waker_comm=,ctx=,wake_ns=]` | One event per off-CPU period: how long a thread was switched out before it ran again — directly comparable to any instrumented span's idle gap. `sleep=1`: it left the CPU to sleep (the tracepoint's state is a `TASK_REPORT` bit); `0`: it was preempted (`TASK_REPORT_MAX`) or yielded while runnable. A sleep names the waking that ended it (below) |
+| `sched_waking` (BTF tracepoint) | `inst:sched:0:<tid>:<ts>:wakeup:comm=,wake_cpu=,wakee_pid=,waker_pid=,waker_tid=,waker_comm=,ctx=task\|irq\|unknown` | A sleeping thread is being made runnable. It runs in the waker's context: `waker_*` is the task that ran the wakeup -- the real waker only for `ctx=task`; for `irq` (hard/soft interrupt or NMI) it is whatever the interrupt hit; `unknown`: the preempt count could not be read (`pcpu_hot`, x86 kernels ≥ 6.2). `wake_cpu` is the CPU the kernel tries first |
 | `sched_migrate_task` | `inst:sched:0:<tid>:<ts>:migrate:comm=<name>,orig_cpu=N,dest_cpu=N` | A thread moved to a different CPU (often cross-NUMA) — a common, otherwise-invisible cause of an unexplained slowdown |
+
+**Which waking ended a sleep** is joined in the kernel, not by timestamps
+afterwards: a task that slept becomes runnable again only through
+`try_to_wake_up`, which fires `sched_waking` once (later wakers find it
+already running), so the last waking recorded for the task when it is
+switched back in (an LRU map, `last_waking`, 65,536 entries) is the one
+that ended the sleep -- also when the waking ran just before the
+switch-out was traced, and whether or not ring-buffer records were
+dropped. A sleep without waker fields lost that record to the LRU map's
+eviction. `task_pid` / `wakee_pid` / `waker_pid` are thread-group ids in
+the kernel's initial pid namespace: a profiled program in its own pid
+namespace (a container) has other ids in the hooks' records, and nothing
+matches. Before 2026-10 the tracer attached `sched_wakeup` and emitted
+`comm=`/`target_cpu=` only, and `off_cpu` had no `sleep=`; such traces get
+no wakeup edges (counted).
+
+**How the analysis uses it:** a blocking call (MPI receive, wait or
+collective, an OpenMP barrier / lock / taskwait, a device sync) whose
+thread slept inside it, and whose last sleep there was ended by a waking
+from task context in a traced thread, gets a `wakeup` edge from that
+thread's innermost span at the waking (`src/analysis/semantics/sched.py`;
+cp_model: the source span's start before the call's end, provenance
+`os_wakeup`, tier `medium`, evidence class inferred). The kernel recorded
+the waking; that it released the call is an inference -- a thread is also
+woken by signals, timeouts and other waits inside the same call. Everything
+else gets no edge and is counted (`sched_*` in the dependency
+diagnostics): a call that never slept (a spin wait, or only preempted:
+`sched_no_sleep`), a thread the tracer did not report
+(`sched_threads_unseen`), an older tracer's records
+(`sched_sleep_unflagged`), sleeps naming another process
+(`sched_pid_mismatch`), a sleep whose waking was not recorded
+(`sched_waker_unrecorded`), interrupt or unknown context
+(`sched_waker_not_task`), and a waker without a traced span then
+(`sched_waker_untraced`: a runtime's helper thread, the driver, another
+program).
 
 Events use the same wire protocol ([Wire protocol](#wire-protocol)) every other hook does, over
 `HPROFILER_SOCKET`, with the `sched` category (`src/core/events.py`).
@@ -1488,6 +1644,10 @@ into source control, since it's kernel-version-specific and ~150k lines.
 
 **Status:** compiled, linked and run up to the kernel's privilege check;
 never loaded into a kernel ([Verification status](#verification-status)).
+The kernel verifier has not seen the current program, and nothing has
+checked what the kernel puts in each field; the line formatting is tested
+natively (`tests/native/sched_event_fmt_test.c`), the analysis on
+synthetic records (`tests/test_sched_wakeup.py`).
 
 ### JIT compilation and ACPP
 
@@ -1588,6 +1748,29 @@ This combination gives you:
 - **Per-kernel disassembly** (x86-64 assembly extracted from `clGetProgramInfo`)
 - **CPU sampling** (which CPU functions are hot during kernel execution)
 - **Instruction heat** (per-instruction sample % for the JIT-compiled kernel body)
+
+#### Dependencies between SYCL commands
+
+AdaptiveCpp (checked: 25.10) has no tracing interface for its task graph:
+nothing names a command's requirements to a tool (its instrumentation API
+gives per-command timestamps, `runtime_event_handlers` only allocations;
+the DAG is internal C++ with no stable ABI). Its dependencies reach the
+trace only where the runtime lowers them to calls a hook records, checked
+with `tests/fixtures/sycl_deps.cpp` (`tests/integration/test_sycl_deps.py`):
+
+| Target | How AdaptiveCpp orders dependent commands | In the trace |
+|---|---|---|
+| CUDA | `cudaEventRecord` + `cudaStreamWaitEvent` between its streams, or a host `cudaEventSynchronize` before the next submission | event-wait edges between the device spans; the submitting thread's order |
+| OpenCL | one in-order queue per device; barriers with wait lists; `clWaitForEvents`; USM copies through `clEnqueueMemcpyINTEL` | queue order (stronger than the SYCL dependencies), wait lists, host waits |
+| HIP | like CUDA | not run here (no AMD GPU) |
+| host device (OpenMP backend) | in its own worker threads | nothing: kernel calls (`sycl` category) have only their threads' order |
+| a device command depending on a host-device command | a stream host function that waits inside the runtime | the host function, not what it waited for |
+
+The last two are reported, not guessed: `sycl_host_kernel_calls` and
+`acpp_host_functions` in the dependency diagnostics, with a warning. (A
+CUDA kernel that `depends_on` a host-device event hung in AdaptiveCpp 25.10
+on this machine, with or without hooks; the fixture tests only a buffer
+dependency across backends.)
 
 #### What the jit spans cover
 
@@ -2253,8 +2436,18 @@ merged multi-node trace with `node` tags) → process (labelled with its
 MPI rank when known) → thread (`T1 · tid 100`) → one row per runtime
 (`mpi`, `cuda`, `sync`, `nvtx`, …), and under the process its devices →
 streams → runtime rows. A thread or stream with a single runtime is one
-row. Lane labels show their event count (filtered/total when a filter is
-active); headers show their lane count and can be collapsed. A header row
+row. Streams are numbered per process: `stream 0 (default)` is the default
+stream, then `stream 1`, `stream 2`, … in the order their work first
+appears. The stream id behind the number is the hooks' hash of the
+program's stream handle, or CUPTI's stream id / the HSA queue when no handle
+was matched. It is shown in the event details, with CUPTI's stream id (the
+one Nsight Systems uses), and the search box accepts either the number or
+the id. CUPTI synchronization records name their CUDA context but no
+device, so they are placed on the device of that context's kernels and
+copies (marked *derived* in the details), as `sync (host waits)` rows:
+CUPTI times the host thread's wait, not device work. Lane labels show
+their event count (filtered/total when a filter is active); headers show
+their lane count and can be collapsed. A header row
 is a summary: a thread or stream row shows the busiest of its runtime rows
 with explicit waits taken out; a process, device, node or System row the
 mean busy share of its threads (streams), with the critical-path coverage
@@ -2952,6 +3145,7 @@ hprofiler critical-path [OPTIONS] TRACE_FILE
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--top`, `-n` | `15` | Rows shown in each breakdown |
+| `--window process-begin\|first-event` | `process-begin` | Where the measured wall time and the observed path start: the earliest process-begin marker (a hook's constructor, before `main`; traces without markers fall back to the first recorded event), or the first recorded event, as before 2026-11 ([The window](#the-window-from-process-begin)) |
 | `--sensitivity N` | `5`; none above 4M event nodes | Counterfactual candidates to evaluate ([Modeled longest path, criticality and sensitivity](#modeled-longest-path-criticality-and-sensitivity)); each is one pass over the graph; `0` disables |
 | `--export FILE` | none | Write the trace back out as Chrome Trace JSON with critical-path tags ([`--export`](#--export-highlighting-the-critical-path-in-perfetto)) |
 | `--exact-p2p-high` | off | Grade exact MPI matches `high` where the channel's capture is provably complete ([Edge evidence](#edge-evidence-tiers-provenance-direct-or-inferred)) |
@@ -2968,8 +3162,9 @@ The report keeps these apart:
 
 | Quantity | What it is | Kind of value |
 |---|---|---|
-| Measured wall time | First to last recorded event | measured |
-| Observed critical path | The chain of last-releasing dependencies back from the end of the run, each instant counted once, split into time in calls, time in gated calls, dependency latency, unrecorded thread time and device idle time | derived from the timestamps and the recorded edges |
+| Window | Where the next two start: the earliest process-begin marker (`process_begin`), or the first recorded event (`first_event`: traces without markers, `--window first-event`); and the time from there to the first recorded event | measured |
+| Measured wall time | From the window's start to the last recorded event | measured |
+| Observed critical path | The chain of last-releasing dependencies back from the end of the run to the window's start, each instant counted once, split into time in calls, time in gated calls, dependency latency, unrecorded thread time and device idle time | derived from the timestamps and the recorded edges |
 | Modeled longest path | The longest chain of *required* work (waiting, dependency latency and time in gated calls count zero), computed under each assumption the trace cannot decide | a graph model |
 | Evidence | For each dependency step: kind, runtime, tier, provenance, direct or inferred, and the reason | -- |
 | Variants | The observed and the modeled path under each way of counting time the trace cannot decide (unrecorded time, inferred edges, gated calls' tails), and which spans are on the path under every one | -- |
@@ -3074,8 +3269,9 @@ cycle are dropped and counted.
 
 #### Observed critical path
 
-Followed backwards from the last event of the trace (several at the same
-instant: one is taken and a tie counted): at each event, the incoming
+Followed backwards from the last event of the trace that the walk can
+connect to the program (several at the same instant: one is taken and a tie
+counted): at each event, the incoming
 edge with the latest release time t(source) + w released it. A busy edge
 always wins — its release time is the event's own time. A gap edge
 releases at its source (the thread was free from then on), so a
@@ -3105,6 +3301,83 @@ The path is rank 1's compute (900, busy), then the message (100,
 dependency latency: the send call, the transfer and the receive's own
 processing together — the trace cannot split them), then whatever follows
 on rank 0. The receive's first 900 ns are on no path.
+
+**Where the walk starts.** An event the walk can connect is a host span's
+(a thread's own timeline) or one an edge chain reaches from one
+(`cp_model.connected_events`); a device-side record that nothing recorded
+on a thread leads to is not -- a CUPTI synchronization record whose host
+call was not recorded (it names no thread), device work whose submission
+was not. Such a record is never where the walk starts: the walk could say
+neither what it waited for nor what the program did meanwhile. When the
+trace ends on such records, the path ends at the last event it can connect
+and the report says so -- the text report's "ends before the last event"
+line, a note naming the records and the time after the path's end, and in
+`--json` `unconnectedTailNs` / `unconnectedTailRecords` (`walk.tailByName`
+by name); that time is part of the measured wall time, not of the observed
+path. Separately, every device synchronization record whose host call is
+not in the trace (no host span carries its correlation id) is counted,
+wherever it lies: `unmatchedSyncRecords` by sync kind, and a note. A trace
+with no host span at all is walked from its last event, as before.
+
+Before 2026-11-11 the walk started at the trace's last event, whatever it
+was: Triton programs ended on an event query's `sync event` record with no
+host call and no edge, and the observed path was that one record (143 ns
+of 4.54 s in the tutorial vector add, 512 ns of 232.65 s in the matrix
+multiplication; campaign `smoke2`). Re-analysed, the same stores give
+4.5399 s and 232.650 s, with the last 123 µs / 114 µs (56 / 50 records)
+reported as unconnected; new captures record the queries
+([`cuda` backend](#cuda-backend)) and leave nothing unconnected.
+
+##### The window: from process begin
+
+Every preloaded hook's constructor claims a **process-begin marker** for
+its process ([Instant record](#instant-record)): the moment the first
+hprofiler hook was loaded into it, before `main` (preloaded libraries are
+initialized before the program's own code; only the dynamic loader and
+constructors of libraries initialized earlier come before it). The OMPT
+tool claims when the OpenMP runtime initializes it, so a run traced by
+OMPT alone starts its window there. By default
+(`window_start = "process_begin"`) the measured wall time and the observed
+path start at the **earliest marker of any process that recorded
+something**, so work before a process's first recorded call -- the
+program's setup before `MPI_Init`, say -- is on the path. The path is
+still walked back from the last event; the time from the window's start to
+the path's first event (the first event of its lane, since every later
+event has an in-edge) is **unrecorded thread time** on that lane:
+provenance `process_begin` (direct), tier `certain`, counted in
+`path_unrecorded_ns` and put on the lane's first span as its gap
+(`path_gap_ns[0]`), never on the marker. So the path's spans' times still
+sum to `total_path_ns`, as do the exported `path_ns` tags to `observedNs`,
+and the observed path equals the wall time. In a run with several
+processes, that time can include time before the path's process had
+started (a later launch): the trace does not tell which.
+
+The modeled longest path gives each host lane's first event that nothing
+precedes the time since **its own** process's marker, as the virtual
+source's edge (unrecorded time, counted as work in the default variant,
+zero with unrecorded time as idle). A thread created after its process
+began and reached by no recorded dependency gets the time before it
+existed, too -- part of what that variant assumes about unrecorded time.
+
+Traces recorded before the markers, a process with no marker (forked
+children: the fork is not recorded; a program that ran a `vfork` child --
+Python's `subprocess` -- before its first record, captured before
+2026-11-11: [Hook transport](#hook-transport-and-collector)) and
+`--window first-event` keep the
+old window: from the first recorded event, with no lead (`window_start =
+"first_event"`). The text report says which window it used in its
+"Window" line, and how long before the first recorded event it starts;
+`--json` has `windowStart` (`"process_begin"` \| `"first_event"`),
+`windowStartNs` and `windowLeadNs` (window start to the first recorded
+event), and `walk.leadNs` (window start to the path's own first event:
+the lead above).
+
+There is **no end marker**: the window ends at the last recorded event.
+No point at a process's exit excludes the profiler's own work: a return
+from `main` calls `exit` inside libc, which no wrapper sees; the atexit
+handlers and the hooks' destructors run in no order hprofiler controls
+and include the CUPTI flush and every hook's final drain. An MPI
+program's last recorded event is normally its `MPI_Finalize`.
 
 The span-level fields keep their invariants for existing readers:
 `path_span_indices` are the spans the path passes, in first-appearance
@@ -3256,9 +3529,13 @@ call the same builders (`criticalpath._add_gpu_edges`, `_add_nccl_edges`,
 | Runtime | Rule | Edges | Tags it needs |
 |---|---|---|---|
 | MPI | A persistent request's `MPI_Start` (one per request of an `MPI_Startall`) is a post like `Isend`/`Irecv`; its completion names it | `p2p` | `type=start,ptype=send\|recv`, `sid=` |
+| MPI | A channel's sends are in `sseq=` order and its receives in `rseq=` order; a missing number is a lost record, placed in the one channel that can own it (else the pairings after it are `low`) | `p2p` | `sseq=`, `rseq=` |
+| MPI | A matched probe is the receive for message order; the call that received its message (`MPI_Mrecv`, or `MPI_Imrecv`'s completion) gets the edge | `p2p` | `mid=`/`sid=` on the probe, `psid=` on the receive |
+| MPI | (`commid`, `cseq`) is one collective on every member, also persistent collectives (each `MPI_Start`) | `arrival` | `cseq=`, `csize=` |
 | MPI | A non-blocking collective is posted by its call and completes in the `MPI_Wait*` naming its request: the last poster's call gates each member's completion; a member nobody else gates is released by its own post | `arrival` | `type=ibcast\|...`, `sid=` |
+| MPI | Every process's `MPI_Init`/`MPI_Init_thread` is one rendezvous, every process's `MPI_Finalize` another (each process's last arrival gates every member's return): not required by the MPI standard, but what the libraries checked do (below). An edge the timestamps contradict -- a process left before another arrived -- is dropped and counted (`dropped_contradicting_time`), and the call is then an ungated blocking call; fewer members than `csize=` (a lost record, one node of a multi-node job) is `low`, a process with two calls of a kind (`MPI_Comm_spawn`, several worlds in one trace) is not grouped | `arrival` (`medium`, provenance `lifecycle_sync`, inferred) | `type=init\|finalize`, `rank=`, `csize=` |
 | MPI | Rooted collectives with their root recorded: bcast / scatter[v] members wait for the root only; the reduce / gather[v] root for the last arriver; the other members for nobody (scan / exscan keep the rendezvous) | `arrival` (`rooted_flow`) | `root=`, `wroot=` |
-| CUDA/ROCm | Host functions are stream-ordered work (in their stream's FIFO); one callback thread runs them in turn | `sequential` (`high` across streams) | `op=host_func`, `exec=host` |
+| CUDA/ROCm | Host functions are stream-ordered work (in their stream's FIFO); one callback thread runs them in turn. One captured into a graph (`captured=1`) is not timed: no span, no edge | `sequential` (`high` across streams) | `op=host_func`, `exec=host` |
 | CUDA | A synchronous copy that blocks the host (`blocking=1`) returns after its device copy | `device_wait` | `blocking=` |
 | CUDA/ROCm | The legacy default stream (stream 0) waits for the earlier work of every blocking stream of its device and holds back their later work (only the binding edges); non-blocking streams are exempt; streams whose creation was not recorded are assumed blocking (`medium`; wrong for per-thread-default-stream programs) | `sequential` | `op=stream_create`, `nonblocking=1`, sync copies' `stream=0` |
 | OpenCL | An in-order queue runs its commands in enqueue order; a blocking transfer waits for its queue | `sequential`, `device_wait` | `queue=`, `ooo=`, `blocking=1` |
@@ -3267,11 +3544,173 @@ call the same builders (`criticalpath._add_gpu_edges`, `_add_nccl_edges`,
 | NCCL | The k-th send from a to b pairs with the k-th receive on b from a, between the spans timing the work: a grouped operation's `group_exec` span, an asynchronous one's device span; collectives rendezvous on those spans | `p2p` (`nccl_pseq`), `arrival` | `pseq=`, `group=`, `timing=` |
 | OpenMP | A taskwait waits for its task's children created before it; a taskgroup for the tasks created inside it and their descendants (a task completes with its last execution fragment) | `task_join` | `task=`, `parent=`, `id=` |
 | OpenMP | A recorded dependence orders source before sink | `task_dep` | `omp_task_dependence` |
+| OpenMP (GNU) | A task's depend clauses against its earlier siblings, by OpenMP's rules: `in` after the last `out`/`inout`/`mutexinoutset` of the location, `out`/`inout` after it and the `in`s since, `inoutset` as a set, `omp_all_memory` after every earlier dependence; `mutexinoutset` is ordered like `out` (libgomp serializes it); a `taskwait depend(...)` waits for the siblings its clauses conflict with (`high`: reconstructed, not reported) | `task_dep`, `task_join` | `deps=`, `id=`, `parent=` |
+| CUDA | Inside one graph launch, the exec's own edges between the nodes the device records name; a port edge (`p`) is no completion dependency | `graph_dep` | `graph_edges`, `gnode=`, `gexec=` |
+| HIP | Host functions run on one callback thread in submission order; each enqueue links to its run | `sequential`, `explicit_span_id` | `op=host_func`, `lid=` |
+| OpenCL | A command waiting for a user event waits for the `clSetUserEventStatus` that completed it | `explicit_span_id` | `ev=`, `wait=` |
+| OS | A blocking call that slept and was woken from task context by a traced thread waits for that thread's span at the waking | `wakeup` (`medium`) | `off_cpu` with `sleep=1`, `waker_tid=`, `ctx=task` |
 | OpenMP | A contended lock acquisition ends at the previous holder's release (OMPT `wait_id=`, GNU `lock=`, GNU unnamed critical sections as one lock) | `lock_order` | `mutex=`, `wait_id=` / `lock=` |
+| OpenMP (OMPT) | Nothing of a parallel region runs after its join (the end of the region's span, recorded by its master). A span of the region (`psid=` its id) recorded as ending later -- LLVM libomp reports a worker's implicit-barrier end and implicit-task end when it releases the worker for the next region, or at exit -- ends at the join in the model; the time from the join to the worker's next event is the worker idle (lane mode `idle`, never work, waiting or dependency latency). The edges ending at a capped event and that idle time have provenance `region_join` (inferred); capped spans are counted in the notes. So a worker's next task is released by the region's fork, and a worker's task end joins its region | lane edges (`idle`), `fork` / `join` | `type=parallel` + `sid=`, `psid=` |
 
 OpenCL device spans, asynchronously timed NCCL spans and CUDA host
 functions (`side=gpu`) are on no host thread's program order: their tid is
 a driver or callback thread's.
+
+#### Dependency capture by runtime
+
+What each hook records, what the analysis reconstructs from the runtime's
+ordering rules over those records, and what stays uncertain. Where capture
+is incomplete the trace says so: on the record (`wait_unknown=`,
+`mid_unknown=1`, `deps_unsupported=`, `unmapped=`), in a counter emitted at
+exit, in the dependency diagnostics stored with the trace
+(`metadata.dependencyDiagnostics`) and as a warning (`hprofiler
+critical-path`, `summary`, the GUI). A dependency the records do not
+establish gets no edge: it is never filled in by a guess.
+
+| Runtime | Recorded directly | Reconstructed from ordering rules | Uncertain or not captured |
+|---|---|---|---|
+| MPI | request ids (`sid=`/`psid=`); the source and tag `MPI_Status` reported for wildcards; communicator ids; sequence numbers `sseq=` (sends per destination), `rseq=` (receive posts), `cseq=`/`csize=` (collectives) per communicator; matched-probe message ids (`mid=`); `startall=1`; `MPI_Init`/`MPI_Finalize` calls | which send a receive matched (non-overtaking: the k-th send of a (sender, receiver, tag, communicator) channel with its k-th receive, in sequence order); a collective's members by (`commid`, `cseq`); where a lost record was; `MPI_Init` and `MPI_Finalize` as rendezvous of every process (`lifecycle_sync`, inferred) | whether the library synchronizes the processes in `MPI_Init`/`MPI_Finalize` (contradicted edges dropped); the order of posts on one channel from two threads whose calls overlap, or from one `MPI_Startall` (`low`); a gap several channels could own (`low` after it); unwrapped calls (no number, no gap); unregistered communicators (no numbers); when a message arrived relative to when its receiver looked |
+| OpenMP, GNU libgomp | task ids (`id=`, `parent=`, `team=`); each task's and `taskwait depend`'s clauses as tokens (`deps=`, `ndeps=`); lock tokens (`lock=`); libgomp's ABI level | task dependences by OpenMP's rules over the siblings in creation order; taskwait/taskgroup joins; lock hand-offs | clauses of an ABI the hook does not decode (`deps_unsupported=`), entries over 256 per record (`deps_omitted=`), addresses beyond the token table (`dep_unknown=`) |
+| OpenMP, OMPT | task ids, dependences (`omp_task_dependence`), wait ids | joins, lock hand-offs | a worker's implicit-barrier and implicit-task end under LLVM libomp: delivered when the worker is released for the next region or at exit, so their recorded ends are not trusted after the region's join -- capped there (`region_join`, inferred, reported) |
+| CUDA | correlation ids; stream and event lives (`stream=`/`event=`: a fresh number for each reuse of an address); stream flags and priority (`stream_info`, from CUPTI's resource callbacks); each graph exec's structure once (`graph_exec`, `graph_nodes`, `graph_edges`), the node a device record ran (`gnode=`), exec versions (`gexec=`, `gver=`, `graph_exec_update`) | stream FIFO; an event wait waits for the latest record of its event; edges between the nodes of one graph launch | child graphs' nodes (CUPTI names no clone for them: `unmapped=`); edges whose type data the driver refuses (`lossy=1`); event-address reuse never observed on this driver |
+| HIP | stream and event lives, flags, priority; host functions linked to their run (`lid=`); cooperative, Ext, 2D, peer and device-to-device launches and copies | stream FIFO; host functions in submission order on one callback thread | tested against a mock runtime only (no AMD GPU) |
+| OpenCL | queues (`queue=`, `ooo=1`); events (`ev=`) with the application's references followed; whole wait lists (`wait=`, `nwait=`); user events and the call completing them; Intel USM enqueues; each device's clock mapping (`dev=`, `clock=`, `clock_err_ns=`, `ocl_clock`) | in-order queue order; wait lists; barriers, markers, `clFinish`, `clWaitForEvents` | events the hook did not see created or beyond its table (`wait_unknown=`), lists over 4096 ids (`wait_omitted=`); devices without `clGetDeviceAndHostTimer` (offset unbounded) |
+| OS scheduler | per sleep, the waking that ended it (waker thread and process, context, time), joined in the kernel; sleep vs. preemption | a blocking call that slept and was woken from task context by a traced thread waits for that thread's span (`wakeup`, `medium`) | spin waits; wakeups from interrupt context; everything, until the program is loaded somewhere with `CAP_BPF` |
+| AdaptiveCpp | nothing of its own task graph | what it lowers to CUDA / OpenCL / HIP calls, through those hooks | host-device kernels' dependencies; device commands waiting for host-device ones |
+
+**MPI_Init and MPI_Finalize.** The standard requires neither call to
+synchronize the processes (`MPI_Finalize` is collective over connected
+processes, but may return early), so these edges are inferred, `medium`,
+never direct. Checked with the `mpi_lifecycle.c` fixture: Open MPI 5.0.11
+returned every rank from `MPI_Init` within 0.1 ms of each other, after the
+last rank arrived, and from `MPI_Finalize` after the last arrival (in two
+groups 40 ms apart); Intel MPI 2021 returned all ranks from
+`MPI_Finalize` at the same instant and from `MPI_Init` after the last
+arrival. A library that lets a rank go before the last one arrived is
+caught by the timestamps: that edge is dropped and counted, and the call
+stays an ungated blocking call (its time `inUngatedBlockingCalls`), never
+waiting for a partner it did not wait for -- unless it let the rank go by
+less than the hook's own work after `PMPI_Init` (`hook_ns=`, a few tenths
+of a millisecond), which the span's end includes. Other MPI libraries (MPICH,
+Cray MPICH, MVAPICH) were not checked.
+
+**MPI channels.** The matcher orders a channel's sends by `sseq=` and its
+receives by `rseq=` when every record of the channel carries one, else by
+start time (older traces). A number missing between recorded ones is a lost
+record: when exactly one channel can own it (the only channel of that
+sender/receiver pair, or the only one whose counts are short by exactly the
+missing number) it is placed -- a stand-in consumes one partner and has no
+edge -- and the pairs around it stay exact; otherwise every receive of the
+channels it could belong to, from the gap on, is `low`. A wildcard receive
+that was never resolved counts as a receive gap (its channel is unknown).
+The same `low` tier marks pairs whose order the records do not fix:
+overlapping posts of two threads on one channel, and the requests of one
+`MPI_Startall`. A process that lost MPI events but whose channels show no
+gap keeps its exact pairings (before sequence numbers, every pairing in
+such a process was `low`). Collectives: where every member's `cseq=`
+sequence is complete and the types agree, members are grouped by
+(`commid`, `cseq`); a missing number or a member count short of `csize=`
+leaves that collective's last arriver unknown (`low`). Diagnostics:
+`send_seq_gaps`, `recv_seq_gaps`, `seq_gaps_placed`, `matched_after_gap`,
+`uncertain_channels`/`uncertain_reasons`, `send_record_lost`,
+`concurrent_posts`, `matched_probes`, `matched_receive_unlinked`,
+`collective_seq_gaps`, `collectives_incomplete`,
+`collective_seq_misaligned`.
+
+**GNU libgomp depend clauses.** libgomp reports no dependences to tools;
+the hook reads the depend array `GOMP_task` and `GOMP_taskwait_depend`
+receive -- libgomp's private ABI, checked on GCC 13.3 (`GOMP_5.1.2`) by
+dumping the arrays of every dependence type -- and records each storage
+location as a token (`deps=<kind><token>;...`, kinds `i` in, `o`
+out/inout, `m` mutexinoutset, `s` inoutset, token `*` for
+`omp_all_memory`): the trace never carries an address. The old layout
+(GCC ≥ 4.9) is decoded wherever `GOMP_4.0` exists, the new one (depobj,
+inoutset) from `GOMP_5.0` to `GOMP_5.1.2`, the newest checked
+(`HPROFILER_GOMP_DEPEND=force` decodes it on a newer ABI). Any other ABI,
+inconsistent counts or an unknown kind record `deps_unsupported=<reason>`
+and no address: that task's dependences are unknown. The analysis applies
+OpenMP's rules to the siblings in creation order (`semantics/openmp.py`):
+reconstructed from the clauses, so `high`, never `certain`. Lock tokens
+are retired at `omp_init_*lock`/`omp_destroy_*lock`, so a lock initialized
+later at the same address is another lock; dependence tokens are never
+retired (OpenMP matches dependences by address among siblings, so a reused
+address is the same dependence). Counters at exit: `gomp_abi_level`,
+`gomp_dep_tokens`, `gomp_dep_unknown`.
+
+**CUDA graphs and stream lives.** With native tracing, CUPTI's resource
+callbacks report every stream's creation and destruction and every graph
+exec's instantiation, whatever API or library made them (statically
+linked runtimes too). At instantiation the source graph is read once
+(nodes, edges, node types, child graphs recursively) and its edges are
+translated to the exec's own nodes through CUPTI's clone pairs -- device
+records name the exec's nodes (`graphNodeId`, `gnode=`), not the source
+graph's. A child graph becomes two marker nodes around its own nodes, so
+an empty child still orders what surrounds it; its inner nodes have no
+clone and stay unmapped (`unmapped=N`): no device record can name them,
+and no edge reaches them. An exec's topology cannot change after
+instantiation; its version (`gver=`) counts the calls that changed what
+its nodes do. At most 2^20 nodes and 2^22 edges per exec (`truncated=1`:
+none emitted). Diagnostics: `gpu_graph_launches`,
+`gpu_graph_launches_unstructured`, `gpu_graph_unmapped_nodes`,
+`gpu_graph_unusable`, `gpu_graph_weak_edges`. A stream's or event's
+number is the handle's hash for its first life (what the NCCL hook and
+older traces compute) and a fresh number (from 1,000,000) for every later
+life of the same address, so two streams are never read as one FIFO;
+`cudaStreamPerThread` is the calling thread's own stream. A handle first
+seen in use starts its first life then, and a stream's flags are queried
+once (`stream_info,queried=1`; `gpu_streams_queried`).
+
+**OpenMP worker ends after the join.** LLVM libomp (seen with clang 20's
+libomp in the hprofiler-stack image and LLVM 20's on the development
+machine) calls a
+worker's `sync_region` end for the implicit barrier at the end of a
+parallel region, and its `implicit_task` end, only when the worker leaves
+the runtime's fork barrier -- at the next region's fork, or at exit. Taken
+as recorded, the worker's barrier looks gated until the next fork, and a
+backward walk through it reaches the last arriver of the *previous* region
+instead of what released the worker (the fork, after an MPI receive on
+another rank, say): a hybrid MPI+OpenMP token ring lost every other rank's
+work between two regions, and the join edges of those tasks were dropped as
+contradicting the timestamps. `cp_model` therefore ends every span of a
+region at the region's join when it was recorded later, and treats the
+time after it as the worker idle (above). The recorded spans are kept as
+they are (the timeline shows them); only the model's event times change,
+and the notes say how many spans were capped and by how much. GNU libgomp
+traces do not show this: the hook times each thread's share of
+`GOMP_parallel` from its trampoline, which returns before the region's
+implicit barrier, and no region-wide span is recorded, so nothing is capped
+there (see the GNU libgomp limitation on joins in
+[Known limitations](#known-limitations)).
+
+**HIP** has the same stream and event lives (the wrappers' create and
+destroy calls; no resource callbacks), and host functions
+(`hipLaunchHostFunc`, `hipStreamAddCallback`) are linked to their run
+(`lid=`) and ordered on the runtime's one callback thread. Tested against
+a stand-in runtime (`tests/fixtures/hip_mock.c`) only.
+
+**OpenCL**, **OS wakeups** and **AdaptiveCpp**: see the
+[`opencl` backend](#opencl-backend), the
+[OS scheduler tracer](#os-scheduler-tracer-ebpf) and
+[Dependencies between SYCL commands](#dependencies-between-sycl-commands).
+
+**Tables and their capacity.** Every table is bounded, and an entry that
+does not fit is counted and reported -- never given another entry's
+identity:
+
+| Hook | Table | Capacity | Memory | Beyond capacity |
+|---|---|---|---|---|
+| MPI | communicators (sequence counters) | 256 | 48 B each (12 KiB) + 4 B per destination rank after a communicator's first send | `commid=-1`, no numbers (`mpi_seq_unkeyed`) |
+| MPI | matched-probe messages | 1,024 live | 56 B each (56 KiB) | no `mid=`, receive `mid_unknown=1` (`mpi_msg_untracked`) |
+| MPI | persistent requests | 1,024 | 72 B each | not linked (as before) |
+| GNU libgomp | dependence tokens | 16 shards × 16,384 slots | 16 B per slot, grown on demand (≤ 4 MiB) | `dep_unknown=` (`gomp_dep_unknown`) |
+| GNU libgomp | lock tokens | 16 × 1,024 | ≤ 256 KiB | `lock=?` |
+| CUDA, HIP | streams, events (each) | 64 Ki handles | 16 B per slot, grown on demand (≤ 1 MiB each) | keeps the hash for all lives (`cuda_handle_table_full`, `rocm_handle_table_full`) |
+| CUDA | graph-exec versions | 4,096 execs above version 1 | 8 B each | version reported as 0 (unknown) |
+| CUDA | graph structure | per exec, read once | 2^20 nodes / 2^22 edges | `truncated=1`, no edges |
+| OpenCL | events | 64 Ki live | 32 B per slot, grown on demand (≤ 2 MiB) | no `ev=`, waiters' `wait_unknown=` (`ocl_event_table_full`) |
+| OpenCL | devices (clock mapping) | 32 | — | `dev=-1`, a shared `callback_end` mapping |
+| OpenCL | extension wrappers | 4 platforms | — | real pointers, unrecorded (`ocl_ext_unwrapped`) |
+| eBPF | off-CPU starts, last wakings | 65,536 each (LRU) | 16 B / 40 B values; computed from the kernel's element layout (48 B header + key + value, preallocated): ≈ 4.5 MiB and 6 MiB -- the off-CPU map grew by 0.5 MiB (8 → 16 B values). Never loaded, not measured | the oldest entries are evicted: an off-CPU period is not emitted, a sleep has no waker fields |
 
 #### Clock domains and timestamp bounds
 
@@ -3351,8 +3790,32 @@ trace does not decide, and only worlds the runtime's matching rules allow:
   ended is never generated, so a receive only one send can have completed
   keeps it.
 - **Last arriver**: a rendezvous whose last arriver arrived within the
-  clocks' uncertainty of another member (on one clock: a tie) gets the
-  other one as last, for every member at once.
+  clocks' uncertainty of another member (on one clock: a tie -- the same
+  nanosecond) gets the other one as last. Only where the edges come from a
+  last arriver ([Runtime semantics](#runtime-semantics)):
+  - the members of an all-to-all rendezvous -- collectives without a
+    recorded root, barriers, `MPI_Init` / `MPI_Finalize`, OpenMP barriers,
+    NCCL collectives: every member's edge moves to the other one at once;
+  - the root of a `reduce` / `gather[v]` whose members recorded it
+    (`wroot=`): another last arriver redirects only the root's edge (or
+    removes it, when the root itself may have arrived last);
+  - never the members of a `bcast` / `scatter[v]` whose members recorded
+    the root: they wait for the root, whoever arrived last -- on one clock
+    and across clock domains alike.
+
+  A non-blocking collective's members are compared by their posts' starts
+  (`MPI_Ibcast` ...), and its edges go to their completions (the
+  `MPI_Wait*`). Before 2026-11-11 the generator compared the edges'
+  destinations and took the latest-starting one as the other last arriver
+  wherever the recorded source started earlier: every broadcast whose root
+  started first got a unit the data flow rules out (on `osu_ibcast` 650 of
+  652, with an `MPI_Wait` as the "last arriver"; campaign `smoke2`: 681 of
+  692 units in all), the evidence counted their candidates ambiguous (2235
+  on `osu_ibcast`), and an older `osu_ibcast` trace got "not enough
+  evidence" from them. Re-analysed, only the ties are left (`osu_ibcast` 2,
+  IMB `sendrecv` 1, `multi` 1, `anysource` and Comb `testsome` 0; the ties
+  of OSU `allreduce` 3, CUDA `allreduce` 2 and mixbench's OpenMP barriers
+  2 unchanged), with every observed path and its spans unchanged.
 - **Launch correlation**: device operations whose correlation ids matched
   several host submissions form one unit per group sharing candidates. A
   submission launches one operation, so an option moves an operation to a
@@ -3589,7 +4052,8 @@ trace), in every process. The count is in the MPI dependency diagnostics
 #### Reading the output
 
 ```
-  Measured wall time          : 20.00ms  (first to last recorded event)
+  Window                      : from the first recorded event (no process-begin marker before it in this trace)
+  Measured wall time          : 20.00ms  (window start to last recorded event)
   Observed critical path      : 17.96ms  (each instant once; 18 spans)
   Modeled longest path        : 17.70ms  (required work only; a model, not a measurement)
     unrecorded time as idle   : 12.53ms
@@ -3617,7 +4081,10 @@ trace), in every process. The count is in the MPI dependency diagnostics
     direct_evidence_only   observed     17.96ms, 18 spans (different spans)
 ```
 
-(A synthetic two-rank Comb-like trace.) The observed path says where the
+(A synthetic two-rank Comb-like trace, recorded without process-begin
+markers; with them the first line reads `from process begin (the earliest
+hook constructor), 1.00ms before the first recorded event`.) The observed
+path says where the
 run's time went along the chain that ended it; its composition separates
 work in calls from waiting and untraced time. The modeled path says how
 long the recorded work chain is when waiting is free; with sensitivity it
@@ -3631,8 +4098,28 @@ notes list holes in the graph.
 #### Compatibility
 
 - **Stored traces** need no migration: span records are unchanged, and
-  persisted edges of an older builder version (`cp-4` and before) are
-  rebuilt on the first analysis and stored as `cp-5`.
+  persisted edges of an older builder version are rebuilt on the first
+  analysis and stored under the current one (`cp-8`). Traces recorded
+  before the new tags (sequence numbers, `deps=`, graph structure, stream
+  lives, full wait lists, waker fields) analyze as before, with the
+  fallbacks described in [Dependency capture by runtime](#dependency-capture-by-runtime).
+  Two kinds were appended to the edge kinds (`graph_dep`, `wakeup`), so
+  stored edge codes keep their meaning.
+- **Window and MPI lifecycle** (2026-11): the wall time and the observed
+  path start at the earliest process-begin marker (`--window
+  first-event` restores the old window; traces without markers get it
+  anyway, labelled `first_event`). `--json` gained `windowStart`,
+  `windowStartNs`, `windowLeadNs`, `walk.leadNs`; the report `window_start`,
+  `window_start_ns`, `window_lead_ns`; provenances `process_begin`
+  (direct) and `lifecycle_sync` (inferred). New traces carry `MPI_Init` /
+  `MPI_Init_thread` / `MPI_Finalize` spans and their rendezvous edges
+  (edge builder `cp-8`; older stored edges are rebuilt once).
+- **OpenMP worker ends** (2026-11): spans of a parallel region recorded as
+  ending after the region's join are capped at it in the model (provenance
+  `region_join`). The `--json` composition gained `threadIdleNs` (an
+  OpenMP worker idle after its region's join, on the path -- normally 0),
+  the text output a matching line when it is non-zero, and blame a
+  `(thread idle)` bucket; stored traces need nothing.
 - **The report** (`CriticalPathReport`) keeps every field with the
   invariants above; their values follow the event-point model (what
   changed is listed in [Observed critical path](#observed-critical-path)).
@@ -3667,7 +4154,11 @@ composition, evidence time by tier and class, variants, the graph's edge
 counts and drops, clocks, the walk's ties and undecidable steps, the
 path's dependency steps with their evidence, sensitivity (modeled and
 replayed), criticality, alternative worlds, the evidence statuses, blame,
-probabilities and notes.
+probabilities and notes. Since 2026-11-11 also `unconnectedTailNs` /
+`unconnectedTailRecords` (the records after the observed path's end that
+it cannot connect, [Observed critical path](#observed-critical-path)),
+`walk.tailByName`, and `unmatchedSyncRecords` (device synchronization
+records without their host call, by sync kind).
 
 ### POP-style efficiency
 
@@ -3709,7 +4200,7 @@ Communication Efficiency = Serialization Efficiency × Transfer Efficiency
 | Factor | Formula | Exact or approximate? |
 |---|---|---|
 | Load Balance | avg(useful time per rank) / max(useful time per rank) | **Exact** — "useful time" is the merged (overlap-deduplicated) wall-clock interval covered by `cpu`/`cuda`/`rocm`/`opencl`/`openmp` category spans on that rank/process |
-| Communication Efficiency | max(useful time per rank) / wall time | **Exact** |
+| Communication Efficiency | max(useful time per rank) / wall time | **Exact** -- the wall time is the extent of the recorded spans other than `MPI_Init`/`MPI_Finalize` (POP describes the run between them; traces without those spans are measured as before), and those two calls are not counted as communication either |
 | Transfer Efficiency | ideal message time (self-fitted α+bytes/β model) / actual message time | **Approximate** — see below |
 | Serialization Efficiency | (communication time that is actually on the critical path) / (total communication time) | **Approximate**, and only computed when critical-path analysis ([Critical path](#critical-path)) is available — `--no-critical-path` disables it |
 | Computational Scaling | mean IPC(this trace) / mean IPC(`--baseline` trace), capped at 1.0 | **Approximate proxy** — POP's stricter definition also scales instruction count, not just IPC; requires a `--baseline` trace at a lower rank/thread count (inherent to the metric itself, not a limitation of this implementation — POP's own methodology needs a reference case too) |
@@ -4615,6 +5106,16 @@ when no trace has rank 0). Every other trace's offset, decided by
    remaining problems reported: an offset outside its measured bound is
    never applied.
 
+Process-begin markers ([Instant record](#instant-record)) come before
+`MPI_Init`, and so before its clock measurement: they are shifted by the
+offset measured in `MPI_Init` (the drift is held constant before it, not
+extrapolated). A node's window start therefore carries that node's offset
+bound plus whatever its clock drifted between process start and
+`MPI_Init` (normally the program's startup: a few ms to seconds). The
+merged trace's window starts at the earliest marker of any node; the
+`MPI_Init` rendezvous between nodes is ordered by the same offsets, and a
+contradiction there drops the edge like any other.
+
 The decision of every trace is stored in the merged trace
 (`metadata.clock.merge`: method, estimate, bound, drift, correction,
 number of matched messages). On one host, round-1 per-rank traces whose
@@ -4938,13 +5439,14 @@ OpenCL hook.
 | `mpi` | `op=sendrecv` | The `MPI_Sendrecv[_replace]` pair (`.send` half `type=send`, the call `type=recv`) |
 | `mpi` | `type=start,ptype=send\|recv,peer=,wpeer=,tag=,commid=,bytes=,sid=`, `startall=1` | `MPI_Start` (one zero-length span per request of an `MPI_Startall`, at the call's start): a persistent request's post |
 | `mpi` | `root=R,wroot=W` | Rooted collectives (blocking and non-blocking): the root's rank in the communicator and in `MPI_COMM_WORLD` |
+| `mpi` | `type=init\|finalize,rank=,commid=0,csize=,hook_ns=`, `required=,provided=` | `MPI_Init`/`MPI_Init_thread` and `MPI_Finalize`: the call from the wrapper's entry to its return; `hook_ns=` the hook's own work in it (outside the `PMPI_` call); `MPI_Init_thread`'s thread levels (`MPI_THREAD_*` as 0 single, 1 funneled, 2 serialized, 3 multiple) |
 | `opencl`, `memory`, `sync` | `queue=N`, `ooo=1`, `ev=N`, `wait=N;N...`, `nwait=N`, `wait_unknown=N` | OpenCL command queue (out-of-order), the event an enqueue handed to the caller, its wait list (at most 12 ids, the full length, how many events the hook could not name) |
 | `memory` | `blocking=1` | OpenCL blocking transfer (no device span: the host call is the transfer) |
 | `opencl`, `memory` | `side=gpu` | OpenCL device spans (event completion callbacks), transfers included |
 | `opencl` | `type=marker\|barrier,side=cpu` | `clEnqueueMarkerWithWaitList` / `clEnqueueBarrierWithWaitList` |
 | `memory` | `blocking=1\|staged\|0` | CUDA `cudaMemcpy`: returns after the copy / after staging pageable memory for DMA / without host synchronization (device to device), per CUDA's API synchronization behaviour; `cudaMemset` on pinned host memory `blocking=1` |
 | `cuda` | `type=stream_create,op=stream_create,stream=S`, `nonblocking=1`, `priority=P` | Stream creation (`cudaStreamCreate[WithFlags\|WithPriority]`, `cuStreamCreate[WithPriority]`) |
-| `cuda` | `op=host_func` (host); `type=host_func,side=gpu,exec=host,timing=host,lid=` | `cudaLaunchHostFunc` / `cudaStreamAddCallback` / `cuLaunchHostFunc`: the enqueue call, and the function's run on the runtime's callback thread, in stream order |
+| `cuda` | `op=host_func` (host); `type=host_func,side=gpu,exec=host,timing=host,lid=` | `cudaLaunchHostFunc` / `cudaStreamAddCallback` / `cuLaunchHostFunc`: the enqueue call, and the function's run on the runtime's callback thread, in stream order. An enqueue on a stream being captured into a graph says `captured=1` and has no run span: the function becomes a graph node that runs once per launch of the graph, so the hook passes it through unwrapped (the same for `hipLaunchHostFunc` / `hipStreamAddCallback`) |
 | `mpi` | `wildcard=1` | `MPI_Irecv` posted with `MPI_ANY_SOURCE`/`MPI_ANY_TAG`; real peer/tag not yet known (see [`mpi` backend](#mpi-backend)) |
 | `mpi` | `rpeer=P,rtag=T` | Resolved wildcard match, on the completing `Wait`/`Waitany`/`Test`/`Testany` span |
 | `mpi` | `rmatches=<req_id>/<peer>/<tag>;...` | Resolved wildcard matches for `MPI_Waitall`/`MPI_Waitsome` (multiple requests at once) |
@@ -5064,6 +5566,36 @@ boundary rule as `span:` records (see "Names containing `:`" above) and
 populates `InstantEvent.tags` the same way `SpanEvent.tags` is populated;
 the `MPI_Test*`/`MPI_Cancel` instants carry `flag=`/`psid=`/`rpeer=`/`rtag=`
 there.
+
+**Process-begin marker.**
+
+```
+inst:other:<pid>:<tid>:<ts_ns>:process_begin:type=process_begin,hook=<hook>
+```
+
+One per process image, from `hooks/common/hp_transport.h`: `hp_tx_init`,
+which every preloaded hook (MPI, CUDA, ROCm, OpenCL, NCCL, GNU libgomp)
+calls from its constructor, claims the process's begin time
+(`CLOCK_MONOTONIC`, as every record). The OMPT tool has no constructor:
+the OpenMP runtime loads it and calls
+`ompt_initialize` when the runtime initializes, which is where it claims
+-- in a run with only the OMPT tool, the marker is the OpenMP runtime's
+start, not the process's. The claim lives in one exported
+object, `hprofiler_process_mark`, which each hook looks up with
+`dlsym(RTLD_DEFAULT)`, so every hook loaded into the process shares the
+first one's: the earliest hook to load wins (`hook=` names it) and the
+others neither claim nor send again. The marker is sent with the image's
+first record, by whichever hook emits first: a process that records
+nothing -- a shell, `mpirun`, `srun`, Hydra or PRRTE proxies, which inherit
+the preload -- sends none. A forked child sends none (its pid differs from
+the claim's); an `exec`'d image claims and sends its own (the analysis
+keeps a pid's earliest) -- also one exec'd from a `vfork` child, which
+leaves the parent's claim alone ([Hook transport](#hook-transport-and-collector)). Its cost: one `dlsym` and one atomic
+compare-and-swap in the constructor (about 0.4 µs), one more record per
+process (about 0.75 µs, sent with the first), and on every record two
+atomic loads (the shared object's address, its `sent` flag: about 0.6 ns)
+-- a microbenchmark of `hp_transport.h` on the development machine,
+median of 30 processes.
 
 #### Device-activity status record
 
@@ -5190,11 +5722,25 @@ one shared transport, included once per hook library:
   status. Later events (other libraries' destructors) go out synchronously,
   after the calling thread's own leftover ring, so its order is kept.
 - **fork:** the child drops the parent's buffered records (the parent sends
-  them), its socket copy and cached pid/tids, and starts its own transport
-  on its first event.
+  them), its socket copy and cached tids, records its own pid, and starts
+  its own transport on its first event.
 - **exec:** preloaded hooks interpose `execve`/`execv`/`execvp`/`execvpe`/
-  `execl`/`execlp`/`execle` and drain before the image is replaced (a
-  `vfork` child is detected and left alone).
+  `execl`/`execlp`/`execle` and drain before the image is replaced.
+- **vfork:** a `vfork` child (Python's `subprocess`, so Triton compiling its
+  launcher with `cc`; `posix_spawn`-style launchers) shares the parent's
+  memory until it execs and runs no `atfork` handlers. The exec wrappers
+  run in it, in the parent's memory: they compare its pid with the one the
+  transport recorded when it was configured (the hooks' constructors; again
+  in a forked child) and touch nothing -- no drain, no cached id. The exec'd
+  image is a process of its own (its marker and records under its pid; `cc`
+  records nothing and sends nothing). Before 2026-11-11 the pid was cached
+  on first use: a vfork before the parent's first record (Triton's driver
+  compiles `cuda_utils.c` before the first tensor) filled the parent's cache
+  with the child's pid -- every later record of the program carried the
+  child's pid, its process-begin marker was never sent (the claim looked
+  like another process's), and its transport was shut down to synchronous
+  sends. Traces from such runs show one process under a pid that is not the
+  program's, and no marker (the window falls back to the first event).
 - `HPROFILER_TRANSPORT=sync` selects synchronous sends (same records, same
   status) for A/B comparisons; `HPROFILER_RING_KB` (default 512) and
   `HPROFILER_DRAIN_US` (idle drain interval, default 500) tune the rings.
@@ -5724,6 +6270,66 @@ main cost of very event-dense runs. The ring primitive itself
 measures ~110–230 ns per push regardless of thread count, against 0.3–14 µs
 for mutex + `write(2)` at 1–8 threads.
 
+#### Dependency-capture overhead and memory
+
+What the dependency records of [Dependency capture by runtime](#dependency-capture-by-runtime)
+cost, measured with microbenchmarks that time a tight loop of one call
+inside the program (`HPROFILER_RING_KB=65536` for MPI, so no producer
+waited for the collector), each the median of 5 runs, on the development
+machine on 2026-10-29: the hooks before these records ("before") against
+the current ones ("after"), and the program without a hook. Each row's
+"before → after" difference is the added per-call work; the ranges give
+the spread over the repeated sessions (the unhooked MPI loop itself varied
+from 0.18 to 4.4 µs between sessions: Intel MPI's single-process path is
+noisy here).
+
+| Call | No hook | Before | After | Added per call | Why |
+|---|---|---|---|---|---|
+| MPI `Isend`+`Recv`+`Wait` to self (Intel MPI, 1 rank) | 0.18–4.4 µs | 2.3–7.7 µs | 2.4–8.2 µs | 0.1–0.5 µs | sequence counters under the communicator mutex, `sseq=`/`rseq=` |
+| MPI `Allreduce` (1 rank) | 18–20 ns | 0.55–0.70 µs | 0.74–0.84 µs | 0.12–0.29 µs | `cseq=`/`csize=` |
+| GNU libgomp `task` without depend | 0.34–0.40 µs | 1.2–1.9 µs | 1.1–2.0 µs | ≤ 0.15 µs (within noise) | ABI check (once), task id |
+| GNU libgomp `task depend(inout) depend(in)` | 0.65–0.71 µs | 1.2–2.0 µs | 1.4–2.3 µs | 0.05–0.26 µs | two token lookups (sharded table), `deps=` |
+| GNU libgomp lock set+unset | 14 ns | 1.1–2.6 µs | 1.1–2.4 µs | none measurable | token instead of address |
+| CUDA kernel launch | 1.3–1.4 µs | 3.0–3.5 µs | 3.0 µs | none measurable | stream-life lookup |
+| CUDA graph launch (4 nodes) | 3.3–3.5 µs | 5.8–6.8 µs | 5.8–6.9 µs | ≤ 0.3 µs | `gexec=`/`gver=` lookup |
+| CUDA graph instantiation (1,000 nodes, once per exec) | 1.9–2.1 ms | 2.5–3.0 ms | 3.1–3.3 ms | 0.3–0.7 ms | the structure read once (nodes, edges, clone pairs) |
+| OpenCL kernel enqueue chained on its predecessor | 2.6–2.9 µs | 6.6–8.1 µs | 6.7–10.4 µs | ≤ 2.3 µs (within noise in 2 of 3 sessions) | event registration with references |
+| OpenCL enqueue with a 64-event wait list | 9.5–9.8 µs | 18.9–22.5 µs | 22.6–27.2 µs | 0.3–8 µs | every id emitted (was: the first 12) |
+| OpenCL `clRetainEvent`+`clReleaseEvent` | 58–63 ns | 58–67 ns | 89–115 ns | 26–57 ns | the event table follows references |
+| OpenCL Intel USM copy (`clEnqueueMemcpyINTEL`) | 3.5–4.1 µs | 4.3–5.2 µs (not recorded) | 8.0–10.9 µs | 2.8–6.6 µs | now recorded like any transfer |
+| HIP launch (stand-in runtime) | ~0 | 1.6–1.9 µs | 1.5–1.9 µs | none measurable | stream-life lookup |
+
+**Bytes per record** (whole wire lines, from the transport's byte
+counts): the MPI benchmark's 706,000 records grew by 8.9 B on average
+(233.0 → 241.9 B: `sseq=`, `rseq=`, `cseq=`, `csize=`); the GNU libgomp
+task benchmark's 600,000 by 7.5 B (195.4 → 202.8 B: `deps=` tokens on half
+the tasks, task ids); an OpenCL wait list costs its ids' digits plus a
+separator each, up to 4096 ids. A CUDA graph exec's structure is emitted
+once, at instantiation: about 145 B for the `graph_exec` header, 14.5 B per
+node and 24.5 B per edge (measured on a 1,000-node chain), in parts of 256;
+one `stream_info` record per stream life. The eBPF event grew from 48 to
+96 B in the kernel ring buffer; an `off_cpu` line of a sleep with its waker
+is about 161 B (61 B before).
+
+**Table memory** is in [Tables and their capacity](#dependency-capture-by-runtime):
+at most about 12 KiB + 4 B per destination rank (MPI communicators), 56 KiB
+(matched probes), 4.3 MiB (GNU libgomp tokens), 1 MiB per handle kind
+(CUDA, HIP), 2 MiB (OpenCL events), all grown on demand except the fixed
+MPI tables.
+
+**Not measured:** multi-rank MPI (the benchmark is one rank sending to
+itself), ROCm on an AMD GPU (the HIP numbers are against a stand-in
+library), CUDA's resource callbacks under a stream-creation storm, and the
+whole eBPF side -- the program has never been loaded (no `CAP_BPF`): its
+per-event work is two map operations more per waking and per switch-in
+(an LRU-hash update in `sched_waking`, a lookup and a delete in
+`sched_switch`), not timed.
+
+**Analysis cost.** The wakeup edges (`semantics/sched.py`) cost under 10 ms
+on traces without scheduler records (one store query) and 0.43 s for 70,000
+blocking calls with 70,000 sleeps (synthetic trace, 35 MB peak); the other
+new rules run inside the existing builders' passes.
+
 #### `--call-tree` overhead
 
 When `--call-tree` is active (`HPROFILER_CALLSTACK=1`), each intercepted API
@@ -5858,6 +6464,12 @@ LULESH, mixbench) checks traces against each benchmark's own ground truth.
 | OpenMP via GNU libgomp interception | ✅ Verified against ground truth; confirmed at an HPC site | Ground-truth suite, `test_gomp_hook.py`, `run_matrix.sh`; tasks, `taskwait`, `taskgroup` and the lock API in `test_openmp_sync.py` (task bodies run on their real arguments, exact counts); harness EPCC taskbench/syncbench: `omp_task_create` = T·I (PARALLEL_TASK), `omp_taskwait` = T·I (TASK_WAIT), `omp_lock_hold` = Q (LOCK_CONTENDED) and = I (LOCK_UNCONTENDED: 1590 = 5·320 − 10); a GROMACS run on the Dardel cluster (`srun`, 4 ranks) produced populated OpenMP/sync/MPI lanes | The exact Cray `cpeGNU` code paths beyond what the local GCC emits; `taskloop`, `sections`, `ordered` (not intercepted) |
 | MPI hook semantics (wildcard resolution, `Waitany`/`Waitsome`/`Test*`/`Cancel`, `commid=`, RMA synchronization) | ✅ Verified end to end in one process | `test_mpi_protocol.py`, `test_mpi_rma.py`: real hook, real wire bytes, production parser; ground-truth suite (1 rank to itself) | — |
 | MPI with real ranks (statuses, cancellation, sub-communicators, `Comm_dup`, `Sendrecv*`, newly wrapped calls, wildcard resolution, `Test` polling, `commid=` agreement, dependency diagnostics) | ✅ Verified with 4 Intel MPI ranks | `test_mpi_multirank.py` (`tests/fixtures/mpi_status.c`): the program's output equals the unprofiled run; every receive paired, including renumbered sub-communicators and two concurrent duplicates; (`tests/fixtures/mpi_proto.c`): the output against its ground truth unprofiled and profiled, `rpeer`/`rtag` and `rmatches` resolving exactly the three wildcard messages, `polls + 1` `MPI_Test` instants with one `flag=1`, the cancelled receive without a match or edge, one `commid=` per `Comm_split` half shared by its two ranks, three high/certain phase-A edges and one `Test`-only completion counted; harness: hprofiler-fixtures MPI protocol checks, IMB `-multi` groups (1272/1272 receives matched), OSU per-rank | Open MPI, Cray MPICH, Slurm/PMIx launches, more than one node |
+| MPI sequence numbers (`sseq=`/`rseq=`/`cseq=`), matched probes (`mid=`), (`commid`, `cseq`) grouping, newly wrapped `I*v`/`Iscan` collectives and communicator constructors | ✅ Verified with 4 Intel MPI ranks | `tests/integration/test_mpi_sequence.py` (`tests/fixtures/mpi_seq.c`): output equal to the unprofiled run; numbers contiguous per key, also for two threads posting to one destination; every pairing agrees with the value its receive got (exact, tag-wildcard and full-wildcard receives, three communicators, two threads per side) or is marked `low` on the contested channel; `Mprobe`/`Mrecv` linked although the library reused the message handle, `Improbe`/`Imrecv`/`Wait`, `MPI_MESSAGE_NO_PROC`, a `PMPI_Mprobe` probe reported as `mid_unknown=1`; collectives grouped by (`commid`, `cseq`); a send record removed from the real trace: no edge for its receive, the rest unchanged, the gap reported. `tests/test_mpi_sequence.py`: both builders on synthetic gaps, placement, concurrency, misaligned `cseq`. MPI-4 persistent collectives: an MPICH 4.1 single-process run | Open MPI, Cray MPICH, more than one node; a real transport loss (the removal is simulated); persistent collectives on more than one rank |
+| GNU libgomp depend clauses (`deps=`), task parents and joins, lock tokens | ✅ Verified on GCC 13.3 (`GOMP_5.1.2`) | `tests/integration/test_gomp_deps.py` (`tests/fixtures/gomp_deps.c`): the reconstructed dependence pairs equal the program's for every type GCC passes (in, out, inout, mutexinoutset, inoutset, depobj, `omp_all_memory`); `taskwait depend` waits for the conflicting sibling only; a re-initialized lock gets a new token; no address in the trace; with the ABI level forced past the checked one, `deps_unsupported=abi` and no dependence edges. `tests/test_openmp_dependences.py` (rules) | Other libgomp releases (GCC < 9 and ≥ 14 decode only after their layout is checked) |
+| CUDA graph structure (`graph_exec`/`graph_nodes`/`graph_edges`, `gnode=`, `gexec=`/`gver=`), stream and event lives, `stream_info` | ✅ Verified on the MX550 (CUDA 12.9 toolkit) | `tests/integration/test_cuda_graphs.py` (`tests/fixtures/cuda_graphs.cu`): structure once per exec on the exec's node ids, node types incl. a child graph's markers, fork / join, an empty join node and a disabled node passed through, edges around a child graph, a captured graph, versions 1 / 1 / 2 / 3 across `cudaGraphExecUpdate` and `cudaGraphNodeSetEnabled`, a stream re-created at the same address as two lives; `tests/native/cupti_records_test.c` | Event-address reuse (this driver never reused one: that check skips); child graphs' inner nodes (no clone pairing: unmapped by design); multi-GPU; device graph launches |
+| HIP stream and event lives, host functions, cooperative / Ext launches, 2D / peer / device-to-device copies | ⚠️ Against a stand-in runtime only | `tests/integration/test_rocm_hip_mock.py` (`tests/fixtures/hip_mock.c` as `libamdhip64.so`): lives across address reuse, host functions in order on one callback thread, every new wrapper's tags | Any AMD GPU; ROCprofiler-SDK records; real HIP's handle reuse |
+| OpenCL full wait lists, event references, user events, per-device clocks, Intel USM enqueues | ✅ Verified on an NVIDIA GPU (`callback_end`) and the Intel CPU runtime (`host_timer`) | `tests/integration/test_opencl_events.py` (`tests/fixtures/ocl_events.c`): a 40-event list whole, a user event gating its kernel on `clSetUserEventStatus`, a released event's reused address not inheriting its id, a tiny event table naming nothing falsely, each device's own clock domain, `clEnqueueMemFillINTEL`/`MemcpyINTEL` with their wait lists; `tests/native/opencl_trampoline_test.c` (extension wrappers per platform, the fifth platform's fallback) | AMD and Intel GPU OpenCL; more than four platforms in one process |
+| AdaptiveCpp dependencies | ✅ Checked on AdaptiveCpp 25.10: CUDA (MX550), OpenCL (Intel CPU), OpenMP host device | `tests/integration/test_sycl_deps.py` (`tests/fixtures/sycl_deps.cpp`): accessor and event dependencies across two queues become event waits on CUDA and queue order on OpenCL; on the host device none, reported; a CUDA copy depending on a host-device kernel waits in an unlinked host function, reported. `tests/test_sycl_dependencies.py` | HIP; a CUDA kernel that `depends_on` a host-device event (hangs in AdaptiveCpp here, with or without hooks); AdaptiveCpp's SMCP (ahead-of-time) targets |
 | File-descriptor inheritance, exit status, collector socket fallback | ✅ Verified | `test_runner_process.py`: an inherited pipe is usable in the program and no descriptor is added; exit codes and signals; the abstract socket with the real GNU libgomp hook; harness OSU per-rank (`PMI_FD`) | — |
 | Call-site attribution and disassembly (OMPT, libgomp, MPI) | ✅ Verified end to end | `test_callsite_e2e.py` on MPICH, LLVM libomp, GNU libgomp, launched through a wrapper | — |
 | CUDA native device activity (CUPTI) | ✅ Functionally verified on one GPU | `test_cuda_native_activity.py` on the MX550 in all three `HPROFILER_DEVICE_ACTIVITY` modes plus a static-runtime build (again on 2026-10-15, driver 580.178.04); harness vendor-samples: 298/298 `cuLaunchKernel` with `mod=` and `hdev=`, device spans carrying the launch's module; correlation and device-clock correction: `test_gpu_activity.py` (a unique id 77 µs early is linked, a wrapped id decided by time, a synthetic 0 → −80 µs drift corrected without reordering, no drift → unchanged) and the timestamps of the one real drifting run (`tests/fixtures/cupti_drift_mixbench.json`, also re-assembled from that run's store): all 298 kernels linked with `mod=` and launch metrics, maximum correction 79.7 µs, none before its submission afterwards | Any comparison against Nsight Systems or other vendor tools; other GPUs; drift ahead of the host (undetectable) |
@@ -5879,18 +6491,20 @@ LULESH, mixbench) checks traces against each benchmark's own ground truth.
 | Span ids shared by two hooks (older traces) and per-hook id spaces | ✅ Unit tested; checked on a saved LLNL Comb trace and real CUDA / MPI runs | `test_span_links.py`: resolution by family / enclosing range / time, no guess across families; a thread whose CUDA launch, device kernel, `MPI_Irecv` and `MPI_Wait` share one id gives a forest with the right links in both call-tree builders and the flame graph (1500 such iterations: was a RecursionError); MPI completion → MPI request, not the later CUDA call, in both edge builders; `hp_ids.h` ids of the six hooks differ. Comb CUDA trace copy (816 shared ids): call tree 0.2 s, depth 9, all three GUI loader steps OK (was the error); the harness's GUI self-test on the 8 clean-test traces that failed (OSU CUDA ibcast / iallreduce / bw / mbw_mr, Comb CUDA ×2, LULESH LLVM c1 / c8 -- recursion error or killed at a 6 GB cap) passes under a 3 GB cap, peaks 93–831 MB, 1–17 s (the old call tree on OSU iallreduce: ~90 MB/s until killed); all 816 explicit MPI links MPI → MPI (281 went to a CUDA call); path unchanged, 383.6/384.9 ms. New hooks: CUDA and MPI fixture runs carry hook tags 1 and 3; CUDA / MPI / OpenMP / OpenCL integration tests pass | ROCm id space compile-checked only (no AMD GPU here) |
 | Run comparison | ✅ Verified on constructed scenarios | `test_causal_compare.py` scenarios with known single differences; GUI interaction test | Real program pairs beyond the scenarios |
 | Multi-node merge and clock offsets | ✅ Verified on one host (true offset 0); ⚠️ multi-host pending | `test_multinode.py`: known offsets, asymmetric latency, 50 ppm drift, three coupled nodes, no clock data, older counters, same `boot_id`, CLI; harness per-rank OSU latency/allreduce and LULESH gnu-c1 with `HPROFILER_CLOCK_SYNC=1`: offsets 0, 0 violations (were 326 and 711); the forced estimate path (`HPROFILER_CLOCK_SYNC_IGNORE_BOOT_ID=1`) within 41 ns of 0, 0 violations | A real multi-host run (Vera/Dardel): network latency asymmetry, real drift, different boot_ids |
+| Critical-path window from process begin; `MPI_Init`/`MPI_Finalize` spans and rendezvous | ✅ Verified with 4 Intel MPI ranks and the knownpath harness (Open MPI 5.0, LLVM libomp, MX550) | `test_cp_window.py` (window, lead on the first span, `path_ns` sum = `observedNs`, no markers / `--window first-event`, modeled leads, rendezvous kept / dropped / `low`, CLI); `test_mpi_lifecycle.py` (`mpi_lifecycle.c`, 4 Intel MPI ranks: spans inside the program's own times, one marker per rank and none from the launcher, one with two hooks, the last rank's 60 ms before `MPI_Init` on the path); `test_transport_native.py` (one marker per recording image, plain / ASan+UBSan / TSan). Harness `fixcheck-window` against `knownpath/truth.py` (before → after): MPI token rings rank 0 40.1 → 60.1 ms of 60, recall per rank 66.8 % → 100 %, precision 99.95–99.96 %; `mpi-collective` rank 0 100.1 → 200.1 ms of 200, precision 99.97 %; path time before `MPI_Init` 1.7–4.3 ms (launch skew to the last rank's `MPI_Init`); `omp-imbalance` +0.45 %, `omp-tasks` +0.37 % of truth; `hybrid-chain` precision 97.4 → 95.4 % (rank 0's first OpenMP fork, 9.1 ms, now in the window); GPU time on the path / measured unchanged (99.1 %, 99.2 %, 80.2 %); OSU latency: both spans on both ranks, capture complete | MPICH, Cray MPICH, MVAPICH; multi-node merges with markers; ROCm and GNU-libgomp-only runs |
+| Where the observed path starts (records it cannot connect); CUDA event queries and driver-API event syncs; the transport in a `vfork` child | ✅ Verified on the MX550 (CUDA 12.8 runtime and CUPTI; PyTorch 2.11 with the CUDA 13 runtime and CUPTI; driver 580) | `test_cp_unconnected_tail.py` (a trace ending on a sync record without its host call: the walk starts at the last host event, tail and unmatched records reported, `path_ns` sum kept; with the host calls nothing left; no host span: as before); `test_transport_native.py` `vfork` scenario (vfork+exec before the first record and in mid-run: every record keeps the parent's pid, its marker sent, its ring kept -- all three fail with the transport before 2026-11-11; plain / ASan+UBSan / TSan); `test_native_gpu_records.py` (callback spans for un-intercepted event syncs and completed queries, none for a not-ready query or a runtime query's own driver call); `test_cuda_vfork_events.py` (`cuda_vfork_events.cu` on the MX550: the program's own pid on every span, one marker, every `sync=event` record with its host call -- `cudaEventSynchronize`, `cudaEventQuery`, `cuEventSynchronize`, `cuEventQuery` --, the not-ready query unrecorded, window from the marker, nothing unconnected). Harness `fixcheck-triton`: Triton tutorial vector add observed path 143 ns → 7.854 s = its wall time from process begin (the marker now sent; 3.43 s of Python start-up before the first call), 3645 spans with 459 `add_kernel`, every one of 1476 `sync event` records with its `cudaEventQuery`, one pid (the program's); `knownpath` GPU time on the path 35.38 ms (`cuda-chain`, smoke2 34.95–35.61 ms) and 36.12 ms (`torch-chain`, one run; smoke2 36.34–39.90, smoke 35.73–37.09 ms) -- the same traces' structure, and smoke2's ten GPU stores re-analysed give identical GPU time on the path | Other PyTorch / CUDA versions and drivers (whether CUPTI reports queries); ROCm (`hipEventQuery` not recorded); MPICH; multi-node |
 | Node-collector mode (`collect` + `exec`) | ✅ Verified on one node | `test_node_collector.py`: 4 Intel MPI ranks started with `mpirun … hprofiler exec` into one trace, every receive paired, idle exit; `exec` started before its collector waits and loses nothing; harness LULESH 8 ranks: per-rank vs. node-collector overhead (see [Node-collector mode](#node-collector-mode-hprofiler-collect--hprofiler-exec)) | Slurm (`srun`, PMIx), more than one node |
 | Opt-in exact point-to-point rule (`--exact-p2p-high`) | ✅ Unit tested; tier mix measured | `test_exact_p2p_rule.py` (both edge builders: complete channel, older hooks, unequal counts, Mprobe/persistent requests, cancelled sends, unregistered communicators, event loss, off by default); harness traces osu/imb/hprofiler-fixtures before → after | Whether "high" on these edges is warranted on MPI libraries other than Intel MPI / MPICH |
 | Hook semantic tags (OMPT `sk=`/`task=`/`parent=`, corrected sync-region and target kind names; OpenCL `queue=`/`ev=`/`wait=`/`blocking=`; MPI `MPI_Start` posts, `root=`/`wroot=`; NCCL `pseq=`/`group=`/async timing; CUDA `blocking=`, stream creation flags, host functions) | ✅ Verified with real runtimes on hooks built in a scratch directory (`build/` is not rebuilt here) | LLVM libomp (`test_openmp_sync.py`: 2 `omp_taskwait`, 1 `omp_taskgroup`, every sync region with `sk=`; the shipped `build/lib` fails the kind check -- the old names -- and the new tests skip there); the NVIDIA OpenCL ICD on the MX550 (`test_opencl_deps.py`); 4 Intel MPI ranks (`test_mpi_persist.py`, `test_mpi_multirank.py` and the protocol/RMA suites on the new hook); the MX550 with CUPTI and the proxy (`test_cuda_deps.py`); NCCL against a stand-in libnccl that launches real kernels and defers grouped operations (`test_nccl_hook.py`) | Real NCCL and multi-GPU; ROCm; GNU libgomp has no task ids on `taskwait`; `build/` until it is rebuilt in the user's container |
 | Evidence model (candidates, match groups, statuses, persisted) | ⚠️ Unit tested on synthetic traces | `test_evidence.py`: the default view equals `build_edges()` on MPI, OpenMP, CUDA and mixed traces; statuses, groups, contradicted edges kept, `explain()`, memory/disk persistence and staleness | Application traces |
 | Gated-call bounds, unknown mode, variants | ⚠️ Unit tested on synthetic traces | `test_cp_model.py`: each variant's modeled length equals a brute force over all paths, `0 ≤ whi ≤ d`, the range brackets the headline; unmatched receives are unknown, a receive's processing tail, the last arriver | Application traces |
 | Clock domains, offsets, undecidable steps | ⚠️ Unit tested on synthetic traces; one real OpenCL trace | `test_cp_clock.py` (solver, domains, a late OpenCL clock shifted back, a cross-node contradiction, an undecidable step); the `ocl_deps.c` fixture on the NVIDIA ICD: its device clock shifted by −50.6 µs to satisfy its waits | Multi-node traces; drifting device clocks over long runs |
-| Runtime semantics edges (MPI persistent / non-blocking / rooted; CUDA host functions, blocking copies, legacy stream; OpenCL queues; NCCL pairs and groups; OpenMP task joins, dependences, locks) | ✅ Verified on the fixtures above; unit tested on synthetic traces | `test_semantics_mpi.py`, `test_semantics_gpu.py`, `test_semantics_runtimes.py` (both pipelines equal); graph checks in the integration tests: 20 persistent messages paired on 4 Intel MPI ranks, bcast root → 3 members, `Ibcast`/`Iallreduce` → their waits; host functions in stream order and the legacy stream's binding edges on the MX550; OpenCL wait lists, marker, barrier, `clFinish`, blocking transfer on the ICD; 51 task joins and 1 dependence with LLVM libomp | Application traces; real NCCL; per-thread-default-stream CUDA programs (assumed blocking streams) |
-| Alternative worlds and the "not enough evidence" verdict | ⚠️ Unit tested on synthetic traces | `test_cp_alternatives.py`: none on forced answers, shifted alignments, every world of a channel pairing each send once and in order (60 random channels, with and without lost events), a receive only one send can have completed, a tie, a clock-uncertain last arriver, a reused correlation id as a swap, a verdict that flips when the path moves, when spans join it in another world, or when the modeled length varies | Application traces; how often the verdict is right |
+| Runtime semantics edges (MPI persistent / non-blocking / rooted / sequence-ordered / matched probes; CUDA host functions, blocking copies, legacy stream, graph-internal edges; OpenCL queues, user events; NCCL pairs and groups; OpenMP task joins, dependences (also GNU `deps=`), locks; HIP host functions; OS wakeups) | ✅ Verified on the fixtures above; unit tested on synthetic traces | `test_semantics_mpi.py`, `test_semantics_gpu.py`, `test_semantics_runtimes.py`, `test_mpi_sequence.py`, `test_openmp_dependences.py`, `test_sched_wakeup.py` (both pipelines equal); graph checks in the integration tests: 20 persistent messages paired on 4 Intel MPI ranks, bcast root → 3 members, `Ibcast`/`Iallreduce` → their waits; host functions in stream order and the legacy stream's binding edges on the MX550; OpenCL wait lists, marker, barrier, `clFinish`, blocking transfer on the ICD; 51 task joins and 1 dependence with LLVM libomp | Application traces; real NCCL; per-thread-default-stream CUDA programs (assumed blocking streams) |
+| Alternative worlds and the "not enough evidence" verdict | ⚠️ Unit tested on synthetic traces | `test_cp_alternatives.py`: none on forced answers, shifted alignments, every world of a channel pairing each send once and in order (60 random channels, with and without lost events), a receive only one send can have completed, a tie, a clock-uncertain last arriver, a reused correlation id as a swap, a verdict that flips when the path moves, when spans join it in another world, or when the modeled length varies; rooted collectives: no unit for a `bcast` whose root starts first, on one clock or across clock domains with bounds wider than the gaps, nor for an `MPI_Ibcast`'s waits; a `reduce` whose two latest non-root arrivals are within the bounds redirects only the root's edge; a barrier tie on one clock is one unit; an `MPI_Iallreduce` post tie redirects the members' completions (5 of these 6 fail with the generator before 2026-11-11). Saved harness stores (`smoke2`, re-analysed with the installed build, `last_arriver` units before → after): `osu_ibcast` 652 → 2, IMB `sendrecv` 11 → 1, `multi` 14 → 1, `anysource` 7 → 0, Comb `testsome` 1 → 0, ties unchanged (OSU `allreduce` 3, CUDA `allreduce` 2, mixbench `cpu-llvm` 2); observed path and its span count unchanged in all; `osu_ibcast` from `smoke` "not enough evidence" → "no alternatives" | Application traces; how often the verdict is right; multi-node traces with real clock bounds; MPICH |
 | Edge calibration (method) | ⚠️ Method unit tested; demonstrated on simulated data only | `test_edge_calibration.py` (PAV, ECE, Brier, log loss, strata, round trip); `tests/validation/test_edge_calibration.py`: simulated MPI channels with lost send records, held-out ECE 0.003 and Brier 0.027 vs. 0.163 for the base rate | Any calibration on real programs: none ships, every probability is "unquantified" |
 | Attribution: blame (joint release), replay counterfactuals, compare's joint origins | ⚠️ Unit tested on synthetic traces | `test_cp_attribution.py` (exact replay of unchanged traces, shrinking moves the end, blame of a receive, a joint release, blame passed through a waiting sender, every waiting nanosecond charged once); replay monotone and 1-Lipschitz on 25 random traces (`test_cp_model.py`); `test_causal_compare.py` joint release | Application traces; whether replayed reductions match real reruns |
 | Reports: CLI sections, `--json`, `--export` tags, GUI evidence fields, serialization efficiency from path time | ✅ Unit tested | `test_critical_path_cli.py`, `test_timeline_analysis_evidence.py`, `test_gui_text_overflow.py` (the new rows, large font); `test_criticalpath.py` (a call partly on the path counts that part) | — |
-| eBPF scheduler tracer | ⚠️ Compiled, linked, run to the privilege check — never loaded | `bpftool gen skeleton` structure check; `EPERM` exactly where `unprivileged_bpf_disabled=2` puts it | The kernel BPF verifier, event correctness, attaching to an `hprofiler run` capture |
+| eBPF scheduler tracer, wakeup edges | ⚠️ Compiled, linked, run to the privilege check — never loaded | `bpftool gen skeleton` structure check; `EPERM` exactly where `unprivileged_bpf_disabled=2` puts it; the kernel and userspace event layouts are asserted equal at compile time; `tests/test_sched_wakeup.py`: every emitted line (`tests/native/sched_event_fmt_test.c`, ASan+UBSan) through the collector's parser, and the wakeup edges and each fallback on synthetic records, both builders | The kernel BPF verifier, what the kernel puts in each field (`prev_state` encoding, `pcpu_hot`, `wake_cpu`), the in-kernel waking join, attaching to an `hprofiler run` capture, any per-event cost |
 | Trace store | ✅ Verified at scale | Memory/disk parity test; 2M/5M-span stress test | — |
 | TUI | ✅ Interaction tests | Textual `run_test()` tests (dashboard, timeline, connectors, flame graph, disassembly messages) | — |
 | GUI | ✅ Interaction tests and live displays | Synthesized-input QML tests, real-process tests (`test_gui_cancel.py`, Compare launch, Open Profile), screenshots on a real X server, use over `ssh -Y` to an HPC cluster | The platform file-picker dialog; menus clicked with the mouse |
@@ -5904,7 +6518,7 @@ LULESH, mixbench) checks traces against each benchmark's own ground truth.
 | **Backend probes** | Auto-detection enables a backend only when its probe passes (a CUDA device answers `cuInit`, `/dev/kfd` lists a GPU, `likwid-perfctr` can measure, an OpenCL device exists). A probe proves the hardware answers, not that every feature works (e.g. CUPTI activity on that device), and a backend requested explicitly is used even when its probe fails (with a warning). | `hprofiler backends` shows each probe's reason. |
 | **Collector ingestion rate** | The Python collector ingests ~35k events/s after the run; tens of millions of events take minutes to ingest (memory stays bounded). If it falls behind *during* the run long enough to fill a thread's ring, producers wait (bounded) and then drop — always counted and warned about. | Raise `HPROFILER_RING_KB`, or narrow the backends or region. |
 | **Single-node capture** | The collector socket is reachable only on the node running `hprofiler run`. Multi-node traces need one capture per node plus `merge-nodes`. Its clock alignment is verified on one host only (same clock, and the estimate path forced); across hosts the offsets rest on the measurement bound and the message order, never validated against an independent clock. The drift model is linear between the `MPI_Init` and `MPI_Finalize` measurements. Processes of one host in different time namespaces are distinguished only through the collector's own namespace. | Treat cross-node edges as unverified until a multi-host run confirms them; read the per-trace decisions `merge-nodes` prints. |
-| **OpenCL GPU timing** | Device timestamps are converted with one calibration sample at the first event; sub-millisecond kernels may carry ±50 µs timestamp error. | Use the CUDA or ROCm backend for short-kernel timing. |
+| **OpenCL GPU timing** | A device with `clGetDeviceAndHostTimer` is mapped with a bounded error (`clock_err_ns=`, re-calibrated every 100 ms, an assumed 100 ppm drift in between); one without it (the NVIDIA ICD here) from its first completion callback, late by that callback's delivery latency -- unbounded, and reported (`ocl_clock_unbounded`). | Use the CUDA or ROCm backend for short-kernel timing on such devices. |
 | **OpenCL depth** | Only host-API events (kernel name, transfer size); no intra-kernel constructs. | Inherent: OpenCL has no construct callback API. |
 | **CUDA/ROCm records arrive late** | Native records come in buffers (CUPTI flushes every `HPROFILER_CUPTI_FLUSH_MS` and at exit); correlation runs once after the run. | Expected. |
 | **Abnormal exit loses GPU records** | Records still buffered in CUPTI/ROCprofiler-SDK are lost if the process dies (signal, `_exit`); the trace says so (missing `final_flush`). | Let the program exit normally. |
@@ -5930,10 +6544,16 @@ LULESH, mixbench) checks traces against each benchmark's own ground truth.
 | **Device peak values** | Computed from driver attributes (DRAM: memory clock × bus width × data-rate factor ×2, ×4 for CDNA3/MI300), datasheet tables only as fallback; L2/L3 bandwidths are architecture estimates; CPU DRAM bandwidth falls back to 50 GB/s without readable `dmidecode` (root). Each value carries its provenance, shown in the System tab: `detected` (read from the driver/OS), `computed` (exact formula from detected values), `datasheet` (vendor peak for the model), `estimate` (architecture-level rule of thumb), `fallback` (generic default). Only the MX550 value was checked against real hardware. | Check provenance before treating ceilings as exact. |
 | **Record size** | Records up to 64 KiB are sent intact; larger ones are rejected and counted (`oversize`). Stacks over 16 KiB end in a `[truncated]` frame; frame names are capped at 1 KiB; call-site tags that do not fit become `codeptr=truncated`. | — |
 | **Critical path: `Test*`-only completion** | `MPI_Test*`/`MPI_Cancel` are instant events; a non-blocking receive completed only by `Test*` polling gets no cross-rank edge. Such requests are counted (`test_only_completions`) and warned about. | — |
-| **Critical path: rendezvous grouping** | No instance id is recorded for MPI collectives or OpenMP barriers: they are grouped by call order where every member made the same calls (per communicator / team), else by overlapping intervals, both inferred; rooted collectives (bcast, reduce, gather, scatter, scan) are modeled like all-to-all rendezvous. NCCL calls with `commid=`/`seq=` are paired exactly. | Read the evidence section and the `direct_evidence_only` alternative. |
+| **Critical path: rendezvous grouping** | No instance id is recorded for MPI collectives or OpenMP barriers: they are grouped by call order where every member made the same calls (per communicator / team), else by overlapping intervals, both inferred. Rooted collectives whose members recorded the root (`wroot=`) follow their data flow: `bcast` / `scatter[v]` members wait for the root, the `reduce` / `gather[v]` root for the last arriver, the other members for nobody ([Runtime semantics](#runtime-semantics)); without a recorded root (older hooks), `scan` / `exscan`, and NCCL `broadcast` / `reduce` they are modeled like all-to-all rendezvous (a note counts those edges). NCCL calls with `commid=`/`seq=` are paired exactly. | Read the evidence section and the `direct_evidence_only` alternative. |
 | **Critical path: holes in the MPI graph** | Calls that are not wrapped (see the [`mpi` backend](#mpi-backend)'s list), events lost in the capture, and requests posted before the hook was loaded leave receives without an edge. They are counted per communicator in `metadata.dependencyDiagnostics` and warned about, not hidden. Messages on unregistered communicators (`commid=-1`) between the same ranks with one tag can be confused with each other. | Check "MPI dependency coverage" in `hprofiler critical-path`. |
-| **Critical path: order-based pairing after event loss** | Point-to-point messages and event syncs are paired by order; after a lost event the pairing of that channel may be shifted. Such edges are only *marked* "low" in processes with recorded loss; they are not corrected (that would need per-channel sequence numbers in the hook). | Avoid drops (`HPROFILER_RING_KB`); read "low" edges with care. |
-| **Critical path: GPU devices and graphs** | A device-wide sync is tied to its device through `hdev=`, read with `cuCtxGetDevice`/`hipGetDevice` after the call — never run on real multi-GPU hardware. Proxy device spans from hooks without `hdev=` carry no device and share a stream key across GPUs. Kernels of one CUDA graph launch get no edges among themselves (the graph's internal dependencies are not recorded). | — |
+| **Critical path: order-based pairing after event loss** | Point-to-point messages and event syncs are paired by order. MPI's sequence numbers show where a record is missing; a gap one channel must own is placed and the pairs around it stay exact, any other gap makes the later pairings of the channels it could belong to `low` (marked, not corrected). Calls the hook does not wrap take no number and leave no gap; the order of posts from two threads whose calls overlap, and of one `MPI_Startall`'s requests, is not recorded (`low`). Unregistered communicators (`commid=-1`) have no numbers. Event syncs still rely on recorded event records. | Avoid drops (`HPROFILER_RING_KB`); read "low" edges with care. |
+| **Critical path: GPU devices and graphs** | A device-wide sync is tied to its device through `hdev=`, read with `cuCtxGetDevice`/`hipGetDevice` after the call — never run on real multi-GPU hardware. Proxy device spans from hooks without `hdev=` carry no device and share a stream key across GPUs. A CUDA graph launch's internal edges come from the exec's structure (native tracing only): a child graph's own nodes are unmapped (CUPTI pairs no clone with them) and ordered only by the launch stream; HIP graphs and proxy-mode CUDA graphs have no internal edges. CUDA event-address reuse is handled but was never observed on the development machine's driver. Event records made with `cudaEventRecordWithFlags` (PyTorch) or the driver API are not recorded, so an event sync or completed event query on such an event is resolved by the device-wide rule (`medium`: the last finished work of every stream of its process). | — |
+| **CUDA/HIP host functions in graphs** | A host function enqueued while its stream is captured into a graph (`cudaLaunchHostFunc`, `cuLaunchHostFunc`, `cudaStreamAddCallback`, `hipLaunchHostFunc`, `hipStreamAddCallback`) is passed through unwrapped (`captured=1`): its runs, once per graph launch, are not timed. Host nodes added with `cudaGraphAddHostNode` are not wrapped either. (Until 2026-11 the hook wrapped captured ones in a one-shot context: the second graph launch called through freed memory and the program crashed.) | — |
+| **Critical path: window** | The window starts at the first hprofiler hook's constructor: the dynamic loader's work and constructors that run before it are outside. It ends at the last recorded event (no end marker, see [The window](#the-window-from-process-begin)): the program's own work after its last recorded call and its exit are outside. Time from the window's start to the path's first event is one unrecorded interval: before that process started, its thread existed, or its first recorded call. | Instrument (or annotate) the work before the first call where it matters; `--window first-event` for the former window. |
+| **Critical path: MPI_Init / MPI_Finalize rendezvous** | Inferred from what Open MPI 5.0 and Intel MPI 2021 do (every rank leaves after the last arrived), not from the standard; other libraries not checked. A library that does not synchronize there loses those edges by the timestamp check, but one that synchronizes only some ranks (by node, say) is still read as one rendezvous where the timestamps allow it. | Read `lifecycle_sync` steps in the evidence section. |
+| **Critical path: GNU libgomp joins** | The GNU libgomp hook records each thread's share of `GOMP_parallel` but neither the region-wide span nor the implicit barrier that joins it, so the master's wait for a slower worker at the end of a region is not recorded and the path does not cross to that worker (a two-thread region whose worker is slower loses the worker's extra time from the path). | Use an LLVM libomp build (OMPT) where the path inside OpenMP regions matters. |
+| **Critical path: SYCL (AdaptiveCpp)** | AdaptiveCpp exposes no task graph: dependencies appear only where it lowers them to CUDA / OpenCL / HIP calls. Host-device kernels' dependencies, and a device command's dependency on a host-device one (a stream host function waiting inside the runtime), are not recorded; both are counted and warned about. | — |
+| **Critical path: OS wakeups** | The eBPF tracer has never been loaded; its `wakeup` edges (`medium`) cover only blocking calls that slept and were woken from task context by a traced thread, in the same pid namespace as the hooks. Spin waits, interrupt-context wakeups and untraced wakers give none (counted). | — |
 | **Critical path: OpenMP teams without an id** | Barriers are grouped per team via OMPT's parallel id or the GNU libgomp hook's `team=`; traces recorded without either group barriers of one name per process, so concurrent (nested) teams' barriers can be merged. | Re-record with the current hooks. |
 | **Critical path: what the trace cannot decide** | Waiting vs. processing inside a blocking call, untraced time on a thread (work or idle), the parts of a message's latency, ties between equally consistent paths: reported as bounds, alternatives and notes ([What the trace cannot support](#what-the-trace-cannot-support)); the modeled path and its counterfactuals are a graph model, not measurements. | — |
 | **POP Transfer Efficiency** | Fitted from the trace's own messages (latency/bandwidth model), not a network replay. | Treat it as a proxy; see the report's notes. |
@@ -5967,6 +6587,15 @@ python3 -m unittest tests.integration.test_profiling_accuracy \
     tests.integration.test_opencl_modules tests.integration.test_gomp_teams \
     tests.integration.test_openmp_sync tests.integration.test_node_collector \
     tests.integration.test_cuda_module_launches
+# Dependency capture (sequence numbers, depend clauses, graphs, events):
+python3 -m unittest tests.integration.test_mpi_sequence \
+    tests.integration.test_gomp_deps tests.integration.test_cuda_graphs \
+    tests.integration.test_opencl_events tests.integration.test_opencl_deps \
+    tests.integration.test_rocm_hip_mock tests.integration.test_sycl_deps
+# test_mpi_sequence needs 4 real ranks (as test_mpi_multirank);
+# test_cuda_graphs a CUDA GPU with CUPTI; test_rocm_hip_mock builds a
+# stand-in libamdhip64.so (no AMD GPU needed); test_sycl_deps AdaptiveCpp
+# (ACPP=, else /opt/AdaptiveCpp/bin/acpp or acpp on PATH).
 # test_mpi_multirank needs an MPI whose launcher starts 4 real ranks; it
 # sources HPROFILER_TEST_MPIVARS (default: Intel MPI's
 # /opt/intel/oneapi/mpi/latest/env/vars.sh) when that file exists.

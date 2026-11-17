@@ -22,6 +22,11 @@
  *             the parent's pre-fork records arrive exactly once
  *   nocollector  no listener: emitting never hangs, records counted as lost
  *   exec      records emitted before execv() arrive (drain before exec)
+ *   vfork     vfork()+execv() of an image that records nothing (Triton's cc
+ *             through Python's subprocess), before the first record and in
+ *             mid-run: the child shares the parent's memory and must touch
+ *             nothing -- every record keeps the parent's pid, the parent
+ *             sends its marker, its transport stays a ring
  */
 #define _GNU_SOURCE
 #include "../../hooks/common/hp_transport.h"
@@ -41,6 +46,11 @@ static long g_long_ok, g_long_bad, g_newline_ok, g_pids_seen[8];
 static int g_npids;
 static unsigned long long g_images[8];
 static int g_nimages;
+/* process-begin markers (hp_transport.h): counted apart from the data
+ * lines; mark_self: those of this test's own process */
+static long g_marks, g_mark_self;
+static long g_self_lines;                /* rec: lines carrying this process's pid */
+static int g_ring_at_end = -1;           /* the transport was a ring before finish() */
 static char g_last_status[700];
 
 static void note_pid(long pid) {
@@ -64,10 +74,18 @@ static void handle_line(char *line, size_t len) {
         pthread_mutex_unlock(&g_mu);
         return;
     }
+    long mpid = 0;
+    if (sscanf(line, "inst:other:%ld:", &mpid) == 1 && strstr(line, ":process_begin:type=process_begin,hook=")) {
+        g_marks++;
+        if (mpid == (long)getpid()) g_mark_self++;
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
     g_lines++;
     long pid = 0, t = 0, seq = 0;
     if (sscanf(line, "rec:%ld:%ld:%ld:", &pid, &t, &seq) == 3) {
         note_pid(pid);
+        if (pid == (long)getpid()) g_self_lines++;
         if (t >= 0 && t < MAXT) {
             /* a gap is a dropped record (overflow scenario); going
              * backwards is a reordering or duplicate -- never allowed */
@@ -168,13 +186,14 @@ static long status_field(const char *key) {
 }
 
 static void finish(const char *scenario) {
+    g_ring_at_end = atomic_load(&hp_tx.state) == HP_TX_RING;
     hp_tx_shutdown(1);
     usleep(200000);
     pthread_mutex_lock(&g_mu);
     printf("RESULT scenario=%s lines=%ld bad_order=%ld gaps=%ld final=%ld status_lines=%ld long_ok=%ld "
-           "long_bad=%ld newline_ok=%ld pids=%d images=%d",
+           "long_bad=%ld newline_ok=%ld pids=%d images=%d marks=%ld mark_self=%ld self_lines=%ld ring=%d",
            scenario, g_lines, g_bad_order, g_gaps, g_xport_final, g_status_lines, g_long_ok, g_long_bad,
-           g_newline_ok, g_npids, g_nimages);
+           g_newline_ok, g_npids, g_nimages, g_marks, g_mark_self, g_self_lines, g_ring_at_end);
     pthread_mutex_unlock(&g_mu);
     printf(" emitted=%ld sent=%ld dropped_full=%ld dropped_lost=%ld oversize=%ld waits=%ld sanitized=%ld\n",
            status_field("emitted"), status_field("sent"), status_field("dropped_full"),
@@ -211,6 +230,19 @@ static void run_workers_from(int first, int threads, int n) {
 
 static void run_workers(int threads, int n) { run_workers_from(0, threads, n); }
 
+/* vfork() + execv() of this binary as an image that records nothing, as
+ * Python's subprocess runs cc: the execv wrapper runs in the vfork child */
+static void spawn_vfork(const char *self) {
+    pid_t c = vfork();
+    if (c == 0) {
+        char *args[] = { (char *)self, "vfork", "child", NULL };
+        execv(self, args);
+        _exit(3);
+    }
+    int st;
+    waitpid(c, &st, 0);
+}
+
 static void emit_long(size_t n) {
     char *b = malloc(n + 32);
     int k = snprintf(b, 32, "long:%zu:", n);
@@ -229,9 +261,10 @@ int main(int argc, char **argv) {
         setenv("HPROFILER_RING_KB", "16", 1);
         setenv("HPROFILER_RING_WAIT_MS", "5000", 1);
     }
-    int exec_image = strcmp(sc, "exec") == 0 && argc > 2;
+    int exec_image = argc > 2;
     if (!exec_image) start_collector(strcmp(sc, "nocollector") != 0);
     hp_tx_init("test");
+    if (exec_image && strcmp(sc, "vfork") == 0) return 0;   /* the vfork'ed image: nothing */
 
     if (strcmp(sc, "order") == 0) {
         run_workers(8, 20000);
@@ -292,6 +325,12 @@ int main(int argc, char **argv) {
         int st;
         waitpid(c, &st, 0);
         wait_lines(501, 10000);
+    } else if (strcmp(sc, "vfork") == 0) {
+        spawn_vfork(argv[0]);                 /* before this process's first record */
+        for (int i = 0; i < 1000; i++) hp_tx_emitf("rec:%d:0:%d:parent\n", (int)hp_tx_pid(), i);
+        spawn_vfork(argv[0]);                 /* in mid-run */
+        for (int i = 1000; i < 2000; i++) hp_tx_emitf("rec:%d:0:%d:parent\n", (int)hp_tx_pid(), i);
+        wait_lines(2000, 10000);
     }
     finish(sc);
     return 0;

@@ -746,15 +746,16 @@ class Runner:
             print(f"[hprofiler][warn] GPU activity correlation failed: {exc!r} -- "
                   "device spans are left uncorrelated", file=_sys_ga.stderr)
 
-        # Known holes in the MPI dependency graph (receives without a
-        # sender, Test*-only and orphan completions), counted once here and
-        # stored with the trace (one pass over the MPI spans only).
-        if "mpi" in self.backends:
+        # Known holes in the dependency graph (MPI receives without a sender,
+        # Test*-only and orphan completions, sequence gaps; OpenMP depend
+        # clauses not decoded; ...), counted once here and stored with the
+        # trace (one pass over the runtimes' spans).
+        if {"mpi", "openmp", "cuda", "rocm", "opencl"} & set(self.backends):
             try:
-                from ..analysis.criticalpath import mpi_dependency_diagnostics
-                metadata.dependency_diagnostics = mpi_dependency_diagnostics(trace)
+                from ..analysis.criticalpath import dependency_diagnostics
+                metadata.dependency_diagnostics = dependency_diagnostics(trace)
             except Exception as exc:
-                print(f"[hprofiler][warn] MPI dependency diagnostics failed: {exc!r}",
+                print(f"[hprofiler][warn] dependency diagnostics failed: {exc!r}",
                       file=_sys_rx.stderr)
 
         # Incomplete capture / degraded device tracing: say so now (the

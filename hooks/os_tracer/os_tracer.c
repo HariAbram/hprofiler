@@ -27,21 +27,7 @@
 #include <bpf/libbpf.h>
 #include "sched_trace.skel.h"
 
-/* Must match sched_trace.bpf.c's struct sched_event (kept in sync by hand:
- * the BPF side cannot include a userspace header). */
-#define EV_OFFCPU  1
-#define EV_WAKEUP  2
-#define EV_MIGRATE 3
-
-struct sched_event {
-    unsigned int kind;
-    unsigned int pid;
-    unsigned long long ts_ns;
-    unsigned long long dur_ns;
-    int orig_cpu;
-    int dest_cpu;
-    char comm[16];
-};
+#include "sched_event_fmt.h"
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -74,48 +60,12 @@ static void send_line(const char *buf, size_t len) {
     }
 }
 
-/* Replace ':' (field separator), ',' (tag separator) and '=' (key/value)
- * with '_' before embedding a comm in a tag value: a thread can set an
- * arbitrary comm (prctl(PR_SET_NAME)), and an unsanitized ':' would move the
- * record's name/tag boundary. */
-static void sanitize_comm(char *out, const char *in, size_t cap) {
-    size_t i = 0;
-    for (; in[i] != '\0' && i < cap - 1; i++) {
-        char c = in[i];
-        out[i] = (c == ':' || c == ',' || c == '=') ? '_' : c;
-    }
-    out[i] = '\0';
-}
-
 static int handle_event(void *ctx, void *data, size_t data_sz) {
     (void)ctx;
     if (data_sz < sizeof(struct sched_event)) return 0;
-    const struct sched_event *ev = data;
-    char comm[17];
-    sanitize_comm(comm, ev->comm, sizeof(comm));
-
-    char line[256];
-    int n = 0;
-    switch (ev->kind) {
-        case EV_OFFCPU:
-            n = snprintf(line, sizeof(line),
-                "span:sched:0:%u:%llu:%llu:off_cpu:comm=%s\n",
-                ev->pid, ev->ts_ns, ev->dur_ns, comm);
-            break;
-        case EV_WAKEUP:
-            n = snprintf(line, sizeof(line),
-                "inst:sched:0:%u:%llu:wakeup:comm=%s,target_cpu=%d\n",
-                ev->pid, ev->ts_ns, comm, ev->dest_cpu);
-            break;
-        case EV_MIGRATE:
-            n = snprintf(line, sizeof(line),
-                "inst:sched:0:%u:%llu:migrate:comm=%s,orig_cpu=%d,dest_cpu=%d\n",
-                ev->pid, ev->ts_ns, comm, ev->orig_cpu, ev->dest_cpu);
-            break;
-        default:
-            return 0;
-    }
-    if (n > 0 && n < (int)sizeof(line)) send_line(line, (size_t)n);
+    char line[384];
+    int n = format_sched_event((const struct sched_event *)data, line, sizeof(line));
+    if (n > 0) send_line(line, (size_t)n);
     return 0;
 }
 

@@ -626,9 +626,22 @@ ncclResult_t ncclCommAbort(ncclComm_t comm) {
 }
 
 /* ── Stream id ───────────────────────────────────────────────────────────
- * Pointer hash identical to cuda_hook.c's get_stream_id(), so both hooks
- * report the same stream=N for the same handle (0 = default stream). */
+ * The CUDA hook's stream= number when it is loaded too (its exported
+ * hprofiler_cuda_stream_id(): it follows a handle's lives, so a stream
+ * re-created at a destroyed one's address is another number); else the
+ * pointer hash both hooks use for a handle's first life (0 = default). */
+typedef int (*hp_stream_id_fn)(const void *);
+static hp_stream_id_fn g_cuda_stream_id = NULL;
+static int g_cuda_stream_id_tried = 0;
+
 static int stream_id(cudaStream_t s) {
+    if (!__atomic_load_n(&g_cuda_stream_id_tried, __ATOMIC_ACQUIRE)) {
+        hp_stream_id_fn f = (hp_stream_id_fn)dlsym(RTLD_DEFAULT, "hprofiler_cuda_stream_id");
+        __atomic_store_n(&g_cuda_stream_id, f, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_cuda_stream_id_tried, 1, __ATOMIC_RELEASE);
+    }
+    hp_stream_id_fn f = __atomic_load_n(&g_cuda_stream_id, __ATOMIC_RELAXED);
+    if (f) return f((const void *)s);
     if (!s) return 0;
     uint64_t v = (uint64_t)(uintptr_t)s;
     v ^= v >> 33; v *= 0xff51afd7ed558ccdULL;

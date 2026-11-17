@@ -164,6 +164,15 @@ class TestEventsAndLanes(_Pair):
         self.assertEqual([ck(e) for e in self.mem.counters], [ck(e) for e in self.disk.counters])
         self.assertEqual(self.mem.span_count(), self.disk.span_count())
 
+    def test_instants_by_name(self):
+        ik = lambda e: (e.seq, e.name, e.timestamp_ns, e.pid, e.tid, e.tags)
+        names = sorted({e.name for e in self.mem.instants})
+        self.assertTrue(names)
+        for name in names + ["no such instant"]:
+            want = [ik(e) for e in self.mem.instants if e.name == name]
+            self.assertEqual([ik(e) for e in self.mem.iter_instants(name=name)], want, name)
+            self.assertEqual([ik(e) for e in self.disk.iter_instants(name=name)], want, name)
+
     def test_tags_are_lossless(self):
         # JSON-typed tag values (ints, floats, bools, None, lists) survive.
         values = {repr(s.tags.get("extra")) for s in self.disk.spans if "extra" in s.tags}

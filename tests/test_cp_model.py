@@ -397,6 +397,120 @@ class TestStartGated(unittest.TestCase):
         self.assertEqual(res.graph_evidence["by_kind"], {"fork": 2, "join": 2})
 
 
+# ── OpenMP worker ends reported after the region's join ─────────────────────
+
+MS = 1_000_000
+
+
+def omp_region(pid, sid, a, master_work, worker_work, worker_end, tids):
+    """An LLVM-libomp-style region as ompt_tool.c records it: the master's
+    parallel_region [fork, join], both implicit tasks, loops and implicit
+    barriers -- the worker's barrier and task ending at `worker_end`, when
+    the runtime released the worker (the next fork, or exit). Times in ms."""
+    m, w = tids
+    join = a + max(master_work, 1 + worker_work) + 0.01
+
+    def span(name, cat, tid, s0, s1, typ, **kw):
+        return SpanEvent(name, cat, round(s0 * MS), round(s1 * MS) - round(s0 * MS), pid, tid,
+                         tags={"type": typ, **kw.pop("tags", {})}, **kw)
+    return [span("parallel_region", Category.OPENMP, m, a, join, "parallel", span_id=sid),
+            span("omp_implicit_task", Category.OPENMP, m, a, join, "implicit_task", parent_span_id=sid),
+            span("omp_loop_static", Category.OPENMP, m, a, a + master_work, "work", parent_span_id=sid),
+            span("omp_barrier_parallel", Category.SYNC, m, a + master_work, join, "sync", parent_span_id=sid,
+                 tags={"sk": "9"}),
+            span("omp_implicit_task", Category.OPENMP, w, a + 1, worker_end, "implicit_task", parent_span_id=sid),
+            span("omp_loop_static", Category.OPENMP, w, a + 1, a + 1 + worker_work, "work", parent_span_id=sid),
+            span("omp_barrier_parallel", Category.SYNC, w, a + 1 + worker_work, worker_end, "sync",
+                 parent_span_id=sid, tags={"sk": "9"})], join
+
+
+class TestRegionJoin(unittest.TestCase):
+    """A worker's implicit barrier and implicit task reported as ending when
+    the runtime released it for the next region or at exit (LLVM libomp),
+    not when the barrier completed: capped at the region's join, the time
+    after it the worker idle (cp_model "idle", provenance region_join)."""
+
+    @staticmethod
+    def hybrid():
+        # rank 0: one region (master slow, 100 ms), then the token to rank 1;
+        # rank 1: a region (worker slow, 30 ms), the receive, a second region
+        # (worker slow, 50 ms). Workers' ends: at rank 1's next fork, at exit.
+        exit_ms = 400
+        r0, j0 = omp_region(1, "100", 0, 100, 10, exit_ms, (10, 11))
+        r1, j1 = omp_region(2, "200", 0, 5, 30, 112.48, (20, 21))
+        r2, _j2 = omp_region(2, "201", 111.5, 5, 50, exit_ms, (20, 21))
+        msgs = [mpi("MPI_Send", 1, round((j0 + 1) * MS), round((j0 + 2) * MS), type="send", rank=0, peer=1,
+                    wpeer=1, tag=0, commid=0),
+                mpi("MPI_Recv", 2, round((j1 + 1) * MS), 111 * MS, type="recv", rank=1, peer=0, wpeer=0, tag=0,
+                    commid=0)]
+        for s in msgs:
+            s.tid = 10 if s.pid == 1 else 20
+        return _trace([*r0, *r1, *r2, *msgs])
+
+    def busy_by_pid(self, t, res):
+        spans = list(t.iter_spans())
+        g, out = res.graph, {}
+        for e, ns in zip(res.walk.steps, res.walk.cover):
+            if g.mode[e] == cm.BUSY:
+                pid = spans[g.owner[e]].pid
+                out[pid] = out.get(pid, 0) + ns
+        return out
+
+    def test_the_path_follows_the_fork_not_the_late_barrier_end(self):
+        t = self.hybrid()
+        res = model(t, sensitivity=0)
+        busy = self.busy_by_pid(t, res)
+        # rank 0's slow master (100 ms) and rank 1's second region's slow
+        # worker (50 ms) -- not rank 1's first region, which the receive waited past
+        self.assertAlmostEqual(busy[1] / MS, 100, delta=1)
+        self.assertAlmostEqual(busy[2] / MS, 50, delta=1)
+        self.assertLess(res.dependency_by_kind.get("arrival", 0), MS)
+        self.assertIn("p2p", res.dependency_by_kind)
+        self.assertIn("fork", res.dependency_by_kind)
+        self.assertEqual(res.thread_idle_ns, 0)
+        self.assertEqual(res.graph_evidence.get("dropped_contradicting_time", {}), {})   # no join dropped
+        # the path ends at the last region's join, not at the workers' exit
+        self.assertAlmostEqual(res.covered_ns / MS, 162.51, delta=0.01)
+
+    def test_capped_spans_and_their_idle_time_are_reported(self):
+        t = self.hybrid()
+        res = model(t, sensitivity=0)
+        g = res.graph
+        spans = list(t.iter_spans())
+        capped = {(spans[j].pid, spans[j].name, spans[j].parent_span_id): ns for j, ns in g.capped.items()}
+        self.assertEqual(len(capped), 6)                  # each worker's barrier and task, three regions
+        self.assertAlmostEqual(capped[(1, "omp_barrier_parallel", "100")] / MS, 400 - 100.01, delta=0.01)
+        self.assertAlmostEqual(capped[(2, "omp_implicit_task", "200")] / MS, 112.48 - 31.01, delta=0.01)
+        idle = [e for e in range(len(g)) if g.mode[e] == cm.IDLE and g.kind[e] == cm._K["thread"]]
+        self.assertEqual(len(idle), 1)                    # rank 1's worker between its two regions
+        e = idle[0]
+        self.assertEqual(cm.PROVS[g.prov[e]], "region_join")
+        self.assertEqual(cm.edge_class("region_join", "certain"), "inferred")
+        self.assertAlmostEqual((g.t[g.dst[e]] - g.t[g.src[e]]) / MS, 112.5 - 31.01, delta=0.01)
+        into = [cm.PROVS[g.prov[x]] for x in range(len(g)) if g.dst[x] & 1 and (g.dst[x] >> 1) in g.capped
+                and g.mode[x] != cm.DEP]
+        self.assertTrue(into and set(into) == {"region_join"}, into)
+        rep = cp.analyze(t, sensitivity=0, alternatives=0)
+        self.assertTrue(any("after their parallel region's join" in n for n in rep.notes), rep.notes)
+        self.assertEqual(cp.report_to_dict(rep)["composition"]["threadIdleNs"], 0)
+
+    def test_without_late_ends_nothing_changes(self):
+        # the same regions with the workers' ends at the barrier's completion
+        r1, j1 = omp_region(2, "200", 0, 5, 30, 31.01, (20, 21))
+        r2, j2 = omp_region(2, "201", 40, 5, 50, 91.01, (20, 21))
+        res = model(_trace([*r1, *r2]), sensitivity=0)
+        self.assertEqual(res.graph.capped, {})
+        self.assertEqual(res.thread_idle_ns, 0)
+
+    def test_gnu_libgomp_region_spans_are_not_capped(self):
+        # gomp_hook.c: one omp_parallel_region span per thread, no region-wide
+        # span, each ending when the thread's share returns
+        spans = [SpanEvent("omp_parallel_region", Category.OPENMP, 0, 20 * MS, 1, tid,
+                           tags={"type": "parallel_region", "team": "7"}) for tid in (1, 2)]
+        res = model(_trace(spans), sensitivity=0)
+        self.assertEqual(res.graph.capped, {})
+
+
 # ── ambiguous edges ─────────────────────────────────────────────────────────
 
 class TestAmbiguity(unittest.TestCase):

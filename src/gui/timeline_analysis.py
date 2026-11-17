@@ -52,7 +52,7 @@ FAMILY_LABELS = {
     "critical": "Critical-path hops", "mpi_p2p": "MPI point-to-point", "mpi_collective": "MPI collectives",
     "openmp": "OpenMP barriers / tasks / locks", "submission": "CPU → GPU submission",
     "gpu_sync": "GPU / OpenCL synchronization, stream and queue order", "nccl": "NCCL",
-    "other": "Other explicit ids",
+    "other": "Other explicit ids, OS wakeups",
 }
 
 
@@ -71,7 +71,7 @@ def edge_family(kind: str, dst_cat: str) -> str:
         return "openmp"
     if kind == "launch":
         return "submission"
-    if kind in ("device_wait", "device_sync", "stream_order", "event_wait", "sequential"):
+    if kind in ("device_wait", "device_sync", "stream_order", "event_wait", "sequential", "graph_dependency"):
         return "gpu_sync"
     return "other"
 
@@ -739,6 +739,9 @@ def _summary(report, res, data: AnalysisData) -> dict:
         comp.append({"group": "in an ungated blocking call", "key": cat, "ns": ns})
     if report.path_device_idle_ns:
         comp.append({"group": "device idle", "key": "stream", "ns": report.path_device_idle_ns})
+    if report.path_thread_idle_ns:
+        comp.append({"group": "thread idle", "key": "OpenMP worker after its region's join",
+                     "ns": report.path_thread_idle_ns})
     ev = res.graph_evidence
     alt_summary = _alternatives_summary(report, data)
     crit = res.crit

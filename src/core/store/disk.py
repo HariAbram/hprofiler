@@ -742,11 +742,15 @@ class DiskTraceStore(TraceStore):
         e.seq = seq
         return e
 
-    def iter_instants(self) -> Iterator[InstantEvent]:
+    def iter_instants(self, *, name: str | None = None) -> Iterator[InstantEvent]:
         with self._lock:
             self._flush_locked()
-        sql = "SELECT row, seq, ts_ns, tid, cat, name_id, tags FROM instants ORDER BY row"
-        return heapq.merge(*[self._query_iter(sh, sql, (), self._row_to_instant) for sh in self.shards()],
+            nid = None if name is None else self._name_id.get(name)
+        if name is not None and nid is None:
+            return iter(())
+        where, params = ("", ()) if nid is None else (" WHERE name_id = ?", (nid,))
+        sql = f"SELECT row, seq, ts_ns, tid, cat, name_id, tags FROM instants{where} ORDER BY row"
+        return heapq.merge(*[self._query_iter(sh, sql, params, self._row_to_instant) for sh in self.shards()],
                            key=lambda e: e.seq)
 
     def iter_counters(self, *, order: str = "seq") -> Iterator[CounterEvent]:

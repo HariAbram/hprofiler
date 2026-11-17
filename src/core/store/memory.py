@@ -167,8 +167,10 @@ class MemoryTraceStore(TraceStore):
                 continue
             yield s
 
-    def iter_instants(self) -> Iterator[InstantEvent]:
+    def iter_instants(self, *, name: str | None = None) -> Iterator[InstantEvent]:
         with self._lock:
+            if name is not None:
+                return iter([i for i in self._instants if i.name == name])
             return iter(list(self._instants))
 
     def iter_counters(self, *, order: str = "seq") -> Iterator[CounterEvent]:

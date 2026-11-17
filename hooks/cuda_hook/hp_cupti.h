@@ -31,13 +31,24 @@ HP_HIDDEN void hp_cuda_pc_record(const void *record, uint32_t kind);
  * cuModuleGetFunction, or a host stub the runtime registered -- or 0 when it
  * comes from no captured module. cuda_hook.c owns the table. */
 HP_HIDDEN uint64_t hp_cuda_function_module(const void *fn);
+/* Stream lives (cuda_hook.c "Stream and event identity"): a new life of
+ * `stream` begins (returns its stream= number) / ends; the stream= number
+ * of a handle in its current life. */
+HP_HIDDEN int  hp_cuda_stream_born(const void *stream);
+HP_HIDDEN void hp_cuda_stream_died(const void *stream);
+HP_HIDDEN int  hp_cuda_stream_id(const void *stream);
+/* The event= number of an event handle (cudaEvent_t / CUevent), the one
+ * cuda_hook.c's own event spans carry. */
+HP_HIDDEN int  hp_cuda_event_id(const void *event);
 
 /* ── provided by cupti_trace.c ─────────────────────────────────────────── */
 
 #define HP_CUPTI_ACTIVITY   1u   /* kernel/memcpy/memset/sync activity + callbacks */
 #define HP_CUPTI_PCSAMPLING 2u   /* PC sampling + function records */
-#define HP_CUPTI_CB_SYNCS   4u   /* also emit host spans for sync calls from callbacks
-                                    (static-runtime programs: no wrapper sees them) */
+#define HP_CUPTI_CB_SYNCS   4u   /* also emit host spans for device/stream syncs, stream
+                                    waits and event records from callbacks (static-
+                                    runtime programs: no wrapper sees them); event syncs
+                                    and completed event queries always are */
 
 /* Loads libcupti with dlopen on first use and enables the requested
  * features. Returns the feature bits that are active afterwards (0 when
@@ -63,6 +74,16 @@ HP_HIDDEN void hp_cupti_final_flush(void);
  * process's single CUPTI buffer-callback registration). */
 HP_HIDDEN int hp_cupti_compiled(void);
 
+/* 1 while CUPTI's resource callbacks report every stream's creation and
+ * destruction (cuda_hook.c's wrappers then leave stream lives to them). */
+HP_HIDDEN int hp_cupti_streams_tracked(void);
+/* CUPTI's id of a graph exec -- the graph= its device records carry -- and
+ * the exec's version: 1 at instantiation, +1 per successful update of its
+ * nodes (cuGraphExecUpdate, cuGraphExec*SetParams, cuGraphNodeSetEnabled).
+ * 0 when unknown (native tracing inactive). */
+HP_HIDDEN uint32_t hp_cupti_graph_exec_id(const void *exec);
+HP_HIDDEN uint32_t hp_cupti_graph_exec_version(uint32_t exec_id);
+
 #ifdef HP_CUPTI_UNIT_TEST
 /* Test entry points: feed one synthetic record / drop report through the
  * same code the buffer-completion callback uses. */
@@ -76,6 +97,8 @@ void hp_cupti_test_set_cb_syncs(int on);
 void hp_cupti_test_api_callback(int runtime_domain, const void *callback_data);
 /* ... with its callback id (CUPTI_DRIVER_TRACE_CBID_* / CUPTI_RUNTIME_TRACE_CBID_*). */
 void hp_cupti_test_api_callback_id(int runtime_domain, uint32_t cbid, const void *callback_data);
+/* ... a resource-domain callback (CUPTI_CBID_RESOURCE_*, CUpti_ResourceData). */
+void hp_cupti_test_resource_callback(uint32_t cbid, const void *resource_data);
 #endif
 
 #endif /* HP_CUPTI_H */

@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from . import cp_model as cm
 
 UNRECORDED, UNKNOWN, IDLE = "(unrecorded)", "(unknown)", "(device idle)"
+THREAD_IDLE = "(thread idle)"            # an OpenMP worker held after its region's join (cp_model "idle")
 _LANE_KINDS = frozenset({cm._K["thread"], cm._K["device_work"], cm._K["stream_order"]})
 
 
@@ -231,7 +232,7 @@ def blame(g: cm.EventGraph, *, joint_ns: int = 1000, depth: int = 4, max_steps: 
                 for s_e in joint:
                     charge(g.src[s_e], lo, min(hi, max(lo, g.t[g.src[s_e]])), wait_part / len(joint), level + 1)
             elif m == cm.IDLE:
-                other[IDLE] += part
+                other[THREAD_IDLE if g.kind[e] == cm._K["thread"] else IDLE] += part
             elif m == cm.UNKNOWN:
                 other[UNKNOWN] += part
             else:

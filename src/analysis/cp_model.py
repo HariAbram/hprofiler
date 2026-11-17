@@ -47,6 +47,19 @@ Lane edges -- a thread's or a device operation's own time:
             "gap" (never as plain work)
       gap   no recorded call open: untraced work or idle time, the trace
             cannot tell -- both are computed (see "Bounds")
+      idle  after an OpenMP worker's part of a parallel region, until its
+            next event: nothing of a region runs after its join (the end
+            of the region's own span, recorded by its master thread), so a
+            span inside the region (psid= the region's id) recorded as
+            ending later is capped at the join. LLVM libomp reports a
+            worker's implicit-barrier end and implicit-task end when the
+            worker is released for the next region, or at exit -- not when
+            the barrier completed. The time from the join to the recorded
+            end is the worker held idle by the runtime, w = 0 (never work,
+            waiting or dependency latency); the edges ending at a capped
+            event and that idle time have provenance "region_join"
+            (inferred). Capped spans are counted (EventGraph.capped, the
+            report's notes)
   * Device work (and other device-timed spans): one edge S -> E, busy, or
     wait when a dependency gates its end (an NCCL collective).
 
@@ -187,7 +200,7 @@ VARIANTS: dict[str, tuple[bool, bool, bool]] = {
 
 KINDS = ("thread", "device_work", "stream_order", "event_wait", "launch", "device_wait",
          "device_sync", "p2p", "arrival", "fork", "join", "explicit_span_id", "sequential",
-         "task_join", "task_dependence", "lock_handoff")
+         "task_join", "task_dependence", "lock_handoff", "graph_dependency", "wakeup")
 _K = {k: i for i, k in enumerate(KINDS)}
 
 CONFS = ("certain", "high", "medium", "low")          # criticalpath.EDGE_CONFS order
@@ -221,6 +234,23 @@ PROVENANCE: dict[str, tuple[str, str]] = {
     "rooted_flow": ("inferred", "a rooted collective's data flow with the root its members recorded "
                                 "(wroot=): from the root (bcast, scatter) or to it (reduce, gather), "
                                 "members grouped by call order"),
+    "dep_rules": ("inferred", "the depend clauses the GNU libgomp hook decoded (deps=, tokens for the "
+                              "storage locations) and OpenMP's dependence rules over the siblings in "
+                              "creation order: reconstructed, not reported by the runtime"),
+    "graph_edge": ("direct", "an edge of the CUDA graph exec that ran (its structure, read once at "
+                             "instantiation, between the nodes its device records name)"),
+    "os_wakeup": ("inferred", "the kernel's record of the waking that ended the blocking call's last sleep, "
+                              "run by a traced thread inside the source span (os_tracer): the waking is "
+                              "recorded, that it released the call is inferred"),
+    "lifecycle_sync": ("inferred", "MPI_Init / MPI_Finalize as one rendezvous of every process: common "
+                                   "implementations synchronize there (Open MPI's PMIx fence), the MPI standard "
+                                   "does not require it; the timestamps drop an edge they contradict"),
+    "process_begin": ("direct", "from the window's start (the earliest process-begin marker: a hook's "
+                                "constructor, before main) to the path's first event: unrecorded thread time"),
+    "region_join": ("inferred", "nothing of an OpenMP parallel region runs after its join: a worker's span of "
+                                "the region recorded as ending later (LLVM libomp reports a worker's implicit "
+                                "barrier and task end when the worker is released for the next region) ends "
+                                "at the join; the time after it is the worker idle"),
 }
 PROVS = tuple(PROVENANCE)
 _P = {p: i for i, p in enumerate(PROVS)}
@@ -249,7 +279,9 @@ def edge_reason(kind: str, prov: str, conf: str) -> str:
     """Why the edge exists and has its tier, in words."""
     why = PROVENANCE[prov][1]
     if conf == "low":
-        return why + "; the process lost events, so the pairing may be shifted"
+        return why + ("; the records do not fix the pairing's order (the process lost events, a "
+                      "sequence-number gap that could not be placed, or posts that overlapped on two "
+                      "threads), so it may be shifted")
     extra = _TIER_REASON.get((kind, conf))
     return f"{why}; {extra}" if extra else why
 
@@ -261,11 +293,14 @@ def runtime_of_edge(kind: str, src_cat: str, dst_cat: str) -> str:
         return "openmp"
     if kind in ("fork", "join"):
         return "openmp"
+    if kind == "wakeup":
+        return "sched"
     if kind == "arrival":
         return dst_cat if dst_cat in ("mpi", "nccl") else "openmp"
     if kind == "launch":
         return dst_cat
-    if kind in ("device_wait", "device_sync", "stream_order", "event_wait", "sequential", "explicit_span_id"):
+    if kind in ("device_wait", "device_sync", "stream_order", "event_wait", "sequential", "explicit_span_id",
+                "graph_dependency"):
         return src_cat
     return dst_cat
 
@@ -300,6 +335,7 @@ class EventGraph:
         self._origin = -1                          # span-level edge being added
         self.enabled = bytearray()
         self.order = array.array(_i32())          # active nodes, topological order
+        self.connected: bytearray | None = None   # connected_events(), once the order is final
         # per span
         self.cat: list[str] = [""] * n
         self.name_id = array.array(_i32(), bytes(4 * n))
@@ -310,6 +346,9 @@ class EventGraph:
         self.release = array.array("q", [-1]) * n  # gated call: latest source event of its gates
         self.rooted = bytearray(n)                # rooted collective, root not recorded
         self.rootflow = bytearray(n)              # rooted collective with its root recorded
+        self.lifecycle = bytearray(n)             # MPI_Init / MPI_Finalize (type=init / finalize)
+        self.lead: dict[int, int] = {}            # source node -> unrecorded time since its process began
+        self.window_start: int | None = None      # see Skeleton
         self.excluded = bytearray(n)
         # diagnostics
         self.dropped: Counter = Counter()        # dependency kind -> edges contradicting timestamps
@@ -320,6 +359,7 @@ class EventGraph:
         self.clock_contradicted = 0               # edges disabled: no clock offsets satisfy them
         self.clock_disabled: set[int] = set()     # their event edge ids
         self.skeleton = None                      # Skeleton (build_event_graph(keep_skeleton=True))
+        self.capped: dict[int, int] = {}          # span -> ns of its recorded end after its region's join
         self.skipped_edges = array.array("q")     # span-level edges with no event edge (same lane, unmapped)
         self.improper_nesting = 0
         self.cycle_edges_dropped = 0
@@ -413,9 +453,16 @@ class Skeleton:
     lanes: list
     dom_keys: list
     dom_bounds: list
+    capped: dict = field(default_factory=dict)    # span -> ns its end was capped by (region join)
+    lifecycle: bytearray = field(default_factory=bytearray)
+    begin: array.array | None = None              # span -> its process's begin marker (NO_BEGIN: none)
+    window_start: int | None = None               # the observed path's start (Walk.lead), None: its first event
 
 
-def _read_spans(trace: "Trace", graph) -> Skeleton:
+NO_BEGIN = -(1 << 63)          # Skeleton.begin: the span's process has no begin marker
+
+
+def _read_spans(trace: "Trace", graph, begin_of: dict | None = None) -> Skeleton:
     from . import cp_clock
     from . import criticalpath as cp
     from .semantics import blocking_wait
@@ -428,9 +475,12 @@ def _read_spans(trace: "Trace", graph) -> Skeleton:
                   excluded=bytearray(n), rooted=bytearray(n), rootflow=bytearray(n), blocking=bytearray(n),
                   domain=array.array(_i32(), bytes(4 * n)), stream_key={},
                   lane=array.array(_i32(), [-1]) * n, resolved_wildcard=bytearray(n), lanes=[],
-                  dom_keys=[], dom_bounds=[])
+                  dom_keys=[], dom_bounds=[], lifecycle=bytearray(n),
+                  begin=array.array("q", [NO_BEGIN]) * n if begin_of else None)
     name_ids: dict[str, int] = {}
     lanes: dict[tuple[int, int], array.array] = defaultdict(lambda: array.array("q"))
+    region_end: dict[tuple[int, str], int] = {}       # (pid, region id) -> its join
+    in_region: list[tuple[int, int, str]] = []         # (span, pid, region id)
     count = 0
     for i, s in enumerate(trace.iter_spans()):
         count += 1
@@ -475,8 +525,18 @@ def _read_spans(trace: "Trace", graph) -> Skeleton:
                 sk.rooted[i] = 1
         if blocking_wait(s):
             sk.blocking[i] = 1
+        if s.category.value == "mpi" and typ in cp._MPI_LIFECYCLE_TYPES:
+            sk.lifecycle[i] = 1
+        if begin_of and not sk.device[i]:
+            sk.begin[i] = begin_of.get(s.pid, NO_BEGIN)
+        if s.category.value in ("openmp", "sync") and not sk.device[i]:
+            if typ == "parallel" and s.span_id:
+                region_end[(s.pid, s.span_id)] = sk.t[2 * i + 1]
+            elif s.parent_span_id:
+                in_region.append((i, s.pid, s.parent_span_id))
     if count != n:
         raise ValueError(f"{count} spans, but the graph has {n} ordinals")
+    _cap_at_region_join(sk, region_end, in_region)
     sk.lanes = list(lanes.values())
     for li, members in enumerate(sk.lanes):
         for j in members:
@@ -485,6 +545,19 @@ def _read_spans(trace: "Trace", graph) -> Skeleton:
         sk.dom_keys.append(cp_clock.REFERENCE)
         sk.dom_bounds.append(0.0)
     return sk
+
+
+def _cap_at_region_join(sk: Skeleton, region_end: dict, in_region: list) -> None:
+    """End every span of an OpenMP parallel region (psid= the region's id)
+    no later than the region's join (module docstring, "idle")."""
+    for i, pid, rid in in_region:
+        join = region_end.get((pid, rid))
+        if join is None:
+            continue
+        st, en = sk.t[2 * i], sk.t[2 * i + 1]
+        if en > join >= st:
+            sk.capped[i] = en - join
+            sk.t[2 * i + 1] = join
 
 
 def _shifted(sk: Skeleton, shift: dict) -> Skeleton:
@@ -511,6 +584,10 @@ def _assemble(sk: Skeleton, edges, *, clocks: bool, prior_clock=None) -> EventGr
     g.device, g.excluded, g.rooted, g.rootflow, g.blocking = sk.device, sk.excluded, sk.rooted, sk.rootflow, \
         sk.blocking
     g.domain = sk.domain
+    g.capped = sk.capped
+    g.window_start = sk.window_start
+    if len(sk.lifecycle) == n:
+        g.lifecycle = sk.lifecycle
     _add_dependency_edges(g, edges, cp.EDGE_KINDS, sk.stream_key, sk.lane, sk.resolved_wildcard)
     # a call whose end a dependency from another lane gates can wait inside;
     # it is released at the latest source event of those dependencies. The
@@ -551,17 +628,36 @@ def _assemble(sk: Skeleton, edges, *, clocks: bool, prior_clock=None) -> EventGr
     else:
         g.clock = prior_clock
     _break_cycles(g)
+    if sk.begin is not None:
+        _window_leads(g, sk.begin)
     return g
 
 
-def build_event_graph(trace: "Trace", graph, *, clocks: bool = True, keep_skeleton: bool = False) -> EventGraph:
+def _window_leads(g: EventGraph, begin: array.array) -> None:
+    """g.lead: for a host span's start event that nothing precedes (no
+    enabled in-edge: the first event of its thread, reached by nothing),
+    the unrecorded time since its process began -- the virtual source's
+    edge to it in the modeled longest path, a gap like any other."""
+    for j in range(g.n):
+        b = begin[j]
+        if b == NO_BEGIN or g.device[j] or g.excluded[j]:
+            continue
+        v = 2 * j
+        if g.t[v] <= b or any(g.enabled[g.in_idx[k]] for k in range(g.in_ptr[v], g.in_ptr[v + 1])):
+            continue
+        g.lead[v] = g.t[v] - b
+
+
+def build_event_graph(trace: "Trace", graph, *, clocks: bool = True, keep_skeleton: bool = False,
+                      begin_of: dict | None = None, window_start: int | None = None) -> EventGraph:
     """The event-point graph of a trace from its persisted span-level edges
     (criticalpath.Graph). Spans are read once, in ordinal (= seq) order.
     clocks: analyze the clock domains (see "Clocks"); a shiftable domain
     whose times contradict its dependencies is shifted and the graph
     assembled once more. keep_skeleton: keep what was read from the spans
     (g.skeleton) for graph_with_edges."""
-    sk = _read_spans(trace, graph)
+    sk = _read_spans(trace, graph, begin_of)
+    sk.window_start = window_start
     g = _assemble(sk, graph.edges, clocks=clocks)
     if clocks:
         ca = g.clock
@@ -729,12 +825,18 @@ def _add_dependency_edge(g: EventGraph, v, u, k, c, edge_kinds, stream_key, lane
         prov = "nccl_pseq" if g.cat[v] == "nccl" else \
             "status_resolved" if resolved_wildcard[v] and c == high else "posting_order"
         g.add(S_u, E_v, DEP, _K["p2p"], _P[prov], c, -1)
-    elif kind == "task_join":
-        g.add(E_u, E_v, DEP, _K["task_join"], _P["task_id"], c, -1)
-    elif kind == "task_dep":
-        g.add(E_u, S_v, DEP, _K["task_dependence"], _P["task_id"], c, -1)
+    elif kind == "task_join":       # "high": a taskwait depend(...) by the rules (semantics/openmp.py)
+        g.add(E_u, E_v, DEP, _K["task_join"], _P["dep_rules" if c == high else "task_id"], c, -1)
+    elif kind == "task_dep":        # "certain": reported by OMPT; "high": GNU deps= by the rules
+        g.add(E_u, S_v, DEP, _K["task_dependence"], _P["dep_rules" if c == high else "task_id"], c, -1)
     elif kind == "lock_order":
         g.add(E_u, E_v, DEP, _K["lock_handoff"], _P["lock_handoff"], c, -1, tol)
+    elif kind == "graph_dep":
+        g.add(E_u, S_v, DEP, _K["graph_dependency"], _P["graph_edge"], c, -1, tol)
+    elif kind == "wakeup":          # the waking lies inside u: only u's start is known to precede it
+        g.add(S_u, E_v, DEP, _K["wakeup"], _P["os_wakeup"], c, -1, tol)
+    elif kind == "arrival" and g.lifecycle[v]:
+        g.add(S_u, E_v, DEP, _K["arrival"], _P["lifecycle_sync"], c, -1)
     elif kind == "arrival":
         if c == high:
             prov = "nccl_seq" if g.cat[v] == "nccl" else \
@@ -769,7 +871,8 @@ def _add_thread_lane(g: EventGraph, members) -> None:
         else:
             evs.append((st, 1, 0, j, -1))                # zero length: S then E together
     evs.sort()
-    kind, prov = _K["thread"], _P["thread_timeline"]
+    kind, prov, joined = _K["thread"], _P["thread_timeline"], _P["region_join"]
+    capped = g.capped
     open_: list[int] = []
     prev = -1
     for _t, _o, _k, _j, node in evs:
@@ -777,11 +880,19 @@ def _add_thread_lane(g: EventGraph, members) -> None:
         for nd in ((2 * j, 2 * j + 1) if node < 0 else (node,)):
             if prev >= 0:
                 inner = open_[-1] if open_ else -1
+                into_cap = nd & 1 and (nd >> 1) in capped
                 if inner < 0:
-                    g.add(prev, nd, GAP, kind, prov, 0, -1)
+                    # after a span capped at its region's join: the worker
+                    # idle until its recorded end (and the runtime's
+                    # dispatch of what comes next, within the tolerance)
+                    held = capped.get(prev >> 1, -1) if prev & 1 else -1
+                    if held >= 0 and g.t[nd] <= g.t[prev] + held + ga.CLOCK_TOLERANCE_NS:
+                        g.add(prev, nd, IDLE, kind, joined, 0, -1)
+                    else:
+                        g.add(prev, nd, GAP, kind, prov, 0, -1)
                 else:
                     g.add(prev, nd, WAIT if g.gated[inner] else UNKNOWN if g.blocking[inner] else BUSY,
-                          kind, prov, 0, inner)
+                          kind, joined if into_cap else prov, 0, inner)
             if node >= 0:
                 if nd & 1:
                     if open_ and open_[-1] == j:
@@ -866,10 +977,17 @@ class Walk:
     undecidable_ns: int = 0          # how much later the chosen release was, summed
     undecidable_samples: list[dict] = field(default_factory=list)
     undecidable_steps: list[tuple[int, int]] = field(default_factory=list)   # (chosen, alternative) edge
+    lead: int = 0                    # unrecorded time from the window's start to the first event
+    # after the sink: the trace's last event is a record the walk cannot
+    # connect (last_events) -- how much later, how many such records end
+    # after the sink, by name
+    tail_ns: int = 0
+    tail_records: int = 0
+    tail_names: dict[str, int] = field(default_factory=dict)
 
     @property
     def length(self) -> int:
-        return sum(self.cover)
+        return sum(self.cover) + self.lead
 
     def spans(self, g: EventGraph) -> set[int]:
         """Spans that own time on the path, or whose events it passes."""
@@ -881,17 +999,62 @@ class Walk:
         return out
 
 
+def connected_events(g: EventGraph) -> bytearray:
+    """Events the walk can connect to the program: those of host spans (a
+    thread's own timeline) and every event an enabled edge chain reaches
+    from one. A device-side record that nothing recorded on a thread leads
+    to -- a CUPTI synchronization record whose host call was not recorded,
+    device work whose submission was not -- is not: the walk could say
+    neither what it waited for nor what the program did meanwhile. All
+    events when the trace has no host span at all."""
+    if g.connected is not None:
+        return g.connected
+    ok = bytearray(2 * g.n)
+    dev, exc, enabled, src, in_ptr, in_idx = g.device, g.excluded, g.enabled, g.src, g.in_ptr, g.in_idx
+    for v in g.order:
+        j = v >> 1
+        if not dev[j] and not exc[j]:
+            ok[v] = 1
+            continue
+        for k in range(in_ptr[v], in_ptr[v + 1]):
+            e = in_idx[k]
+            if enabled[e] and ok[src[e]]:
+                ok[v] = 1
+                break
+    if not any(ok):
+        for v in g.order:
+            ok[v] = 1
+    g.connected = ok
+    return ok
+
+
 def last_events(g: EventGraph) -> list[int]:
-    """The events at the latest timestamp that nothing follows (an
-    enclosing span's end, not the nested end at the same instant), highest
-    node first. Several: the trace ends on several lanes at once."""
+    """The connected events (connected_events) at the latest timestamp that
+    nothing follows (an enclosing span's end, not the nested end at the
+    same instant), highest node first. Several: the trace ends on several
+    lanes at once."""
     if not g.order:
         return []
-    tmax = max(g.t[v] for v in g.order)
-    at = [v for v in g.order if g.t[v] == tmax]
+    ok = connected_events(g)
+    cand = [v for v in g.order if ok[v]]
+    tmax = max(g.t[v] for v in cand)
+    at = [v for v in cand if g.t[v] == tmax]
     free = [v for v in at if not any(g.enabled[g.out_idx[k]]
                                      for k in range(g.out_ptr[v], g.out_ptr[v + 1]))]
     return sorted(free or at, reverse=True)
+
+
+def _unconnected_tail(g: EventGraph, sink: int) -> tuple[int, int, dict[str, int]]:
+    """(time from the sink to the trace's last event, the records ending
+    after the sink, by name) -- the records the walk cannot connect."""
+    ok = connected_events(g)
+    ts = g.t[sink]
+    tail, names = 0, Counter()
+    for v in g.order:
+        if g.t[v] > ts and v & 1 and not ok[v]:
+            tail = max(tail, g.t[v] - ts)
+            names[g.name(v >> 1)] += 1
+    return tail, sum(names.values()), dict(names)
 
 
 def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False,
@@ -974,7 +1137,10 @@ def walk(g: EventGraph, *, gap_as_work: bool = False, direct_only: bool = False,
         v = u
     steps.reverse()
     cover.reverse()
-    return Walk(steps, cover, v, sink, ties, samples, undecidable, undecidable_ns, u_samples, u_steps)
+    lead = 0 if g.window_start is None else max(0, t[v] - g.window_start)
+    tail_ns, tail_records, tail_names = _unconnected_tail(g, sink)
+    return Walk(steps, cover, v, sink, ties, samples, undecidable, undecidable_ns, u_samples, u_steps, lead,
+                tail_ns, tail_records, tail_names)
 
 
 # ── modeled longest path ─────────────────────────────────────────────────────
@@ -986,9 +1152,10 @@ def longest(g: EventGraph, *, gap_as_work: bool = True, direct_only: bool = Fals
     in_ptr, in_idx, src, enabled, mode, d, owner, whi = (g.in_ptr, g.in_idx, g.src, g.enabled, g.mode,
                                                           g.d, g.owner, g.whi)
     dst = g.dst
+    lead = g.lead if gap_as_work else None
     best_all = 0
     for v in g.order:
-        best = 0
+        best = lead.get(v, 0) if lead else 0         # the virtual source's edge
         for k in range(in_ptr[v], in_ptr[v + 1]):
             e = in_idx[k]
             if not enabled[e]:
@@ -1088,8 +1255,9 @@ def criticality(g: EventGraph, F: array.array, length: int) -> Criticality:
             tight[e] = 1
             diff[pos[u] + 1] += 1
             diff[pos[v] + 1] -= 1
+    lead = g.lead
     for v in order:
-        if B[v] == length:                     # virtual source -> v
+        if (lead.get(v, 0) if lead else 0) + B[v] == length:     # virtual source -> v
             diff[0] += 1
             diff[pos[v] + 1] -= 1
         if F[v] == length:                     # v -> virtual sink
@@ -1166,6 +1334,7 @@ class ModelResult:
     modeled_ns: int = 0
     modeled_unrecorded_idle_ns: int = 0
     modeled_direct_only_ns: int = 0
+    thread_idle_ns: int = 0                  # an OpenMP worker idle after its region's join (lane "idle")
     crit: Criticality | None = None
     sensitivity: list[dict] = field(default_factory=list)
     sensitivity_note: str = ""
@@ -1215,6 +1384,9 @@ def path_rows(g: EventGraph, w: Walk) -> list[PathRow]:
     """Steps merged into runs: consecutive lane steps of one owner in one
     mode, and every other step on its own."""
     rows: list[PathRow] = []
+    if w.lead and w.first >= 0:
+        rows.append(PathRow(w.first >> 1, 0, w.lead, g.t[w.first] - w.lead, g.t[w.first], "gap", "thread",
+                            "certain"))
     for e, ns in zip(w.steps, w.cover):
         m = g.mode[e]
         u, v = g.src[e], g.dst[e]
@@ -1253,7 +1425,7 @@ def _span_view(g: EventGraph, w: Walk):
         return k
 
     if w.first >= 0:
-        intro(w.first >> 1, "", "")
+        gaps[intro(w.first >> 1, "", "")] += w.lead
     for e, ns in zip(w.steps, w.cover):
         m = g.mode[e]
         kind, conf = legacy_kind(KINDS[g.kind[e]]), CONFS[g.conf[e]]
@@ -1265,19 +1437,27 @@ def _span_view(g: EventGraph, w: Walk):
     return order, credited, gaps, kinds[1:], confs[1:]
 
 
-def observed_path(trace: "Trace", graph, *, keep_skeleton: bool = False) -> tuple[EventGraph, Walk]:
-    g = build_event_graph(trace, graph, keep_skeleton=keep_skeleton)
+def observed_path(trace: "Trace", graph, *, keep_skeleton: bool = False,
+                  window_start: int | None = None, begin_of: dict | None = None) -> tuple[EventGraph, Walk]:
+    """The event graph and its observed path. window_start: the path starts
+    there (the earliest process-begin marker): the time from it to the
+    walk's first event is unrecorded thread time on that event's span
+    (Walk.lead). begin_of: pid -> process begin, for the modeled path's
+    leads (g.lead)."""
+    g = build_event_graph(trace, graph, keep_skeleton=keep_skeleton, begin_of=begin_of, window_start=window_start)
     return g, walk(g)
 
 
 def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
-                  sensitivity_node_limit: int = 4_000_000, keep_skeleton: bool = False) -> ModelResult:
+                  sensitivity_node_limit: int = 4_000_000, keep_skeleton: bool = False,
+                  window_start: int | None = None, begin_of: dict | None = None) -> ModelResult:
     """The observed path, its composition and evidence, the modeled longest
     path, criticality, alternatives and (top `sensitivity` candidates)
     counterfactual reductions. sensitivity=None: 5 when the graph has at
     most `sensitivity_node_limit` event nodes, else none (each candidate is
     a full longest-path pass); 0: none."""
-    g, w = observed_path(trace, graph, keep_skeleton=keep_skeleton)
+    g, w = observed_path(trace, graph, keep_skeleton=keep_skeleton, window_start=window_start,
+                         begin_of=begin_of)
     work: dict[str, int] = defaultdict(int)
     in_call: dict[str, int] = defaultdict(int)
     dep_kind: dict[str, int] = defaultdict(int)
@@ -1286,7 +1466,13 @@ def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
     cls: dict[str, int] = defaultdict(int)
     prov: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     unmatched: dict[str, int] = defaultdict(int)
-    unrecorded = idle = 0
+    unrecorded = idle = thread_idle = 0
+    thread = _K["thread"]
+    if w.lead:                                  # the window's start to the first event
+        unrecorded += w.lead
+        tier["certain"] += w.lead
+        cls["direct"] += w.lead
+        prov["process_begin"] = [w.lead, 1]
     for e, ns in zip(w.steps, w.cover):
         m = g.mode[e]
         if m == BUSY:
@@ -1298,7 +1484,10 @@ def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
         elif m == GAP:
             unrecorded += ns
         elif m == IDLE:
-            idle += ns
+            if g.kind[e] == thread:          # a worker held after its region's join
+                thread_idle += ns
+            else:
+                idle += ns
         else:
             dep_kind[KINDS[g.kind[e]]] += ns
             dep_src[g.cat[g.src[e] >> 1]] += ns
@@ -1316,6 +1505,7 @@ def analyze_model(trace: "Trace", graph, *, sensitivity: int | None = None,
         by_tier=dict(tier), by_class=dict(cls), by_provenance={k: (v[0], v[1]) for k, v in prov.items()},
         rows=path_rows(g, w), path_spans=spans, credited=credited, gaps=gaps,
         entering_kinds=kinds, entering_confs=confs, unmatched_by_category=dict(unmatched),
+        thread_idle_ns=thread_idle,
     )
     res.graph_evidence = _graph_evidence(g)
     res.covered_range_ns = (w.length, w.length)

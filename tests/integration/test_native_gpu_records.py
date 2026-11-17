@@ -156,6 +156,12 @@ class TestCuptiDecoder(unittest.TestCase):
             ("cuLaunchKernel", "launch", "740"),
             ("cudaStreamSynchronize", "sync", "750"),   # static-runtime mode only
             ("cudaStreamWaitEvent", "stream_wait", "751"),
+            # event syncs and completed queries: always (the not-ready
+            # query 755 and the runtime query's own driver call 757: none)
+            ("cudaEventSynchronize", "sync", "752"),
+            ("cuEventSynchronize", "sync", "753"),
+            ("cuEventQuery", "sync", "754"),
+            ("cudaEventQuery", "sync", "756"),
             ("cuLaunchKernelEx", "launch", "760"),
             ("cuLaunchKernel", "launch", "761"),
             ("cuLaunchKernelEx_ptsz", "launch", "762"),
@@ -164,6 +170,9 @@ class TestCuptiDecoder(unittest.TestCase):
             ("cuMemcpyHtoDAsync", "launch", "765"),
         ])
         self.assertEqual(cb[4].tags["sync"], "stream")
+        self.assertEqual([(s.tags["sync"], s.tags["event"]) for s in cb[6:10]],
+                         [("event", "49"), ("event", "50"), ("event", "51"), ("event", "52")])
+        self.assertNotIn("event", cb[4].tags)
         self.assertTrue(all(s.tags["side"] == "cpu" and s.tags["timing"] == "host" for s in cb))
 
     def test_callback_launches_name_their_module(self):

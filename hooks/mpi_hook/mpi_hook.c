@@ -5,16 +5,27 @@
  *
  * Wrapped: point-to-point (Send, Ssend, Bsend, Rsend, Recv, Isend, Issend,
  * Ibsend, Irsend, Irecv, Sendrecv, Sendrecv_replace, Probe, Iprobe,
- * Mprobe/Improbe/Mrecv/Imrecv (as markers), Wait*, Test*, Cancel),
- * non-blocking collectives (Ibarrier, Ibcast, Iallreduce, Ireduce,
- * Iallgather, Ialltoall, Iscatter, Igather), persistent requests
- * (Send_init, Bsend_init, Ssend_init, Rsend_init, Recv_init, Start, Startall,
+ * Mprobe/Improbe/Mrecv/Imrecv (linked by mid=, see "Matched probes"), Wait*,
+ * Test*, Cancel), non-blocking collectives (Ibarrier, Ibcast, Iallreduce,
+ * Ireduce, Iallgather, Ialltoall, Iscatter, Igather, Iallgatherv,
+ * Ialltoallv, Igatherv, Iscatterv, Ireduce_scatter, Ireduce_scatter_block,
+ * Iscan, Iexscan), persistent requests (Send_init, Bsend_init, Ssend_init,
+ * Rsend_init, Recv_init, with MPI 4 the persistent collectives Barrier_init,
+ * Bcast_init, Reduce_init, Allreduce_init, Allgather_init, Alltoall_init,
+ * Gather_init, Scatter_init, Reduce_scatter_block_init; Start, Startall,
  * Request_free), collectives (Bcast, Reduce,
  * Allreduce, Alltoall, Allgather, Scatter, Gather, Allgatherv, Alltoallv,
  * Gatherv, Scatterv, Reduce_scatter, Reduce_scatter_block, Barrier, Scan,
  * Exscan), one-sided (Put, Get, Accumulate, Win_fence/flush/flush_all/lock/
- * lock_all/unlock/unlock_all), Init/Init_thread/Finalize, and
- * Comm_dup/split/create/free (only for commid= and rank translation).
+ * lock_all/unlock/unlock_all), Init/Init_thread/Finalize, and the
+ * communicator constructors Comm_dup/split/split_type/create/create_group,
+ * Cart_create/sub, Graph_create, Dist_graph_create[_adjacent],
+ * Intercomm_merge and Comm_free (only for commid=, rank translation and the
+ * sequence numbers).
+ *
+ * Sequence numbers (sseq= / rseq= / cseq=): see "Communicator identity and
+ * sequence numbers". They expose a lost record and its place in a channel's
+ * order; they cannot say what the lost call was.
  *
  * Request linking: a posted request gets an id (sid=); completion calls
  * report the ids they completed (psid=). Every MPI_Start (and each request
@@ -38,11 +49,13 @@
  * completion) its MPI_COMM_WORLD rank, so analyses can pair messages on
  * sub-communicators. null=1 marks MPI_PROC_NULL.
  *
- * Communicator identity: commid=0 is MPI_COMM_WORLD; communicators from
- * Comm_dup/split/create get an id assigned by their local rank 0 and
+ * Communicator identity: commid=0 is MPI_COMM_WORLD; communicators from the
+ * wrapped constructors get an id assigned by their local rank 0 and
  * broadcast over the new communicator right after creation (safe: creation
- * is collective). -1 = unregistered (MPI_COMM_SELF, or an API not wrapped
- * here such as Comm_create_group or Cart_create).
+ * is collective over it). -1 = unregistered: MPI_COMM_SELF,
+ * intercommunicators (the broadcast would need MPI_ROOT on one side),
+ * MPI_Comm_idup, MPI_Comm_spawn's and other unwrapped constructors, or the
+ * table full.
  */
 
 #define _GNU_SOURCE
@@ -172,35 +185,128 @@ static char *xstrdup_tags(const char *s, size_t *len) {
     return x;
 }
 
-/* ── Communicator identity ──────────────────────────────────────────── */
+/* ── Communicator identity and sequence numbers ─────────────────────────
+ * Every registered communicator (MPI_COMM_WORLD, and those created by the
+ * wrapped constructors below) carries three kinds of counters, so the
+ * analysis can tell a complete record of a channel from one with a hole:
+ *   sseq=<n>   on every send post: the n-th send this process posted to that
+ *              destination (comm-local rank) on that communicator, from 1;
+ *   rseq=<n>   on every receive post (receives, persistent receive starts,
+ *              the receive half of MPI_Sendrecv, a successful matched probe):
+ *              the n-th on that communicator in this process, from 1;
+ *   cseq=<n>   on every collective call (blocking, non-blocking initiation,
+ *              persistent collective init and start), with csize= the
+ *              communicator's size: the n-th on that communicator, from 1.
+ *              MPI requires every member to call its collectives in the same
+ *              order, so (commid, cseq) names one collective on every rank.
+ * A missing number between two recorded ones is a record the hook made but
+ * the trace does not hold (dropped in transport); it says that a call is
+ * missing and where, never what it was. Calls the hook does not intercept
+ * (MPI-4 large-count, Fortran bindings) take no number and leave no gap.
+ * Counters are taken at the call's entry under g_comm_mutex, so concurrent
+ * calls from several threads get distinct numbers in the order they entered
+ * the hook -- which for calls that overlap in time need not be the order the
+ * library matched them (the analysis treats such pairs as unordered).
+ * Unregistered communicators (commid=-1: MPI_COMM_SELF, intercommunicators,
+ * MPI_Comm_idup, the table full) get no numbers, counted in
+ * mpi_seq_unkeyed at MPI_Finalize. The table holds COMM_TABLE_CAP
+ * communicators (48 B each with MPICH-ABI handles: 12 KiB); a send counter
+ * array (4 B per destination rank) is allocated on a communicator's first
+ * send and freed with it. */
 #define COMM_TABLE_CAP 256
-typedef struct { MPI_Comm comm; int64_t id; } CommRec;
+typedef struct {
+    MPI_Comm  comm;
+    int64_t   id;
+    int       size;           /* number of ranks (sseq array length) */
+    uint64_t  rseq, cseq;     /* receive posts / collective calls so far */
+    uint32_t *sseq;           /* per destination rank; NULL until the first send */
+} CommRec;
 static CommRec         g_comm_table[COMM_TABLE_CAP];
 static int              g_comm_n       = 0;
 static int64_t          g_comm_id_seq  = 1;   /* 0 reserved for MPI_COMM_WORLD */
 static pthread_mutex_t  g_comm_mutex   = PTHREAD_MUTEX_INITIALIZER;
+static CommRec          g_world        = {0};  /* MPI_COMM_WORLD, set at MPI_Init */
+static uint64_t         g_seq_unkeyed  = 0;    /* calls with no sequence number */
+
+/* The record of `comm`, NULL when unregistered. Caller holds g_comm_mutex. */
+static CommRec *comm_rec_locked(MPI_Comm comm) {
+    if (comm == MPI_COMM_WORLD) return g_world.size > 0 ? &g_world : NULL;
+    for (int i = 0; i < g_comm_n; i++)
+        if (g_comm_table[i].comm == comm) return &g_comm_table[i];
+    return NULL;
+}
 
 static int64_t comm_id_for(MPI_Comm comm) {
     if (comm == MPI_COMM_WORLD) return 0;
     pthread_mutex_lock(&g_comm_mutex);
-    for (int i = 0; i < g_comm_n; i++) {
-        if (g_comm_table[i].comm == comm) {
-            int64_t id = g_comm_table[i].id;
-            pthread_mutex_unlock(&g_comm_mutex);
-            return id;
+    CommRec *r = comm_rec_locked(comm);
+    int64_t id = r ? r->id : -1;   /* -1: MPI_COMM_SELF, or created via an un-hooked API */
+    pthread_mutex_unlock(&g_comm_mutex);
+    return id;
+}
+
+enum { SEQ_SEND, SEQ_RECV, SEQ_COLL };
+
+/* The communicator's id and the next number of kind `kind` (0: none -- an
+ * unregistered communicator, MPI_PROC_NULL, a destination out of range or
+ * no memory for the send counters). *size_out (may be NULL): its size. */
+static uint64_t comm_seq(MPI_Comm comm, int kind, int peer, int64_t *id_out, int *size_out) {
+    uint64_t seq = 0;
+    pthread_mutex_lock(&g_comm_mutex);
+    CommRec *r = comm_rec_locked(comm);
+    if (id_out) *id_out = r ? r->id : (comm == MPI_COMM_WORLD ? 0 : -1);
+    if (size_out) *size_out = r ? r->size : 0;
+    if (!(kind != SEQ_COLL && peer == MPI_PROC_NULL)) {   /* MPI_PROC_NULL: no message, no hole */
+        if (r && kind == SEQ_RECV) {
+            seq = ++r->rseq;
+        } else if (r && kind == SEQ_COLL) {
+            seq = ++r->cseq;
+        } else if (r && peer >= 0 && peer < r->size) {
+            if (!r->sseq) r->sseq = (uint32_t *)calloc((size_t)r->size, sizeof(uint32_t));
+            if (r->sseq) seq = ++r->sseq[peer];
         }
+        if (!seq) g_seq_unkeyed++;
     }
     pthread_mutex_unlock(&g_comm_mutex);
-    return -1;  /* unregistered: MPI_COMM_SELF, or created via an un-hooked API */
+    return seq;
+}
+
+/* ",<key>=<seq>" into buf (cap >= 32), or "" for seq 0 -- without printf:
+ * it runs on every wrapped call. */
+static void seq_tag(char *buf, size_t cap, const char *key, uint64_t seq) {
+    buf[0] = '\0';
+    if (!seq) return;
+    char digits[24];
+    int n = 0;
+    while (seq && n < 24) { digits[n++] = (char)('0' + seq % 10); seq /= 10; }
+    size_t k = strlen(key), pos = 0;
+    if (k + (size_t)n + 3 > cap) return;
+    buf[pos++] = ',';
+    memcpy(buf + pos, key, k); pos += k;
+    buf[pos++] = '=';
+    while (n) buf[pos++] = digits[--n];
+    buf[pos] = '\0';
+}
+
+/* Size of a communicator's peer space: its group, or for an
+ * intercommunicator the remote group (never registered, see below). */
+static int comm_size_of(MPI_Comm comm) {
+    int n = 0;
+    if (PMPI_Comm_size(comm, &n) != MPI_SUCCESS) return 0;
+    return n;
 }
 
 /* Call only on a communicator that was just collectively created (every
  * member reaches this together). The id packs the bootstrapping process's
  * MPI_COMM_WORLD rank with its local sequence number: a sequence number
  * alone would collide between unrelated communicators bootstrapped by
- * different world ranks (e.g. the two halves of a Comm_split). */
+ * different world ranks (e.g. the two halves of a Comm_split).
+ * Intercommunicators are left unregistered: the id's broadcast would need
+ * MPI_ROOT on one side (root=0 makes both groups wait for the other). */
 static void comm_id_register(MPI_Comm new_comm) {
     if (new_comm == MPI_COMM_NULL) return;
+    int inter = 0;
+    if (PMPI_Comm_test_inter(new_comm, &inter) != MPI_SUCCESS || inter) return;
     long long id = 0;
     int my_local_rank = 0;
     PMPI_Comm_rank(new_comm, &my_local_rank);
@@ -213,21 +319,23 @@ static void comm_id_register(MPI_Comm new_comm) {
         id = ((long long)world_rank << 32) | (local_seq & 0xffffffffLL);
     }
     PMPI_Bcast(&id, 1, MPI_LONG_LONG, 0, new_comm);
+    int size = comm_size_of(new_comm);
     pthread_mutex_lock(&g_comm_mutex);
     if (g_comm_n < COMM_TABLE_CAP) {
-        g_comm_table[g_comm_n].comm = new_comm;
-        g_comm_table[g_comm_n].id   = (int64_t)id;
+        g_comm_table[g_comm_n] = (CommRec){new_comm, (int64_t)id, size, 0, 0, NULL};
         g_comm_n++;
     }
     pthread_mutex_unlock(&g_comm_mutex);
 }
 
 /* A freed handle can be reused by the next communicator the library
- * creates; forgetting it keeps that one from inheriting this one's id. */
+ * creates; forgetting it keeps that one from inheriting this one's id and
+ * counters. */
 static void comm_id_forget(MPI_Comm comm) {
     pthread_mutex_lock(&g_comm_mutex);
     for (int i = 0; i < g_comm_n; i++) {
         if (g_comm_table[i].comm == comm) {
+            free(g_comm_table[i].sseq);
             g_comm_table[i] = g_comm_table[--g_comm_n];
             break;
         }
@@ -395,6 +503,68 @@ int MPI_Comm_split(MPI_Comm comm, int color, int key, MPI_Comm *newcomm) {
 int MPI_Comm_create(MPI_Comm comm, MPI_Group group, MPI_Comm *newcomm) {
     int ret = PMPI_Comm_create(comm, group, newcomm);
     if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+/* More constructors: every member of the new communicator calls them, so
+ * comm_id_register's broadcast over it is safe. (MPI_Comm_idup is not
+ * wrapped -- its communicator may not be used before it completes -- and
+ * intercommunicators stay unregistered, see comm_id_register.) */
+int MPI_Comm_split_type(MPI_Comm comm, int split_type, int key, MPI_Info info, MPI_Comm *newcomm) {
+    int ret = PMPI_Comm_split_type(comm, split_type, key, info, newcomm);
+    if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+int MPI_Comm_create_group(MPI_Comm comm, MPI_Group group, int tag, MPI_Comm *newcomm) {
+    int ret = PMPI_Comm_create_group(comm, group, tag, newcomm);
+    if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+int MPI_Cart_create(MPI_Comm comm, int ndims, const int dims[], const int periods[], int reorder,
+                    MPI_Comm *newcomm) {
+    int ret = PMPI_Cart_create(comm, ndims, dims, periods, reorder, newcomm);
+    if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+int MPI_Cart_sub(MPI_Comm comm, const int remain_dims[], MPI_Comm *newcomm) {
+    int ret = PMPI_Cart_sub(comm, remain_dims, newcomm);
+    if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+int MPI_Graph_create(MPI_Comm comm, int nnodes, const int indx[], const int edges[], int reorder,
+                     MPI_Comm *newcomm) {
+    int ret = PMPI_Graph_create(comm, nnodes, indx, edges, reorder, newcomm);
+    if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+int MPI_Dist_graph_create(MPI_Comm comm, int n, const int sources[], const int degrees[],
+                          const int destinations[], const int weights[], MPI_Info info, int reorder,
+                          MPI_Comm *newcomm) {
+    int ret = PMPI_Dist_graph_create(comm, n, sources, degrees, destinations, weights, info, reorder,
+                                     newcomm);
+    if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+int MPI_Dist_graph_create_adjacent(MPI_Comm comm, int indegree, const int sources[],
+                                   const int sourceweights[], int outdegree, const int destinations[],
+                                   const int destweights[], MPI_Info info, int reorder,
+                                   MPI_Comm *newcomm) {
+    int ret = PMPI_Dist_graph_create_adjacent(comm, indegree, sources, sourceweights, outdegree,
+                                              destinations, destweights, info, reorder, newcomm);
+    if (ret == MPI_SUCCESS && newcomm && *newcomm != MPI_COMM_NULL) comm_id_register(*newcomm);
+    return ret;
+}
+
+int MPI_Intercomm_merge(MPI_Comm intercomm, int high, MPI_Comm *newintracomm) {
+    int ret = PMPI_Intercomm_merge(intercomm, high, newintracomm);
+    if (ret == MPI_SUCCESS && newintracomm && *newintracomm != MPI_COMM_NULL)
+        comm_id_register(*newintracomm);
     return ret;
 }
 
@@ -753,11 +923,29 @@ static int clock_sync_rounds(void) {
  * hook does not wrap. The critical path's exact-match rule
  * (HPROFILER_EXACT_P2P_HIGH) relies on it. Counters, not an instant: every
  * MPI instant names the application's call site. */
-static void emit_capture_info(void) {
+static void emit_capture_info(int thread_level) {
     int version = 0, subversion = 0;
     PMPI_Get_version(&version, &subversion);
     emit_ctr("mpi", "mpi_version", (int64_t)(version * 100 + subversion), "version");
     emit_ctr("mpi", "mpi_p2p_capture_complete", version < 4 ? 1 : 0, "flag");
+    /* sseq= / rseq= / cseq= (see "Communicator identity and sequence
+     * numbers") and mid= on matched probes are recorded by this hook */
+    emit_ctr("mpi", "mpi_seq_version", 1, "version");
+    /* MPI_THREAD_SINGLE..MULTIPLE as 0..3: whether concurrent posts are possible */
+    emit_ctr("mpi", "mpi_thread_level", (int64_t)thread_level, "level");
+}
+
+static int thread_level_index(int provided) {
+    return provided == MPI_THREAD_MULTIPLE ? 3 : provided == MPI_THREAD_SERIALIZED ? 2
+         : provided == MPI_THREAD_FUNNELED ? 1 : 0;
+}
+
+/* MPI_COMM_WORLD's record (communicator identity and sequence numbers). */
+static void world_init(void) {
+    int size = comm_size_of(MPI_COMM_WORLD);
+    pthread_mutex_lock(&g_comm_mutex);
+    g_world = (CommRec){MPI_COMM_WORLD, 0, size, 0, 0, NULL};
+    pthread_mutex_unlock(&g_comm_mutex);
 }
 
 static void clock_sync_if_requested(const char *phase) {
@@ -840,40 +1028,108 @@ static void clock_sync_if_requested(const char *phase) {
     emit_ctr("mpi", "clock_sync_round_trip_ns", (int64_t)best_delay, "ns");
 }
 
+/* ── Lifecycle ──────────────────────────────────────────────────────────
+ * MPI_Init / MPI_Init_thread / MPI_Finalize are spans of their own (type=
+ * init / finalize, rank=, commid=0, csize=): the call as the application
+ * sees it, from the wrapper's entry to its return, so the hook's own work
+ * in it (registering MPI_COMM_WORLD, the capture counters and with them the
+ * transport's first connection, HPROFILER_CLOCK_SYNC, the final drain) is
+ * inside the span and never in the application's time around it; hook_ns=
+ * says how much of the span that work took (the rest is the PMPI_ call).
+ * MPI_Init's span is sent last, once the rank is known and the transport
+ * is up. The call-site tags are resolved before the span's end is taken
+ * (lifecycle_site), so that what follows it is one record's push. */
+typedef struct { char tag[2400]; } lifecycle_site_t;
+
+static void lifecycle_site(lifecycle_site_t *ls, const void *site) {
+    ls->tag[0] = 0;
+    if (site) hprofiler_append_codeptr_tag(ls->tag, sizeof(ls->tag), site);
+}
+
+static void emit_lifecycle(const lifecycle_site_t *ls, const char *name, const char *type, uint64_t t0,
+                           uint64_t t1, uint64_t hook_ns, const char *extra) {
+    if (!hp_tx_enabled()) return;
+    hp_tx_emitf("span:mpi:%d:%d:%llu:%llu:%s:type=%s,rank=%d,commid=0,csize=%d,hook_ns=%llu%s%s\n",
+                (int)hp_tx_pid(), (int)hp_tx_tid(), (unsigned long long)t0, (unsigned long long)(t1 - t0), name,
+                type, g_mpi_rank, g_world.size, (unsigned long long)hook_ns, extra ? extra : "", ls->tag);
+    emit_callstack(t0);
+}
+
+/* After a successful PMPI_Init[_thread]: everything the hook sets up. */
+static void after_init(int provided) {
+    PMPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
+    world_init();
+    hp_tx_init("mpi");
+    cs_init();
+    emit_capture_info(thread_level_index(provided));
+    clock_sync_if_requested("init");
+}
+
 int MPI_Init(int *argc, char ***argv) {
+    uint64_t t0 = now_ns();
     int ret = PMPI_Init(argc, argv);
+    uint64_t t1 = now_ns();
     if (ret == MPI_SUCCESS) {
-        PMPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
-        hp_tx_init("mpi");
-        cs_init();
-        emit_capture_info();
-        clock_sync_if_requested("init");
+        int provided = MPI_THREAD_SINGLE;
+        PMPI_Query_thread(&provided);
+        after_init(provided);
+        lifecycle_site_t ls;
+        lifecycle_site(&ls, __builtin_return_address(0));
+        uint64_t t2 = now_ns();
+        emit_lifecycle(&ls, "MPI_Init", "init", t0, t2, t2 - t1, NULL);
     }
     return ret;
 }
 
 int MPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
+    uint64_t t0 = now_ns();
     int ret = PMPI_Init_thread(argc, argv, required, provided);
+    uint64_t t1 = now_ns();
     if (ret == MPI_SUCCESS) {
-        PMPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
-        hp_tx_init("mpi");
-        cs_init();
-        emit_capture_info();
-        clock_sync_if_requested("init");
+        int level = provided ? *provided : MPI_THREAD_SINGLE;
+        after_init(level);
+        char extra[48];
+        snprintf(extra, sizeof(extra), ",required=%d,provided=%d", thread_level_index(required),
+                 thread_level_index(level));
+        lifecycle_site_t ls;
+        lifecycle_site(&ls, __builtin_return_address(0));
+        uint64_t t2 = now_ns();
+        emit_lifecycle(&ls, "MPI_Init_thread", "init", t0, t2, t2 - t1, extra);
     }
     return ret;
 }
 
+static uint64_t g_msg_untracked = 0;   /* see "Matched probes" */
+
 /* Drain this rank's buffered events while it is certainly alive: launchers
  * may kill ranks soon after MPI_Finalize returns. Data already sent stays in
  * the collector's receive queue even if this process dies. Later events go
- * out synchronously; the destructor sends the closing status again. */
+ * out synchronously; the destructor sends the closing status again. The
+ * MPI_Finalize span (entry to return; hook_ns= the hook's work before
+ * PMPI_Finalize, the drain included) is one of them: sent synchronously as
+ * soon as PMPI_Finalize returns -- a launcher that kills the rank in that
+ * instant loses it, nothing else. */
 int MPI_Finalize(void) {
+    uint64_t t0 = now_ns();
     /* second measurement (drift), while every rank is still here */
     clock_sync_if_requested("finalize");
     if (g_clock_comm != MPI_COMM_NULL) PMPI_Comm_free(&g_clock_comm);
+    pthread_mutex_lock(&g_comm_mutex);
+    uint64_t unkeyed = g_seq_unkeyed;
+    pthread_mutex_unlock(&g_comm_mutex);
+    /* calls on unregistered communicators: no sequence number to check */
+    emit_ctr("mpi", "mpi_seq_unkeyed", (int64_t)unkeyed, "calls");
+    /* matched-probe messages the hook could not follow (table full, or a
+     * receive of a message whose probe it never saw) */
+    emit_ctr("mpi", "mpi_msg_untracked", (int64_t)__atomic_load_n(&g_msg_untracked, __ATOMIC_RELAXED),
+             "messages");
     hp_tx_shutdown(1);
-    return PMPI_Finalize();
+    lifecycle_site_t ls;
+    lifecycle_site(&ls, __builtin_return_address(0));
+    uint64_t t1 = now_ns();
+    int ret = PMPI_Finalize();
+    emit_lifecycle(&ls, "MPI_Finalize", "finalize", t0, now_ns(), t1 - t0, NULL);
+    return ret;
 }
 
 __attribute__((constructor)) static void mpi_hook_init(void) { hp_tx_init("mpi"); }
@@ -885,13 +1141,14 @@ __attribute__((destructor)) static void mpi_hook_fini(void) { hp_tx_shutdown(1);
  * wpeer= (world). */
 #define _P2P(FNAME, PMPI_CALL, TYPE_STR, ...)                          \
 int FNAME(__VA_ARGS__) {                                                \
-    char extra[256], pt[48];                                            \
+    char extra[288], pt[48], sq[32];                                    \
     size_t nb = (size_t)count * dtype_size(datatype);                  \
-    int64_t cid = comm_id_for(comm);                                    \
+    int64_t cid = -1;                                                   \
+    seq_tag(sq, sizeof(sq), "sseq", comm_seq(comm, SEQ_SEND, peer_rank, &cid, NULL)); \
     peer_tags(pt, sizeof(pt), comm, peer_rank);                         \
     snprintf(extra, sizeof(extra),                                      \
-             "type=%s,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s", \
-             TYPE_STR, nb, g_mpi_rank, peer_rank, tag, (long long)cid, pt); \
+             "type=%s,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s%s", \
+             TYPE_STR, nb, g_mpi_rank, peer_rank, tag, (long long)cid, pt, sq); \
     uint64_t t0 = now_ns();                                             \
     int ret = PMPI_CALL;                                                \
     emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                  \
@@ -927,13 +1184,14 @@ _P2P(MPI_Rsend,
 
 /* The tags of a receive whose source/tag are known after the call:
  * peer= is the resolved comm-local source, wpeer= its world rank. */
-static void recv_tags(char *buf, size_t cap, const char *type, size_t nb, MPI_Comm comm,
-                      int source, int tag, int wildcard) {
-    char pt[48];
+static void recv_tags(char *buf, size_t cap, const char *type, size_t nb, MPI_Comm comm, int64_t cid,
+                      int source, int tag, int wildcard, uint64_t rseq) {
+    char pt[48], sq[32];
     peer_tags(pt, sizeof(pt), comm, source);
-    snprintf(buf, cap, "type=%s,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s%s",
-             type, nb, g_mpi_rank, source, tag, (long long)comm_id_for(comm), pt,
-             wildcard ? ",wildcard=1" : "");
+    seq_tag(sq, sizeof(sq), "rseq", rseq);
+    snprintf(buf, cap, "type=%s,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s%s%s",
+             type, nb, g_mpi_rank, source, tag, (long long)cid, pt,
+             wildcard ? ",wildcard=1" : "", sq);
 }
 
 int MPI_Recv(void *buf, int count, MPI_Datatype datatype,
@@ -944,6 +1202,8 @@ int MPI_Recv(void *buf, int count, MPI_Datatype datatype,
      * wildcard match is always resolvable (see the file header). */
     MPI_Status local_status;
     MPI_Status *use_status = (status == MPI_STATUS_IGNORE) ? &local_status : status;
+    int64_t cid = -1;
+    uint64_t rseq = comm_seq(comm, SEQ_RECV, source, &cid, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Recv(buf, count, datatype, source, tag, comm, use_status);
     uint64_t t1 = now_ns();
@@ -953,7 +1213,7 @@ int MPI_Recv(void *buf, int count, MPI_Datatype datatype,
         resolved_tag    = use_status->MPI_TAG;
     }
     char extra[288];
-    recv_tags(extra, sizeof(extra), "recv", nb, comm, resolved_source, resolved_tag, wildcard);
+    recv_tags(extra, sizeof(extra), "recv", nb, comm, cid, resolved_source, resolved_tag, wildcard, rseq);
     emit_span("mpi", t0, t1 - t0, "MPI_Recv", extra);
     return ret;
 }
@@ -961,14 +1221,15 @@ int MPI_Recv(void *buf, int count, MPI_Datatype datatype,
 /* Non-blocking sends: a request id (sid=) links the call to its completion. */
 static int isend_common(const void *site, const char *name, const char *type, int ret,
                         uint64_t t0, uint64_t t1, MPI_Request *request, size_t nb,
-                        int dest, int tag, MPI_Comm comm) {
+                        int dest, int tag, MPI_Comm comm, int64_t cid, uint64_t sseq) {
     uint64_t req_id = (ret == MPI_SUCCESS && request && *request != MPI_REQUEST_NULL)
                       ? req_register(*request, type, dest, tag, nb, 0) : 0;
-    char extra[288], pt[48], sid[40] = "";
+    char extra[320], pt[48], sid[40] = "", sq[32];
     peer_tags(pt, sizeof(pt), comm, dest);
+    seq_tag(sq, sizeof(sq), "sseq", sseq);
     if (req_id) snprintf(sid, sizeof(sid), ",sid=%llu", (unsigned long long)req_id);
-    snprintf(extra, sizeof(extra), "type=%s,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s%s",
-             type, nb, g_mpi_rank, dest, tag, (long long)comm_id_for(comm), pt, sid);
+    snprintf(extra, sizeof(extra), "type=%s,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s%s%s",
+             type, nb, g_mpi_rank, dest, tag, (long long)cid, pt, sid, sq);
     emit_span_at(site, "mpi", t0, t1 - t0, name, extra);
     return ret;
 }
@@ -976,90 +1237,234 @@ static int isend_common(const void *site, const char *name, const char *type, in
 int MPI_Isend(const void *buf, int count, MPI_Datatype datatype,
               int dest, int tag, MPI_Comm comm, MPI_Request *request) {
     size_t nb = (size_t)count * dtype_size(datatype);
+    int64_t cid = -1;
+    uint64_t sseq = comm_seq(comm, SEQ_SEND, dest, &cid, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Isend(buf, count, datatype, dest, tag, comm, request);
     uint64_t t1 = now_ns();
     return isend_common(__builtin_return_address(0), "MPI_Isend", "isend", ret, t0, t1,
-                        request, nb, dest, tag, comm);
+                        request, nb, dest, tag, comm, cid, sseq);
 }
 
 int MPI_Issend(const void *buf, int count, MPI_Datatype datatype,
                int dest, int tag, MPI_Comm comm, MPI_Request *request) {
     size_t nb = (size_t)count * dtype_size(datatype);
+    int64_t cid = -1;
+    uint64_t sseq = comm_seq(comm, SEQ_SEND, dest, &cid, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Issend(buf, count, datatype, dest, tag, comm, request);
     uint64_t t1 = now_ns();
     return isend_common(__builtin_return_address(0), "MPI_Issend", "issend", ret, t0, t1,
-                        request, nb, dest, tag, comm);
+                        request, nb, dest, tag, comm, cid, sseq);
 }
 
 int MPI_Ibsend(const void *buf, int count, MPI_Datatype datatype,
                int dest, int tag, MPI_Comm comm, MPI_Request *request) {
     size_t nb = (size_t)count * dtype_size(datatype);
+    int64_t cid = -1;
+    uint64_t sseq = comm_seq(comm, SEQ_SEND, dest, &cid, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Ibsend(buf, count, datatype, dest, tag, comm, request);
     uint64_t t1 = now_ns();
     return isend_common(__builtin_return_address(0), "MPI_Ibsend", "ibsend", ret, t0, t1,
-                        request, nb, dest, tag, comm);
+                        request, nb, dest, tag, comm, cid, sseq);
 }
 
 int MPI_Irsend(const void *buf, int count, MPI_Datatype datatype,
                int dest, int tag, MPI_Comm comm, MPI_Request *request) {
     size_t nb = (size_t)count * dtype_size(datatype);
+    int64_t cid = -1;
+    uint64_t sseq = comm_seq(comm, SEQ_SEND, dest, &cid, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Irsend(buf, count, datatype, dest, tag, comm, request);
     uint64_t t1 = now_ns();
     return isend_common(__builtin_return_address(0), "MPI_Irsend", "irsend", ret, t0, t1,
-                        request, nb, dest, tag, comm);
+                        request, nb, dest, tag, comm, cid, sseq);
 }
 
-/* Matched probes and receives: messages received through an MPI_Message
- * handle are not paired by the critical path (instants, no edges); the
- * instant on the probe's communicator tells the analysis that its message
- * order there is incomplete. MPI_Mrecv has no communicator argument. */
-static void mprobe_instant(const void *site, const char *name, const char *type, MPI_Comm comm,
-                           int source, int tag, int found, const MPI_Status *st) {
-    char extra[288], res[64] = "";
-    if (found && st)
-        snprintf(res, sizeof(res), ",rpeer=%d,rtag=%d", st->MPI_SOURCE, st->MPI_TAG);
-    snprintf(extra, sizeof(extra), "type=%s,rank=%d,peer=%d,tag=%d,commid=%lld,flag=%d%s", type,
-             g_mpi_rank, source, tag, (long long)comm_id_for(comm), found, res);
-    emit_instant_at(site, "mpi", name, extra);
+/* ── Matched probes ─────────────────────────────────────────────────────
+ * A successful MPI_Mprobe / MPI_Improbe takes a message off the matching
+ * queue -- it is the receive as far as message order goes -- and hands back
+ * an MPI_Message handle that a later MPI_Mrecv / MPI_Imrecv (maybe on
+ * another thread) receives. The hook gives each such message an id (mid=,
+ * from the request-id space) and keeps it in a table keyed by the live
+ * handle:
+ *   MPI_Mprobe   span (it blocks until a message arrives): type=mprobe,
+ *                sid=<mid>, rseq=, the resolved rpeer=/rtag=/rwpeer=;
+ *   MPI_Improbe  instant, flag=0|1; with flag=1 the same tags as MPI_Mprobe
+ *                (mid= instead of sid=: an instant is not a span);
+ *   MPI_Mrecv    span, type=mrecv, psid=<mid> and the probe's channel
+ *                (rseq=, rpeer=, rtag=, rwpeer=, commid=, via=mprobe|improbe,
+ *                wildcard=1 when the probe named ANY_SOURCE / ANY_TAG);
+ *   MPI_Imrecv   span, type=imrecv, psid=<mid>, the same channel tags and
+ *                sid=<request id> (its MPI_Wait or MPI_Test names it, psid=).
+ * The entry leaves the table when its message is received, so a handle the
+ * library reuses for a later probe gets a new id. A receive of a handle the
+ * table does not hold (its probe was not seen, or the table was full) says
+ * mid_unknown=1; MPI_MESSAGE_NO_PROC (a probe of MPI_PROC_NULL) is null=1,
+ * no message. MSG_TABLE_CAP live messages (56 B each: 56 KiB); beyond that a probe
+ * gets no mid= and its receive reports mid_unknown=1 -- both counted in
+ * mpi_msg_untracked at MPI_Finalize. MPI has no call that frees a probed
+ * message without receiving it. */
+#define MSG_TABLE_CAP 1024
+typedef struct {
+    MPI_Message msg;
+    uint64_t    mid, rseq;
+    int         src, tag, wsrc, improbe, wildcard;
+    int64_t     commid;
+} MsgRec;
+static MsgRec          g_msgs[MSG_TABLE_CAP];
+static int             g_msg_n = 0;
+static pthread_mutex_t g_msg_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t next_request_id(void) {
+    pthread_mutex_lock(&g_req_mutex);
+    uint64_t id = hp_span_id(HP_ID_MPI, (uint32_t)hp_tx_pid(), (uint32_t)(g_req_seq++ & 0xffffffffull));
+    pthread_mutex_unlock(&g_req_mutex);
+    return id;
+}
+
+static uint64_t msg_add(MPI_Message msg, uint64_t rseq, int src, int tag, int wsrc, int64_t commid,
+                        int improbe, int wildcard) {
+    uint64_t mid = next_request_id();
+    int stored = 0;
+    pthread_mutex_lock(&g_msg_mutex);
+    if (g_msg_n < MSG_TABLE_CAP) {
+        g_msgs[g_msg_n++] = (MsgRec){msg, mid, rseq, src, tag, wsrc, improbe, wildcard, commid};
+        stored = 1;
+    }
+    pthread_mutex_unlock(&g_msg_mutex);
+    if (!stored) __atomic_add_fetch(&g_msg_untracked, 1, __ATOMIC_RELAXED);
+    return stored ? mid : 0;
+}
+
+static int msg_take(MPI_Message msg, MsgRec *out) {
+    int found = 0;
+    pthread_mutex_lock(&g_msg_mutex);
+    for (int i = 0; i < g_msg_n; i++) {
+        if (g_msgs[i].msg == msg) {
+            *out = g_msgs[i];
+            g_msgs[i] = g_msgs[--g_msg_n];
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_msg_mutex);
+    return found;
+}
+
+/* The probe's tags (both probes): ",rpeer=..,rtag=..[,rwpeer=..],rseq=..,<idkey>=<mid>". */
+static void probe_match_tags(char *buf, size_t cap, MPI_Comm comm, const MPI_Status *st,
+                             uint64_t rseq, const char *idkey, uint64_t mid) {
+    int w = world_rank_of(comm, st->MPI_SOURCE);
+    int n = snprintf(buf, cap, ",rpeer=%d,rtag=%d", st->MPI_SOURCE, st->MPI_TAG);
+    if (w >= 0 && n > 0 && (size_t)n < cap) n += snprintf(buf + n, cap - (size_t)n, ",rwpeer=%d", w);
+    if (rseq && n > 0 && (size_t)n < cap)
+        n += snprintf(buf + n, cap - (size_t)n, ",rseq=%llu", (unsigned long long)rseq);
+    if (mid && n > 0 && (size_t)n < cap)
+        snprintf(buf + n, cap - (size_t)n, ",%s=%llu", idkey, (unsigned long long)mid);
 }
 
 int MPI_Mprobe(int source, int tag, MPI_Comm comm, MPI_Message *message, MPI_Status *status) {
     MPI_Status local_status;
     MPI_Status *use_status = (status == MPI_STATUS_IGNORE) ? &local_status : status;
+    int wildcard = (source == MPI_ANY_SOURCE) || (tag == MPI_ANY_TAG);
+    /* posted (and matched) at entry, like a blocking receive */
+    int64_t cid = -1;
+    uint64_t rseq = comm_seq(comm, SEQ_RECV, source, &cid, NULL);
+    uint64_t t0 = now_ns();
     int ret = PMPI_Mprobe(source, tag, comm, message, use_status);
-    mprobe_instant(__builtin_return_address(0), "MPI_Mprobe", "mprobe", comm, source, tag,
-                   ret == MPI_SUCCESS, use_status);
+    uint64_t t1 = now_ns();
+    char extra[320], res[160] = "";
+    int found = ret == MPI_SUCCESS && message;
+    if (found && *message == MPI_MESSAGE_NO_PROC) {
+        snprintf(res, sizeof(res), ",null=1");
+    } else if (found) {
+        int w = world_rank_of(comm, use_status->MPI_SOURCE);
+        uint64_t mid = msg_add(*message, rseq, use_status->MPI_SOURCE, use_status->MPI_TAG, w, cid, 0,
+                               wildcard);
+        probe_match_tags(res, sizeof(res), comm, use_status, rseq, "sid", mid);
+    }
+    snprintf(extra, sizeof(extra), "type=mprobe,rank=%d,peer=%d,tag=%d,commid=%lld,flag=%d%s%s",
+             g_mpi_rank, source, tag, (long long)cid, found, wildcard ? ",wildcard=1" : "", res);
+    emit_span("mpi", t0, t1 - t0, "MPI_Mprobe", extra);
     return ret;
 }
 
 int MPI_Improbe(int source, int tag, MPI_Comm comm, int *flag, MPI_Message *message, MPI_Status *status) {
     MPI_Status local_status;
     MPI_Status *use_status = (status == MPI_STATUS_IGNORE) ? &local_status : status;
+    int wildcard = (source == MPI_ANY_SOURCE) || (tag == MPI_ANY_TAG);
     int ret = PMPI_Improbe(source, tag, comm, flag, message, use_status);
-    mprobe_instant(__builtin_return_address(0), "MPI_Improbe", "improbe", comm, source, tag,
-                   ret == MPI_SUCCESS && flag && *flag, use_status);
+    int found = ret == MPI_SUCCESS && flag && *flag && message;
+    char extra[320], res[160] = "";
+    int64_t cid = comm_id_for(comm);
+    if (found && *message == MPI_MESSAGE_NO_PROC) {
+        snprintf(res, sizeof(res), ",null=1");
+    } else if (found) {
+        /* only a probe that found a message took one off the queue */
+        uint64_t rseq = comm_seq(comm, SEQ_RECV, source, NULL, NULL);
+        int w = world_rank_of(comm, use_status->MPI_SOURCE);
+        uint64_t mid = msg_add(*message, rseq, use_status->MPI_SOURCE, use_status->MPI_TAG, w, cid, 1,
+                               wildcard);
+        probe_match_tags(res, sizeof(res), comm, use_status, rseq, "mid", mid);
+    }
+    snprintf(extra, sizeof(extra), "type=improbe,rank=%d,peer=%d,tag=%d,commid=%lld,flag=%d%s%s",
+             g_mpi_rank, source, tag, (long long)cid, found, wildcard ? ",wildcard=1" : "", res);
+    emit_instant("mpi", "MPI_Improbe", extra);
     return ret;
 }
 
+/* The channel a matched receive gets from its probe (msg_take), or
+ * mid_unknown=1 / null=1. */
+static void matched_recv_tags(char *buf, size_t cap, MPI_Message msg) {
+    MsgRec m;
+    if (msg == MPI_MESSAGE_NO_PROC) {
+        snprintf(buf, cap, ",null=1");
+    } else if (msg != MPI_MESSAGE_NULL && msg_take(msg, &m)) {
+        int n = snprintf(buf, cap, ",psid=%llu,commid=%lld,rpeer=%d,rtag=%d,via=%s",
+                         (unsigned long long)m.mid, (long long)m.commid, m.src, m.tag,
+                         m.improbe ? "improbe" : "mprobe");
+        if (m.wsrc >= 0 && n > 0 && (size_t)n < cap)
+            n += snprintf(buf + n, cap - (size_t)n, ",rwpeer=%d", m.wsrc);
+        if (m.rseq && n > 0 && (size_t)n < cap)
+            n += snprintf(buf + n, cap - (size_t)n, ",rseq=%llu", (unsigned long long)m.rseq);
+        if (m.wildcard && n > 0 && (size_t)n < cap)
+            snprintf(buf + n, cap - (size_t)n, ",wildcard=1");
+    } else {
+        __atomic_add_fetch(&g_msg_untracked, 1, __ATOMIC_RELAXED);
+        snprintf(buf, cap, ",mid_unknown=1");
+    }
+}
+
 int MPI_Mrecv(void *buf, int count, MPI_Datatype datatype, MPI_Message *message, MPI_Status *status) {
+    MPI_Message msg = message ? *message : MPI_MESSAGE_NULL;
+    uint64_t t0 = now_ns();
     int ret = PMPI_Mrecv(buf, count, datatype, message, status);
-    char extra[96];
-    snprintf(extra, sizeof(extra), "type=mrecv,rank=%d,bytes=%zu", g_mpi_rank,
-             (size_t)count * dtype_size(datatype));
-    emit_instant("mpi", "MPI_Mrecv", extra);
+    uint64_t t1 = now_ns();
+    char extra[320], tail[224];
+    matched_recv_tags(tail, sizeof(tail), msg);
+    snprintf(extra, sizeof(extra), "type=mrecv,rank=%d,bytes=%zu%s", g_mpi_rank,
+             (size_t)count * dtype_size(datatype), tail);
+    emit_span("mpi", t0, t1 - t0, "MPI_Mrecv", extra);
     return ret;
 }
 
 int MPI_Imrecv(void *buf, int count, MPI_Datatype datatype, MPI_Message *message, MPI_Request *request) {
+    MPI_Message msg = message ? *message : MPI_MESSAGE_NULL;
+    size_t nb = (size_t)count * dtype_size(datatype);
+    uint64_t t0 = now_ns();
     int ret = PMPI_Imrecv(buf, count, datatype, message, request);
-    char extra[96];
-    snprintf(extra, sizeof(extra), "type=imrecv,rank=%d,bytes=%zu", g_mpi_rank,
-             (size_t)count * dtype_size(datatype));
-    emit_instant("mpi", "MPI_Imrecv", extra);
+    uint64_t t1 = now_ns();
+    char extra[352], tail[224], sid[40] = "";
+    matched_recv_tags(tail, sizeof(tail), msg);
+    /* its completion names it (psid=) like an Irecv; the source is already
+     * resolved, so no status is needed there */
+    uint64_t req_id = (ret == MPI_SUCCESS && request && *request != MPI_REQUEST_NULL)
+                      ? req_register(*request, "imrecv", -1, 0, nb, 0) : 0;
+    if (req_id) snprintf(sid, sizeof(sid), ",sid=%llu", (unsigned long long)req_id);
+    snprintf(extra, sizeof(extra), "type=imrecv,rank=%d,bytes=%zu%s%s", g_mpi_rank, nb, tail, sid);
+    emit_span("mpi", t0, t1 - t0, "MPI_Imrecv", extra);
     return ret;
 }
 
@@ -1070,6 +1475,8 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype,
     /* A wildcard receive is resolved at completion: keep the communicator's
      * translation with the request (see "World-rank translation"). */
     Xlate *xl = (wildcard && comm != MPI_COMM_WORLD) ? xlate_acquire(comm) : NULL;
+    int64_t cid = -1;
+    uint64_t rseq = comm_seq(comm, SEQ_RECV, source, &cid, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Irecv(buf, count, datatype, source, tag, comm, request);
     uint64_t t1 = now_ns();
@@ -1081,7 +1488,7 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype,
     /* A wildcard Irecv's peer/tag are unknown until completion (rpeer=/
      * rtag=/rwpeer= on the completing call); this span carries wildcard=1. */
     char extra[320], sid[40] = "";
-    recv_tags(extra, sizeof(extra), "irecv", nb, comm, source, tag, wildcard);
+    recv_tags(extra, sizeof(extra), "irecv", nb, comm, cid, source, tag, wildcard, rseq);
     if (req_id) {
         snprintf(sid, sizeof(sid), ",sid=%llu", (unsigned long long)req_id);
         strncat(extra, sid, sizeof(extra) - strlen(extra) - 1);
@@ -1101,15 +1508,17 @@ int MPI_Irecv(void *buf, int count, MPI_Datatype datatype,
  * wait for the other rank's call). */
 static void sendrecv_emit(const void *site, const char *name, uint64_t t0, uint64_t t1,
                           MPI_Comm comm, int dest, int sendtag, size_t sbytes,
-                          int source, int recvtag, size_t rbytes, int wildcard) {
-    char sname[64], pt[48], extra[320];
+                          int source, int recvtag, size_t rbytes, int wildcard,
+                          uint64_t sseq, uint64_t rseq) {
+    char sname[64], pt[48], extra[352], sq[32];
     snprintf(sname, sizeof(sname), "%s.send", name);
     peer_tags(pt, sizeof(pt), comm, dest);
+    seq_tag(sq, sizeof(sq), "sseq", sseq);
     snprintf(extra, sizeof(extra),
-             "type=send,op=sendrecv,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s",
-             sbytes, g_mpi_rank, dest, sendtag, (long long)comm_id_for(comm), pt);
+             "type=send,op=sendrecv,bytes=%zu,rank=%d,peer=%d,tag=%d,commid=%lld%s%s",
+             sbytes, g_mpi_rank, dest, sendtag, (long long)comm_id_for(comm), pt, sq);
     emit_span_at(site, "mpi", t0, 0, sname, extra);
-    recv_tags(extra, sizeof(extra), "recv", rbytes, comm, source, recvtag, wildcard);
+    recv_tags(extra, sizeof(extra), "recv", rbytes, comm, comm_id_for(comm), source, recvtag, wildcard, rseq);
     strncat(extra, ",op=sendrecv", sizeof(extra) - strlen(extra) - 1);
     emit_span_at(site, "mpi", t0, t1 - t0, name, extra);
 }
@@ -1120,6 +1529,8 @@ int MPI_Sendrecv(const void *sendbuf, int sendcount, MPI_Datatype sendtype, int 
     int wildcard = (source == MPI_ANY_SOURCE) || (recvtag == MPI_ANY_TAG);
     MPI_Status local_status;
     MPI_Status *use_status = (status == MPI_STATUS_IGNORE) ? &local_status : status;
+    uint64_t sseq = comm_seq(comm, SEQ_SEND, dest, NULL, NULL);
+    uint64_t rseq = comm_seq(comm, SEQ_RECV, source, NULL, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Sendrecv(sendbuf, sendcount, sendtype, dest, sendtag,
                             recvbuf, recvcount, recvtype, source, recvtag, comm, use_status);
@@ -1128,7 +1539,7 @@ int MPI_Sendrecv(const void *sendbuf, int sendcount, MPI_Datatype sendtype, int 
     if (ret == MPI_SUCCESS && wildcard) { rs = use_status->MPI_SOURCE; rt = use_status->MPI_TAG; }
     sendrecv_emit(__builtin_return_address(0), "MPI_Sendrecv", t0, t1, comm,
                   dest, sendtag, (size_t)sendcount * dtype_size(sendtype),
-                  rs, rt, (size_t)recvcount * dtype_size(recvtype), wildcard);
+                  rs, rt, (size_t)recvcount * dtype_size(recvtype), wildcard, sseq, rseq);
     return ret;
 }
 
@@ -1137,6 +1548,8 @@ int MPI_Sendrecv_replace(void *buf, int count, MPI_Datatype datatype, int dest, 
     int wildcard = (source == MPI_ANY_SOURCE) || (recvtag == MPI_ANY_TAG);
     MPI_Status local_status;
     MPI_Status *use_status = (status == MPI_STATUS_IGNORE) ? &local_status : status;
+    uint64_t sseq = comm_seq(comm, SEQ_SEND, dest, NULL, NULL);
+    uint64_t rseq = comm_seq(comm, SEQ_RECV, source, NULL, NULL);
     uint64_t t0 = now_ns();
     int ret = PMPI_Sendrecv_replace(buf, count, datatype, dest, sendtag, source, recvtag,
                                     comm, use_status);
@@ -1145,7 +1558,7 @@ int MPI_Sendrecv_replace(void *buf, int count, MPI_Datatype datatype, int dest, 
     if (ret == MPI_SUCCESS && wildcard) { rs = use_status->MPI_SOURCE; rt = use_status->MPI_TAG; }
     size_t nb = (size_t)count * dtype_size(datatype);
     sendrecv_emit(__builtin_return_address(0), "MPI_Sendrecv_replace", t0, t1, comm,
-                  dest, sendtag, nb, rs, rt, nb, wildcard);
+                  dest, sendtag, nb, rs, rt, nb, wildcard, sseq, rseq);
     return ret;
 }
 
@@ -1430,12 +1843,14 @@ int MPI_Cancel(MPI_Request *request) {
 
 #define _COLL(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)             \
 int FNAME(__VA_ARGS__) {                                                \
-    char extra[192];                                                    \
+    char extra[224], sq[32];                                            \
     size_t nb = (BYTES_EXPR);                                           \
-    int64_t cid = comm_id_for(comm);                                    \
+    int64_t cid = -1;                                                   \
+    int csize = 0;                                                      \
+    seq_tag(sq, sizeof(sq), "cseq", comm_seq(comm, SEQ_COLL, 0, &cid, &csize)); \
     snprintf(extra, sizeof(extra),                                      \
-             "type=%s,bytes=%zu,rank=%d,commid=%lld",                   \
-             TYPE_STR, nb, g_mpi_rank, (long long)cid);                \
+             "type=%s,bytes=%zu,rank=%d,commid=%lld,csize=%d%s",        \
+             TYPE_STR, nb, g_mpi_rank, (long long)cid, csize, sq);     \
     uint64_t t0 = now_ns();                                             \
     int ret = PMPI_CALL;                                                \
     emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                  \
@@ -1448,18 +1863,20 @@ int FNAME(__VA_ARGS__) {                                                \
  * collective semantics). */
 #define _COLLR(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)            \
 int FNAME(__VA_ARGS__) {                                                \
-    char extra[224];                                                    \
+    char extra[256], sq[32];                                            \
     size_t nb = (BYTES_EXPR);                                           \
-    int64_t cid = comm_id_for(comm);                                    \
+    int64_t cid = -1;                                                   \
+    int csize = 0;                                                      \
+    seq_tag(sq, sizeof(sq), "cseq", comm_seq(comm, SEQ_COLL, 0, &cid, &csize)); \
     int wroot = world_rank_of(comm, root);                              \
     if (wroot >= 0)                                                     \
         snprintf(extra, sizeof(extra),                                  \
-                 "type=%s,bytes=%zu,rank=%d,commid=%lld,root=%d,wroot=%d", \
-                 TYPE_STR, nb, g_mpi_rank, (long long)cid, root, wroot);\
+                 "type=%s,bytes=%zu,rank=%d,commid=%lld,root=%d,wroot=%d,csize=%d%s", \
+                 TYPE_STR, nb, g_mpi_rank, (long long)cid, root, wroot, csize, sq); \
     else                                                                \
         snprintf(extra, sizeof(extra),                                  \
-                 "type=%s,bytes=%zu,rank=%d,commid=%lld,root=%d",       \
-                 TYPE_STR, nb, g_mpi_rank, (long long)cid, root);       \
+                 "type=%s,bytes=%zu,rank=%d,commid=%lld,root=%d,csize=%d%s", \
+                 TYPE_STR, nb, g_mpi_rank, (long long)cid, root, csize, sq); \
     uint64_t t0 = now_ns();                                             \
     int ret = PMPI_CALL;                                                \
     emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                  \
@@ -1508,11 +1925,15 @@ _COLLR(MPI_Gather,
       void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm)
 
 int MPI_Barrier(MPI_Comm comm) {
-    int64_t cid = comm_id_for(comm);
+    int64_t cid = -1;
+    int csize = 0;
+    char sq[32];
+    seq_tag(sq, sizeof(sq), "cseq", comm_seq(comm, SEQ_COLL, 0, &cid, &csize));
     uint64_t t0 = now_ns();
     int ret = PMPI_Barrier(comm);
-    char extra[96];
-    snprintf(extra, sizeof(extra), "type=barrier,rank=%d,commid=%lld", g_mpi_rank, (long long)cid);
+    char extra[128];
+    snprintf(extra, sizeof(extra), "type=barrier,rank=%d,commid=%lld,csize=%d%s", g_mpi_rank,
+             (long long)cid, csize, sq);
     emit_span("mpi", t0, now_ns()-t0, "MPI_Barrier", extra);
     return ret;
 }
@@ -1714,22 +2135,25 @@ int MPI_Win_unlock_all(MPI_Win win) {
 #define _ICOLL(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)             \
 int FNAME(__VA_ARGS__, MPI_Request *request) {                           \
     size_t nb = (BYTES_EXPR);                                            \
-    int64_t cid = comm_id_for(comm);                                     \
+    int64_t cid = -1;                                                    \
+    int csize = 0;                                                       \
+    char sq[32];                                                         \
+    seq_tag(sq, sizeof(sq), "cseq", comm_seq(comm, SEQ_COLL, 0, &cid, &csize)); \
     uint64_t t0 = now_ns();                                              \
     int ret = PMPI_CALL;                                                  \
     uint64_t req_id = (ret == MPI_SUCCESS && request &&                  \
                        *request != MPI_REQUEST_NULL)                     \
                       ? req_register(*request, TYPE_STR, -1, 0, nb, 0) : 0;\
-    char extra[192];                                                      \
+    char extra[224];                                                      \
     if (req_id)   /* sid=: the completing call links back (psid=) */      \
         snprintf(extra, sizeof(extra),                                   \
-                 "type=%s,bytes=%zu,rank=%d,commid=%lld,sid=%llu",       \
-                 TYPE_STR, nb, g_mpi_rank, (long long)cid,               \
+                 "type=%s,bytes=%zu,rank=%d,commid=%lld,csize=%d%s,sid=%llu", \
+                 TYPE_STR, nb, g_mpi_rank, (long long)cid, csize, sq,    \
                  (unsigned long long)req_id);                            \
     else                                                                  \
         snprintf(extra, sizeof(extra),                                   \
-                 "type=%s,bytes=%zu,rank=%d,commid=%lld",                \
-                 TYPE_STR, nb, g_mpi_rank, (long long)cid);              \
+                 "type=%s,bytes=%zu,rank=%d,commid=%lld,csize=%d%s",     \
+                 TYPE_STR, nb, g_mpi_rank, (long long)cid, csize, sq);   \
     emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                   \
     return ret;                                                           \
 }
@@ -1738,37 +2162,44 @@ int FNAME(__VA_ARGS__, MPI_Request *request) {                           \
 #define _ICOLLR(FNAME, PMPI_CALL, TYPE_STR, BYTES_EXPR, ...)            \
 int FNAME(__VA_ARGS__, MPI_Request *request) {                           \
     size_t nb = (BYTES_EXPR);                                            \
-    int64_t cid = comm_id_for(comm);                                     \
+    int64_t cid = -1;                                                    \
+    int csize = 0;                                                       \
+    char sq[32];                                                         \
+    seq_tag(sq, sizeof(sq), "cseq", comm_seq(comm, SEQ_COLL, 0, &cid, &csize)); \
     int wroot = world_rank_of(comm, root);                               \
     uint64_t t0 = now_ns();                                              \
     int ret = PMPI_CALL;                                                  \
     uint64_t req_id = (ret == MPI_SUCCESS && request &&                  \
                        *request != MPI_REQUEST_NULL)                     \
                       ? req_register(*request, TYPE_STR, -1, 0, nb, 0) : 0;\
-    char extra[224], rtag[48], stag[40];                                  \
+    char extra[256], rtag[48], stag[40];                                  \
     if (wroot >= 0) snprintf(rtag, sizeof(rtag), ",root=%d,wroot=%d", root, wroot); \
     else            snprintf(rtag, sizeof(rtag), ",root=%d", root);       \
     stag[0] = '\0';                                                       \
     if (req_id) snprintf(stag, sizeof(stag), ",sid=%llu", (unsigned long long)req_id); \
-    snprintf(extra, sizeof(extra), "type=%s,bytes=%zu,rank=%d,commid=%lld%s%s", \
-             TYPE_STR, nb, g_mpi_rank, (long long)cid, rtag, stag);      \
+    snprintf(extra, sizeof(extra), "type=%s,bytes=%zu,rank=%d,commid=%lld%s,csize=%d%s%s", \
+             TYPE_STR, nb, g_mpi_rank, (long long)cid, rtag, csize, sq, stag); \
     emit_span("mpi", t0, now_ns()-t0, #FNAME, extra);                   \
     return ret;                                                           \
 }
 
 int MPI_Ibarrier(MPI_Comm comm, MPI_Request *request) {
-    int64_t cid = comm_id_for(comm);
+    int64_t cid = -1;
+    int csize = 0;
+    char sq[32];
+    seq_tag(sq, sizeof(sq), "cseq", comm_seq(comm, SEQ_COLL, 0, &cid, &csize));
     uint64_t t0 = now_ns();
     int ret = PMPI_Ibarrier(comm, request);
     uint64_t t1 = now_ns();
     uint64_t req_id = (ret == MPI_SUCCESS && request && *request != MPI_REQUEST_NULL)
                       ? req_register(*request, "ibarrier", -1, 0, 0, 0) : 0;
-    char extra[128];
+    char extra[160];
     if (req_id)
-        snprintf(extra, sizeof(extra), "type=ibarrier,rank=%d,commid=%lld,sid=%llu",
-                 g_mpi_rank, (long long)cid, (unsigned long long)req_id);
+        snprintf(extra, sizeof(extra), "type=ibarrier,rank=%d,commid=%lld,csize=%d%s,sid=%llu",
+                 g_mpi_rank, (long long)cid, csize, sq, (unsigned long long)req_id);
     else
-        snprintf(extra, sizeof(extra), "type=ibarrier,rank=%d,commid=%lld", g_mpi_rank, (long long)cid);
+        snprintf(extra, sizeof(extra), "type=ibarrier,rank=%d,commid=%lld,csize=%d%s", g_mpi_rank,
+                 (long long)cid, csize, sq);
     emit_span("mpi", t0, t1 - t0, "MPI_Ibarrier", extra);
     return ret;
 }
@@ -1818,37 +2249,111 @@ _ICOLLR(MPI_Igather,
        const void *sendbuf, int sendcount, MPI_Datatype sendtype,
        void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm)
 
+/* The vector / scan forms (same tags; bytes= as their blocking forms). */
+_ICOLL(MPI_Iallgatherv,
+       PMPI_Iallgatherv(sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype, comm, request),
+       "iallgatherv",
+       sendbuf == MPI_IN_PLACE ? own_count(recvcounts, comm) * dtype_size(recvtype)
+                               : (size_t)sendcount * dtype_size(sendtype),
+       const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf,
+       const int recvcounts[], const int displs[], MPI_Datatype recvtype, MPI_Comm comm)
+
+_ICOLL(MPI_Ialltoallv,
+       PMPI_Ialltoallv(sendbuf, sendcounts, sdispls, sendtype, recvbuf, recvcounts, rdispls, recvtype,
+                       comm, request),
+       "ialltoallv",
+       sendbuf == MPI_IN_PLACE ? count_sum(recvcounts, comm) * dtype_size(recvtype)
+                               : count_sum(sendcounts, comm) * dtype_size(sendtype),
+       const void *sendbuf, const int sendcounts[], const int sdispls[], MPI_Datatype sendtype,
+       void *recvbuf, const int recvcounts[], const int rdispls[], MPI_Datatype recvtype, MPI_Comm comm)
+
+_ICOLLR(MPI_Igatherv,
+       PMPI_Igatherv(sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype, root, comm,
+                     request),
+       "igatherv",
+       sendbuf == MPI_IN_PLACE ? own_count(recvcounts, comm) * dtype_size(recvtype)
+                               : (size_t)sendcount * dtype_size(sendtype),
+       const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf,
+       const int recvcounts[], const int displs[], MPI_Datatype recvtype, int root, MPI_Comm comm)
+
+_ICOLLR(MPI_Iscatterv,
+       PMPI_Iscatterv(sendbuf, sendcounts, displs, sendtype, recvbuf, recvcount, recvtype, root, comm,
+                      request),
+       "iscatterv",
+       recvbuf == MPI_IN_PLACE ? own_count(sendcounts, comm) * dtype_size(sendtype)
+                               : (size_t)recvcount * dtype_size(recvtype),
+       const void *sendbuf, const int sendcounts[], const int displs[], MPI_Datatype sendtype,
+       void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm)
+
+_ICOLL(MPI_Ireduce_scatter,
+       PMPI_Ireduce_scatter(sendbuf, recvbuf, recvcounts, datatype, op, comm, request),
+       "ireduce_scatter", count_sum(recvcounts, comm) * dtype_size(datatype),
+       const void *sendbuf, void *recvbuf, const int recvcounts[], MPI_Datatype datatype,
+       MPI_Op op, MPI_Comm comm)
+
+_ICOLL(MPI_Ireduce_scatter_block,
+       PMPI_Ireduce_scatter_block(sendbuf, recvbuf, recvcount, datatype, op, comm, request),
+       "ireduce_scatter_block", block_total(recvcount, comm) * dtype_size(datatype),
+       const void *sendbuf, void *recvbuf, int recvcount, MPI_Datatype datatype,
+       MPI_Op op, MPI_Comm comm)
+
+_ICOLL(MPI_Iscan,
+       PMPI_Iscan(sendbuf, recvbuf, count, datatype, op, comm, request),
+       "iscan", (size_t)count * dtype_size(datatype),
+       const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
+
+_ICOLL(MPI_Iexscan,
+       PMPI_Iexscan(sendbuf, recvbuf, count, datatype, op, comm, request),
+       "iexscan", (size_t)count * dtype_size(datatype),
+       const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
+
 /* ── Persistent requests ────────────────────────────────────────────── */
 
 /* A persistent request (MPI_*_init) is a template: each MPI_Start /
- * MPI_Startall posts one message with its peer, tag and communicator. The
- * handle table keeps those per request handle, so every start is reported
- * as a post the point-to-point matcher can pair (type=start,ptype=send|recv
- * with peer=/wpeer=/tag=/commid=) and is registered like an Isend/Irecv
- * (its completion names it with psid=). Entries leave at MPI_Request_free;
- * a re-initialised handle overwrites its entry. */
+ * MPI_Startall activates it. The handle table keeps the template per request
+ * handle, so every start of a point-to-point template is reported as a post
+ * the point-to-point matcher can pair (type=start,ptype=send|recv with
+ * peer=/wpeer=/tag=/commid= and sseq= / rseq= taken at the start) and is
+ * registered like an Isend/Irecv (its completion names it with psid=).
+ * A persistent collective (MPI-4: MPI_Allreduce_init ...) is reported at its
+ * init (type=<coll>_init with cseq=: the init is itself a collective call in
+ * the communicator's order) and at every start (type=start,ptype=coll,
+ * ctype=<coll>, cseq=, csize=, root=/wroot=, sid=): each activation is
+ * ordered like a non-blocking collective's initiation. Entries leave at
+ * MPI_Request_free; a re-initialised handle overwrites its entry.
+ * PERSIST_CAP templates (72 B each: 72 KiB); a start of a template that did not fit
+ * carries none of these tags. MPI_Startall activates its requests "in some
+ * order" (the MPI standard): their numbers follow the array, and
+ * startall=1 says they may have been activated in another order. */
 #define PERSIST_CAP 1024
+enum { PERSIST_RECV = 0, PERSIST_SEND = 1, PERSIST_COLL = 2 };
 typedef struct {
     MPI_Request req;
-    int         send;          /* 1: a send template, 0: a receive */
-    int         peer, tag;
+    int         kind;
+    int         peer, tag;     /* point-to-point; for a collective peer = root (-1: none) */
+    int         wroot;         /* collective: the root's world rank (-1: none / unknown) */
     size_t      bytes;
     MPI_Comm    comm;
     int64_t     commid;
+    char        ctype[24];     /* collective: its type (allreduce, bcast ...) */
 } PersistRec;
 static PersistRec      g_persist[PERSIST_CAP];
 static int             g_persist_n = 0;
 static pthread_mutex_t g_persist_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void persist_add(MPI_Request req, int send, int peer, int tag, size_t nb, MPI_Comm comm) {
+static void persist_add(MPI_Request req, int kind, int peer, int tag, size_t nb, MPI_Comm comm,
+                        const char *ctype, int wroot) {
     if (req == MPI_REQUEST_NULL) return;
+    int64_t cid = comm_id_for(comm);
     pthread_mutex_lock(&g_persist_mutex);
     int slot = -1;
     for (int i = 0; i < g_persist_n; i++)
         if (g_persist[i].req == req) { slot = i; break; }
     if (slot < 0 && g_persist_n < PERSIST_CAP) slot = g_persist_n++;
-    if (slot >= 0)
-        g_persist[slot] = (PersistRec){req, send, peer, tag, nb, comm, comm_id_for(comm)};
+    if (slot >= 0) {
+        g_persist[slot] = (PersistRec){req, kind, peer, tag, wroot, nb, comm, cid, ""};
+        if (ctype) { strncpy(g_persist[slot].ctype, ctype, 23); g_persist[slot].ctype[23] = '\0'; }
+    }
     pthread_mutex_unlock(&g_persist_mutex);
 }
 
@@ -1876,25 +2381,49 @@ static int persistent_init(const void *site, const char *name, const char *type,
              type, nb, g_mpi_rank, peer, tag, (long long)comm_id_for(comm));
     emit_span_at(site, "mpi", t0, now_ns() - t0, name, extra);
     if (ret == MPI_SUCCESS && request)
-        persist_add(*request, strncmp(type, "recv", 4) != 0, peer, tag, nb, comm);
+        persist_add(*request, strncmp(type, "recv", 4) != 0 ? PERSIST_SEND : PERSIST_RECV, peer, tag, nb,
+                    comm, NULL, -1);
     return ret;
 }
 
+/* The number one activation of `pr` takes (before PMPI_Start*). */
+static uint64_t persist_seq(const PersistRec *pr, int *csize) {
+    if (pr->kind == PERSIST_COLL) return comm_seq(pr->comm, SEQ_COLL, 0, NULL, csize);
+    return comm_seq(pr->comm, pr->kind == PERSIST_SEND ? SEQ_SEND : SEQ_RECV, pr->peer, NULL, NULL);
+}
+
 /* Registers one started persistent request and writes its post tags
- * (",ptype=..,peer=..,tag=..,commid=..[,wpeer=..|,null=1][,sid=..]") into buf. */
-static void persist_started(MPI_Request req, char *buf, size_t cap) {
-    PersistRec pr;
+ * (",ptype=..,peer=..,tag=..,commid=..[,wpeer=..|,null=1][,sseq=|rseq=][,sid=..]"
+ * or the collective's ",ptype=coll,ctype=..,commid=..,csize=..[,root=..]
+ * [,cseq=..][,sid=..]") into buf. */
+static void persist_started(MPI_Request req, const PersistRec *pr, uint64_t seq, int csize,
+                            char *buf, size_t cap) {
     buf[0] = '\0';
-    if (req == MPI_REQUEST_NULL || !persist_get(req, &pr)) return;
-    int wildcard = !pr.send && (pr.peer == MPI_ANY_SOURCE || pr.tag == MPI_ANY_TAG);
-    Xlate *xl = (wildcard && pr.comm != MPI_COMM_WORLD) ? xlate_acquire(pr.comm) : NULL;
-    uint64_t id = req_register_ex(req, pr.send ? "isend" : "irecv", pr.peer, pr.tag, pr.bytes,
-                                  wildcard, pr.comm, xl);
+    if (pr->kind == PERSIST_COLL) {
+        uint64_t id = req_register(req, "pcoll", -1, 0, pr->bytes, 0);
+        int n = snprintf(buf, cap, ",ptype=coll,ctype=%s,commid=%lld,bytes=%zu,csize=%d", pr->ctype,
+                         (long long)pr->commid, pr->bytes, csize);
+        if (pr->peer >= 0 && n > 0 && (size_t)n < cap)
+            n += pr->wroot >= 0 ? snprintf(buf + n, cap - (size_t)n, ",root=%d,wroot=%d", pr->peer, pr->wroot)
+                                : snprintf(buf + n, cap - (size_t)n, ",root=%d", pr->peer);
+        if (seq && n > 0 && (size_t)n < cap)
+            n += snprintf(buf + n, cap - (size_t)n, ",cseq=%llu", (unsigned long long)seq);
+        if (id && n > 0 && (size_t)n < cap)
+            snprintf(buf + n, cap - (size_t)n, ",sid=%llu", (unsigned long long)id);
+        return;
+    }
+    int send = pr->kind == PERSIST_SEND;
+    int wildcard = !send && (pr->peer == MPI_ANY_SOURCE || pr->tag == MPI_ANY_TAG);
+    Xlate *xl = (wildcard && pr->comm != MPI_COMM_WORLD) ? xlate_acquire(pr->comm) : NULL;
+    uint64_t id = req_register_ex(req, send ? "isend" : "irecv", pr->peer, pr->tag, pr->bytes,
+                                  wildcard, pr->comm, xl);
     char ptag[40];
-    peer_tags(ptag, sizeof(ptag), pr.comm, pr.peer);
+    peer_tags(ptag, sizeof(ptag), pr->comm, pr->peer);
     int n = snprintf(buf, cap, ",ptype=%s,peer=%d,tag=%d,commid=%lld,bytes=%zu%s%s",
-                     pr.send ? "send" : "recv", pr.peer, pr.tag, (long long)pr.commid, pr.bytes,
+                     send ? "send" : "recv", pr->peer, pr->tag, (long long)pr->commid, pr->bytes,
                      ptag, wildcard ? ",wildcard=1" : "");
+    if (seq && n > 0 && (size_t)n < cap)
+        n += snprintf(buf + n, cap - (size_t)n, ",%s=%llu", send ? "sseq" : "rseq", (unsigned long long)seq);
     if (id && n > 0 && (size_t)n < cap)
         snprintf(buf + n, cap - (size_t)n, ",sid=%llu", (unsigned long long)id);
 }
@@ -1921,13 +2450,93 @@ int MPI_Recv_init(void *buf, int count, MPI_Datatype datatype,
                            (size_t)count * dtype_size(datatype), source, tag, comm, request);
 }
 
+#if MPI_VERSION >= 4
+/* MPI-4 persistent collectives: the init (a collective call, cseq=) and the
+ * template every start activates. */
+static int pcoll_init(const void *site, const char *name, const char *ctype, int ret, uint64_t t0,
+                      uint64_t cseq, int csize, int64_t cid, size_t nb, int root, MPI_Comm comm,
+                      MPI_Request *request) {
+    int wroot = root >= 0 ? world_rank_of(comm, root) : -1;
+    char extra[256], sq[32], rt[48] = "";
+    if (root >= 0 && wroot >= 0) snprintf(rt, sizeof(rt), ",root=%d,wroot=%d", root, wroot);
+    else if (root >= 0)          snprintf(rt, sizeof(rt), ",root=%d", root);
+    seq_tag(sq, sizeof(sq), "cseq", cseq);
+    snprintf(extra, sizeof(extra), "type=%s_init,bytes=%zu,rank=%d,commid=%lld,csize=%d%s%s", ctype, nb,
+             g_mpi_rank, (long long)cid, csize, rt, sq);
+    emit_span_at(site, "mpi", t0, now_ns() - t0, name, extra);
+    if (ret == MPI_SUCCESS && request) persist_add(*request, PERSIST_COLL, root, 0, nb, comm, ctype, wroot);
+    return ret;
+}
+
+#define _PCOLL(FNAME, PMPI_CALL, CTYPE, BYTES_EXPR, ROOT_EXPR, ...)                       \
+int FNAME(__VA_ARGS__, MPI_Info info, MPI_Request *request) {                              \
+    int csize = 0;                                                                          \
+    int64_t cid = -1;                                                                       \
+    uint64_t cseq = comm_seq(comm, SEQ_COLL, 0, &cid, &csize);                             \
+    size_t nb = (BYTES_EXPR);                                                               \
+    uint64_t t0 = now_ns();                                                                 \
+    int ret = PMPI_CALL;                                                                    \
+    return pcoll_init(__builtin_return_address(0), #FNAME, CTYPE, ret, t0, cseq, csize, cid, nb, \
+                      (ROOT_EXPR), comm, request);                                          \
+}
+
+int MPI_Barrier_init(MPI_Comm comm, MPI_Info info, MPI_Request *request) {
+    int csize = 0;
+    int64_t cid = -1;
+    uint64_t cseq = comm_seq(comm, SEQ_COLL, 0, &cid, &csize);
+    uint64_t t0 = now_ns();
+    int ret = PMPI_Barrier_init(comm, info, request);
+    return pcoll_init(__builtin_return_address(0), "MPI_Barrier_init", "barrier", ret, t0, cseq, csize, cid,
+                      0, -1, comm, request);
+}
+
+_PCOLL(MPI_Bcast_init, PMPI_Bcast_init(buffer, count, datatype, root, comm, info, request),
+       "bcast", (size_t)count * dtype_size(datatype), root,
+       void *buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm)
+_PCOLL(MPI_Reduce_init, PMPI_Reduce_init(sendbuf, recvbuf, count, datatype, op, root, comm, info, request),
+       "reduce", (size_t)count * dtype_size(datatype), root,
+       const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, int root,
+       MPI_Comm comm)
+_PCOLL(MPI_Allreduce_init, PMPI_Allreduce_init(sendbuf, recvbuf, count, datatype, op, comm, info, request),
+       "allreduce", (size_t)count * dtype_size(datatype), -1,
+       const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
+_PCOLL(MPI_Allgather_init,
+       PMPI_Allgather_init(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm, info, request),
+       "allgather", (size_t)sendcount * dtype_size(sendtype), -1,
+       const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount,
+       MPI_Datatype recvtype, MPI_Comm comm)
+_PCOLL(MPI_Alltoall_init,
+       PMPI_Alltoall_init(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm, info, request),
+       "alltoall", (size_t)sendcount * dtype_size(sendtype), -1,
+       const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount,
+       MPI_Datatype recvtype, MPI_Comm comm)
+_PCOLL(MPI_Gather_init,
+       PMPI_Gather_init(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, root, comm, info, request),
+       "gather", (size_t)sendcount * dtype_size(sendtype), root,
+       const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount,
+       MPI_Datatype recvtype, int root, MPI_Comm comm)
+_PCOLL(MPI_Scatter_init,
+       PMPI_Scatter_init(sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, root, comm, info, request),
+       "scatter", (size_t)sendcount * dtype_size(sendtype), root,
+       const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount,
+       MPI_Datatype recvtype, int root, MPI_Comm comm)
+_PCOLL(MPI_Reduce_scatter_block_init,
+       PMPI_Reduce_scatter_block_init(sendbuf, recvbuf, recvcount, datatype, op, comm, info, request),
+       "reduce_scatter_block", block_total(recvcount, comm) * dtype_size(datatype), -1,
+       const void *sendbuf, void *recvbuf, int recvcount, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
+#undef _PCOLL
+#endif
+
 int MPI_Start(MPI_Request *request) {
+    PersistRec pr;
+    int have = request && *request != MPI_REQUEST_NULL && persist_get(*request, &pr);
+    int csize = 0;
+    uint64_t seq = have ? persist_seq(&pr, &csize) : 0;
     uint64_t t0 = now_ns();
     int ret = PMPI_Start(request);
-    char post[192], extra[256];
+    char post[256], extra[320];
     post[0] = '\0';
-    if (ret == MPI_SUCCESS && request && *request != MPI_REQUEST_NULL)
-        persist_started(*request, post, sizeof(post));
+    if (ret == MPI_SUCCESS && have) persist_started(*request, &pr, seq, csize, post, sizeof(post));
     snprintf(extra, sizeof(extra), "type=start,rank=%d%s", g_mpi_rank, post);
     emit_span("mpi", t0, now_ns()-t0, "MPI_Start", extra);
     return ret;
@@ -1937,19 +2546,30 @@ int MPI_Start(MPI_Request *request) {
  * request at the call's start (as MPI_Sendrecv's .send part): each is one
  * post the matcher pairs. */
 int MPI_Startall(int count, MPI_Request requests[]) {
+    PersistRec *prs = (count > 0 && requests) ? (PersistRec *)malloc((size_t)count * sizeof(PersistRec)) : NULL;
+    uint64_t *seqs = prs ? (uint64_t *)calloc((size_t)count, sizeof(uint64_t)) : NULL;
+    int *csizes = seqs ? (int *)calloc((size_t)count, sizeof(int)) : NULL;
+    char *have = csizes ? (char *)calloc((size_t)count, 1) : NULL;
+    if (have)
+        for (int i = 0; i < count; i++)
+            if (requests[i] != MPI_REQUEST_NULL && persist_get(requests[i], &prs[i])) {
+                have[i] = 1;
+                seqs[i] = persist_seq(&prs[i], &csizes[i]);
+            }
     uint64_t t0 = now_ns();
     int ret = PMPI_Startall(count, requests);
     uint64_t t1 = now_ns();
-    if (ret == MPI_SUCCESS && requests) {
+    if (ret == MPI_SUCCESS && requests && have) {
         for (int i = 0; i < count; i++) {
-            if (requests[i] == MPI_REQUEST_NULL) continue;
-            char post[192], extra[256];
-            persist_started(requests[i], post, sizeof(post));
+            if (!have[i] || requests[i] == MPI_REQUEST_NULL) continue;
+            char post[256], extra[320];
+            persist_started(requests[i], &prs[i], seqs[i], csizes[i], post, sizeof(post));
             if (!post[0]) continue;
             snprintf(extra, sizeof(extra), "type=start,rank=%d%s,startall=1", g_mpi_rank, post);
             emit_span("mpi", t0, 0, "MPI_Start", extra);
         }
     }
+    free(prs); free(seqs); free(csizes); free(have);
     char extra[64];
     snprintf(extra, sizeof(extra), "type=startall,count=%d,rank=%d", count, g_mpi_rank);
     emit_span("mpi", t0, t1-t0, "MPI_Startall", extra);

@@ -26,10 +26,17 @@
  *               for anything emitted later (a thread with buffered records
  *               drains its own ring first, keeping its order).
  *   fork        the child drops the parent's buffered records (the parent
- *               sends them), its socket and cached ids, and starts its own
- *               transport on its first event.
+ *               sends them), its socket and cached thread id, records its
+ *               own pid, and starts its own transport on its first event.
  *   exec        preloaded hooks interpose execve/execv/execvp/execvpe/
  *               execl/execlp/execle and drain before the image is replaced.
+ *               In a vfork() child (it shares the parent's memory until the
+ *               exec) they touch nothing: see hp_tx_is_self().
+ *   begin       one process_begin instant per process image: the time the
+ *               first hook library's hp_tx_init() ran (its constructor,
+ *               before main), sent once, with the image's first record --
+ *               so launchers that preload the hooks but record nothing
+ *               (shells, env, mpirun) leave no marker. See "Process begin".
  *
  * HPROFILER_TRANSPORT=sync sends synchronously instead (same records, same
  * status), for A/B overhead comparisons. HPROFILER_RING_KB sets the
@@ -153,7 +160,52 @@ static inline void hp_tx_max(_Atomic uint64_t *slot, uint64_t v) {
                                                             memory_order_relaxed)) {}
 }
 
+/* Process begin ──────────────────────────────────────────────────────────
+ * Every hook library defines hprofiler_process_mark (exported) and uses the
+ * one dlsym(RTLD_DEFAULT) finds -- the first hook in the global scope -- so
+ * all hooks of a process share it; a library loaded privately (an OMPT tool
+ * dlopen'ed by libomp) uses its own when no preloaded hook has one. The
+ * first hp_tx_init() of the image claims begin_ns; the first record any of
+ * them emits sends "inst:other:<pid>:<pid>:<begin>:process_begin:
+ * type=process_begin,hook=<claimer>" once (a compare-and-swap on sent). A
+ * forked child inherits the parent's mark (sent, or another pid) and sends
+ * none: no constructor runs in it. Cost: one relaxed load per record. */
+typedef struct {
+    _Atomic uint64_t begin_ns;
+    _Atomic pid_t    pid;
+    _Atomic int      sent;
+    const char      *hook;
+} hp_proc_mark_t;
+__attribute__((visibility("default"))) hp_proc_mark_t hprofiler_process_mark;
+
+static hp_proc_mark_t *hp_proc_mark(void) {
+    static hp_proc_mark_t *_Atomic m;
+    hp_proc_mark_t *p = atomic_load_explicit(&m, memory_order_acquire);
+    if (!p) {
+        p = (hp_proc_mark_t *)dlsym(RTLD_DEFAULT, "hprofiler_process_mark");
+        if (!p) p = &hprofiler_process_mark;
+        atomic_store_explicit(&m, p, memory_order_release);
+    }
+    return p;
+}
+
+static void hp_proc_claim(const char *hook) {
+    hp_proc_mark_t *m = hp_proc_mark();
+    uint64_t zero = 0;
+    if (atomic_compare_exchange_strong(&m->begin_ns, &zero, hp_tx_now())) {
+        m->hook = hook;
+        atomic_store_explicit(&m->pid, getpid(), memory_order_release);
+    }
+}
+
 /* ids ──────────────────────────────────────────────────────────────────── */
+/* The pid is recorded when the transport is configured (hp_tx_init(), the
+ * hooks' constructors) and again in a forked child (atfork); the lazy fill
+ * below is only for a hook that emits before it ever called hp_tx_init().
+ * A vfork() child shares this memory and runs no atfork handlers, so
+ * nothing it runs may fill the cache: the parent would carry on with the
+ * child's pid (and send no process-begin marker, the claim being "another
+ * process's"). See hp_tx_is_self(). */
 static inline pid_t hp_tx_pid(void) {
     pid_t p = atomic_load_explicit(&hp_tx.pid, memory_order_relaxed);
     if (p == 0) {
@@ -306,6 +358,7 @@ static void hp_tx_configure(void) {
     hp_tx.wait_ns = hp_tx_env_u64("HPROFILER_RING_WAIT_MS", 1000, 0, 600000) * 1000000ull;
     hp_tx.drain_ns = hp_tx_env_u64("HPROFILER_DRAIN_US", 500, 50, 1000000) * 1000ull;
     hp_tx.image_ns = hp_tx_now();
+    atomic_store_explicit(&hp_tx.pid, getpid(), memory_order_relaxed);
     pthread_key_create(&hp_tx.key, hp_tx_ring_dtor);
     pthread_atfork(NULL, NULL, hp_tx_atfork_child);
 }
@@ -313,6 +366,7 @@ static void hp_tx_configure(void) {
 static inline void hp_tx_init(const char *hook) {
     if (!hp_tx.hook) hp_tx.hook = hook;
     pthread_once(&hp_tx.once, hp_tx_configure);
+    hp_proc_claim(hook);
 }
 
 static inline int hp_tx_enabled(void) {
@@ -549,8 +603,24 @@ static void hp_tx_push(char *rec, size_t len) {
 /* public API ───────────────────────────────────────────────────────────── */
 
 /* Emit one complete record. `rec` must end with '\n'; it is copied. */
+__attribute__((format(printf, 1, 2))) static void hp_tx_emitf(const char *fmt, ...);
+
+/* The process_begin instant, before the image's first record (see
+ * "Process begin"). Called with the re-entrancy guard clear. */
+static inline void hp_proc_send_mark(void) {
+    hp_proc_mark_t *m = hp_proc_mark();
+    if (atomic_load_explicit(&m->sent, memory_order_relaxed)) return;
+    pid_t pid = atomic_load_explicit(&m->pid, memory_order_acquire);
+    if (pid == 0 || pid != hp_tx_pid()) return;          /* not claimed yet, or a forked child */
+    int expect = 0;
+    if (!atomic_compare_exchange_strong(&m->sent, &expect, 1)) return;
+    hp_tx_emitf("inst:other:%d:%d:%llu:process_begin:type=process_begin,hook=%s\n", (int)pid, (int)pid,
+                (unsigned long long)atomic_load(&m->begin_ns), m->hook ? m->hook : "?");
+}
+
 static void hp_tx_emit(const char *rec, size_t len) {
     if (!hp_tx_enabled() || len == 0 || hp_tx_tls_busy) return;
+    hp_proc_send_mark();
     hp_tx_tls_busy = 1;
     HP_TX_INC(emitted, 1);
     if (len > HP_TX_MAX_RECORD) {
@@ -579,6 +649,7 @@ static void hp_tx_emit(const char *rec, size_t len) {
 __attribute__((format(printf, 1, 2)))
 static void hp_tx_emitf(const char *fmt, ...) {
     if (!hp_tx_enabled() || hp_tx_tls_busy) return;
+    hp_proc_send_mark();
     hp_tx_tls_busy = 1;
     HP_TX_INC(emitted, 1);
     char stack[1024];
@@ -676,7 +747,7 @@ static void hp_tx_atfork_child(void) {
     hp_tx.drain_started = 0;
     atomic_store(&hp_tx.stop, 0);
     atomic_store(&hp_tx.kick, 0);
-    atomic_store(&hp_tx.pid, 0);
+    atomic_store(&hp_tx.pid, getpid());
     atomic_store(&hp_tx.state, HP_TX_UNINIT);
     hp_tx_tls_ctr = NULL;
     memset(&hp_tx.ctr, 0, sizeof(hp_tx.ctr));
@@ -693,16 +764,23 @@ static void hp_tx_atfork_child(void) {
  * missing final status tells the collector instead). On a failed exec the
  * transport simply restarts on the next event. */
 #ifndef HP_TX_NO_EXEC_WRAPPERS
+/* Is this the process the transport belongs to? Not in a vfork() child
+ * (Python's subprocess, posix_spawn-style launchers): it shares the
+ * parent's memory and runs no atfork handlers, so touching the transport
+ * there would drain (and stop) the PARENT's, and filling the pid cache
+ * would give the parent the child's pid. Reads the recorded pid only --
+ * never hp_tx_pid() or hp_tx_enabled(), which may write. 0 (never
+ * configured): nothing to drain either way. */
+static inline int hp_tx_is_self(void) {
+    pid_t p = atomic_load_explicit(&hp_tx.pid, memory_order_relaxed);
+    return p != 0 && p == (pid_t)syscall(SYS_getpid);
+}
 static void hp_tx_before_exec(void) {
-    if (!hp_tx_enabled()) return;
-    /* A vfork() child shares the parent's memory and runs no atfork
-     * handlers: touching the transport there would drain (and stop) the
-     * PARENT's. Its pid differs from the cached one -- leave everything. */
-    if ((pid_t)syscall(SYS_getpid) != hp_tx_pid()) return;
+    if (!hp_tx_is_self() || !hp_tx_enabled()) return;
     hp_tx_shutdown(1);
 }
 static void hp_tx_after_failed_exec(void) {
-    if ((pid_t)syscall(SYS_getpid) != hp_tx_pid()) return;
+    if (!hp_tx_is_self()) return;
     pthread_mutex_lock(&hp_tx.init_mu);
     if (atomic_load(&hp_tx.state) == HP_TX_SYNC && hp_tx.want_ring) atomic_store(&hp_tx.state, HP_TX_UNINIT);
     pthread_mutex_unlock(&hp_tx.init_mu);

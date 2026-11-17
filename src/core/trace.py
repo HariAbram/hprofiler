@@ -259,8 +259,8 @@ class Trace:
         lane, categories, window, has_stack, gpu_model, filt)."""
         return self.store.iter_spans(**constraints)
 
-    def iter_instants(self) -> "Iterator[InstantEvent]":
-        return self.store.iter_instants()
+    def iter_instants(self, *, name: str | None = None) -> "Iterator[InstantEvent]":
+        return self.store.iter_instants(name=name)
 
     def iter_counters(self, order: str = "seq") -> "Iterator[CounterEvent]":
         return self.store.iter_counters(order=order)

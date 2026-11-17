@@ -18,10 +18,11 @@
  * runtime/driver API call at entry. cuda_hook.c arms a thread-local capture
  * around each intercepted call (hp_cupti_arm/disarm) and puts the captured
  * ids on its host span, so the Python side can match device records to the
- * exact host call. Kernel launches and copies/memsets made through calls
- * the LD_PRELOAD layer cannot see (e.g. from libraries with a statically
- * linked CUDA runtime) get a host span from the callback itself (src=
- * cupti_cb), so their device work is still correlated.
+ * exact host call. Kernel launches, copies/memsets, event synchronizations
+ * and completed event queries made through calls the LD_PRELOAD layer
+ * cannot see (the driver API, libraries with a statically linked CUDA
+ * runtime) get a host span from the callback itself (src=cupti_cb), so
+ * their device records are still correlated.
  *
  * Clock: CUPTI timestamps default to CLOCK_REALTIME. When available,
  * cuptiActivityRegisterTimestampCallback makes CUPTI use our CLOCK_MONOTONIC
@@ -104,6 +105,9 @@ void hp_cupti_arm(void) {}
 void hp_cupti_disarm(uint32_t *corr, uint32_t *corr2) { *corr = 0; *corr2 = 0; }
 void hp_cupti_flush(void) {}
 void hp_cupti_final_flush(void) {}
+int hp_cupti_streams_tracked(void) { return 0; }
+uint32_t hp_cupti_graph_exec_id(const void *exec) { (void)exec; return 0; }
+uint32_t hp_cupti_graph_exec_version(uint32_t exec_id) { (void)exec_id; return 0; }
 
 #else
 /* ── CUPTI available at build time ───────────────────────────────────────── */
@@ -123,7 +127,14 @@ static struct {
     CUptiResult (CUPTIAPI *RegisterTimestampCallback)(uint64_t (CUPTIAPI *)(void));
     CUptiResult (CUPTIAPI *FlushPeriod)(uint32_t);
     CUptiResult (CUPTIAPI *EnableLatencyTimestamps)(uint8_t);
+    /* graph and stream ids (CUDA 11.x / 12.x CUPTI; absent: not reported) */
+    CUptiResult (CUPTIAPI *GetGraphId)(CUgraph, uint32_t *);
+    CUptiResult (CUPTIAPI *GetGraphNodeId)(CUgraphNode, uint64_t *);
+    CUptiResult (CUPTIAPI *GetGraphExecId)(CUgraphExec, uint32_t *);
+    CUptiResult (CUPTIAPI *GetStreamIdEx)(CUcontext, CUstream, uint8_t, uint32_t *);
+    CUptiResult (CUPTIAPI *GetContextId)(CUcontext, uint32_t *);
 } p;
+static int g_res_ok = 0;                /* resource callbacks enabled (stream lives, graphs) */
 
 static pthread_once_t  g_lib_once  = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_start_mu  = PTHREAD_MUTEX_INITIALIZER;
@@ -237,7 +248,7 @@ static void emit_kernel(const CUpti_ActivityKernel9 *k) {
         APPEND(x, n, ",queued=%llu,submitted=%llu",
                (unsigned long long)to_mono(k->queued), (unsigned long long)to_mono(k->submitted));
     if (k->graphId)
-        APPEND(x, n, ",graph=%u", k->graphId);
+        APPEND(x, n, ",graph=%u,gnode=%llu", k->graphId, (unsigned long long)k->graphNodeId);
     hp_cuda_emit_span("cuda", 0, s, e - s, k->name ? k->name : "<unnamed kernel>", x);
 }
 
@@ -258,6 +269,10 @@ static void emit_memcpy(const hp_memcpy_rec_t *m) {
         APPEND(x, n, ",corr2=%u", m->runtimeCorrelationId);
     if (m->flags & CUPTI_ACTIVITY_FLAG_MEMCPY_ASYNC)
         APPEND(x, n, ",async=1");
+#ifdef HP_CUPTI_MEMCPY6
+    if (m->graphId)
+        APPEND(x, n, ",graph=%u,gnode=%llu", m->graphId, (unsigned long long)m->graphNodeId);
+#endif
     hp_cuda_emit_span("memory", 0, s, e - s, name, x);
 }
 
@@ -282,6 +297,8 @@ static void emit_memset(const CUpti_ActivityMemset4 *m) {
                  "bytes=%llu,corr=%u,dev=%u,ctx=%u,nstream=%u",
            (unsigned long long)m->bytes, m->correlationId,
            m->deviceId, m->contextId, m->streamId);
+    if (m->graphId)
+        APPEND(x, n, ",graph=%u,gnode=%llu", m->graphId, (unsigned long long)m->graphNodeId);
     hp_cuda_emit_span("memory", 0, s, e - s, "memset", x);
 }
 
@@ -385,6 +402,467 @@ static void CUPTIAPI buf_completed(CUcontext ctx, uint32_t stream_id, uint8_t *b
     hp_cuda_in_hook = saved;
 }
 
+/* ── Resource callbacks: stream lives and graph structure ────────────────
+ * With the resource domain enabled CUPTI reports every stream's creation
+ * and destruction and every graph exec's instantiation, whatever API or
+ * library made them (also statically linked runtimes):
+ *   STREAM_CREATED     begins a new life of the handle (cuda_hook.c's
+ *                      stream= numbers) and emits a zero-length stream_info
+ *                      span: stream=, nstream= (CUPTI's id, the one device
+ *                      records carry), ctx=, nonblocking=, priority=
+ *   STREAM_DESTROY_STARTING  ends the life: the next stream at that address
+ *                      gets another number
+ *   GRAPHNODE_CLONED   pairs an exec's node with the graph node it copies
+ *                      (kept per thread until the exec is created)
+ *   GRAPHEXEC_CREATED  the exec's structure, once: see graph_snapshot()
+ *   GRAPHEXEC_DESTROY_STARTING  forgets the exec's version.
+ * Numeric callback ids (cupti_callbacks.h, stable); the graph data layout
+ * is CUpti_GraphData's. */
+enum {
+    HP_RES_STREAM_CREATED = 3, HP_RES_STREAM_DESTROY_STARTING = 4, HP_RES_GRAPHEXEC_CREATED = 18,
+    HP_RES_GRAPHEXEC_DESTROY_STARTING = 19, HP_RES_GRAPHNODE_CLONED = 20,
+};
+typedef struct {
+    CUgraph graph, originalGraph;
+    CUgraphNode node, originalNode;
+    int nodeType;
+    CUgraphNode dependency;
+    CUgraphExec graphExec;
+} hp_graph_data_t;
+
+int hp_cupti_streams_tracked(void) { return __atomic_load_n(&g_res_ok, __ATOMIC_ACQUIRE); }
+
+/* Driver calls made from the callbacks, resolved from the process's
+ * libcuda (also when a static runtime opened it with RTLD_LOCAL). */
+static struct {
+    CUresult (*GetNodes)(CUgraph, CUgraphNode *, size_t *);
+    CUresult (*GetEdges)(CUgraph, CUgraphNode *, CUgraphNode *, size_t *);
+    CUresult (*GetEdges2)(CUgraph, CUgraphNode *, CUgraphNode *, void *, size_t *);
+    CUresult (*NodeGetType)(CUgraphNode, int *);
+    CUresult (*ChildGraph)(CUgraphNode, CUgraph *);
+    CUresult (*StreamGetFlags)(CUstream, unsigned int *);
+    CUresult (*StreamGetPriority)(CUstream, int *);
+} drv;
+static pthread_once_t g_drv_once = PTHREAD_ONCE_INIT;
+
+static void drv_init(void) {
+    void *h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) return;
+#define DSYM(f, n) (drv.f = (__typeof__(drv.f))dlsym(h, n))
+    DSYM(GetNodes, "cuGraphGetNodes");
+    DSYM(GetEdges, "cuGraphGetEdges");
+    DSYM(GetEdges2, "cuGraphGetEdges_v2");
+    DSYM(NodeGetType, "cuGraphNodeGetType");
+    DSYM(ChildGraph, "cuGraphChildGraphNodeGetGraph");
+    DSYM(StreamGetFlags, "cuStreamGetFlags");
+    DSYM(StreamGetPriority, "cuStreamGetPriority");
+#undef DSYM
+}
+
+static void emit_instant(const char *name, const char *tags) {
+    char head[160];
+    int hn = snprintf(head, sizeof(head), "inst:cuda:%d:%d:%llu:%s:", (int)getpid(), (int)syscall(SYS_gettid),
+                      (unsigned long long)mono_ns(), name);
+    size_t tl = strlen(tags);
+    char *line = (char *)malloc((size_t)hn + tl + 2);
+    if (!line) return;
+    memcpy(line, head, (size_t)hn);
+    memcpy(line + hn, tags, tl);
+    line[hn + tl] = '\n';
+    line[hn + tl + 1] = '\0';
+    hp_cuda_emit_line(line);
+    free(line);
+}
+
+static void stream_created(const CUpti_ResourceData *rd) {
+    CUstream st = rd->resourceHandle.stream;
+    int id = hp_cuda_stream_born((const void *)st);
+    pthread_once(&g_drv_once, drv_init);
+    int saved = hp_cuda_in_hook;
+    hp_cuda_in_hook = 1;                      /* the queries below are not the program's */
+    unsigned flags = 0;
+    int prio = 0, okf = drv.StreamGetFlags && drv.StreamGetFlags(st, &flags) == CUDA_SUCCESS;
+    int okp = drv.StreamGetPriority && drv.StreamGetPriority(st, &prio) == CUDA_SUCCESS;
+    uint32_t nstream = 0, ctx = 0;
+    int oks = p.GetStreamIdEx && p.GetStreamIdEx(rd->context, st, 0, &nstream) == CUPTI_SUCCESS;
+    int okc = p.GetContextId && rd->context && p.GetContextId(rd->context, &ctx) == CUPTI_SUCCESS;
+    hp_cuda_in_hook = saved;
+    char x[256];
+    int n = 0;
+    APPEND(x, n, "type=stream_info,op=stream_info,side=cpu,rt=cuda,timing=host,src=cupti_res,stream=%d", id);
+    if (okf) APPEND(x, n, ",nonblocking=%u", flags & 1u);
+    if (okp) APPEND(x, n, ",priority=%d", prio);
+    if (oks) APPEND(x, n, ",nstream=%u", nstream);
+    if (okc) APPEND(x, n, ",ctx=%u", ctx);
+    hp_cuda_emit_span("cuda", (pid_t)syscall(SYS_gettid), mono_ns(), 0, "stream_info", x);
+}
+
+/* ── Graph versions ──────────────────────────────────────────────────────
+ * An exec's version: 1 at instantiation, +1 per successful driver call that
+ * changes what its nodes do (cuGraphExecUpdate*, cuGraphExec*SetParams*,
+ * cuGraphNodeSetEnabled, cuGraphExecNodeSetParams). Graph launches carry
+ * gexec= (CUPTI's exec id) and gver=; each change is an instant
+ * graph_exec_update. GEXEC_CAP execs with a version above 1 (8 B each);
+ * beyond, a launch reports the version as 0 (unknown). An exec's topology
+ * cannot change after instantiation (cuGraphExecUpdate refuses a different
+ * one), so its structure is recorded once. */
+#define GEXEC_CAP 4096
+typedef struct { uint32_t id, ver; } GexecVer;
+static GexecVer        g_gexec[GEXEC_CAP];
+static int             g_ngexec = 0, g_gexec_full = 0;
+static pthread_mutex_t g_gexec_mu = PTHREAD_MUTEX_INITIALIZER;
+
+uint32_t hp_cupti_graph_exec_id(const void *exec) {
+    uint32_t id = 0;
+    if (!exec || !p.GetGraphExecId) return 0;
+    int saved = hp_cuda_in_hook;
+    hp_cuda_in_hook = 1;
+    CUptiResult r = p.GetGraphExecId((CUgraphExec)exec, &id);
+    hp_cuda_in_hook = saved;
+    return r == CUPTI_SUCCESS ? id : 0;
+}
+
+uint32_t hp_cupti_graph_exec_version(uint32_t exec_id) {
+    if (!exec_id) return 0;
+    uint32_t v = 1;
+    pthread_mutex_lock(&g_gexec_mu);
+    for (int i = 0; i < g_ngexec; i++)
+        if (g_gexec[i].id == exec_id) { v = g_gexec[i].ver; break; }
+    if (v == 1 && g_gexec_full) v = 0;            /* it may be one that did not fit */
+    pthread_mutex_unlock(&g_gexec_mu);
+    return v;
+}
+
+static uint32_t gexec_bump(uint32_t exec_id) {
+    uint32_t v = 0;
+    pthread_mutex_lock(&g_gexec_mu);
+    int i = 0;
+    while (i < g_ngexec && g_gexec[i].id != exec_id) i++;
+    if (i < g_ngexec) v = ++g_gexec[i].ver;
+    else if (g_ngexec < GEXEC_CAP) { g_gexec[g_ngexec++] = (GexecVer){exec_id, 2}; v = 2; }
+    else g_gexec_full = 1;
+    pthread_mutex_unlock(&g_gexec_mu);
+    return v;
+}
+
+static void gexec_forget(uint32_t exec_id) {
+    pthread_mutex_lock(&g_gexec_mu);
+    for (int i = 0; i < g_ngexec; i++)
+        if (g_gexec[i].id == exec_id) { g_gexec[i] = g_gexec[--g_ngexec]; break; }
+    pthread_mutex_unlock(&g_gexec_mu);
+}
+
+static void graph_exec_updated(const CUpti_CallbackData *cb) {
+    const char *f = cb->functionName;
+    if (!f || strncmp(f, "cuGraph", 7) != 0) return;
+    int update = strncmp(f, "cuGraphExecUpdate", 17) == 0
+              || (strncmp(f, "cuGraphExec", 11) == 0 && strstr(f, "SetParams"))
+              || strncmp(f, "cuGraphNodeSetEnabled", 21) == 0;
+    if (!update || !cb->functionParams || !cb->functionReturnValue) return;
+    if (*(const CUresult *)cb->functionReturnValue != CUDA_SUCCESS) return;
+    /* every one of these takes the exec first */
+    CUgraphExec exec = *(CUgraphExec const *)cb->functionParams;
+    uint32_t id = hp_cupti_graph_exec_id((const void *)exec);
+    if (!id) return;
+    uint32_t v = gexec_bump(id);
+    char x[192];
+    char name[64];
+    snprintf(name, sizeof(name), "%s", f);
+    char *suffix = strstr(name, "_v");
+    if (suffix && suffix[2] >= '0' && suffix[2] <= '9' && !strchr(suffix + 2, '_')) *suffix = '\0';
+    snprintf(x, sizeof(x), "type=graph_exec_update,op=graph_exec_update,rt=cuda,gexec=%u,gver=%u,api=%s", id, v,
+             name);
+    emit_instant("cudaGraphExecUpdate", x);
+}
+
+/* ── Graph structure ─────────────────────────────────────────────────────
+ * At GRAPHEXEC_CREATED the source graph is read once (cuGraphGetNodes,
+ * cuGraphGetEdges, cuGraphNodeGetType, child graphs recursively) and its
+ * edges are translated to the exec's own nodes through the clone pairs --
+ * the device records name the exec's nodes (graphNodeId=, gnode= on the
+ * span), not the source graph's. Emitted as instants:
+ *   cudaGraphExec   type=graph_exec,gexec=<exec id>,cgraph=<graph id>,
+ *                   nnodes=,nedges=[,unmapped=N][,lossy=1][,truncated=1]
+ *   cudaGraphNodes  type=graph_nodes,gexec=,part=,nodes=<node>/<type>;...
+ *   cudaGraphEdges  type=graph_edges,gexec=,part=,edges=<a>-<b>[p];...
+ * ('/', not ':': a tag value never holds the record's field separator).
+ * <type> is CUgraphNodeType; a child graph becomes two marker nodes (type
+ * 100 entry, 101 exit) around its own nodes, so an empty child still orders
+ * what is around it. An edge marked p is not a completion dependency
+ * (programmatic / launch-order ports, CUDA 12.3): the downstream node may
+ * start before the upstream one ends. A node without a clone (unmapped=)
+ * keeps a marker id: no device record can name it. Edges read without
+ * their edge data where the driver refuses that (lossy=1) are not emitted.
+ * At most HP_GRAPH_MAX_NODES nodes / HP_GRAPH_MAX_EDGES edges per exec
+ * (truncated=1: none emitted). The exec's later launches only look up its
+ * id and version: the structure is never read again. */
+#define HP_GRAPH_MAX_NODES (1u << 20)
+#define HP_GRAPH_MAX_EDGES (1u << 22)
+#define HP_GRAPH_PART      256
+#define HP_GRAPH_MAX_DEPTH 8
+#define HP_MARK_BIT        (1ULL << 62)
+
+typedef struct { uint32_t graph; uint64_t node, orig; } ClonePair;
+static __thread ClonePair *t_clones;
+static __thread size_t     t_nclones, t_cclones;
+
+static void note_clone(const hp_graph_data_t *g) {
+    if (!g || !p.GetGraphNodeId || !p.GetGraphId) return;
+    uint32_t gid = 0;
+    uint64_t nid = 0, oid = 0;
+    if (!g->graph || p.GetGraphId(g->graph, &gid) != CUPTI_SUCCESS) return;
+    if (!g->node || p.GetGraphNodeId(g->node, &nid) != CUPTI_SUCCESS) return;
+    if (!g->originalNode || p.GetGraphNodeId(g->originalNode, &oid) != CUPTI_SUCCESS) return;
+    if (t_nclones == t_cclones) {
+        size_t nc = t_cclones ? t_cclones * 2 : 256;
+        if (nc > HP_GRAPH_MAX_NODES) return;
+        ClonePair *np = (ClonePair *)realloc(t_clones, nc * sizeof(ClonePair));
+        if (!np) return;
+        t_clones = np;
+        t_cclones = nc;
+    }
+    t_clones[t_nclones++] = (ClonePair){gid, nid, oid};
+}
+
+typedef struct {
+    uint32_t exec;
+    ClonePair *map;        /* this exec's pairs, sorted by orig */
+    size_t nmap;
+    uint64_t *nid; int *ntype; size_t nn, cn;
+    uint64_t *ea, *eb; char *ep; size_t ne, ce;
+    uint64_t marks;
+    int unmapped, lossy, truncated;
+} Snap;
+
+static int pair_cmp(const void *a, const void *b) {
+    uint64_t x = ((const ClonePair *)a)->orig, y = ((const ClonePair *)b)->orig;
+    return x < y ? -1 : x > y;
+}
+
+static uint64_t exec_node(Snap *S, CUgraphNode n) {
+    uint64_t orig = 0;
+    if (p.GetGraphNodeId(n, &orig) == CUPTI_SUCCESS && S->nmap) {
+        ClonePair key = {0, 0, orig};
+        const ClonePair *hit = (const ClonePair *)bsearch(&key, S->map, S->nmap, sizeof(ClonePair), pair_cmp);
+        if (hit) return hit->node;
+    }
+    S->unmapped++;
+    return HP_MARK_BIT | ++S->marks;
+}
+
+static void snap_node(Snap *S, uint64_t id, int type) {
+    if (S->truncated) return;
+    if (S->nn == S->cn) {
+        size_t nc = S->cn ? S->cn * 2 : 64;
+        if (nc > HP_GRAPH_MAX_NODES) { S->truncated = 1; return; }
+        uint64_t *a = (uint64_t *)realloc(S->nid, nc * sizeof(uint64_t));
+        int *b = a ? (int *)realloc(S->ntype, nc * sizeof(int)) : NULL;
+        if (a) S->nid = a;
+        if (!b) { S->truncated = 1; return; }
+        S->ntype = b;
+        S->cn = nc;
+    }
+    S->nid[S->nn] = id;
+    S->ntype[S->nn++] = type;
+}
+
+static void snap_edge(Snap *S, uint64_t a, uint64_t b, char weak) {
+    if (S->truncated) return;
+    if (S->ne == S->ce) {
+        size_t nc = S->ce ? S->ce * 2 : 64;
+        if (nc > HP_GRAPH_MAX_EDGES) { S->truncated = 1; return; }
+        uint64_t *x = (uint64_t *)realloc(S->ea, nc * sizeof(uint64_t));
+        if (x) S->ea = x;
+        uint64_t *y = x ? (uint64_t *)realloc(S->eb, nc * sizeof(uint64_t)) : NULL;
+        if (y) S->eb = y;
+        char *z = y ? (char *)realloc(S->ep, nc) : NULL;
+        if (!z) { S->truncated = 1; return; }
+        S->ep = z;
+        S->ce = nc;
+    }
+    S->ea[S->ne] = a;
+    S->eb[S->ne] = b;
+    S->ep[S->ne++] = weak;
+}
+
+static int handle_cmp(const void *a, const void *b) {
+    uintptr_t x = (uintptr_t)*(CUgraphNode const *)a, y = (uintptr_t)*(CUgraphNode const *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* One graph level: its nodes (a child graph's as two markers around its
+ * own), its edges; *roots / *leaves (malloc'd, the caller frees) the
+ * entry / exit ids of its sources and sinks, for the level above. */
+static void snap_graph(Snap *S, CUgraph g, int depth, uint64_t **roots, size_t *nroots,
+                       uint64_t **leaves, size_t *nleaves) {
+    *roots = *leaves = NULL;
+    *nroots = *nleaves = 0;
+    size_t n = 0, ne = 0;
+    if (drv.GetNodes(g, NULL, &n) != CUDA_SUCCESS || n > HP_GRAPH_MAX_NODES) { S->truncated = 1; return; }
+    CUgraphNode *nodes = (CUgraphNode *)calloc(n ? n : 1, sizeof(CUgraphNode));
+    CUgraphNode *sorted = (CUgraphNode *)calloc(n ? n : 1, sizeof(CUgraphNode));
+    uint64_t *ent = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    uint64_t *ext = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    int *in = (int *)calloc(n ? n : 1, sizeof(int)), *out = (int *)calloc(n ? n : 1, sizeof(int));
+    size_t *order = (size_t *)calloc(n ? n : 1, sizeof(size_t));
+    if (!nodes || !sorted || !ent || !ext || !in || !out || !order || drv.GetNodes(g, nodes, &n) != CUDA_SUCCESS) {
+        S->truncated = 1;
+        goto done;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int type = -1;
+        drv.NodeGetType(nodes[i], &type);
+        CUgraph child = NULL;
+        if (type == 4 && drv.ChildGraph && depth < HP_GRAPH_MAX_DEPTH &&      /* CU_GRAPH_NODE_TYPE_GRAPH */
+            drv.ChildGraph(nodes[i], &child) == CUDA_SUCCESS && child) {
+            ent[i] = HP_MARK_BIT | ++S->marks;
+            ext[i] = HP_MARK_BIT | ++S->marks;
+            snap_node(S, ent[i], 100);
+            snap_node(S, ext[i], 101);
+            uint64_t *cr, *cl;
+            size_t ncr, ncl;
+            snap_graph(S, child, depth + 1, &cr, &ncr, &cl, &ncl);
+            for (size_t k = 0; k < ncr; k++) snap_edge(S, ent[i], cr[k], 0);
+            for (size_t k = 0; k < ncl; k++) snap_edge(S, cl[k], ext[i], 0);
+            if (!ncr) snap_edge(S, ent[i], ext[i], 0);
+            free(cr);
+            free(cl);
+        } else {
+            ent[i] = ext[i] = exec_node(S, nodes[i]);
+            snap_node(S, ent[i], type);
+        }
+    }
+    /* sorted handles -> index, for the edge list */
+    memcpy(sorted, nodes, n * sizeof(CUgraphNode));
+    qsort(sorted, n, sizeof(CUgraphNode), handle_cmp);
+    for (size_t i = 0; i < n; i++) {
+        CUgraphNode *hit = (CUgraphNode *)bsearch(&nodes[i], sorted, n, sizeof(CUgraphNode), handle_cmp);
+        if (hit) order[hit - sorted] = i;
+    }
+    CUresult er = drv.GetEdges ? drv.GetEdges(g, NULL, NULL, &ne) : CUDA_ERROR_NOT_SUPPORTED;
+    int with_data = 0;
+    if (er != CUDA_SUCCESS && drv.GetEdges2) {
+        er = drv.GetEdges2(g, NULL, NULL, NULL, &ne);
+        with_data = er == CUDA_SUCCESS;
+    }
+    if (er != CUDA_SUCCESS) { S->lossy = 1; ne = 0; }
+    if (ne > HP_GRAPH_MAX_EDGES) { S->truncated = 1; goto done; }
+    if (ne) {
+        CUgraphNode *from = (CUgraphNode *)calloc(ne, sizeof(CUgraphNode));
+        CUgraphNode *to = (CUgraphNode *)calloc(ne, sizeof(CUgraphNode));
+        unsigned char *data = with_data ? (unsigned char *)calloc(ne, 8) : NULL;   /* CUgraphEdgeData: 8 B */
+        CUresult r = (!from || !to || (with_data && !data)) ? CUDA_ERROR_OUT_OF_MEMORY
+                   : with_data ? drv.GetEdges2(g, from, to, data, &ne) : drv.GetEdges(g, from, to, &ne);
+        if (r == CUDA_SUCCESS) {
+            for (size_t k = 0; k < ne; k++) {
+                CUgraphNode *a = (CUgraphNode *)bsearch(&from[k], sorted, n, sizeof(CUgraphNode), handle_cmp);
+                CUgraphNode *b = (CUgraphNode *)bsearch(&to[k], sorted, n, sizeof(CUgraphNode), handle_cmp);
+                if (!a || !b) continue;
+                size_t ia = order[a - sorted], ib = order[b - sorted];
+                /* edge data: from_port, to_port, type -- anything but the default
+                 * full dependency lets the downstream node start early */
+                char weak = data && (data[8 * k] || data[8 * k + 1] || data[8 * k + 2]) ? 'p' : 0;
+                snap_edge(S, ext[ia], ent[ib], weak);
+                out[ia]++;
+                in[ib]++;
+            }
+        } else {
+            S->lossy = 1;
+        }
+        free(from);
+        free(to);
+        free(data);
+    }
+    *roots = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    *leaves = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    for (size_t i = 0; *roots && *leaves && i < n; i++) {
+        if (!in[i]) (*roots)[(*nroots)++] = ent[i];
+        if (!out[i]) (*leaves)[(*nleaves)++] = ext[i];
+    }
+done:
+    free(nodes); free(sorted); free(ent); free(ext); free(in); free(out); free(order);
+}
+
+static void graph_snapshot(const hp_graph_data_t *g) {
+    pthread_once(&g_drv_once, drv_init);
+    uint32_t exec = 0, gid = 0;
+    if (!g || !g->graphExec || !p.GetGraphExecId || p.GetGraphExecId(g->graphExec, &exec) != CUPTI_SUCCESS)
+        return;
+    if (g->graph && p.GetGraphId) p.GetGraphId(g->graph, &gid);
+    Snap S = {0};
+    S.exec = exec;
+    /* this exec's clone pairs (an exec's internal graph has its id) */
+    S.map = (ClonePair *)malloc((t_nclones ? t_nclones : 1) * sizeof(ClonePair));
+    for (size_t i = 0; S.map && i < t_nclones; i++)
+        if (t_clones[i].graph == exec) S.map[S.nmap++] = t_clones[i];
+    t_nclones = 0;
+    if (S.map) qsort(S.map, S.nmap, sizeof(ClonePair), pair_cmp);
+    int saved = hp_cuda_in_hook;
+    hp_cuda_in_hook = 1;                      /* the queries are not the program's */
+    if (drv.GetNodes && drv.NodeGetType && p.GetGraphNodeId && g->graph) {
+        uint64_t *r, *l;
+        size_t nr, nl;
+        snap_graph(&S, g->graph, 0, &r, &nr, &l, &nl);
+        free(r);
+        free(l);
+    } else {
+        S.truncated = 1;
+    }
+    hp_cuda_in_hook = saved;
+    char head[256];
+    int hn = 0;
+    APPEND(head, hn, "type=graph_exec,op=graph_exec,rt=cuda,src=cupti_res,gexec=%u,cgraph=%u,nnodes=%zu,nedges=%zu",
+           exec, gid, S.truncated ? (size_t)0 : S.nn, S.truncated ? (size_t)0 : S.ne);
+    if (S.unmapped) APPEND(head, hn, ",unmapped=%d", S.unmapped);
+    if (S.lossy) APPEND(head, hn, ",lossy=1");
+    if (S.truncated) APPEND(head, hn, ",truncated=1");
+    emit_instant("cudaGraphExec", head);
+    if (!S.truncated) {
+        char *buf = (char *)malloc(HP_GRAPH_PART * 48 + 128);
+        for (size_t base = 0; buf && base < S.nn; base += HP_GRAPH_PART) {
+            int n = snprintf(buf, 128, "type=graph_nodes,gexec=%u,part=%zu,nodes=", exec, base / HP_GRAPH_PART);
+            for (size_t i = base; i < S.nn && i < base + HP_GRAPH_PART; i++)
+                n += snprintf(buf + n, 48, "%s%llu/%d", i > base ? ";" : "", (unsigned long long)S.nid[i], S.ntype[i]);
+            emit_instant("cudaGraphNodes", buf);
+        }
+        for (size_t base = 0; buf && base < S.ne; base += HP_GRAPH_PART) {
+            int n = snprintf(buf, 128, "type=graph_edges,gexec=%u,part=%zu,edges=", exec, base / HP_GRAPH_PART);
+            for (size_t i = base; i < S.ne && i < base + HP_GRAPH_PART; i++)
+                n += snprintf(buf + n, 48, "%s%llu-%llu%s", i > base ? ";" : "", (unsigned long long)S.ea[i],
+                              (unsigned long long)S.eb[i], S.ep[i] ? "p" : "");
+            emit_instant("cudaGraphEdges", buf);
+        }
+        free(buf);
+    }
+    free(S.map); free(S.nid); free(S.ntype); free(S.ea); free(S.eb); free(S.ep);
+}
+
+static void resource_callback(CUpti_CallbackId cbid, const CUpti_ResourceData *rd) {
+    if (!rd) return;
+    switch ((int)cbid) {
+    case HP_RES_STREAM_CREATED:
+        stream_created(rd);
+        break;
+    case HP_RES_STREAM_DESTROY_STARTING:
+        hp_cuda_stream_died((const void *)rd->resourceHandle.stream);
+        break;
+    case HP_RES_GRAPHNODE_CLONED:
+        note_clone((const hp_graph_data_t *)rd->resourceDescriptor);
+        break;
+    case HP_RES_GRAPHEXEC_CREATED:
+        graph_snapshot((const hp_graph_data_t *)rd->resourceDescriptor);
+        break;
+    case HP_RES_GRAPHEXEC_DESTROY_STARTING: {
+        const hp_graph_data_t *g = (const hp_graph_data_t *)rd->resourceDescriptor;
+        uint32_t id = g ? hp_cupti_graph_exec_id((const void *)g->graphExec) : 0;
+        if (id) gexec_forget(id);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 /* ── callback API: correlation capture + un-intercepted submissions ────── */
 
 static __thread int      t_armed;
@@ -405,29 +883,46 @@ static const api_class_t k_classes[] = {
     {"cudaMemcpy",      "memory", "memcpy", NULL}, {"cuMemcpy",    "memory", "memcpy", NULL},
     {"cudaMemset",      "memory", "memset", NULL}, {"cuMemset",    "memory", "memset", NULL},
 };
-/* Synchronization calls: only with HP_CUPTI_CB_SYNCS (a static-runtime
+/* Event synchronizations and event queries, always: CUPTI reports both as
+ * event synchronization records (a query when it found the event complete
+ * -- only those are emitted, as by cuda_hook.c's cudaEventQuery), and such
+ * a record needs its host call. A driver-API call (cuEventSynchronize,
+ * cuEventQuery) or one through a runtime no wrapper sees has no other.
+ * Their first parameter is the event (event=, cuda_hook.c's numbering). */
+static const api_class_t k_event_classes[] = {
+    {"cudaEventSynchronize", "sync", "sync", "event"}, {"cuEventSynchronize", "sync", "sync", "event"},
+    {"cudaEventQuery",       "sync", "sync", "event"}, {"cuEventQuery",       "sync", "sync", "event"},
+};
+/* Other synchronization calls: only with HP_CUPTI_CB_SYNCS (a static-runtime
  * program, where no LD_PRELOAD wrapper sees them). Otherwise they are left
  * out -- other hprofiler hooks (NCCL) make such calls internally for their
  * own timing and would show up as application calls. */
 static const api_class_t k_sync_classes[] = {
     {"cudaDeviceSynchronize", "sync", "sync", "device"}, {"cuCtxSynchronize",    "sync", "sync", "device"},
     {"cudaStreamSynchronize", "sync", "sync", "stream"}, {"cuStreamSynchronize", "sync", "sync", "stream"},
-    {"cudaEventSynchronize",  "sync", "sync", "event"},  {"cuEventSynchronize",  "sync", "sync", "event"},
     {"cudaStreamWaitEvent",   "cuda", "stream_wait", NULL}, {"cuStreamWaitEvent", "cuda", "stream_wait", NULL},
     {"cudaEventRecord",       "cuda", "event_record", NULL}, {"cuEventRecord",    "cuda", "event_record", NULL},
 };
 static int g_cb_syncs = 0;
 
+static const api_class_t *find_class(const api_class_t *tab, size_t n, const char *name) {
+    for (size_t i = 0; i < n; i++)
+        if (strncmp(name, tab[i].prefix, strlen(tab[i].prefix)) == 0)
+            return &tab[i];
+    return NULL;
+}
+#define FIND_CLASS(tab, name) find_class(tab, sizeof(tab) / sizeof(tab[0]), name)
+
 static const api_class_t *classify(const char *name) {
     if (!name) return NULL;
-    for (size_t i = 0; i < sizeof(k_classes) / sizeof(k_classes[0]); i++)
-        if (strncmp(name, k_classes[i].prefix, strlen(k_classes[i].prefix)) == 0)
-            return &k_classes[i];
-    if (g_cb_syncs)
-        for (size_t i = 0; i < sizeof(k_sync_classes) / sizeof(k_sync_classes[0]); i++)
-            if (strncmp(name, k_sync_classes[i].prefix, strlen(k_sync_classes[i].prefix)) == 0)
-                return &k_sync_classes[i];
-    return NULL;
+    const api_class_t *c = FIND_CLASS(k_classes, name);
+    if (!c) c = FIND_CLASS(k_event_classes, name);
+    if (!c && g_cb_syncs) c = FIND_CLASS(k_sync_classes, name);
+    return c;
+}
+
+static int is_event_class(const api_class_t *c) {
+    return c >= k_event_classes && c < k_event_classes + sizeof(k_event_classes) / sizeof(k_event_classes[0]);
 }
 
 /* Kernel launches the hook did not intercept (cuLaunchKernelEx obtained with
@@ -470,6 +965,11 @@ static void emit_callback_span(const CUpti_CallbackData *cb, int is_rt, CUpti_Ca
                                uint64_t t0, uint64_t t1) {
     const api_class_t *c = classify(cb->functionName);
     if (!c) return;
+    /* an event query that found the event not complete: a poll, not
+     * recorded (see k_event_classes) */
+    if (strstr(cb->functionName, "EventQuery") && cb->functionReturnValue
+        && *(const int *)cb->functionReturnValue != 0)
+        return;
     /* "cudaLaunchKernel_v7000" -> "cudaLaunchKernel" */
     char name[128];
     snprintf(name, sizeof(name), "%s", cb->functionName);
@@ -490,18 +990,33 @@ static void emit_callback_span(const CUpti_CallbackData *cb, int is_rt, CUpti_Ca
                      type, c->op, cb->correlationId, (unsigned long long)sid);
     if (c->sync && n > 0 && n < (int)sizeof(x))
         n += snprintf(x + n, sizeof(x) - (size_t)n, ",sync=%s", c->sync);
+    if (is_event_class(c) && cb->functionParams && n > 0 && n < (int)sizeof(x))
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",event=%d",
+                      hp_cuda_event_id(*(const void *const *)cb->functionParams));
     uint64_t mod = hp_cuda_function_module(launch_function(is_rt, cbid, cb->functionParams));
     if (mod && n > 0 && n < (int)sizeof(x))
-        snprintf(x + n, sizeof(x) - (size_t)n, ",mod=%016llx", (unsigned long long)mod);
+        n += snprintf(x + n, sizeof(x) - (size_t)n, ",mod=%016llx", (unsigned long long)mod);
+    if (!strcmp(c->op, "graph") && cb->functionParams) {
+        /* cudaGraphLaunch / cuGraphLaunch take the exec first */
+        uint32_t gexec = hp_cupti_graph_exec_id(*(const void *const *)cb->functionParams);
+        if (gexec && n > 0 && n < (int)sizeof(x))
+            snprintf(x + n, sizeof(x) - (size_t)n, ",gexec=%u,gver=%u", gexec, hp_cupti_graph_exec_version(gexec));
+    }
     hp_cuda_emit_span(c->cat, (pid_t)syscall(SYS_gettid), t0, t1 - t0, name, x);
 }
 
 static void CUPTIAPI api_callback(void *ud, CUpti_CallbackDomain dom,
                                   CUpti_CallbackId cbid, const void *data) {
     (void)ud;
+    if (dom == CUPTI_CB_DOMAIN_RESOURCE) {
+        resource_callback(cbid, (const CUpti_ResourceData *)data);
+        return;
+    }
     if (dom != CUPTI_CB_DOMAIN_RUNTIME_API && dom != CUPTI_CB_DOMAIN_DRIVER_API) return;
     const CUpti_CallbackData *cb = (const CUpti_CallbackData *)data;
     int is_rt = dom == CUPTI_CB_DOMAIN_RUNTIME_API;
+    if (!is_rt && cb->callbackSite == CUPTI_API_EXIT && !hp_cuda_in_hook)
+        graph_exec_updated(cb);        /* a graph exec's version (see "Graph versions") */
 
     if (t_armed) {                      /* inside an intercepted call */
         if (cb->callbackSite == CUPTI_API_ENTER) {
@@ -615,6 +1130,11 @@ static void lib_init(void) {
     SYM(RegisterTimestampCallback, "cuptiActivityRegisterTimestampCallback");
     SYM(FlushPeriod, "cuptiActivityFlushPeriod");
     SYM(EnableLatencyTimestamps, "cuptiActivityEnableLatencyTimestamps");
+    SYM(GetGraphId, "cuptiGetGraphId");
+    SYM(GetGraphNodeId, "cuptiGetGraphNodeId");
+    SYM(GetGraphExecId, "cuptiGetGraphExecId");
+    SYM(GetStreamIdEx, "cuptiGetStreamIdEx");
+    SYM(GetContextId, "cuptiGetContextId");
 
     p.GetVersion(&g_lib_version);      /* checked by try_libcupti() */
     /* Must precede every cuptiActivityEnable so all records use it. */
@@ -667,6 +1187,9 @@ unsigned hp_cupti_start(unsigned want) {
         g_callbacks_ok = p.Subscribe(&sub, api_callback, NULL) == CUPTI_SUCCESS &&
                          p.EnableDomain(1, sub, CUPTI_CB_DOMAIN_RUNTIME_API) == CUPTI_SUCCESS &&
                          p.EnableDomain(1, sub, CUPTI_CB_DOMAIN_DRIVER_API) == CUPTI_SUCCESS;
+        /* stream lives and graph structure (see "Resource callbacks") */
+        __atomic_store_n(&g_res_ok, g_callbacks_ok &&
+                         p.EnableDomain(1, sub, CUPTI_CB_DOMAIN_RESOURCE) == CUPTI_SUCCESS, __ATOMIC_RELEASE);
         if (p.EnableLatencyTimestamps && p.EnableLatencyTimestamps(1) == CUPTI_SUCCESS)
             g_latency = 1;
         CUptiResult rk = p.Enable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
@@ -737,6 +1260,9 @@ void hp_cupti_test_api_callback(int runtime_domain, const void *callback_data) {
 void hp_cupti_test_api_callback_id(int runtime_domain, uint32_t cbid, const void *callback_data) {
     api_callback(NULL, runtime_domain ? CUPTI_CB_DOMAIN_RUNTIME_API : CUPTI_CB_DOMAIN_DRIVER_API,
                  (CUpti_CallbackId)cbid, callback_data);
+}
+void hp_cupti_test_resource_callback(uint32_t cbid, const void *resource_data) {
+    api_callback(NULL, CUPTI_CB_DOMAIN_RESOURCE, (CUpti_CallbackId)cbid, resource_data);
 }
 #endif
 
